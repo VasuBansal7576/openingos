@@ -18,8 +18,8 @@ If an unresolved choice changes shared contracts, resolve it before dependent im
 An ADR records a decision and its consequences; it is not a standalone worker ticket.
 One implementation package can depend on several ADRs, and one ADR can constrain several packages.
 For sponsor work, use `docs/integrations/sponsor-contracts.md` and the package details in `docs/implementation/sponsor-integration-plan.md`.
-For Jev work, use `docs/integrations/jev-contract.md` for the actual API boundary and pending J-cases.
-For coordinated builds, use `docs/implementation/orca-handoff.md` for the user's model roles, permission policy and startup proofs.
+For Jev work, use ADR-0005's API contract and the package plan's J-cases.
+For coordinated builds, use `ROADMAP.md` for order and `AGENTS.md` for model roles and permission boundaries.
 The coordinator assigns the relevant S-cases and records their evidence mode before dispatch.
 Use proof packages to resolve proposed contracts; do not send feature workers to guess around them.
 

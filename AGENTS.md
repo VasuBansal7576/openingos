@@ -5,8 +5,8 @@
 Read `PRD.md` before changing product behavior.
 Read `docs/adr/README.md` and the relevant decision records before production implementation; proposed records do not authorize dependent feature work.
 For provider integration work, read `docs/integrations/sponsor-contracts.md` and take an assigned package from `docs/implementation/sponsor-integration-plan.md`.
-For Jev work, also read `docs/integrations/jev-contract.md`; a coding-agent Jev model listing is not deployed application access.
-For Orca coordination, read `docs/implementation/orca-handoff.md` for requested model roles, permission boundaries and runtime checks.
+For Jev work, read ADR-0005's API contract; a coding-agent Jev model listing is not deployed application access.
+For Orca coordination, follow `ROADMAP.md` for setup and build order.
 Do not infer application API behavior from a coding-agent plugin or copy provider example endpoints without the required access checks.
 For implementation or delivery work, read and follow `skills/openingos-factory/SKILL.md`.
 That is a tracked project skill, loaded through this file rather than a global installation.
@@ -28,7 +28,9 @@ Do not treat proposed ADRs, a green tooling check, or demonstration fixtures as 
 - All hackathon outreach goes only to the owner's privately configured mailbox, with the owner playing the supplier; block real-vendor email, contact forms and alternate channels in every workspace.
 - Use real providers for live runs and preserve honest waiting/failure states; label owner-authored terms as controlled demo evidence, never genuine vendor quotes or realized savings.
 - Use Orca for developer orchestration when authorized; it is not the customer application's runtime.
-- Use OpenCode Go `opencode-go/muse-spark-1.3-contributor` and Codex CLI `gpt-5.6-luna` as implementation workers, with Codex CLI `gpt-6-astra` as independent reviewer; verify effective models before assigning work.
+- Use Codex CLI `gpt-6-astra` as coordinator and a separate `gpt-6-astra` session as independent reviewer.
+- Use OpenCode Go `opencode-go/muse-spark-1.3-contributor` and Codex CLI `gpt-5.6-luna` as implementation workers; verify effective models before assigning work.
+- Astra owns setup, proof tasks and routine technical decisions; accept or amend proposed ADRs from evidence before dependent workers start.
 - The coordinator handles routine worker permissions and recovery within existing authority, not blanket approvals, security bypasses or new spending.
 - Preserve existing uncommitted work and stable P-, H-, and D- requirement meanings.
 - Keep the customer assistant limited to shipped, enabled OpeningOS workflows; see the PRD's product capability boundary and D-17.
@@ -67,5 +69,5 @@ Run `node --test scripts/check-pr.test.mjs` after modifying the CI inspection he
 The `delivery-guard-tests` workflow tests this helper only; application CI must be added with the application foundation.
 Use the project-local hackathon skill to update `hackathon.md` after meaningful work, without claiming unobserved outcomes.
 During multi-worker runs, the coordinator is the sole build-log writer; workers return commit/test evidence instead of editing the same log concurrently.
-Update and push the factual log after verified integrated checkpoints and before a pause or submission, following the Orca handoff.
+Update and push the factual log after verified integrated checkpoints and before a pause or submission.
 Update README setup and status when those facts change; do not claim that instructions are a running background automation.

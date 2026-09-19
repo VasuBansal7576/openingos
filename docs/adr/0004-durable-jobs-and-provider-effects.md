@@ -43,6 +43,8 @@ All branches and retries use the same job allowance and an organization-wide cap
 Reconcile actual cost once; retain a reservation while an outcome or charge is unknown.
 If no defensible upper bound fits, pause instead of making the call.
 Live allowances default to disabled until the owner approves actual limits.
+For the hackathon, Astra configures technical caps against verified authorized credits; free-account signup does not prove available balance or bound a charge.
+Do not enable paid overages, buy credits or add subscriptions to unblock a job.
 
 Dispatch claims recheck cancellation, current access, grant expiry, approved payload and available reservation atomically.
 Revocation blocks operations not yet dispatched.

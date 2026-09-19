@@ -12,9 +12,9 @@ No package below has been implemented or verified yet.
 4. Confirm the assigned base commit, file ownership, environment, expected CI checks and permitted external actions.
 5. Report a conflict before coding against it; do not silently choose a different send path, retry policy or ownership model.
 
-For the model lane, read the [Jev contract](../integrations/jev-contract.md) and assign its J-cases alongside the existing S-cases.
+For the model lane, read [ADR-0005's API contract](../adr/0005-jev-and-openai.md#api-contract) and assign the J-cases below alongside the S-cases.
 F0 proves the hosted API boundary, F1 owns shared model/result validation, and R1/C1 use the same adapter.
-Use the [Orca handoff](orca-handoff.md) for requested model roles, setup gaps, native permission routing and coordinator-owned build-log updates.
+Use the [coordinator roadmap](../../ROADMAP.md) for setup and build order; `AGENTS.md` owns model roles and permissions.
 
 The PRD owns product requirements.
 Accepted ADRs own architecture choices; their linked contracts define the selected interfaces.
@@ -109,6 +109,21 @@ Map S-22 through S-24 to P-05, P-06, P-16, H-04, H-08, D-07, D-12 and D-13 as ap
 S-02 and S-21 use the same owner-only recipient rule; "controlled" does not authorize a second external test recipient.
 These tests supplement the PRD, including document, financial, browser, recovery and equipment cases; they do not replace it.
 
+## Jev acceptance cases
+
+These retain the original J-identifiers and supplement, rather than replace, P/H/D and S-cases.
+All are pending; F0 proves hosted transport, F1 proves validation and policy, and V1 proves the combined path.
+
+| ID | Required evidence |
+| --- | --- |
+| J-01 | A controlled HTTP test observes the fixed endpoint, pinned model, correct body and one request per reserved attempt; secrets never enter frontend code or logs |
+| J-02 | Missing questions, wrong answer types, unknown options, malformed distributions, nonfinite values and unexpected model versions cannot produce an accepted decision |
+| J-03 | 401/422 stop unchanged retries; 429/529 back off; timeout, cancellation and concurrent jobs respect the shared allowance and three-attempt limit |
+| J-04 | A late response cannot apply after input change, revoke a refusal, authorize another recipient or bypass an expired grant |
+| J-05 | An authorized live call from the hosted Convex action returns the pinned model and real usage; test accounts and credentials stay private |
+| J-06 | A versioned domain evaluation includes incomplete offers, legitimate short follow-ups, unrelated requests, adversarial text and changed owner replies; report error rates, latency and interventions before choosing thresholds |
+| J-07 | A published user path shows a useful Jev decision and its independently checked effect, including actual owner-reply negotiation under S-23 |
+
 ## Establish commands and CI before feature work
 
 F0 creates the actual scripts and checks rather than reporting the current documentation tests as application verification.
@@ -137,8 +152,8 @@ Those 23 tests do not execute the planned sponsor integrations.
 | Provider result is ambiguous | Reconcile within the allowed read budget; expose unknown outcome and never invent success |
 | Shared schema needs a change | Ask the foundation owner for the contract amendment; continue independent owned work |
 
-Country/currency, identity selection, browser hosting and model calibration remain listed in the ADR register.
-This plan does not silently settle those choices or shrink the agreed product to avoid them.
+Netherlands/EUR is the selected hackathon market; see PRD section 52 for representative sources.
+Astra resolves identity, browser hosting and model calibration through the ADR register's proof tasks without reducing the agreed product.
 
 ## Return a complete handoff
 

@@ -1,12 +1,11 @@
 # ADR-0005: Jev-first decisions and OpenAI generation
 
-Status: Proposed; account access, task thresholds and the OpenAI snapshot remain unverified.
+Status: Proposed; live API access, task thresholds and the OpenAI snapshot remain unverified.
 Requirements: H-04, D-02, D-03, D-10, D-11, D-12, D-13, D-17.
 
 ## Decision
 
-The [Jev integration contract](../integrations/jev-contract.md) specifies the previously missing HTTP endpoint, backend secret, request/response validation, retry owner and J-01 through J-07 proof cases.
-The proposed first implementation uses server-side HTTP from a Convex action, with a tested SDK as an explicit alternative rather than a second competing client.
+Use one server-side HTTP adapter in an internal Convex action, shared by research and communication.
 Neither this decision nor a coding-agent subscription supplies TypeSafe application API access.
 
 Make Jev the first route for bounded decisions over observed options.
@@ -28,10 +27,38 @@ Source checked September 19, 2026: [TypeSafe models](https://docs.typesafe.ai/mo
 Jev does not fetch a page; the selected tool does.
 An LLM does not determine whether a payment, binding acceptance or unrestricted action is allowed.
 
+## API contract
+
+F0 owns the transport proof; F1 owns shared validators and the decision policy; R1/C1 consume the same adapter, planned at `convex/models/jev.ts`.
+Use `POST https://api.typesafe.ai/v1/systemone` with `Authorization: Bearer <TYPESAFE_API_KEY>` and `Content-Type: application/json`.
+Keep the key in protected backend configuration, never browser code, Git, logs or worker messages.
+Local setup on September 19 created `OpeningOS hackathon` in TypeSafe and saved it in the macOS login Keychain as `OpeningOS TypeSafe`, account `openingos-hackathon`.
+This records the credential's location, not its value; configure `TYPESAFE_API_KEY` privately during F0 and prove live access without printing it.
+Send `{ model: "jev-1.13.0", state, questions }`; the backend supplies the evidence state and permitted questions, not arbitrary visitor instructions.
+Each `questions[id]` uses `type`, `instructions` and its documented schema; a `choice` question maps permitted option IDs to descriptions in `criteria`.
+Question IDs correlate answers but do not supply model instructions.
+The response contains `model`, `answers` and token counts in `usage.input_tokens` and `usage.output_tokens`.
+Choice answers contain `type`, `choice`, `probabilities` and `confidence`; Noul supplies yes-probability in `noul`; Score supplies a rubric score and distribution, not exact arithmetic.
+
+Parse responses from `unknown`; require matching question IDs/types, the pinned model, allowed choices, finite in-range probabilities, complete distributions within tested rounding tolerance and nonnegative integer usage.
+Return `decided`, `needsReview`, `unavailable` or `stale`; only a validated, current `decided` result can supply a choice.
+Reject missing answers, malformed responses or model drift instead of guessing.
+Reserve each attempt through ADR-0004's execution module; use an initial 10-second timeout and at most three total attempts with no workflow or SDK retry multiplier.
+For 429/529, use bounded backoff and a valid server retry delay within the deadline; do not retry unchanged authentication, permission or schema failures.
+Retain uncertain charges after timeouts and discard cancelled or stale results before applying them through an internal mutation.
+Bound input and cost before live calls; the documented request limit is 64k tokens total and 32k for state plus the longest question.
+Do not silently truncate decision-critical evidence or enable private-body debug logs.
+
+Source-checked September 19, 2026: [HTTP schema](https://docs.typesafe.ai/api), [model limits](https://docs.typesafe.ai/models), [known model limitations](https://docs.typesafe.ai/model-jaggedness/jev-1.13).
+The optional SDK is not required for this adapter; adopting it needs a tested ADR amendment and disabled hidden retries.
+The [package plan's J-01 through J-07](../implementation/sponsor-integration-plan.md#jev-acceptance-cases) prove this contract; all remain pending.
+The hosted browser controller still needs ADR-0006's separate compatibility and isolation proof.
+
 ## Decision contract
 
 Each request includes decision type, question/policy version, job ID, input version, evidence references, observed candidate IDs and permitted option IDs.
-Each result records returned model version, choice, probability distribution, confidence, latency, billed usage and the original input version.
+Each result records returned model version, the answer-specific decision fields, latency, actual provider token usage and the original input version.
+Record question/policy version and downstream verification; unknown charges stay unknown rather than becoming invented billed usage.
 Application code validates the output schema, allowed choice and freshness before applying it.
 The independent check records what actually happened after execution.
 Do not store private chain-of-thought or treat generated rationales as source evidence.
@@ -56,7 +83,7 @@ Relevant unknown supplier facts trigger permitted research or clarification befo
 
 Accept numerical thresholds only after measuring false rejections, unauthorized-operation proposals, wrong model matches and incorrectly deferred suitable suppliers.
 Do not insert an arbitrary universal 0.9 threshold into worker contracts.
-The threshold values and tested OpenAI model snapshot are explicit blockers for dependent execution work, not choices delegated to each worker.
+Astra owns the threshold evaluation and tested OpenAI model selection before dependent execution work; workers do not choose incompatible policies independently.
 
 ## Documents and answers
 

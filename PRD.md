@@ -1,6 +1,6 @@
 # OpeningOS product requirements
 
-Revision: 9, September 19, 2026.
+Revision: 10, September 19, 2026.
 Status: proposed product specification, revised from the supplied PRD and its review.
 This document defines intended behavior, not implemented capabilities.
 The original numbered sections retain their subject and numbering.
@@ -19,17 +19,10 @@ It connects requirements, evidence, quotes, approvals, orders, equipment, and ac
 
 ### What changed in this revision
 
-- Restricted the assistant to supported OpeningOS purchasing, supplier, and equipment workflows rather than general-purpose assistance.
-- Distinguished unrelated requests, relevant but unimplemented capabilities, and legitimate contextual follow-ups.
-- Required backend capability checks alongside request classification, with no expansion of authority through prompts, source content, or recovery.
-- Added D-17 for product-scope enforcement while preserving all 51 existing acceptance criteria and launch-only planning sections.
-- Recorded the user's selection of the purchasing workbench and rejection of the opening-scene and price-route alternatives.
-- Preserved the complete selected fixture flow in `design/purchasing-workbench.html`; this is not production architecture or live functionality.
-- Added the [ADR registry](docs/adr/README.md), separating accepted design/platform constraints from technical proposals and blocking experiments.
-- Clarified incomplete web evidence, durable correspondence history and the distinction between provider-owned storage and application-owned authority.
-- Linked source-checked sponsor contracts and worker acceptance cases without changing the 52 existing requirement rows or launch-only scope.
-- Restricted all hackathon outreach to the owner's designated mailbox, with the owner replying as the supplier through real email.
-- Required live research, model calls, email transport and Convex updates while labeling owner-provided commercial terms as controlled demo evidence.
+- Selected Netherlands/EUR and representative public supplier pages for hackathon research, without choosing the commercial launch market.
+- Assigned setup, routine technical decisions and end-to-end proof to Astra through the [coordinator roadmap](ROADMAP.md).
+- Consolidated Jev's API contract into ADR-0005 and its proof cases into the existing package plan.
+- Preserved all 52 acceptance requirements, the selected workbench, real provider execution and owner-only hackathon correspondence.
 
 ### Scope of this revision
 
@@ -1583,15 +1576,34 @@ This PRD revision does not select a mobile framework, implement billing or final
 
 ### External dependencies and unresolved choices
 
-- Select and validate the hackathon supplier region, currency, and representative sites without treating that choice as a finalized commercial launch market.
-- Confirm Luma registration and eligibility through the participant.
-- Confirm available Firecrawl credits and usable OpenAI and AgentMail application access without exposing credentials.
-- Verify usable Jev API access and a deployable browser execution route, including any separate provider allowance or access requirement.
-- Obtain the owner's designated mailbox privately and confirm job-spend authority before enabling live hackathon email; real-vendor outreach remains disabled in every workspace.
-- Verify activation of the installed Convex plugin after the required restart.
-- Provision and verify the intended hosted Convex backend during the authorized build and publication workflow.
-- Sign in to Vibe Apps before the final submission.
+- Astra owns application setup, usable OpenAI/AgentMail/Jev access, hosted browser execution and Convex/Sites verification under the [roadmap](ROADMAP.md).
+- Astra resolves proposed ADRs from proof results before dependent feature work; runtime verification belongs to implementation and testing, not another user questionnaire.
+- The owner supplies the new Firecrawl account/credits and handles registration, eligibility, video, announcement and Vibe Apps submission.
+- Obtain the receiving mailbox privately; never infer it from an account profile or commit metadata.
+- Configure bounded provider allowances from verified access and authorized credits; missing allowances disable live calls, and paid overages/subscriptions require separate permission.
+- Ask before public publication, then verify the final public origin and the real owner-email round trip; local or mocked success cannot replace these checks.
 - Obtain real supplier and customer validation separately from controlled demonstration exchanges; this future validation does not authorize vendor outreach in the hackathon build.
+
+### Selected hackathon research market
+
+Use Netherlands as the supplier market and EUR as the reporting currency, with an English interface and Dutch/English source extraction.
+This is a hackathon test decision, not a commercial launch decision or a claim of nationwide service coverage.
+Preserve source wording, currencies, tax bases and unit conversions; verify delivery and service coverage for the project's location instead of assuming them from a domain.
+The initial benchmark uses these public pages, inspected September 19, 2026:
+
+| Source | What to test |
+| --- | --- |
+| [Maxima espresso catalog](https://maxima.com/nl/barapparatuur/espressomachine/) | Discover related variants, preserve source prices and follow product/specification links |
+| [HorecaTraders two-group machine](https://www.horecatraders.com/nl/espresso-machine-2-groepen-automatisch.html) | Separate tax bases and indicative delivery; flag conflicting boiler descriptions instead of choosing one |
+| [Fleur de Café Linea Classic](https://www.fleurdecafe.nl/la-marzocco-linea-classic-s-ii-av) | Compare a different model with dimensions, published price and lead time; do not mislabel it an exact match |
+
+These are starting sources, not a vendor endorsement, exhaustive supplier list or permanent domain allowlist.
+R1 expands the benchmark across coffee equipment, refrigeration, water treatment and furniture within the same market and job grant.
+Use labeled controlled fixtures for unavailable-price and failure cases when no suitable live example is accessible; never call those fixtures live research.
+Re-fetch current evidence during live tests; recorded prices and search snapshots are not current quotes.
+All supplier contact controls stay disabled; the real email negotiation goes only to the configured owner mailbox.
+
+### Event deadline and eligibility
 
 The submission deadline is September 22, 2026, at 12:00 PM Pacific.
 That is September 23, 2026, at 12:30 AM India Standard Time.

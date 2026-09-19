@@ -12,7 +12,7 @@
 - **Auth:** none
 - **AI models:** none
 - **Started:** 2026-09-19T09:46:19Z
-- **Last updated:** 2026-09-19T17:28:26Z
+- **Last updated:** 2026-09-19T18:06:34Z
 
 ## Log
 
@@ -101,3 +101,12 @@ Rechecked the original setup prompt and current event/setup pages; documented ma
 Verified that Greptile is enabled for OpeningOS with automatic PR reviews, but no review has run; verified Orca readiness and the requested model catalog entries without launching workers or changing account settings.
 All 23 existing repository tests passed, the delivery skill validated, 48 local links and anchors checked, and the synthetic Jev JSON example parsed with matching permitted options.
 All 52 product requirement rows and 24 earlier integration cases remain unchanged; application behavior, live model calls, native permission routing and end-to-end Greptile review are still unverified.
+
+### 2026-09-19 - working tree
+
+Replaced the long Orca handoff with a 45-line coordinator roadmap and consolidated Jev's API contract into ADR-0005, with all seven J-cases retained in the existing implementation plan.
+Assigned coordination, setup and technical proof to Astra, with Muse Spark 1.3 and GPT-5.6 Luna workers and a separate Astra reviewer.
+Selected Netherlands/EUR and three public supplier examples for hackathon research in PRD revision 10; commercial launch planning is unchanged.
+Created a dedicated TypeSafe key with user approval and verified secure local storage; no key value entered the repository and no live inference was tested.
+All 23 existing repository tests passed, the delivery skill validated, 49 local links and anchors checked, and all 52 product requirements plus 24 sponsor cases remained unchanged.
+Application implementation, hosted integration proofs and end-to-end review remain pending; the owner retains Firecrawl account setup and final submission tasks.

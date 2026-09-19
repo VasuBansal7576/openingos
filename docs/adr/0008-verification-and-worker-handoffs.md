@@ -35,9 +35,9 @@ Workers receive packages, not one ADR each, and may need several ADRs for one pa
 Do not dispatch dependent feature workers while their shared contracts are merely proposed.
 Use the [sponsor worker plan](../implementation/sponsor-integration-plan.md) for F0/F1/R1/C1/U1/V1 ownership, exact acceptance cases, command contracts and stop conditions.
 The plan adds detail to these packages without authorizing their execution or replacing unrelated PRD requirements.
-The [Orca handoff](../implementation/orca-handoff.md) records the user's requested implementation workers, independent reviewer, permission handling and startup checks.
-Use OpenCode Go Muse Spark 1.3 and Codex CLI GPT-5.6 Luna for implementation, with Codex CLI GPT-6 Astra for independent review.
-Resolve and verify the exact model IDs from that handoff rather than changing global defaults or accepting a silent fallback.
+The [coordinator roadmap](../../ROADMAP.md) supplies setup and build order; `AGENTS.md` specifies exact model IDs.
+Astra coordinates Muse Spark 1.3 and GPT-5.6 Luna workers, with a separate Astra session for independent review.
+The coordinator owns setup, technical proof and ADR acceptance from evidence, not repeated product questionnaires or silent model substitutions.
 
 ## Environments and realistic tests
 
@@ -45,6 +45,7 @@ Use separate namespaces or deployments for workers, separate AgentMail project i
 Every live outbound test targets the same approved owner recipient; worker isolation does not authorize new external mailboxes.
 A Git worktree does not isolate Convex data or a provider balance.
 Keep a labeled source set with compatible, incompatible, unpublished-price, stale, conflicting and incomplete candidates from the agreed market.
+Use the Netherlands/EUR benchmark selected in PRD section 52, expanding its examples across the declared categories without changing the launch-market plan.
 Add scanned/text documents, multi-item quotes, changed grants, delayed replies and injected transient failures.
 
 The combined path proves real Firecrawl collection, a real OpenAI extraction, useful Jev decisions, a deployed browser operation and a real AgentMail round trip with the owner playing the supplier.

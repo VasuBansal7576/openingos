@@ -1,11 +1,12 @@
 # OpeningOS architecture decisions
 
-Drafted September 19, 2026; integration contracts clarified against PRD revision 9.
+Drafted September 19, 2026; integration contracts clarified against PRD revision 10.
 These documents specify implementation choices, not completed capabilities.
 The user accepted the purchasing workbench and the existing hackathon platform direction.
 The user also requires all hackathon outreach to go only to their designated mailbox, with real provider execution and the user playing the supplier.
 This accepted product constraint applies to ADR-0003 through ADR-0008 even while their technical proposals await proof.
-Other recommendations remain proposed until reviewed and their blocking experiments pass.
+The user delegates routine technical choices and testing to the Astra coordinator.
+Other recommendations remain proposed until Astra reviews the evidence and their blocking experiments pass.
 Do not let workers silently turn a proposal into an accepted contract.
 
 | ADR | Decision | Status |
@@ -19,17 +20,19 @@ Do not let workers silently turn a proposal into an accepted contract.
 | [0007](0007-identity-capabilities-and-approval.md) | Guest identity, private access, capabilities and approvals | Proposed |
 | [0008](0008-verification-and-worker-handoffs.md) | Environments, evidence, CI and Orca implementation packages | Proposed |
 
-## What needs settling
+## Proofs owned by Astra
 
 1. Prove published Sites can read, write and subscribe to the intended hosted Convex deployment.
 2. Prove a hosted Jev-guided browser operation with two isolated sessions, cancellation and an independent result check.
-3. Approve the proposed identity choice and prove guest/private isolation on the published origin.
-4. Confirm the hackathon research country, currency and representative supplier sites.
-5. Confirm application API access, the owner's designated recipient mailbox and a total provider allowance through secure configuration.
+3. Resolve the identity proposal and prove guest/private isolation on the published origin.
+4. Validate collection and comparison against the Netherlands/EUR source set selected in PRD section 52.
+5. Configure available application keys privately and verify access; obtain only missing owner-specific inputs such as the receiving mailbox or paid-spend authorization.
 6. Measure task-specific Jev thresholds and choose a tested OpenAI model snapshot.
 7. Prove the requested Orca worker models and native permission routing; complete OpenCode's Convex setup before assigning backend work.
 
-The Netherlands/EUR in the prototype is a fixture, not a chosen supplier market.
+Netherlands/EUR is now the hackathon research target, not a commercial launch decision; prototype records remain fictional.
+Provider calls remain disabled without verified allowance; no paid overages or new subscriptions are authorized.
+The owner supplies the new Firecrawl account/credits and handles registration, eligibility, video, announcement and submission.
 No keys, account creation, provider purchases, external outreach, hosting changes or deployments are authorized by these documents.
 The next implementation request should begin with these proof tasks and contract tests, not a production-wide coding fan-out.
 
@@ -44,8 +47,8 @@ For Firecrawl, AgentMail and Convex integration, read the [sponsor contracts](..
 The contracts distinguish source-verified behavior, selected implementation rules and unproven runtime behavior.
 ADR-0004 now specifies official-component collection and inbox handling, with outbound mail sent through the shared authorized workflow rather than a second independent queue.
 Its remaining checks are concrete acceptance cases, not permission for each worker to invent a different integration.
-For Jev transport and model proof, read the [Jev contract](../integrations/jev-contract.md).
-For model roles, coordinator-owned logging, permissions and the final ChatGPT Sites publication handoff, read the [Orca handoff](../implementation/orca-handoff.md).
+For Jev transport, read [ADR-0005](0005-jev-and-openai.md#api-contract); its tests live in the worker plan.
+For setup and build order, follow the [coordinator roadmap](../../ROADMAP.md).
 
 ## Current evidence
 
