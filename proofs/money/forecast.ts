@@ -12,6 +12,7 @@ import {
   addMoney,
   assertSameCurrency,
   currencyCode,
+  money,
   moneyDifference,
   moneyZero,
   multiplyMoneyByQuantity,
@@ -105,6 +106,58 @@ function addSettledQuantity(segments: readonly SettledSegment[]): Quantity {
   return total;
 }
 
+interface CostFragment {
+  readonly kind: "remainingOrdered" | "settled";
+  readonly quantity: Quantity;
+  readonly unitPrice: Money;
+}
+
+/**
+ * Round one forecast line once, then allocate exact fragment products.
+ * Every fragment before the final one receives its exact floor and the final
+ * settled fragment receives the residual, so unchanged quantity and price
+ * cannot gain a minor unit when a quantity moves to settled. A price change
+ * remains visible in the exact line total before this residual allocation.
+ */
+function allocateLineCost(currency: string, fragments: readonly CostFragment[]): readonly Money[] {
+  if (fragments.length === 0) {
+    return [];
+  }
+
+  const commonScale = fragments.reduce(
+    (scale, fragment) => Math.max(scale, fragment.quantity.scale),
+    0,
+  );
+  const denominator = 10n ** BigInt(commonScale);
+  let numerator = 0n;
+  for (const fragment of fragments) {
+    const fragmentNumerator = BigInt(fragment.unitPrice.minorUnits) * fragment.quantity.coefficient;
+    numerator += fragmentNumerator * 10n ** BigInt(commonScale - fragment.quantity.scale);
+  }
+  const quotient = numerator / denominator;
+  const remainder = numerator % denominator;
+  const roundedTotal = remainder * 2n >= denominator ? quotient + 1n : quotient;
+  let residual = roundedTotal;
+  const allocated: Money[] = [];
+  for (let index = 0; index < fragments.length; index += 1) {
+    const fragment = fragments[index];
+    if (fragment === undefined) {
+      throw new Error("forecast line cost fragment is missing");
+    }
+    const isFinal = index === fragments.length - 1;
+    const amount = isFinal ? residual : (
+      BigInt(fragment.unitPrice.minorUnits)
+      * fragment.quantity.coefficient
+      * 10n ** BigInt(commonScale - fragment.quantity.scale)
+      / denominator
+    );
+    const allocatedAmount = money(currency, amount);
+    allocated.push(allocatedAmount);
+    residual -= amount;
+  }
+  return Object.freeze(allocated);
+}
+
 function parseSettledSegments(
   input: unknown,
   currency: string,
@@ -179,12 +232,28 @@ export function calculateForecast(input: ForecastInput): ForecastResult {
       throw new TypeError(`line ${lineId} settled quantity exceeds ordered quantity`);
     }
 
-    let lineSettledCost = moneyZero(currency);
-    for (const segment of settledSegments) {
-      lineSettledCost = addMoney(lineSettledCost, multiplyMoneyByQuantity(segment.unitPrice, segment.quantity));
-    }
     const remainingOrderedQuantity = decimalSubtract(orderedQuantity, settledQuantity);
-    const remainingOrderedCost = multiplyMoneyByQuantity(orderedUnitPrice, remainingOrderedQuantity);
+    const costFragments: CostFragment[] = [];
+    if (!remainingOrderedQuantity.isZero()) {
+      costFragments.push({ kind: "remainingOrdered", quantity: remainingOrderedQuantity, unitPrice: orderedUnitPrice });
+    }
+    for (const segment of settledSegments) {
+      costFragments.push({ kind: "settled", quantity: segment.quantity, unitPrice: segment.unitPrice });
+    }
+    const allocatedLineCosts = allocateLineCost(currency, costFragments);
+    let lineSettledCost = moneyZero(currency);
+    let remainingOrderedCost = moneyZero(currency);
+    for (const [index, fragment] of costFragments.entries()) {
+      const fragmentCost = allocatedLineCosts[index];
+      if (fragmentCost === undefined) {
+        throw new Error("forecast line cost allocation is incomplete");
+      }
+      if (fragment.kind === "settled") {
+        lineSettledCost = addMoney(lineSettledCost, fragmentCost);
+      } else {
+        remainingOrderedCost = addMoney(remainingOrderedCost, fragmentCost);
+      }
+    }
     const lineOrderedCurrentCost = addMoney(lineSettledCost, remainingOrderedCost);
 
     const selectedInput = rawLine.selected;
@@ -283,6 +352,7 @@ export interface CommitmentInput {
   readonly orderId: unknown;
   readonly amount: unknown;
   readonly adjustments?: readonly FinancialAdjustmentInput[];
+  readonly settlement?: unknown;
 }
 
 export interface CommitmentFinancials {
@@ -297,8 +367,32 @@ export interface CommitmentFinancials {
   readonly appliedPayments: Money;
   readonly outstanding: Money;
   readonly overpayment: Money;
-  readonly actualAcquisitionCost: Money;
+  readonly actualAcquisitionCost?: Money;
+  readonly settlementEvidence: readonly EvidenceRef[];
   readonly adjustments: readonly NormalizedAdjustment[];
+}
+
+interface SettlementEvidence {
+  readonly amount: Money;
+  readonly evidenceRefs: readonly EvidenceRef[];
+}
+
+function parseSettlement(input: unknown, currency: string): SettlementEvidence | undefined {
+  if (input === undefined) {
+    return undefined;
+  }
+  if (!isRecord(input)) {
+    throw new TypeError("settlement must be an object");
+  }
+  const amount = normalizeMoney(input.amount, "settlement amount");
+  if (amount.currency !== currency) {
+    throw new TypeError("settlement currency does not match commitment currency");
+  }
+  const evidenceRefs = parseEvidenceRefs(input.evidenceRefs, "settlement evidenceRefs");
+  if (evidenceRefs.length === 0) {
+    throw new TypeError("settlement requires evidenceRefs");
+  }
+  return { amount, evidenceRefs };
 }
 
 function parseAdjustment(input: unknown, currency: string, orderId: string): NormalizedAdjustment {
@@ -344,6 +438,13 @@ export class AdjustmentIdempotencyConflictError extends Error {
   }
 }
 
+export class AdjustmentIdentityConflictError extends Error {
+  public constructor(id: string) {
+    super(`adjustment id ${id} was reused with different identity data`);
+    this.name = "AdjustmentIdentityConflictError";
+  }
+}
+
 export function calculateCommitmentFinancials(input: CommitmentInput): CommitmentFinancials {
   const currency = currencyCode(input.currency);
   const orderId = requiredString(input.orderId, "orderId");
@@ -351,6 +452,7 @@ export function calculateCommitmentFinancials(input: CommitmentInput): Commitmen
   if (baseCommitment.currency !== currency) {
     throw new TypeError("base commitment currency does not match commitment currency");
   }
+  const settlement = parseSettlement(input.settlement, currency);
   const rawAdjustments = input.adjustments ?? [];
   if (!Array.isArray(rawAdjustments)) {
     throw new TypeError("commitment adjustments must be an array");
@@ -368,8 +470,18 @@ export function calculateCommitmentFinancials(input: CommitmentInput): Commitmen
     unique.set(normalized.idempotencyKey, normalized);
   }
 
-  const adjustments = [...unique.values()];
-  const byId = new Map(adjustments.map((adjustment) => [adjustment.id, adjustment]));
+  const adjustments = Object.freeze([...unique.values()]);
+  const byId = new Map<string, NormalizedAdjustment>();
+  for (const adjustment of adjustments) {
+    const previous = byId.get(adjustment.id);
+    if (previous !== undefined) {
+      if (previous.idempotencyKey !== adjustment.idempotencyKey || previous.fingerprint !== adjustment.fingerprint) {
+        throw new AdjustmentIdentityConflictError(adjustment.id);
+      }
+      continue;
+    }
+    byId.set(adjustment.id, adjustment);
+  }
   for (const adjustment of adjustments) {
     if (adjustment.kind !== "cashRefund") {
       if (adjustment.linkedAdjustmentId !== undefined) {
@@ -408,7 +520,7 @@ export function calculateCommitmentFinancials(input: CommitmentInput): Commitmen
   const appliedPayments = subtractMoney(grossPayments, refunds);
   const outstanding = subtractMoneyOrZero(obligation, appliedPayments);
   const overpayment = subtractMoneyOrZero(appliedPayments, obligation);
-  return {
+  const base = {
     orderId,
     currency,
     baseCommitment,
@@ -420,9 +532,12 @@ export function calculateCommitmentFinancials(input: CommitmentInput): Commitmen
     appliedPayments,
     outstanding,
     overpayment,
-    actualAcquisitionCost: obligation,
+    settlementEvidence: settlement?.evidenceRefs ?? Object.freeze([]),
     adjustments,
   };
+  return settlement === undefined
+    ? base
+    : { ...base, actualAcquisitionCost: settlement.amount };
 }
 
 export function adjustmentEvidence(adjustment: NormalizedAdjustment): readonly EvidenceRef[] {

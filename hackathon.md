@@ -12,7 +12,7 @@
 - **Auth:** none
 - **AI models:** none
 - **Started:** 2026-09-19T09:46:19Z
-- **Last updated:** 2026-09-19T19:12:33Z
+- **Last updated:** 2026-09-19T19:32:43Z
 
 ## Log
 
@@ -140,3 +140,12 @@ Repairs and a second fixed-commit review are pending; the green CI result does n
 Integrated Muse Spark's pushed repair `c16b807` for request snapshots, deadlines, cancellation, JSON validation, reserved keys, retry advice and ignored response bodies.
 The combined checkout passes 56 controlled proof tests, 23 repository checks and strict TypeScript, including 15 new Jev regressions.
 Independent verification of RJ1–RJ7 and Luna's financial repairs remain pending; no live provider call or application capability is claimed.
+
+### 2026-09-19 - working tree
+
+Integrated Luna’s pushed `a7d4c61` financial repairs and Muse Spark’s pushed `29fed49` Jev repairs.
+Financial proofs now use explicit item and quantity mappings, preserve equivalent allocated partial selections, resolve included-charge coverage, freeze quote snapshots, reject duplicate adjustment identities, require settlement evidence and conserve rounding.
+Jev proofs now copy supported JSON defensively, preserve the original cancellation signal, enforce an inclusive absolute deadline and clean up cancelled test streams.
+The combined checkout passes 75 controlled proof tests, all 23 repository checks, strict TypeScript and whitespace checks.
+The coordinator reproduced a delayed test-timer failure between suites and routed its repair to Muse Spark before this passing combined run.
+Independent review of this combined revision and its remote CI remain pending; hosted integrations and full foundation gates remain unverified.

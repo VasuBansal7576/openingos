@@ -52,7 +52,9 @@ Astra owns shared tooling, dependencies, ADR amendments and progress files, and 
 Neither proof authorizes dependent production features or passes the hosted F0 gates.
 The first independent review requires repairs M1–M7 from Luna and RJ1–RJ7 from Muse Spark, followed by a new fixed combined review.
 Passing tests on `897eea7` do not close those findings.
-Muse Spark's repair `c16b807` is integrated and passes 43 Jev tests; independent verification is pending while Luna continues the financial repairs.
+The follow-up review of `86c4b19` closed RJ1 and RJ3–RJ6 but reproduced further RJ2/RJ7 cases.
+Luna’s `a7d4c61` and Muse Spark’s `29fed49` are now integrated with 75 passing controlled proof tests, 23 repository checks and strict TypeScript.
+The new fixed combined review and remote CI remain pending; neither the prior green CI nor the worker handoffs close review findings by themselves.
 
 ## Duties throughout
 

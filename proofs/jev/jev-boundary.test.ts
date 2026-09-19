@@ -523,12 +523,20 @@ describe("RJ2 absolute deadline and cancellation before acceptance", () => {
 
   test("body completing after the deadline cannot decide", async () => {
     const text = JSON.stringify(validPayload());
+    let timer: ReturnType<typeof setTimeout> | null = null;
     const stream = new ReadableStream<Uint8Array>({
       start(c) {
-        setTimeout(() => {
+        timer = setTimeout(() => {
+          timer = null;
           c.enqueue(new TextEncoder().encode(text));
           c.close();
         }, 30);
+      },
+      cancel() {
+        if (timer !== null) {
+          clearTimeout(timer);
+          timer = null;
+        }
       },
     });
     const stub = stubFetch(() => new Response(stream, { status: 200 }));
@@ -666,8 +674,194 @@ describe("RJ7 non-JSON evidence is rejected before dispatch", () => {
     const stub = stubFetch(() => jsonResponse(validPayload()));
     const result = await jevAttemptOnce({ ...baseOptions(), fetchImpl: stub.fetchImpl, state: new ToJsonBoom() });
     expect(result.outcome).toBe("needsReview");
-    if (result.outcome === "needsReview") expect(result.reason).toBe("request-serialize-failed");
+    if (result.outcome === "needsReview") expect(result.reason).toBe("non-json-state");
     expect(stub.calls()).toBe(0);
+  });
+});
+
+describe("RJ7 defensive copy rejects unsupported structures", () => {
+  test("inherited toJSON cannot rewrite the sent state", async () => {
+    const hooks = {
+      toJSON() {
+        return { price: 0 };
+      },
+    };
+    const state: Record<string, unknown> = Object.create(hooks);
+    state["price"] = 100;
+    const stub = stubFetch(() => jsonResponse(validPayload()));
+    const result = await jevAttemptOnce({ ...baseOptions(), fetchImpl: stub.fetchImpl, state });
+    expect(result.outcome).toBe("needsReview");
+    if (result.outcome === "needsReview") expect(result.reason).toBe("non-json-state");
+    expect(stub.calls()).toBe(0);
+  });
+
+  test("sparse array state is rejected", async () => {
+    const sparse: unknown[] = new Array(1);
+    const stub = stubFetch(() => jsonResponse(validPayload()));
+    const result = await jevAttemptOnce({ ...baseOptions(), fetchImpl: stub.fetchImpl, state: sparse });
+    expect(result.outcome).toBe("needsReview");
+    if (result.outcome === "needsReview") expect(result.reason).toBe("non-json-state");
+    expect(stub.calls()).toBe(0);
+  });
+
+  test("cyclic state fails closed without throwing", async () => {
+    const cyclic: Record<string, unknown> = {};
+    cyclic["self"] = cyclic;
+    const stub = stubFetch(() => jsonResponse(validPayload()));
+    const result = await jevAttemptOnce({ ...baseOptions(), fetchImpl: stub.fetchImpl, state: cyclic });
+    expect(result.outcome).toBe("needsReview");
+    if (result.outcome === "needsReview") expect(result.reason).toBe("non-json-state");
+    expect(stub.calls()).toBe(0);
+  });
+
+  test("over-deep state is rejected", async () => {
+    let deep: unknown = "leaf";
+    for (let i = 0; i < 100; i += 1) deep = [deep];
+    const stub = stubFetch(() => jsonResponse(validPayload()));
+    const result = await jevAttemptOnce({ ...baseOptions(), fetchImpl: stub.fetchImpl, state: deep });
+    expect(result.outcome).toBe("needsReview");
+    if (result.outcome === "needsReview") expect(result.reason).toBe("non-json-state");
+    expect(stub.calls()).toBe(0);
+  });
+
+  test("throwing getter is rejected without invocation or leakage", async () => {
+    const marker = "PRIVATE_GETTER_MARKER_456";
+    const booby: Record<string, unknown> = {};
+    Object.defineProperty(booby, "price", {
+      enumerable: true,
+      get() {
+        throw new Error(marker);
+      },
+    });
+    const stub = stubFetch(() => jsonResponse(validPayload()));
+    const result = await jevAttemptOnce({ ...baseOptions(), fetchImpl: stub.fetchImpl, state: { item: booby } });
+    expect(result.outcome).toBe("needsReview");
+    expect(stub.calls()).toBe(0);
+    expect(JSON.stringify(result)).not.toContain(marker);
+  });
+
+  test("non-enumerable toJSON cannot rewrite the sent state", async () => {
+    const state: Record<string, unknown> = { price: 100 };
+    Object.defineProperty(state, "toJSON", {
+      enumerable: false,
+      value: () => ({ price: 0 }),
+    });
+    const stub = stubFetch(() => jsonResponse(validPayload()));
+    const result = await jevAttemptOnce({ ...baseOptions(), fetchImpl: stub.fetchImpl, state });
+    expect(stub.calls()).toBe(1);
+    expect(result.outcome).toBe("decided");
+    const first = stub.seen()[0];
+    const wire: unknown = JSON.parse(typeof first?.init?.body === "string" ? first.init.body : "{}");
+    const wireState = asTable(asTable(wire)?.["state"]);
+    expect(wireState?.["price"]).toBe(100);
+  });
+
+  test("valid dense snapshots pass through unchanged", async () => {
+    const state = { brief: "Compare three offers", tags: ["a", "b"], nested: { n: 1, flag: true, nothing: null } };
+    const stub = stubFetch(() => jsonResponse(validPayload()));
+    const result = await jevAttemptOnce({ ...baseOptions(), fetchImpl: stub.fetchImpl, state });
+    expect(stub.calls()).toBe(1);
+    expect(result.outcome).toBe("decided");
+    const first = stub.seen()[0];
+    const wire: unknown = JSON.parse(typeof first?.init?.body === "string" ? first.init.body : "{}");
+    expect(asTable(wire)?.["state"]).toEqual(state);
+  });
+});
+
+describe("RJ2 signal swap and spent preparation budget", () => {
+  test("swapping options.signal after dispatch still honors the original abort", async () => {
+    const controllerA = new AbortController();
+    const controllerB = new AbortController();
+    const bytes = new TextEncoder().encode(JSON.stringify(validPayload()));
+    let delivered = false;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(c) {
+        if (!delivered) {
+          delivered = true;
+          c.enqueue(bytes);
+          return;
+        }
+        controllerA.abort();
+        c.close();
+      },
+    });
+    const stub = stubFetch(() => new Response(stream, { status: 200 }));
+    const opts = baseOptions({ fetchImpl: stub.fetchImpl, signal: controllerA.signal, timeoutMs: 2000 });
+    const pending = jevAttemptOnce(opts);
+    opts.signal = controllerB.signal;
+    const result = await pending;
+    expect(stub.calls()).toBe(1);
+    expect(result.outcome).toBe("stale");
+    if (result.outcome === "stale") expect(result.reason).toBe("aborted");
+  });
+
+  test("preparation consuming the deadline dispatches zero requests", async () => {
+    const realNow = Date.now;
+    const target: Record<string, unknown> = { brief: "x".repeat(900_000) };
+    const slow = new Proxy(target, {
+      ownKeys(t) {
+        const end = realNow() + 30;
+        while (realNow() < end) {
+          // Burn preparation time deterministically: 30ms always exceeds the 5ms budget.
+        }
+        return Reflect.ownKeys(t);
+      },
+    });
+    const stub = stubFetch(() => jsonResponse(validPayload()));
+    const result = await jevAttemptOnce({ ...baseOptions(), fetchImpl: stub.fetchImpl, state: slow, timeoutMs: 5 });
+    expect(result.outcome).toBe("unavailable");
+    if (result.outcome === "unavailable") expect(result.reason).toBe("timeout");
+    expect(stub.calls()).toBe(0);
+  });
+});
+
+describe("array own-data and deadline-equality regressions", () => {
+  test("indexed accessor getter never runs and dispatches nothing", async () => {
+    const marker = "PRIVATE_INDEX_MARKER_789";
+    const rigged: unknown[] = ["ok"];
+    Object.defineProperty(rigged, "0", {
+      enumerable: true,
+      configurable: true,
+      get() {
+        throw new Error(marker);
+      },
+    });
+    const stub = stubFetch(() => jsonResponse(validPayload()));
+    const result = await jevAttemptOnce({ ...baseOptions(), fetchImpl: stub.fetchImpl, state: { items: rigged } });
+    expect(result.outcome).toBe("needsReview");
+    if (result.outcome === "needsReview") expect(result.reason).toBe("non-json-state");
+    expect(stub.calls()).toBe(0);
+    expect(JSON.stringify(result)).not.toContain(marker);
+  });
+
+  test("inherited array element is rejected as a hole", async () => {
+    const arr: unknown[] = new Array(1);
+    Object.setPrototypeOf(arr, { 0: "evil" });
+    const stub = stubFetch(() => jsonResponse(validPayload()));
+    const result = await jevAttemptOnce({ ...baseOptions(), fetchImpl: stub.fetchImpl, state: { items: arr } });
+    expect(result.outcome).toBe("needsReview");
+    if (result.outcome === "needsReview") expect(result.reason).toBe("non-json-state");
+    expect(stub.calls()).toBe(0);
+  });
+
+  test("deadline equality is exhausted budget, not a dispatch window", async () => {
+    const realNow = Date.now;
+    const frozen = 1_000_000;
+    const timeout = 50;
+    let now = frozen;
+    Date.now = () => now;
+    try {
+      const stub = stubFetch(() => {
+        now = frozen + timeout;
+        return jsonResponse(validPayload());
+      });
+      const result = await jevAttemptOnce({ ...baseOptions(), fetchImpl: stub.fetchImpl, timeoutMs: timeout });
+      expect(stub.calls()).toBe(1);
+      expect(result.outcome).toBe("unavailable");
+      if (result.outcome === "unavailable") expect(result.reason).toBe("timeout");
+    } finally {
+      Date.now = realNow;
+    }
   });
 });
 

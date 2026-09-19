@@ -24,11 +24,11 @@ export function evidenceRef(input: EvidenceRefInput): EvidenceRef {
 
 export function parseEvidenceRefs(input: unknown, label = "evidenceRefs"): readonly EvidenceRef[] {
   if (input === undefined) {
-    return [];
+    return Object.freeze([]);
   }
 
   const values = requiredArray(input, label);
-  return values.map((value, index) => {
+  return Object.freeze(values.map((value, index) => {
     if (!isRecord(value)) {
       throw new TypeError(`${label}[${index}] must be an object`);
     }
@@ -37,7 +37,7 @@ export function parseEvidenceRefs(input: unknown, label = "evidenceRefs"): reado
       version: value.version,
       locator: value.locator,
     });
-  });
+  }));
 }
 
 export function evidenceKey(value: EvidenceRef): string {
@@ -56,5 +56,5 @@ export function mergeEvidenceRefs(...groups: readonly (readonly EvidenceRef[])[]
       }
     }
   }
-  return merged;
+  return Object.freeze(merged);
 }
