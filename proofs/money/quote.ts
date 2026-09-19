@@ -1,4 +1,4 @@
-import { parsePositiveQuantity } from "./decimal";
+import { decimalCompare, parsePositiveQuantity } from "./decimal";
 import type { Decimal, Quantity } from "./decimal";
 import { evidenceRef, parseEvidenceRefs } from "./evidence";
 import type { EvidenceRef } from "./evidence";
@@ -61,15 +61,27 @@ export type TaxBasis =
 export interface ComparisonScopeInput {
   readonly requirementId: unknown;
   readonly scopeId: unknown;
+  readonly items: unknown;
+}
+
+export interface ComparisonScopeItemInput {
+  readonly itemId: unknown;
+  readonly lineId: unknown;
   readonly unit: unknown;
   readonly requiredQuantity: unknown;
+}
+
+export interface ComparisonScopeItem {
+  readonly itemId: string;
+  readonly lineId: string;
+  readonly unit: string;
+  readonly requiredQuantity: Quantity;
 }
 
 export interface ComparisonScope {
   readonly requirementId: string;
   readonly scopeId: string;
-  readonly unit: string;
-  readonly requiredQuantity: Quantity;
+  readonly items: readonly ComparisonScopeItem[];
 }
 
 export interface TaxBasisInput {
@@ -276,12 +288,37 @@ export function quoteLine(input: QuoteLineInput): QuoteLine {
 export function comparisonScope(input: ComparisonScopeInput): ComparisonScope {
   const requirementId = requiredString(input.requirementId, "comparison requirementId");
   const scopeId = requiredString(input.scopeId, "comparison scopeId");
-  const unit = requiredString(input.unit, "comparison unit");
+  const itemIds = new Set<string>();
+  const lineIds = new Set<string>();
+  const rawItems = input.items;
+  if (!Array.isArray(rawItems) || rawItems.length === 0) {
+    throw new TypeError("comparison scope requires at least one item");
+  }
+  const items = Object.freeze(rawItems.map((rawItem, index) => {
+    if (!isRecord(rawItem)) {
+      throw new TypeError(`comparison item ${index} must be an object`);
+    }
+    const itemId = requiredString(rawItem.itemId, `comparison item ${index} itemId`);
+    const lineId = requiredString(rawItem.lineId, `comparison item ${index} lineId`);
+    if (itemIds.has(itemId)) {
+      throw new TypeError(`duplicate comparison item ${itemId}`);
+    }
+    if (lineIds.has(lineId)) {
+      throw new TypeError(`duplicate comparison line mapping ${lineId}`);
+    }
+    itemIds.add(itemId);
+    lineIds.add(lineId);
+    return Object.freeze({
+      itemId,
+      lineId,
+      unit: requiredString(rawItem.unit, `comparison item ${index} unit`),
+      requiredQuantity: parsePositiveQuantity(rawItem.requiredQuantity, `comparison item ${index} required quantity`),
+    });
+  }));
   return Object.freeze({
     requirementId,
     scopeId,
-    unit,
-    requiredQuantity: parsePositiveQuantity(input.requiredQuantity, "comparison required quantity"),
+    items,
   });
 }
 
@@ -422,10 +459,25 @@ export function createQuote(input: QuoteInput): Quote {
       return comparisonScope({
         requirementId: input.comparisonScope.requirementId,
         scopeId: input.comparisonScope.scopeId,
-        unit: input.comparisonScope.unit,
-        requiredQuantity: input.comparisonScope.requiredQuantity,
+        items: input.comparisonScope.items,
       });
     })();
+  if (parsedComparisonScope !== undefined) {
+    const mappedLineIds = new Set<string>();
+    for (const item of parsedComparisonScope.items) {
+      if (mappedLineIds.has(item.lineId) || !lineIds.has(item.lineId)) {
+        throw new TypeError(`comparison item ${item.itemId} references an unknown or duplicate line`);
+      }
+      const line = lines.find((candidate) => candidate.lineId === item.lineId);
+      if (line === undefined || decimalCompare(line.quantity, item.requiredQuantity) !== 0) {
+        throw new TypeError(`comparison item ${item.itemId} quantity does not match its quote line`);
+      }
+      mappedLineIds.add(item.lineId);
+    }
+    if (mappedLineIds.size !== lines.length) {
+      throw new TypeError("comparison scope must map every quote line");
+    }
+  }
   const base = {
     quoteId,
     version,

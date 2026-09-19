@@ -368,14 +368,24 @@ function comparisonScopesCompatible(left: Quote, right: Quote): boolean {
   if (leftScope === undefined || rightScope === undefined) {
     return false;
   }
-  return leftScope.requirementId === rightScope.requirementId
-    && leftScope.scopeId === rightScope.scopeId
-    && leftScope.unit === rightScope.unit
-    && decimalCompare(leftScope.requiredQuantity, rightScope.requiredQuantity) === 0;
+  if (leftScope.requirementId !== rightScope.requirementId || leftScope.scopeId !== rightScope.scopeId) {
+    return false;
+  }
+  if (leftScope.items.length !== rightScope.items.length) {
+    return false;
+  }
+  const rightItems = new Map(rightScope.items.map((item) => [item.itemId, item]));
+  return leftScope.items.every((leftItem) => {
+    const rightItem = rightItems.get(leftItem.itemId);
+    return rightItem !== undefined
+      && leftItem.unit === rightItem.unit
+      && decimalCompare(leftItem.requiredQuantity, rightItem.requiredQuantity) === 0;
+  });
 }
 
 function comparisonScopeText(scope: ComparisonScope): string {
-  return `${scope.requirementId}/${scope.scopeId} (${scope.requiredQuantity.toString()} ${scope.unit})`;
+  const items = scope.items.map((item) => `${item.itemId}:${item.requiredQuantity.toString()} ${item.unit}`).join(", ");
+  return `${scope.requirementId}/${scope.scopeId} [${items}]`;
 }
 
 function deltaRange(left: QuoteCostSummary, right: QuoteCostSummary): MoneyDeltaRange | undefined {
@@ -448,7 +458,7 @@ export function compareQuotes(left: Quote, right: Quote, options: CompareOptions
 
   if (!scopesCompatible || !leftSummary.selectedAllLines || !rightSummary.selectedAllLines) {
     if (!leftSummary.selectedAllLines || !rightSummary.selectedAllLines) {
-      reasons.push("partial selections require an explicit stable comparison mapping");
+      reasons.push("partial selections require explicit per-item quantities before savings");
     }
     return comparisonResult("incompatible", leftSummary, rightSummary, knownDelta, estimatedDeltaRange, reasons);
   }

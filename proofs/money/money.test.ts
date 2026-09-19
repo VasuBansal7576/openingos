@@ -41,12 +41,7 @@ function quote(
   lines: readonly ReturnType<typeof line>[],
   charges: readonly ChargeInput[] = [],
   tax = inclusiveTaxBasis("NL-EUR-INCLUSIVE", [source(`${quoteId}-source`)]),
-  scope: ComparisonScopeInput = {
-    requirementId: "req-purchase",
-    scopeId: "scope-purchase",
-    unit: "piece",
-    requiredQuantity: "1",
-  },
+  scope?: ComparisonScopeInput,
 ) {
   return createQuote({
     quoteId,
@@ -55,7 +50,16 @@ function quote(
     lines,
     charges,
     taxBasis: tax,
-    comparisonScope: scope,
+    comparisonScope: scope ?? {
+      requirementId: "req-purchase",
+      scopeId: "scope-purchase",
+      items: lines.map((value) => ({
+        itemId: value.lineId,
+        lineId: value.lineId,
+        unit: "piece",
+        requiredQuantity: value.quantity,
+      })),
+    },
     evidenceRefs: [source(`${quoteId}-source`)],
   });
 }
@@ -153,19 +157,57 @@ describe("quote comparison", () => {
     const one = quote("one", [line("machine", 10000)], [], undefined, {
       requirementId: "req-machine",
       scopeId: "scope-machine",
-      unit: "piece",
-      requiredQuantity: "1",
+      items: [{ itemId: "machine", lineId: "machine", unit: "piece", requiredQuantity: "1" }],
     });
     const two = quote("two", [line("machine-a", 9000), line("machine-b", 9000)], [], undefined, {
       requirementId: "req-machine",
       scopeId: "scope-machine",
-      unit: "piece",
-      requiredQuantity: "2",
+      items: [
+        { itemId: "machine-a", lineId: "machine-a", unit: "piece", requiredQuantity: "1" },
+        { itemId: "machine-b", lineId: "machine-b", unit: "piece", requiredQuantity: "1" },
+      ],
     });
     const result = compareQuotes(one, two);
     expect(result.status).toBe("incompatible");
     expect(result.equivalent).toBeUndefined();
     expect(result.reasons.join(" ")).toContain("comparison scopes are not compatible");
+
+    const mixed = quote("mixed", [line("machine", 9000), line("grinder", 9000)], [], undefined, {
+      requirementId: "req-purchase",
+      scopeId: "scope-purchase",
+      items: [
+        { itemId: "machine", lineId: "machine", unit: "piece", requiredQuantity: "1" },
+        { itemId: "grinder", lineId: "grinder", unit: "piece", requiredQuantity: "1" },
+      ],
+    });
+    const twoMachines = quote("two-machines", [line("machine-a", 9000), line("machine-b", 9000)], [], undefined, {
+      requirementId: "req-purchase",
+      scopeId: "scope-purchase",
+      items: [
+        { itemId: "machine-a", lineId: "machine-a", unit: "piece", requiredQuantity: "1" },
+        { itemId: "machine-b", lineId: "machine-b", unit: "piece", requiredQuantity: "1" },
+      ],
+    });
+    expect(compareQuotes(mixed, twoMachines).equivalent).toBeUndefined();
+
+    const localLeft = quote("local-left", [line("left-machine", 10000)], [], undefined, {
+      requirementId: "req-local",
+      scopeId: "scope-local",
+      items: [{ itemId: "machine", lineId: "left-machine", unit: "piece", requiredQuantity: "1" }],
+    });
+    const localRight = quote("local-right", [line("right-equipment", 10000)], [], undefined, {
+      requirementId: "req-local",
+      scopeId: "scope-local",
+      items: [{ itemId: "machine", lineId: "right-equipment", unit: "piece", requiredQuantity: "1" }],
+    });
+    expect(compareQuotes(localLeft, localRight).status).toBe("complete");
+
+    const unitMismatch = quote("unit-mismatch", [line("right-equipment", 10000)], [], undefined, {
+      requirementId: "req-local",
+      scopeId: "scope-local",
+      items: [{ itemId: "machine", lineId: "right-equipment", unit: "set", requiredQuantity: "1" }],
+    });
+    expect(compareQuotes(localLeft, unitMismatch).equivalent).toBeUndefined();
   });
 
   it("keeps unresolved and unselected included coverage incomplete", () => {
@@ -206,6 +248,7 @@ describe("quote comparison", () => {
       rightSelection: [{ lineId: "machine", quantity: "1" }],
     });
     expect(partial.status).toBe("estimated");
+    expect(partial.left.status).toBe("complete");
     expect(partial.left.knownTotal.minorUnits).toBe(1050);
     expect(partial.right.knownTotal.minorUnits).toBe(1000);
     expect(partial.right.estimatedRange?.minimum.minorUnits).toBe(50);
@@ -413,8 +456,7 @@ describe("forecast and commitment financial state", () => {
       comparisonScope: {
         requirementId: "req-purchase",
         scopeId: "scope-purchase",
-        unit: "piece",
-        requiredQuantity: "1",
+        items: [{ itemId: "equipment", lineId: "equipment", unit: "piece", requiredQuantity: "1" }],
       },
       evidenceRefs: [],
     });
