@@ -261,17 +261,17 @@ function includedCoverage(
   if (coveringCharge === undefined || path.has(coveringId)) {
     return "unresolved";
   }
-  if (coveringCharge.state.kind === "included") {
-    const nextPath = new Set(path);
-    nextPath.add(coveringId);
-    return includedCoverage(quote, coveringCharge, selected, allLines, nextPath);
-  }
   const application = chargeApplies(quote, coveringCharge, selected, allLines);
   if (application.unallocated) {
     return "unresolved";
   }
   if (!application.applies) {
     return "unselected";
+  }
+  if (coveringCharge.state.kind === "included") {
+    const nextPath = new Set(path);
+    nextPath.add(coveringId);
+    return includedCoverage(quote, coveringCharge, selected, allLines, nextPath);
   }
   return coveringCharge.state.kind === "unknown" ? "unresolved" : "covered";
 }
@@ -421,6 +421,9 @@ function comparisonScopesCompatible(left: Quote, right: Quote, requireOfferedQua
   if (leftScope.requirementId !== rightScope.requirementId || leftScope.scopeId !== rightScope.scopeId) {
     return false;
   }
+  if (!requireOfferedQuantities) {
+    return true;
+  }
   if (leftScope.items.length !== rightScope.items.length) {
     return false;
   }
@@ -439,6 +442,8 @@ function comparisonScopeText(scope: ComparisonScope): string {
 }
 
 function selectedScopesCompatible(
+  leftQuote: Quote,
+  rightQuote: Quote,
   leftSelection: SelectionState | undefined,
   rightSelection: SelectionState | undefined,
   leftAllLines: boolean,
@@ -448,10 +453,38 @@ function selectedScopesCompatible(
     return true;
   }
   if (leftAllLines || rightAllLines) {
-    return false;
+    const leftItems = selectedScopeItems(leftQuote, leftSelection, leftAllLines);
+    const rightItems = selectedScopeItems(rightQuote, rightSelection, rightAllLines);
+    return selectedScopeItemsEqual(leftItems, rightItems);
   }
-  const leftItems = leftSelection?.scopeItems;
-  const rightItems = rightSelection?.scopeItems;
+  return selectedScopeItemsEqual(leftSelection?.scopeItems, rightSelection?.scopeItems);
+}
+
+function selectedScopeItems(
+  quote: Quote,
+  selection: SelectionState | undefined,
+  allLines: boolean,
+): Map<string, SelectedScopeItem> | undefined {
+  if (!allLines) {
+    return selection?.scopeItems;
+  }
+  if (selection?.scopeItems !== undefined) {
+    return selection.scopeItems;
+  }
+  const scope = quote.comparisonScope;
+  if (scope === undefined) {
+    return undefined;
+  }
+  return new Map(scope.items.map((item) => [
+    item.itemId,
+    { itemId: item.itemId, unit: item.unit, quantity: item.requiredQuantity },
+  ]));
+}
+
+function selectedScopeItemsEqual(
+  leftItems: Map<string, SelectedScopeItem> | undefined,
+  rightItems: Map<string, SelectedScopeItem> | undefined,
+): boolean {
   if (leftItems === undefined || rightItems === undefined || leftItems.size !== rightItems.size) {
     return false;
   }
@@ -536,6 +569,8 @@ export function compareQuotes(left: Quote, right: Quote, options: CompareOptions
   }
 
   const selectedScopesMatch = selectedScopesCompatible(
+    left,
+    right,
     leftSelection,
     rightSelection,
     leftSummary.selectedAllLines,

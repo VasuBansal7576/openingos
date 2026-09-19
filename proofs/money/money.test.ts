@@ -244,11 +244,31 @@ describe("quote comparison", () => {
     expect(selected.right.total?.minorUnits).toBe(9500);
     expect(selected.equivalent?.savings.minorUnits).toBe(1000);
 
-    const fullVersusPartial = compareQuotes(left, right, {
+    const mismatchedFullVersusPartial = compareQuotes(left, right, {
       rightSelection: [{ lineId: "b-machine", itemId: "machine", unit: "piece", quantity: "1" }],
     });
-    expect(fullVersusPartial.status).toBe("incompatible");
-    expect(fullVersusPartial.equivalent).toBeUndefined();
+    expect(mismatchedFullVersusPartial.status).toBe("incompatible");
+    expect(mismatchedFullVersusPartial.equivalent).toBeUndefined();
+
+    const fullOne = quote("full-one", [line("full-machine", 10000)], [
+      knownChargeForTest({
+        chargeId: "delivery-full",
+        label: "Delivery",
+        amount: 500,
+        scope: { kind: "allocated", lineId: "full-machine", method: "fixed" },
+      }),
+    ], undefined, {
+      requirementId: "req-selected",
+      scopeId: "scope-selected",
+      items: [{ itemId: "machine", lineId: "full-machine", unit: "piece", requiredQuantity: "1" }],
+    });
+    const fullVersusPartial = compareQuotes(fullOne, right, {
+      rightSelection: [{ lineId: "b-machine", itemId: "machine", unit: "piece", quantity: "1" }],
+    });
+    expect(fullVersusPartial.status).toBe("complete");
+    expect(fullVersusPartial.left.total?.minorUnits).toBe(10500);
+    expect(fullVersusPartial.right.total?.minorUnits).toBe(9500);
+    expect(fullVersusPartial.equivalent?.savings.minorUnits).toBe(1000);
   });
 
   it("keeps unresolved and unselected included coverage incomplete", () => {
@@ -297,6 +317,27 @@ describe("quote comparison", () => {
       rightSelection: [{ lineId: "machine", itemId: "machine", unit: "piece", quantity: "1" }],
     });
     expect(unresolvedPartial.status).toBe("incomplete");
+
+    const excludedIntermediate = quote("excluded-intermediate", [line("machine", 1000), line("grinder", 1000)], [
+      includedCharge({
+        chargeId: "installation",
+        label: "Installation",
+        coveringId: "service",
+        scope: { kind: "line", lineId: "machine" },
+      }),
+      includedCharge({
+        chargeId: "service",
+        label: "Service",
+        coveringId: "machine",
+        scope: { kind: "line", lineId: "grinder" },
+      }),
+    ]);
+    const excludedIntermediateResult = compareQuotes(excludedIntermediate, excludedIntermediate, {
+      leftSelection: [{ lineId: "machine", itemId: "machine", unit: "piece", quantity: "1" }],
+      rightSelection: [{ lineId: "machine", itemId: "machine", unit: "piece", quantity: "1" }],
+    });
+    expect(excludedIntermediateResult.status).toBe("incomplete");
+    expect(excludedIntermediateResult.reasons.join(" ")).toContain("Installation");
   });
 
   it("rejects included coverage cycles", () => {
