@@ -4,7 +4,8 @@
     "lib": ["ES2022", "DOM"],
     "module": "ESNext",
     "moduleResolution": "Bundler",
-    "types": ["bun"],
+    "types": ["bun", "vite/client"],
+    "jsx": "react-jsx",
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "exactOptionalPropertyTypes": true,
@@ -14,5 +15,6 @@
     "noEmit": true,
     "skipLibCheck": true
   },
-  "include": ["proofs/**/*.ts"]
+  "include": ["app/**/*.ts", "app/**/*.tsx", "convex/**/*.ts", "proofs/**/*.ts", "vite.config.ts"],
+  "exclude": ["node_modules", "dist"]
 }
