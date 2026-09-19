@@ -1,0 +1,25 @@
+# Credentials and local backend state
+.env
+.env.*
+!.env.example
+!.env.template
+*.pem
+*.key
+.convex/
+
+# Dependencies and generated build output
+node_modules/
+dist/
+.next/
+.output/
+.wrangler/
+coverage/
+
+# Local agent installations and research
+.agents/
+.codex/
+.firecrawl/
+.unlazy/
+
+# Operating system metadata
+.DS_Store
