@@ -523,12 +523,20 @@ describe("RJ2 absolute deadline and cancellation before acceptance", () => {
 
   test("body completing after the deadline cannot decide", async () => {
     const text = JSON.stringify(validPayload());
+    let timer: ReturnType<typeof setTimeout> | null = null;
     const stream = new ReadableStream<Uint8Array>({
       start(c) {
-        setTimeout(() => {
+        timer = setTimeout(() => {
+          timer = null;
           c.enqueue(new TextEncoder().encode(text));
           c.close();
         }, 30);
+      },
+      cancel() {
+        if (timer !== null) {
+          clearTimeout(timer);
+          timer = null;
+        }
       },
     });
     const stub = stubFetch(() => new Response(stream, { status: 200 }));
@@ -804,6 +812,56 @@ describe("RJ2 signal swap and spent preparation budget", () => {
     expect(result.outcome).toBe("unavailable");
     if (result.outcome === "unavailable") expect(result.reason).toBe("timeout");
     expect(stub.calls()).toBe(0);
+  });
+});
+
+describe("array own-data and deadline-equality regressions", () => {
+  test("indexed accessor getter never runs and dispatches nothing", async () => {
+    const marker = "PRIVATE_INDEX_MARKER_789";
+    const rigged: unknown[] = ["ok"];
+    Object.defineProperty(rigged, "0", {
+      enumerable: true,
+      configurable: true,
+      get() {
+        throw new Error(marker);
+      },
+    });
+    const stub = stubFetch(() => jsonResponse(validPayload()));
+    const result = await jevAttemptOnce({ ...baseOptions(), fetchImpl: stub.fetchImpl, state: { items: rigged } });
+    expect(result.outcome).toBe("needsReview");
+    if (result.outcome === "needsReview") expect(result.reason).toBe("non-json-state");
+    expect(stub.calls()).toBe(0);
+    expect(JSON.stringify(result)).not.toContain(marker);
+  });
+
+  test("inherited array element is rejected as a hole", async () => {
+    const arr: unknown[] = new Array(1);
+    Object.setPrototypeOf(arr, { 0: "evil" });
+    const stub = stubFetch(() => jsonResponse(validPayload()));
+    const result = await jevAttemptOnce({ ...baseOptions(), fetchImpl: stub.fetchImpl, state: { items: arr } });
+    expect(result.outcome).toBe("needsReview");
+    if (result.outcome === "needsReview") expect(result.reason).toBe("non-json-state");
+    expect(stub.calls()).toBe(0);
+  });
+
+  test("deadline equality is exhausted budget, not a dispatch window", async () => {
+    const realNow = Date.now;
+    const frozen = 1_000_000;
+    const timeout = 50;
+    let now = frozen;
+    Date.now = () => now;
+    try {
+      const stub = stubFetch(() => {
+        now = frozen + timeout;
+        return jsonResponse(validPayload());
+      });
+      const result = await jevAttemptOnce({ ...baseOptions(), fetchImpl: stub.fetchImpl, timeoutMs: timeout });
+      expect(stub.calls()).toBe(1);
+      expect(result.outcome).toBe("unavailable");
+      if (result.outcome === "unavailable") expect(result.reason).toBe("timeout");
+    } finally {
+      Date.now = realNow;
+    }
   });
 });
 

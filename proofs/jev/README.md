@@ -17,7 +17,8 @@ claim of application access or of integrated J-03/J-04 completion.
   byte bound) is validated before any dispatch; NaN/zero bounds are
   rejected with zero requests and the tested hard bounds are unchanged.
 - A normalized immutable JSON snapshot of the exact sent bytes is built
-  before dispatch. Only plain JSON data (Object/null prototypes, dense
+  before dispatch. Only plain JSON data (Object/null prototypes for
+  objects, exactly Array.prototype with own data entries per index for
   arrays) is defensively copied; inherited or non-enumerable serialization
   hooks are never consulted, accessors are rejected without invocation, and
   cycles, sparse arrays, or over-deep graphs fail closed with a generic
@@ -25,6 +26,11 @@ claim of application access or of integrated J-03/J-04 completion.
   and the response validates only against the sent snapshot with the
   snapshotted input version echoed, so mid-flight caller mutation cannot
   smuggle an unsent option or version past validation.
+- One absolute deadline is enforced after every await, immediately before
+  dispatch (preparation counts against it), and before acceptance, covering
+  headers and body alike; exhaustion is inclusive, so arriving exactly at
+  the deadline dispatches nothing further, and header waits use only the
+  remaining budget.
 - One absolute deadline is enforced after every await, immediately before
   dispatch (preparation counts against it), and before acceptance, covering
   headers and body alike; header waits use only the remaining budget.
@@ -96,6 +102,7 @@ Checked `https://docs.typesafe.ai/api` and `https://docs.typesafe.ai/models`:
 ## Evidence mode
 
 Controlled only. Run the shared strict compiler command, then
-`bun test proofs/jev` (52 tests) plus
+`bun test proofs/jev` (55 tests) plus
 `node --test scripts/check-pr.test.mjs scripts/check-workbench.test.mjs`
-(23 tests).
+(23 tests). Delayed-stream fixtures clear their timers on cancel so
+bounded-timeout tests leave no asynchronous work behind for later suites.

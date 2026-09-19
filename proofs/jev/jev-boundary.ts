@@ -210,15 +210,23 @@ function copyJsonData(value: unknown, depth: number, ancestors: Set<object>): Js
   if (typeof value === "number") return Number.isFinite(value) ? { ok: true, value } : { ok: false };
   if (depth > MAX_JSON_COPY_DEPTH) return { ok: false };
   if (Array.isArray(value)) {
+    if (Object.getPrototypeOf(value) !== Array.prototype) return { ok: false };
     if (ancestors.has(value)) return { ok: false };
     ancestors.add(value);
     const out: unknown[] = [];
     for (let index = 0; index < value.length; index += 1) {
-      if (!(index in value)) {
+      // Own data descriptors only: `index in value` would accept inherited
+      // elements and `value[index]` would invoke own indexed getters.
+      const descriptor = Object.getOwnPropertyDescriptor(value, index);
+      if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined) {
         ancestors.delete(value);
         return { ok: false };
       }
-      const element: unknown = value[index];
+      if (!("value" in descriptor)) {
+        ancestors.delete(value);
+        return { ok: false };
+      }
+      const element: unknown = descriptor.value;
       const copied = copyJsonData(element, depth + 1, ancestors);
       if (!copied.ok) {
         ancestors.delete(value);
@@ -743,7 +751,8 @@ export async function jevAttemptOnce(options: JevAttemptOptions): Promise<JevAtt
   const attemptedVersion = options.inputVersion;
   const attemptedSignal = options.signal;
   // One absolute deadline for the whole attempt, enforced after every await,
-  // immediately before dispatch, and before acceptance.
+  // immediately before dispatch, and before acceptance. Exhaustion is
+  // inclusive: reaching the deadline leaves no budget for another request.
   const deadlineMs = started + timeoutMs;
 
   let body: string;
@@ -814,10 +823,12 @@ export async function jevAttemptOnce(options: JevAttemptOptions): Promise<JevAtt
   }
 
   // Preparation counts against the deadline: never dispatch once it is spent.
+  // Budget exhaustion is inclusive: arriving exactly at the deadline leaves
+  // no time for even one bounded request.
   if (isAborted(attemptedSignal)) {
     return { outcome: "stale", reason: "aborted", retry: none, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
   }
-  if (Date.now() > deadlineMs) {
+  if (Date.now() >= deadlineMs) {
     return { outcome: "unavailable", reason: "timeout", retry: { kind: "retryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
   }
 
@@ -864,7 +875,7 @@ export async function jevAttemptOnce(options: JevAttemptOptions): Promise<JevAtt
     discardBody(response);
     return { outcome: "stale", reason: "aborted", retry: none, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
   }
-  if (Date.now() > deadlineMs) {
+  if (Date.now() >= deadlineMs) {
     discardBody(response);
     return { outcome: "unavailable", reason: "timeout", retry: { kind: "retryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
   }
@@ -915,7 +926,7 @@ export async function jevAttemptOnce(options: JevAttemptOptions): Promise<JevAtt
   if (isAborted(attemptedSignal)) {
     return { outcome: "stale", reason: "aborted", retry: none, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
   }
-  if (Date.now() > deadlineMs) {
+  if (Date.now() >= deadlineMs) {
     return { outcome: "unavailable", reason: "timeout", retry: { kind: "retryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
   }
   let payload: unknown;
