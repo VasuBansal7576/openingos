@@ -41,6 +41,8 @@ This file supplies order, not duplicate contracts or a running automation.
 - [x] Install official Convex skills for OpenCode and verify its configured MCP connects.
 - [x] Verify a restarted OpenCode worker sees the twelve Convex MCP tools before backend work; none were invoked.
 - [x] Verify the restarted OpenCode session retains the requested model/high variant and runs its 28 controlled tests without a native approval prompt.
+- [x] Push combined proof checkpoint `897eea7`; pass 41 controlled contract tests, 23 repository checks, strict TypeScript and all four expected CI jobs.
+- [x] Have the independent Astra session review fixed `897eea7` and route its 13 correctness findings plus one fixture-scale gap to the implementation owners.
 - [ ] Verify hosted environment, application credentials, provider allowances and owner recipient.
 - [ ] Integrate and review the independent financial and Jev contract proofs.
 
@@ -48,6 +50,8 @@ The current implementation wave contains controlled proofs only.
 Luna owns `proofs/money/**`; Muse Spark owns `proofs/jev/**`.
 Astra owns shared tooling, dependencies, ADR amendments and progress files, and a separate Astra session reviews fixed commits.
 Neither proof authorizes dependent production features or passes the hosted F0 gates.
+The first independent review requires repairs M1–M7 from Luna and RJ1–RJ7 from Muse Spark, followed by a new fixed combined review.
+Passing tests on `897eea7` do not close those findings.
 
 ## Duties throughout
 
