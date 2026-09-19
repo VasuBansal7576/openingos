@@ -12,7 +12,7 @@
 - **Auth:** none
 - **AI models:** none
 - **Started:** 2026-09-19T09:46:19Z
-- **Last updated:** 2026-09-19T18:06:34Z
+- **Last updated:** 2026-09-19T18:28:18Z
 
 ## Log
 
@@ -110,3 +110,11 @@ Selected Netherlands/EUR and three public supplier examples for hackathon resear
 Created a dedicated TypeSafe key with user approval and verified secure local storage; no key value entered the repository and no live inference was tested.
 All 23 existing repository tests passed, the delivery skill validated, 49 local links and anchors checked, and all 52 product requirements plus 24 sponsor cases remained unchanged.
 Application implementation, hosted integration proofs and end-to-end review remain pending; the owner retains Firecrawl account setup and final submission tasks.
+
+### 2026-09-19 - working tree
+
+Started a supervised Orca run with isolated implementation worktrees and a separate read-only Astra reviewer.
+Verified actual session metadata for OpenAI GPT-5.6 Luna at max effort, OpenCode Go Muse Spark 1.3 Contributor at high effort, and OpenAI GPT-6 Astra for coordination and independent review.
+Exercised scoped native approvals and worker question routing; recovered an update-blocked launch and diagnosed Codex sandbox IPC restrictions without enabling unrestricted worker permissions.
+Converted the coordinator roadmap to checkboxes, recording verified substeps separately from pending foundation and live-provider gates.
+All 23 existing repository tests pass; these checks and preflight evidence do not establish application behavior or live integrations.

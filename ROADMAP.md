@@ -6,27 +6,46 @@ This file supplies order, not duplicate contracts or a running automation.
 
 ## Build order
 
-1. **Preflight.** Astra coordinates and verifies effective worker models, isolated worktrees, credentials and scoped native permission handling.
+1. [ ] **Preflight.** Astra coordinates and verifies effective worker models, isolated worktrees, credentials and scoped native permission handling.
    Load Orca's installed, version-matched orchestration guide.
    Its inspected OpenCode route requires an explicit `opencode --model opencode-go/muse-spark-1.3-contributor` terminal, then supervised `worker-start --terminal` attachment after readiness.
    Verify current support rather than using an unsupported OpenCode `--model` flag or unsupervised injection.
    Test an innocuous worker question and an actual native approval path; Orca `ask/reply` alone is not sandbox approval.
-2. **F0, foundation proofs.** Configure OpenCode's official Convex skills/MCP and verify both workers can access the project skills.
+2. [ ] **F0, foundation proofs.** Configure OpenCode's official Convex skills/MCP and verify both workers can access the project skills.
    Once the app contains Convex, run `npx convex ai-files status`, install missing/stale managed AI files, and read the generated guidelines.
    Establish app CI, hosted Convex access, identity isolation, the Jev adapter and isolated remote browser execution.
    Resolve ordinary technical choices with test evidence and amend the relevant ADR before dependent implementation.
-3. **F1, shared contracts.** Prove schemas, money, authority, owner-only recipients, deduplication and shared provider budgets.
+3. [ ] **F1, shared contracts.** Prove schemas, money, authority, owner-only recipients, deduplication and shared provider budgets.
    Independent controlled contract tests may run alongside F0; freeze affected interfaces only after their prerequisites pass.
    Assign one owner to schema, dependency and lockfile changes.
-4. **R1 / C1 / U1, parallel features.** After accepted F1 contracts land, dispatch research, communication and workbench packages with exclusive file ownership.
+4. [ ] **R1 / C1 / U1, parallel features.** After accepted F1 contracts land, dispatch research, communication and workbench packages with exclusive file ownership.
    Use the Netherlands/EUR source set in PRD section 52; preserve all required categories and the full evaluator journey.
-5. **E1, integrated behavior.** Build recovery, change impact and equipment/service flows against the integrated research and communication modules.
-6. **V1, proof and review.** A separate Astra session reviews a fixed combined commit; implementation owners repair its findings.
+5. [ ] **E1, integrated behavior.** Build recovery, change impact and equipment/service flows against the integrated research and communication modules.
+6. [ ] **V1, proof and review.** A separate Astra session reviews a fixed combined commit; implementation owners repair its findings.
    Prove all 52 P/H/D requirements, 24 S-cases and 7 J-cases, recording live versus controlled evidence and any unmet case.
    Exercise the real owner-email negotiation, Jev decisions, browser recovery, guest isolation and responsive UI; an early working path is not completion.
-7. **Publication and closeout.** Hand the tested pushed revision to ChatGPT Sites for owner-authorized publication with public access.
+7. [ ] **Publication and closeout.** Hand the tested pushed revision to ChatGPT Sites for owner-authorized publication with public access.
    Verify the final public origin, hosted integrations and anonymous evaluator path; then update README and the build log.
    Give the owner the exact URL, commit and redacted evidence for their video, announcement and submission.
+
+## Verified progress
+
+- [x] Read the project instructions, package plan, ADR register and installed Orca orchestration guide.
+- [x] Verify coordinator and separate reviewer sessions use OpenAI `gpt-6-astra`; both report `xhigh` effort.
+- [x] Verify Codex worker session metadata reports OpenAI `gpt-5.6-luna` with requested `max` effort.
+- [x] Verify OpenCode session messages report `opencode-go/muse-spark-1.3-contributor` with `high` variant.
+- [x] Create isolated Luna and Muse Spark worktrees from `987b4ab`; both can read the tracked factory skill.
+- [x] Exercise native scoped approvals: Codex's harmless print command and OpenCode's one-time shell approval.
+- [x] Exercise OpenCode's Orca question/reply round trip.
+- [ ] Finish Codex's Orca question/reply and lifecycle round trip under scoped IPC approval.
+- [ ] Finish OpenCode Convex skills/MCP setup and verify a restarted worker sees both.
+- [ ] Verify hosted environment, application credentials, provider allowances and owner recipient.
+- [ ] Integrate and review the independent financial and Jev contract proofs.
+
+The current implementation wave contains controlled proofs only.
+Luna owns `proofs/money/**`; Muse Spark owns `proofs/jev/**`.
+Astra owns shared tooling, dependencies, ADR amendments and progress files, and a separate Astra session reviews fixed commits.
+Neither proof authorizes dependent production features or passes the hosted F0 gates.
 
 ## Duties throughout
 
