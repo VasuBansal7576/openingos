@@ -12,7 +12,7 @@
 - **Auth:** none
 - **AI models:** none
 - **Started:** 2026-09-19T09:46:19Z
-- **Last updated:** 2026-09-19T13:27:25Z
+- **Last updated:** 2026-09-19T13:29:45Z
 
 ## Log
 
@@ -43,8 +43,10 @@ Extended `PRD.md` to revision 6 with a supported-capability boundary, backend en
 Generated a further three ChatGPT ImageGen concepts after visual feedback; design selection and runtime enforcement remain unimplemented.
 No application, live CI run, Greptile integration, unattended repair runner, commit, or deployment was completed in this session.
 
-### 2026-09-19 - working tree
+### 2026-09-19 - f1dd4e5
 
 Made frequent GitHub-pushed checkpoints and safe completed-task worktree cleanup explicit requirements in `AGENTS.md` and the project delivery skill.
 Cleanup requires verified handoff, remote preservation, settled ownership, and protection of uncommitted or untracked work; the repository currently has only its main checkout, so nothing was removed.
-Prepared the accumulated PRD and delivery files for their first GitHub checkpoint; remote push and CI results are not yet recorded in this entry.
+Committed and pushed the accumulated PRD and delivery files in `f1dd4e5`, then verified the exact commit on GitHub.
+All 19 local CI-helper tests passed, the skill validated, and the [GitHub repository-check run](https://github.com/VasuBansal7576/openingos/actions/runs/35445899698) succeeded for that commit.
+This verifies delivery tooling only; application behavior, Greptile integration, and unattended repair remain unimplemented.
