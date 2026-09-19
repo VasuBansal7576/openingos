@@ -1,6 +1,7 @@
 import {
   applyIfCurrent,
   JEV_DEFAULT_TIMEOUT_MS,
+  JEV_MAX_RETRY_AFTER_MS,
   JEV_MAX_RESPONSE_BYTES,
   jevAttemptOnce,
   validChoiceQuestion,
@@ -236,6 +237,19 @@ export async function runJevClassification(
     if (attempt + 1 >= JEV_MAX_ATTEMPTS) return lastResult;
 
     const retryAfter = freshResult.retry.retryAfterMs;
+    if (retryAfter !== null && retryAfter > JEV_MAX_RETRY_AFTER_MS) {
+      // Do not sleep an untrusted provider-controlled duration. The proof
+      // preserves the exact server minimum, so over-policy advice becomes an
+      // explicit review result instead of an automatic retry.
+      return {
+        outcome: "needsReview",
+        reason: `${freshResult.reason}:manual-review-required`,
+        retry: { ...freshResult.retry, kind: "nonretryable" },
+        latencyMs: freshResult.latencyMs,
+        inputVersion: freshResult.inputVersion,
+        attempts: attempt + 1,
+      };
+    }
     const delay = retryAfter === null
       ? attempt === 0 ? JEV_RETRY_BACKOFF_MS[0] : JEV_RETRY_BACKOFF_MS[1]
       : retryAfter;

@@ -1,11 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { verifyAgentMailWebhook, WebhookVerificationError } from "@agentmail/convex";
+import { AgentMail, type AgentMailComponent } from "@agentmail/convex";
 import {
   JEV_ENDPOINT,
   JEV_PINNED_MODEL,
   type JevFetch,
   type JevQuestion,
 } from "../../proofs/jev/jev-boundary.js";
+import { hasGitHubOAuthCredentials } from "../../convex/auth";
 import { runJevClassification } from "../../convex/models/jev";
 
 const SYNTHETIC_KEY = "f0-controlled-synthetic-key";
@@ -76,6 +77,14 @@ describe("S-01 registered provider components", () => {
     expect(auth).toContain("convexAuth");
     expect(authConfig).toContain('applicationID: "convex"');
     expect(authConfig).toContain("CONVEX_SITE_URL");
+  });
+
+  test("GitHub OAuth is optional while Anonymous remains available", () => {
+    expect(hasGitHubOAuthCredentials(undefined, undefined)).toBe(false);
+    expect(hasGitHubOAuthCredentials("client-id", undefined)).toBe(false);
+    expect(hasGitHubOAuthCredentials(undefined, "client-secret")).toBe(false);
+    expect(hasGitHubOAuthCredentials(" ", "client-secret")).toBe(false);
+    expect(hasGitHubOAuthCredentials("client-id", "client-secret")).toBe(true);
   });
 });
 
@@ -150,7 +159,7 @@ describe("J-03 bounded retry and cancellation", () => {
     expect(stub.calls).toHaveLength(3);
   });
 
-  test("never shortens a server Retry-After minimum", async () => {
+  test("pauses for over-policy Retry-After instead of sleeping it", async () => {
     const delays: number[] = [];
     const stub = stubFetch(() => jsonResponse({ error: "overloaded" }, 529, { "retry-after": "120" }));
     const result = await runJevClassification({
@@ -163,9 +172,33 @@ describe("J-03 bounded retry and cancellation", () => {
         delays.push(milliseconds);
       },
     });
-    expect(result.outcome).toBe("unavailable");
-    expect(delays).toEqual([120_000, 120_000]);
-    expect(stub.calls).toHaveLength(3);
+    expect(result.outcome).toBe("needsReview");
+    if (result.outcome !== "needsReview") throw new Error("expected manual review");
+    expect(result.reason).toContain("retry-after-exceeds-policy");
+    expect(result.retry.retryAfterMs).toBe(120_000);
+    expect(delays).toEqual([]);
+    expect(stub.calls).toHaveLength(1);
+  });
+
+  test("never sleeps a huge untrusted Retry-After header", async () => {
+    const delays: number[] = [];
+    const stub = stubFetch(() => jsonResponse({ error: "overloaded" }, 529, { "retry-after": "2147483647" }));
+    const result = await runJevClassification({
+      apiKey: SYNTHETIC_KEY,
+      state: "state",
+      questions,
+      inputVersion: "input-4c",
+      fetchImpl: stub.fetchImpl,
+      sleepImpl: async (milliseconds) => {
+        delays.push(milliseconds);
+      },
+    });
+    expect(result.outcome).toBe("needsReview");
+    if (result.outcome !== "needsReview") throw new Error("expected manual review");
+    expect(result.reason).toContain("manual-review-required");
+    expect(result.retry.retryAfterMs).toBe(2_147_483_647_000);
+    expect(delays).toEqual([]);
+    expect(stub.calls).toHaveLength(1);
   });
 
   test("pre-cancelled classification makes no request", async () => {
@@ -216,28 +249,62 @@ describe("S-03 AgentMail signature boundary", () => {
     };
   }
 
-  function rejected(headers: Record<string, string>, body = payload): boolean {
-    try {
-      verifyAgentMailWebhook(secret, body, headers);
-      return false;
-    } catch (error) {
-      return error instanceof WebhookVerificationError;
-    }
+  function testContext(counters: { productCallbacks: number; purchasingUpdates: number }): Parameters<AgentMail["handleWebhook"]>[0] {
+    return {
+      runMutation: async () => {
+        counters.productCallbacks += 1;
+        counters.purchasingUpdates += 1;
+        return null;
+      },
+    } as unknown as Parameters<AgentMail["handleWebhook"]>[0];
   }
 
-  test("missing signature headers reject before callback", () => {
-    let callbackCount = 0;
-    if (rejected({})) callbackCount += 0;
-    expect(callbackCount).toBe(0);
-    expect(rejected({})).toBe(true);
+  const component = {} as unknown as AgentMailComponent;
+
+  test("missing webhook secret rejects before product callback or purchasing update", async () => {
+    const counters = { productCallbacks: 0, purchasingUpdates: 0 };
+    const agentmail = new AgentMail(component, { webhookSecret: "" });
+    let error: unknown;
+    try {
+      await agentmail.handleWebhook(
+        testContext(counters),
+        new Request("https://example.test/agentmail/webhook", { method: "POST", body: payload }),
+      );
+    } catch (caught) {
+      error = caught;
+    }
+    expect(String(error)).toContain("AGENTMAIL_WEBHOOK_SECRET");
+    expect(counters).toEqual({ productCallbacks: 0, purchasingUpdates: 0 });
   });
 
-  test("invalid signature rejects before callback", () => {
-    expect(rejected(invalidHeaders)).toBe(true);
+  test("invalid signature rejects before product callback or purchasing update", async () => {
+    const counters = { productCallbacks: 0, purchasingUpdates: 0 };
+    const agentmail = new AgentMail(component, { webhookSecret: secret });
+    const response = await agentmail.handleWebhook(
+      testContext(counters),
+      new Request("https://example.test/agentmail/webhook", {
+        method: "POST",
+        headers: invalidHeaders,
+        body: payload,
+      }),
+    );
+    expect(response.status).toBe(401);
+    expect(counters).toEqual({ productCallbacks: 0, purchasingUpdates: 0 });
   });
 
-  test("tampered body rejects before callback", async () => {
+  test("tampered body after signing the original rejects before product callback or purchasing update", async () => {
+    const counters = { productCallbacks: 0, purchasingUpdates: 0 };
     const headers = await signedHeaders(payload);
-    expect(rejected(headers, `${payload}tampered`)).toBe(true);
+    const agentmail = new AgentMail(component, { webhookSecret: secret });
+    const response = await agentmail.handleWebhook(
+      testContext(counters),
+      new Request("https://example.test/agentmail/webhook", {
+        method: "POST",
+        headers,
+        body: `${payload}tampered`,
+      }),
+    );
+    expect(response.status).toBe(401);
+    expect(counters).toEqual({ productCallbacks: 0, purchasingUpdates: 0 });
   });
 });

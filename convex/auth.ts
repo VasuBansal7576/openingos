@@ -7,11 +7,21 @@ import { convexAuth } from "@convex-dev/auth/server";
  * provider using deployment-only credentials. Project isolation and capability
  * checks remain F1 backend responsibilities; no provider call happens here.
  */
-const github = GitHub({
-  clientId: process.env.AUTH_GITHUB_ID ?? "",
-  clientSecret: process.env.AUTH_GITHUB_SECRET ?? "",
-});
+export function hasGitHubOAuthCredentials(clientId: string | undefined, clientSecret: string | undefined): boolean {
+  return typeof clientId === "string"
+    && clientId.trim().length > 0
+    && typeof clientSecret === "string"
+    && clientSecret.trim().length > 0;
+}
+
+function createGitHubProvider(clientId: string | undefined, clientSecret: string | undefined) {
+  if (typeof clientId !== "string" || clientId.trim().length === 0) return null;
+  if (typeof clientSecret !== "string" || clientSecret.trim().length === 0) return null;
+  return GitHub({ clientId, clientSecret });
+}
+
+const github = createGitHubProvider(process.env.AUTH_GITHUB_ID, process.env.AUTH_GITHUB_SECRET);
 
 export const { auth, signIn, signOut, store, isAuthenticated } = convexAuth({
-  providers: [Anonymous, github],
+  providers: github === null ? [Anonymous] : [Anonymous, github],
 });
