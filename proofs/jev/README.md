@@ -102,7 +102,7 @@ Checked `https://docs.typesafe.ai/api` and `https://docs.typesafe.ai/models`:
 ## Evidence mode
 
 Controlled only. Run the shared strict compiler command, then
-`bun test proofs/jev` (55 tests) plus
+`bun test proofs/jev` (56 tests) plus
 `node --test scripts/check-pr.test.mjs scripts/check-workbench.test.mjs`
 (23 tests). Delayed-stream fixtures clear their timers on cancel so
 bounded-timeout tests leave no asynchronous work behind for later suites.
