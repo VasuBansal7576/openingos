@@ -5,8 +5,8 @@ These documents specify implementation choices, not completed capabilities.
 The user accepted the purchasing workbench and the existing hackathon platform direction.
 The user also requires all hackathon outreach to go only to their designated mailbox, with real provider execution and the user playing the supplier.
 This accepted product constraint applies to ADR-0003 through ADR-0008 even while their technical proposals await proof.
-The user delegates routine technical choices and testing to the Astra coordinator.
-Other recommendations remain proposed until Astra reviews the evidence and their blocking experiments pass.
+The user delegates routine technical choices and testing to the active OpeningOS coordinator.
+Other recommendations remain proposed until the coordinator reviews the evidence and their blocking experiments pass.
 Do not let workers silently turn a proposal into an accepted contract.
 
 | ADR | Decision | Status |
@@ -20,7 +20,7 @@ Do not let workers silently turn a proposal into an accepted contract.
 | [0007](0007-identity-capabilities-and-approval.md) | Guest identity, private access, capabilities and approvals | Proposed |
 | [0008](0008-verification-and-worker-handoffs.md) | Environments, evidence, CI and Orca implementation packages | Proposed |
 
-## Proofs owned by Astra
+## Proofs owned by the coordinator
 
 1. Prove published Sites can read, write and subscribe to the intended hosted Convex deployment.
 2. Prove a hosted Jev-guided browser operation with two isolated sessions, cancellation and an independent result check.

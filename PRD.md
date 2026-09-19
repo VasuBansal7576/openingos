@@ -20,7 +20,7 @@ It connects requirements, evidence, quotes, approvals, orders, equipment, and ac
 ### What changed in this revision
 
 - Selected Netherlands/EUR and representative public supplier pages for hackathon research, without choosing the commercial launch market.
-- Assigned setup, routine technical decisions and end-to-end proof to Astra through the [coordinator roadmap](ROADMAP.md).
+- Assigned setup, routine technical decisions and end-to-end proof to the active OpeningOS coordinator through the [coordinator roadmap](ROADMAP.md).
 - Consolidated Jev's API contract into ADR-0005 and its proof cases into the existing package plan.
 - Preserved all 52 acceptance requirements, the selected workbench, real provider execution and owner-only hackathon correspondence.
 
@@ -1576,8 +1576,8 @@ This PRD revision does not select a mobile framework, implement billing or final
 
 ### External dependencies and unresolved choices
 
-- Astra owns application setup, usable OpenAI/AgentMail/Jev access, hosted browser execution and Convex/Sites verification under the [roadmap](ROADMAP.md).
-- Astra resolves proposed ADRs from proof results before dependent feature work; runtime verification belongs to implementation and testing, not another user questionnaire.
+- The active OpeningOS coordinator owns application setup, usable OpenAI/AgentMail/Jev access, hosted browser execution and Convex/Sites verification under the [roadmap](ROADMAP.md).
+- The active OpeningOS coordinator resolves proposed ADRs from proof results before dependent feature work; runtime verification belongs to implementation and testing, not another user questionnaire.
 - The owner supplies the new Firecrawl account/credits and handles registration, eligibility, video, announcement and Vibe Apps submission.
 - Obtain the receiving mailbox privately; never infer it from an account profile or commit metadata.
 - Configure bounded provider allowances from verified access and authorized credits; missing allowances disable live calls, and paid overages/subscriptions require separate permission.

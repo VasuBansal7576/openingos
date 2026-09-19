@@ -35,7 +35,7 @@ No real vendor is contacted through email, forms or another channel.
 | [Sponsor contracts](docs/integrations/sponsor-contracts.md) | Convex, Firecrawl and AgentMail ownership and effects |
 | [Jev integration](docs/adr/0005-jev-and-openai.md#api-contract) | Backend endpoint, request/response validation and retry policy |
 | [Implementation packages](docs/implementation/sponsor-integration-plan.md) | Dependencies, owned files and acceptance evidence |
-| [Coordinator roadmap](ROADMAP.md) | Astra's setup, build order and completion gates |
+| [Coordinator roadmap](ROADMAP.md) | Coordinator setup, build order and completion gates |
 | [Agent instructions](AGENTS.md) | Repository rules and GitHub delivery responsibilities |
 | [Build log](hackathon.md) | Factual progress, not planned capabilities presented as completed work |
 
@@ -81,4 +81,4 @@ The [official event](https://www.convex.dev/hackathons/all-gas) requires a publi
 OpenAI, Firecrawl and AgentMail must perform observable product work alongside Convex.
 Registration, participant eligibility, a social announcement tagging all four sponsors and submission through the [exact event form](https://vibeapps.dev/judging/convex-all-gas-hackathon-openai/submit) remain separate checks.
 The deadline is September 22, 2026 at noon Pacific, or September 23 at 00:30 India Standard Time.
-The owner handles registration, eligibility, Firecrawl account/credits, video, announcement and submission; Astra owns the build and its verification.
+The owner handles registration, eligibility, Firecrawl account/credits, video, announcement and submission; the active OpeningOS coordinator owns the build and its verification.

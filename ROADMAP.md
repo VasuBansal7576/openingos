@@ -6,11 +6,12 @@ This file supplies order, not duplicate contracts or a running automation.
 
 ## Build order
 
-1. [x] **Preflight.** The active OpeningOS orchestrator verifies effective worker models, isolated worktrees, credentials and scoped native permission handling.
+1. [x] **Preflight.** The active OpeningOS orchestrator verifies effective worker models, isolated worktrees, credential presence and scoped native permission handling.
    Load Orca's installed, version-matched orchestration guide.
    The verified OpenCode route supplies an `openingos-worker` agent through `OPENCODE_CONFIG_CONTENT`, starts `opencode --agent openingos-worker`, confirms `opencode-go/muse-spark-1.3-contributor` with the `high` variant in the TUI, then attaches it through supervised `worker-start --terminal`.
    Codex workers and reviewers start in explicit normally sandboxed terminals before supervised attachment; do not use launch paths that add security-bypass flags.
    Test an innocuous worker question and an actual native approval path; Orca `ask/reply` alone is not sandbox approval.
+   A checked preflight records missing application credentials as blockers for affected live operations; it does not claim that those credentials exist.
 2. [ ] **F0, foundation proofs.** Configure OpenCode's official Convex skills/MCP and verify both workers can access the project skills.
    Once the app contains Convex, run `npx convex ai-files status`, install missing/stale managed AI files, and read the generated guidelines.
    Establish app CI, hosted Convex access, identity isolation, the Jev adapter and isolated remote browser execution.
@@ -45,15 +46,18 @@ This file supplies order, not duplicate contracts or a running automation.
 - [x] Have the independent Astra session review fixed commits, route findings to their owners and verify all M1–M7/RJ1–RJ7 repairs at `595d30c`.
 - [ ] Verify hosted environment, application credentials, provider allowances and owner recipient.
 - [x] Integrate and review the independent financial and Jev contract proofs.
-- [x] Integrate browser-executor controlled contract proof `714155f`; pass 51 tests for signed requests, replay and session isolation, target freshness, blocked write operations, cancellation, bounded recovery and independent completion checks.
+- [x] Integrate browser-executor controlled contract proof `714155f`; its 51 nominal controlled tests passed before independent review.
+- [ ] Close the ten actionable browser-executor findings reported by the separate Astra review of `78e2694`, integrate the Spark-owned repairs and have Astra re-review the fixed combined commit before crediting the affected D-cases.
+- [ ] Integrate and review the Luna-owned application foundation, including strict app and browser-executor CI coverage, official component registration, identity foundation, controlled Jev and AgentMail boundaries and an honest unconfigured-backend state.
 - [x] Shut down settled worker/reviewer sessions and remove both completed worker worktrees through Orca after verifying clean status and remote preservation.
 
-The completed wave contains controlled proofs only, reviewed at `595d30c` with no actionable findings remaining.
+The completed money and Jev proof wave contains controlled proofs only, reviewed at `595d30c` with no actionable findings remaining.
 Luna owned `proofs/money/**`; Muse Spark owned `proofs/jev/**`; Astra owned shared tooling, integration and progress files.
 The separate Astra reviewer also passed 1,144 exact allocation/changed-price cases and 1,760 settlement split/reordering checks.
 The worker branches remain on GitHub; their completed worktrees have been removed, and the coordinator checkout remains available.
 Neither this proof wave nor its green CI accepts the proposed architecture, passes full F0/F1 gates or authorizes dependent product features.
-The next build gate needs a hosted environment, application credentials, provider allowances and the private owner recipient; those facts remain unverified.
+Browser-executor review repairs and the application foundation remain active and do not require live credentials.
+Hosted provider cases still need a hosted environment, application credentials, provider allowances and the private owner recipient; those facts remain unverified and block only the affected live evidence.
 
 ## Duties throughout
 

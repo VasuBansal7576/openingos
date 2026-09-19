@@ -83,7 +83,7 @@ Relevant unknown supplier facts trigger permitted research or clarification befo
 
 Accept numerical thresholds only after measuring false rejections, unauthorized-operation proposals, wrong model matches and incorrectly deferred suitable suppliers.
 Do not insert an arbitrary universal 0.9 threshold into worker contracts.
-Astra owns the threshold evaluation and tested OpenAI model selection before dependent execution work; workers do not choose incompatible policies independently.
+The active OpeningOS coordinator owns the threshold evaluation and tested OpenAI model selection before dependent execution work; workers do not choose incompatible policies independently.
 
 ## Documents and answers
 

@@ -153,7 +153,7 @@ Those 23 tests do not execute the planned sponsor integrations.
 | Shared schema needs a change | Ask the foundation owner for the contract amendment; continue independent owned work |
 
 Netherlands/EUR is the selected hackathon market; see PRD section 52 for representative sources.
-Astra resolves identity, browser hosting and model calibration through the ADR register's proof tasks without reducing the agreed product.
+The active OpeningOS coordinator resolves identity, browser hosting and model calibration through the ADR register's proof tasks without reducing the agreed product.
 
 ## Return a complete handoff
 
