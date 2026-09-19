@@ -49,6 +49,14 @@ function stubFetch(handler: (url: string, init: RequestInit | undefined) => Resp
   return { fetchImpl, calls, requests };
 }
 
+async function waitFor(condition: () => boolean, timeoutMs = 1_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() >= deadline) throw new Error("controlled test condition timed out");
+    await new Promise<void>((resolve) => setTimeout(resolve, 1));
+  }
+}
+
 describe("S-01 registered provider components", () => {
   test("config registers the actual official component entry points", async () => {
     const config = await Bun.file(new URL("../../convex/convex.config.ts", import.meta.url)).text();
@@ -216,6 +224,150 @@ describe("J-03 bounded retry and cancellation", () => {
     });
     expect(result.outcome).toBe("stale");
     expect(stub.calls).toHaveLength(0);
+  });
+
+  test("freezes one request snapshot across retry attempts", async () => {
+    const state = { message: "before" };
+    const mutableQuestions: Record<string, JevQuestion> = {
+      urgency: {
+        type: "noul",
+        instructions: "Is this request urgent?",
+        criteria: { true: "Time-sensitive", false: "Not time-sensitive" },
+      },
+    };
+    const bodies: string[] = [];
+    let call = 0;
+    const stub = stubFetch((_url, init) => {
+      bodies.push(String(init?.body));
+      call += 1;
+      if (call === 1) {
+        state.message = "changed during backoff";
+        mutableQuestions.urgency = {
+          type: "choice",
+          instructions: "What changed?",
+          criteria: { changed: "Changed", same: "Same" },
+        };
+        return jsonResponse({ error: "busy" }, 429, { "retry-after": "0" });
+      }
+      return jsonResponse(successPayload());
+    });
+
+    const result = await runJevClassification({
+      apiKey: SYNTHETIC_KEY,
+      state,
+      questions: mutableQuestions,
+      inputVersion: "input-snapshot",
+      fetchImpl: stub.fetchImpl,
+      sleepImpl: async () => undefined,
+    });
+
+    expect(result.outcome).toBe("decided");
+    expect(stub.calls).toHaveLength(2);
+    expect(bodies[0]).toBe(bodies[1]);
+    expect(JSON.parse(bodies[1] ?? "{}")).toMatchObject({
+      state: { message: "before" },
+      questions: { urgency: { type: "noul" } },
+    });
+  });
+
+  test("stops before another request when the input version changes", async () => {
+    let currentInputVersion = "input-current";
+    const stub = stubFetch(() => {
+      currentInputVersion = "input-new";
+      return jsonResponse({ error: "busy" }, 429, { "retry-after": "0" });
+    });
+
+    const result = await runJevClassification({
+      apiKey: SYNTHETIC_KEY,
+      state: "state",
+      questions,
+      inputVersion: "input-current",
+      currentInputVersion: () => currentInputVersion,
+      fetchImpl: stub.fetchImpl,
+      sleepImpl: async () => undefined,
+    });
+
+    expect(result.outcome).toBe("stale");
+    if (result.outcome !== "stale") throw new Error("expected stale result");
+    expect(result.reason).toBe("input-version-changed");
+    expect(result.attempts).toBe(1);
+    expect(stub.calls).toHaveLength(1);
+  });
+
+  test("stops before another request when current authority is revoked", async () => {
+    let currentAuthority = true;
+    const stub = stubFetch(() => {
+      currentAuthority = false;
+      return jsonResponse({ error: "busy" }, 429, { "retry-after": "0" });
+    });
+
+    const result = await runJevClassification({
+      apiKey: SYNTHETIC_KEY,
+      state: "state",
+      questions,
+      inputVersion: "input-authority",
+      isCurrentAuthority: () => currentAuthority,
+      fetchImpl: stub.fetchImpl,
+      sleepImpl: async () => undefined,
+    });
+
+    expect(result.outcome).toBe("stale");
+    if (result.outcome !== "stale") throw new Error("expected stale result");
+    expect(result.reason).toBe("authority-invalidated");
+    expect(result.attempts).toBe(1);
+    expect(stub.calls).toHaveLength(1);
+  });
+
+  test("aborts the default backoff timer promptly", async () => {
+    const controller = new AbortController();
+    const stub = stubFetch(() => jsonResponse({ error: "busy" }, 529));
+    const pending = runJevClassification({
+      apiKey: SYNTHETIC_KEY,
+      state: "state",
+      questions,
+      inputVersion: "input-default-backoff",
+      signal: controller.signal,
+      fetchImpl: stub.fetchImpl,
+    });
+
+    await waitFor(() => stub.calls.length === 1);
+    controller.abort();
+    const result = await Promise.race([
+      pending,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("abort was not prompt")), 100)),
+    ]);
+
+    expect(result.outcome).toBe("stale");
+    expect(stub.calls).toHaveLength(1);
+  });
+
+  test("aborts a pending Retry-After wait promptly", async () => {
+    const controller = new AbortController();
+    let releaseSleep: () => void = () => undefined;
+    const sleepPending = new Promise<void>((resolve) => {
+      releaseSleep = resolve;
+    });
+    const stub = stubFetch(() => jsonResponse({ error: "busy" }, 529, { "retry-after": "30" }));
+    const pending = runJevClassification({
+      apiKey: SYNTHETIC_KEY,
+      state: "state",
+      questions,
+      inputVersion: "input-retry-after",
+      signal: controller.signal,
+      fetchImpl: stub.fetchImpl,
+      sleepImpl: async () => sleepPending,
+    });
+
+    await waitFor(() => stub.calls.length === 1);
+    controller.abort();
+    const result = await Promise.race([
+      pending,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("abort was not prompt")), 100)),
+    ]);
+    releaseSleep();
+
+    expect(result.outcome).toBe("stale");
+    expect(stub.calls).toHaveLength(1);
   });
 });
 

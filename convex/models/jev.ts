@@ -59,6 +59,7 @@ export interface JevClassificationOptions {
   signal?: AbortSignal;
   sleepImpl?: (milliseconds: number) => Promise<void>;
   currentInputVersion?: () => string;
+  isCurrentAuthority?: () => boolean;
 }
 
 const retryAdviceValidator = v.object({
@@ -177,25 +178,178 @@ function parseQuestions(value: unknown): Record<string, JevQuestion> | null {
   return result;
 }
 
+type RetrySnapshot = { ok: true; value: unknown } | { ok: false };
+
+function copyRetryInput(value: unknown, depth: number, ancestors: Set<object>): RetrySnapshot {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return { ok: true, value };
+  if (typeof value === "number") return Number.isFinite(value) ? { ok: true, value } : { ok: false };
+  if (depth > 64 || typeof value !== "object") return { ok: false };
+  if (ancestors.has(value)) return { ok: false };
+  ancestors.add(value);
+
+  if (Array.isArray(value)) {
+    if (Object.getPrototypeOf(value) !== Array.prototype) {
+      ancestors.delete(value);
+      return { ok: false };
+    }
+    const copy: unknown[] = [];
+    for (let index = 0; index < value.length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, index);
+      if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined || !("value" in descriptor)) {
+        ancestors.delete(value);
+        return { ok: false };
+      }
+      const entry = copyRetryInput(descriptor.value, depth + 1, ancestors);
+      if (!entry.ok) {
+        ancestors.delete(value);
+        return { ok: false };
+      }
+      copy.push(entry.value);
+    }
+    ancestors.delete(value);
+    return { ok: true, value: copy };
+  }
+
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    ancestors.delete(value);
+    return { ok: false };
+  }
+  const copy: Record<string, unknown> = {};
+  for (const key of Object.keys(value)) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined || !("value" in descriptor)) {
+      ancestors.delete(value);
+      return { ok: false };
+    }
+    const entry = copyRetryInput(descriptor.value, depth + 1, ancestors);
+    if (!entry.ok) {
+      ancestors.delete(value);
+      return { ok: false };
+    }
+    if (key === "__proto__") {
+      Object.defineProperty(copy, key, {
+        value: entry.value,
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
+    } else {
+      copy[key] = entry.value;
+    }
+  }
+  ancestors.delete(value);
+  return { ok: true, value: copy };
+}
+
+function immutableRetryInput(value: unknown): RetrySnapshot {
+  try {
+    const copy = copyRetryInput(value, 0, new Set<object>());
+    if (!copy.ok) return copy;
+
+    const freeze = (entry: unknown): void => {
+      if (typeof entry !== "object" || entry === null || Object.isFrozen(entry)) return;
+      Object.freeze(entry);
+      if (Array.isArray(entry)) {
+        for (const child of entry) freeze(child);
+        return;
+      }
+      for (const key of Object.keys(entry)) {
+        const descriptor = Object.getOwnPropertyDescriptor(entry, key);
+        if (descriptor !== undefined && "value" in descriptor) freeze(descriptor.value);
+      }
+    };
+    freeze(copy.value);
+    return copy;
+  } catch {
+    return { ok: false };
+  }
+}
+
+type RetryRequest = {
+  state: unknown;
+  questions: Record<string, JevQuestion>;
+  inputVersion: string;
+};
+
+function freezeRetryRequest(options: JevClassificationOptions): RetryRequest | null {
+  const state = immutableRetryInput(options.state);
+  const questions = immutableRetryInput(options.questions);
+  if (!state.ok || !questions.ok) return null;
+  const parsedQuestions = parseQuestions(questions.value);
+  if (parsedQuestions === null) return null;
+  Object.freeze(parsedQuestions);
+  const request: RetryRequest = {
+    state: state.value,
+    questions: parsedQuestions,
+    inputVersion: options.inputVersion,
+  };
+  return Object.freeze(request);
+}
+
 async function waitForRetry(
   milliseconds: number,
   signal: AbortSignal | undefined,
-  sleepImpl: (milliseconds: number) => Promise<void>,
+  sleepImpl: ((milliseconds: number) => Promise<void>) | undefined,
 ): Promise<boolean> {
   if (milliseconds <= 0) return isAborted(signal);
   if (isAborted(signal)) return true;
 
-  let aborted = false;
-  const onAbort = () => {
-    aborted = true;
-  };
-  signal?.addEventListener("abort", onAbort, { once: true });
+  return await new Promise<boolean>((resolve) => {
+    let settled = false;
+    let timerId: ReturnType<typeof setTimeout> | undefined;
+    const onAbort = (): void => settle(true);
+    const cleanup = (): void => {
+      if (timerId !== undefined) clearTimeout(timerId);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const settle = (aborted: boolean): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(aborted || isAborted(signal));
+    };
+
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (isAborted(signal)) {
+      settle(true);
+      return;
+    }
+
+    if (sleepImpl === undefined) {
+      timerId = setTimeout(() => settle(false), milliseconds);
+      return;
+    }
+    try {
+      const pending = sleepImpl(milliseconds);
+      void pending.then(
+        () => settle(false),
+        () => settle(false),
+      );
+    } catch {
+      settle(false);
+    }
+  });
+}
+
+type CurrentRequestFence = { ok: true } | { ok: false; reason: string };
+
+function currentRequestFence(
+  options: JevClassificationOptions,
+  request: RetryRequest,
+): CurrentRequestFence {
+  if (isAborted(options.signal)) return { ok: false, reason: "cancelled" };
   try {
-    await sleepImpl(milliseconds);
-  } finally {
-    signal?.removeEventListener("abort", onAbort);
+    if (options.currentInputVersion !== undefined && options.currentInputVersion() !== request.inputVersion) {
+      return { ok: false, reason: "input-version-changed" };
+    }
+    if (options.isCurrentAuthority !== undefined && !options.isCurrentAuthority()) {
+      return { ok: false, reason: "authority-invalidated" };
+    }
+  } catch {
+    return { ok: false, reason: "authority-invalidated" };
   }
-  return aborted || isAborted(signal);
+  return { ok: true };
 }
 
 /**
@@ -211,26 +365,46 @@ export async function runJevClassification(
     return unavailableResult(options.inputVersion, "provider-unconfigured", 0);
   }
 
-  const sleepImpl = options.sleepImpl ?? ((milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
   const timeoutMs = options.timeoutMs ?? JEV_DEFAULT_TIMEOUT_MS;
-  let lastResult: JevClassificationResult = unavailableResult(options.inputVersion, "no-attempt", 0);
-
-  for (let attempt = 0; attempt < JEV_MAX_ATTEMPTS; attempt += 1) {
-    if (isAborted(options.signal)) return staleResult(options.inputVersion, "cancelled", attempt);
-    const attemptOptions: JevAttemptOptions = {
+  const request = freezeRetryRequest(options);
+  if (request === null) {
+    const result = await jevAttemptOnce({
       apiKey: options.apiKey,
       state: options.state,
       questions: options.questions,
       inputVersion: options.inputVersion,
       timeoutMs,
       maxResponseBytes: JEV_MAX_RESPONSE_BYTES,
+      ...(options.fetchImpl === undefined ? {} : { fetchImpl: options.fetchImpl }),
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
+    });
+    return { ...result, attempts: 1 };
+  }
+
+  const beforeStart = currentRequestFence(options, request);
+  if (!beforeStart.ok) return staleResult(request.inputVersion, beforeStart.reason, 0);
+
+  let lastResult: JevClassificationResult = unavailableResult(request.inputVersion, "no-attempt", 0);
+
+  for (let attempt = 0; attempt < JEV_MAX_ATTEMPTS; attempt += 1) {
+    const beforeAttempt = currentRequestFence(options, request);
+    if (!beforeAttempt.ok) return staleResult(request.inputVersion, beforeAttempt.reason, attempt);
+    const attemptOptions: JevAttemptOptions = {
+      apiKey: options.apiKey,
+      state: request.state,
+      questions: request.questions,
+      inputVersion: request.inputVersion,
+      timeoutMs,
+      maxResponseBytes: JEV_MAX_RESPONSE_BYTES,
     };
     if (options.fetchImpl !== undefined) attemptOptions.fetchImpl = options.fetchImpl;
     if (options.signal !== undefined) attemptOptions.signal = options.signal;
     const result = await jevAttemptOnce(attemptOptions);
+    const afterAttempt = currentRequestFence(options, request);
+    if (!afterAttempt.ok) return staleResult(request.inputVersion, afterAttempt.reason, attempt + 1);
     const freshResult = options.currentInputVersion === undefined
       ? result
-      : applyIfCurrent(result, options.currentInputVersion());
+      : applyIfCurrent(result, request.inputVersion);
     lastResult = { ...freshResult, attempts: attempt + 1 };
 
     if (freshResult.outcome !== "unavailable" || freshResult.retry.kind !== "retryable") return lastResult;
@@ -253,9 +427,11 @@ export async function runJevClassification(
     const delay = retryAfter === null
       ? attempt === 0 ? JEV_RETRY_BACKOFF_MS[0] : JEV_RETRY_BACKOFF_MS[1]
       : retryAfter;
-    if (await waitForRetry(delay, options.signal, sleepImpl)) {
-      return staleResult(options.inputVersion, "cancelled-during-retry-backoff", attempt + 1);
+    if (await waitForRetry(delay, options.signal, options.sleepImpl)) {
+      return staleResult(request.inputVersion, "cancelled-during-retry-backoff", attempt + 1);
     }
+    const afterWait = currentRequestFence(options, request);
+    if (!afterWait.ok) return staleResult(request.inputVersion, afterWait.reason, attempt + 1);
   }
 
   return lastResult;

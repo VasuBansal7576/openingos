@@ -60,10 +60,18 @@ h1 {
 
 .status-card strong { display: block; margin-bottom: 0.35rem; }
 .status-card p { margin-bottom: 0; color: #a7b7b0; line-height: 1.5; }
+.status-eyebrow { margin-bottom: 0.55rem; color: #d3a866; font-size: 0.68rem; font-weight: 700; letter-spacing: 0.14em; }
+.status-card.success { border-color: rgba(134, 201, 157, 0.34); }
+.status-card.error { border-color: rgba(229, 139, 112, 0.4); }
+.status-card.warning { border-color: rgba(211, 168, 102, 0.4); }
 
 .status-dot { width: 0.7rem; height: 0.7rem; margin-top: 0.3rem; border-radius: 50%; flex: none; }
-.status-dot.ready { background: #86c99d; box-shadow: 0 0 1rem rgba(134, 201, 157, 0.8); }
-.status-dot.pending { background: #d3a866; box-shadow: 0 0 1rem rgba(211, 168, 102, 0.65); }
+.status-dot.success { background: #86c99d; box-shadow: 0 0 1rem rgba(134, 201, 157, 0.8); }
+.status-dot.pending, .status-dot.neutral, .status-dot.warning { background: #d3a866; box-shadow: 0 0 1rem rgba(211, 168, 102, 0.65); }
+.status-dot.error { background: #e58b70; box-shadow: 0 0 1rem rgba(229, 139, 112, 0.65); }
+.retry-button { margin-top: 1rem; padding: 0.65rem 0.9rem; border: 1px solid rgba(211, 168, 102, 0.56); border-radius: 999px; color: #101a1b; background: #d3a866; font: inherit; font-weight: 700; cursor: pointer; }
+.retry-button:hover { background: #e3bc7e; }
+.retry-button:focus-visible { outline: 3px solid #f6f1e8; outline-offset: 3px; }
 
 .principles {
   display: grid;
