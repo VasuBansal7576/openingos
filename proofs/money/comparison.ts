@@ -1,11 +1,11 @@
 import {
-  Decimal,
   decimalCompare,
   decimalZero,
   parsePositiveQuantity,
-  Quantity,
 } from "./decimal";
-import { EvidenceRef, mergeEvidenceRefs } from "./evidence";
+import type { Decimal, Quantity } from "./decimal";
+import { mergeEvidenceRefs } from "./evidence";
+import type { EvidenceRef } from "./evidence";
 import {
   absoluteMoneyDelta,
   addMoney,
@@ -13,12 +13,11 @@ import {
   money,
   moneyDifference,
   moneyZero,
-  Money,
-  MoneyDelta,
   multiplyMoneyByQuantity,
   normalizeMoney,
 } from "./money";
-import { ChargeState, Quote, QuoteCharge, QuoteLine } from "./quote";
+import type { Money, MoneyDelta } from "./money";
+import type { ChargeState, Quote, QuoteCharge, QuoteLine } from "./quote";
 
 export interface LineSelectionInput {
   readonly lineId: unknown;
@@ -278,7 +277,7 @@ function summarizeQuote(quote: Quote, selected: Map<string, Quantity> | undefine
       ? "estimated"
       : "complete";
   const evidenceRefs = mergeEvidenceRefs(quote.evidenceRefs, quote.taxBasis.evidenceRefs, ...lineEvidence, ...chargeEvidence);
-  const summary: QuoteCostSummary = {
+  const summaryBase = {
     quoteId: quote.quoteId,
     quoteVersion: quote.version,
     currency: quote.currency,
@@ -286,15 +285,17 @@ function summarizeQuote(quote: Quote, selected: Map<string, Quantity> | undefine
     lineCosts,
     knownSubtotal,
     knownTotal: knownSubtotal,
-    estimatedRange,
     unknownCharges,
     evidenceRefs,
     selectedAllLines: allLines,
   };
   if (status === "complete") {
-    return { ...summary, total: knownSubtotal };
+    return { ...summaryBase, total: knownSubtotal };
   }
-  return summary;
+  if (estimatedRange !== undefined) {
+    return { ...summaryBase, estimatedRange };
+  }
+  return summaryBase;
 }
 
 function taxBasesCompatible(left: Quote, right: Quote): boolean {
@@ -320,6 +321,18 @@ function deltaRange(left: QuoteCostSummary, right: QuoteCostSummary): MoneyDelta
   };
 }
 
+function comparisonResult(
+  status: ComparisonResult["status"],
+  left: QuoteCostSummary,
+  right: QuoteCostSummary,
+  knownDelta: MoneyDelta,
+  estimatedDeltaRange: MoneyDeltaRange | undefined,
+  reasons: readonly string[],
+): ComparisonResult {
+  const base = { status, left, right, knownDelta, reasons };
+  return estimatedDeltaRange === undefined ? base : { ...base, estimatedDeltaRange };
+}
+
 export function compareQuotes(left: Quote, right: Quote, options: CompareOptions = {}): ComparisonResult {
   if (left.currency !== right.currency) {
     throw new TypeError(`quote currency mismatch: ${left.currency} versus ${right.currency}`);
@@ -343,13 +356,13 @@ export function compareQuotes(left: Quote, right: Quote, options: CompareOptions
 
   const estimatedDeltaRange = deltaRange(leftSummary, rightSummary);
   if (!taxBasesCompatible(left, right)) {
-    return { status: "incompatible", left: leftSummary, right: rightSummary, knownDelta, estimatedDeltaRange, reasons };
+    return comparisonResult("incompatible", leftSummary, rightSummary, knownDelta, estimatedDeltaRange, reasons);
   }
   if (leftSummary.status === "incomplete" || rightSummary.status === "incomplete") {
-    return { status: "incomplete", left: leftSummary, right: rightSummary, knownDelta, estimatedDeltaRange, reasons };
+    return comparisonResult("incomplete", leftSummary, rightSummary, knownDelta, estimatedDeltaRange, reasons);
   }
   if (leftSummary.status === "estimated" || rightSummary.status === "estimated") {
-    return { status: "estimated", left: leftSummary, right: rightSummary, knownDelta, estimatedDeltaRange, reasons };
+    return comparisonResult("estimated", leftSummary, rightSummary, knownDelta, estimatedDeltaRange, reasons);
   }
 
   const leftTotal = leftSummary.total;
@@ -364,12 +377,14 @@ export function compareQuotes(left: Quote, right: Quote, options: CompareOptions
     : delta.minorUnits > 0
       ? right.quoteId
       : undefined;
-  const equivalent: EquivalentComparison = {
+  const equivalentBase = {
     leftTotal,
     rightTotal,
     delta,
     savings: absoluteMoneyDelta(delta),
-    cheaperQuoteId,
   };
+  const equivalent: EquivalentComparison = cheaperQuoteId === undefined
+    ? equivalentBase
+    : { ...equivalentBase, cheaperQuoteId };
   return { status: "complete", left: leftSummary, right: rightSummary, knownDelta, equivalent, reasons };
 }

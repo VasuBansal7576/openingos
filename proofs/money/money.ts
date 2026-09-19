@@ -1,4 +1,4 @@
-import { Quantity } from "./decimal";
+import type { Quantity } from "./decimal";
 import { isRecord } from "./validation";
 
 export const EUR = "EUR";

@@ -4,22 +4,22 @@ import {
   decimalSubtract,
   decimalZero,
   parsePositiveQuantity,
-  Quantity,
 } from "./decimal";
-import { EvidenceRef, evidenceKey, parseEvidenceRefs } from "./evidence";
+import type { Quantity } from "./decimal";
+import { evidenceKey, parseEvidenceRefs } from "./evidence";
+import type { EvidenceRef } from "./evidence";
 import {
   addMoney,
   assertSameCurrency,
   currencyCode,
   moneyDifference,
   moneyZero,
-  Money,
-  MoneyDelta,
   multiplyMoneyByQuantity,
   normalizeMoney,
   subtractMoney,
   subtractMoneyOrZero,
 } from "./money";
+import type { Money, MoneyDelta } from "./money";
 import { isRecord, requiredString } from "./validation";
 
 export interface SettledSegmentInput {
@@ -325,7 +325,16 @@ function parseAdjustment(input: unknown, currency: string, orderId: string): Nor
   const evidenceRefs = parseEvidenceRefs(input.evidenceRefs, `adjustment ${id} evidenceRefs`);
   const evidenceFingerprint = evidenceRefs.map(evidenceKey).join(",");
   const fingerprint = [id, adjustmentOrderId, input.kind, amount.minorUnits.toString(), linkedAdjustmentId ?? "", evidenceFingerprint].join("|");
-  return { id, idempotencyKey, orderId: adjustmentOrderId, kind: input.kind, amount, linkedAdjustmentId, evidenceRefs, fingerprint };
+  const normalizedBase: Omit<NormalizedAdjustment, "linkedAdjustmentId"> = {
+    id,
+    idempotencyKey,
+    orderId: adjustmentOrderId,
+    kind: input.kind,
+    amount,
+    evidenceRefs,
+    fingerprint,
+  };
+  return linkedAdjustmentId === undefined ? normalizedBase : { ...normalizedBase, linkedAdjustmentId };
 }
 
 export class AdjustmentIdempotencyConflictError extends Error {
