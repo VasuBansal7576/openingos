@@ -38,8 +38,13 @@ Checked `https://docs.typesafe.ai/api` and `https://docs.typesafe.ai/models`:
 - Limits are 64k tokens per request and 32k for state plus the longest
   question. Token accounting needs the backend reservation path, so this
   proof enforces only byte-level transport bounds (1 MiB request cap,
-  256 KiB response cap, 10 s default timeout) and leaves allowance
-  enforcement to the coordinator-owned execution module.
+  256 KiB response cap, 10 s default timeout covering headers AND the body
+  stream) and leaves allowance enforcement to the coordinator-owned
+  execution module.
+- Body-stream hardening: a stalled body reports `unavailable/timeout`, a
+  rejected stream reports `unavailable/body-error` (never a raw throw), and
+  an abort during the body cancels the reader and reports `stale`. Covered
+  by three regression tests.
 
 ## J-case coverage (this proof)
 

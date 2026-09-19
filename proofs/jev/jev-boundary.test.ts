@@ -376,6 +376,50 @@ describe("transport bounds and secrecy", () => {
   });
 });
 
+describe("body-stream timeout, cancellation, and errors", () => {
+  test("stalled body resolves to timeout within one request", async () => {
+    const stalled = new Response(new ReadableStream<Uint8Array>(() => undefined), { status: 200 });
+    const stub = stubFetch(() => stalled);
+    const result = await jevAttemptOnce({ ...baseOptions(), fetchImpl: stub.fetchImpl, timeoutMs: 30 });
+    expect(stub.calls()).toBe(1);
+    expect(result.outcome).toBe("unavailable");
+    if (result.outcome === "unavailable") {
+      expect(result.reason).toBe("timeout");
+      expect(result.retry.kind).toBe("retryable");
+    } else {
+      throw new Error("expected unavailable");
+    }
+  });
+
+  test("rejected body stream resolves to a typed error, never throws", async () => {
+    const broken = new Response(
+      new ReadableStream<Uint8Array>({ start(controller) { controller.error(new Error("boom")); } }),
+      { status: 200 },
+    );
+    const stub = stubFetch(() => broken);
+    const result = await jevAttemptOnce({ ...baseOptions(), fetchImpl: stub.fetchImpl });
+    expect(stub.calls()).toBe(1);
+    expect(result.outcome).toBe("unavailable");
+    if (result.outcome === "unavailable") {
+      expect(result.reason).toBe("body-error");
+      expect(result.retry.kind).toBe("retryable");
+    } else {
+      throw new Error("expected unavailable");
+    }
+  });
+
+  test("abort after headers cancels the body read and returns stale", async () => {
+    const stalled = new Response(new ReadableStream<Uint8Array>(() => undefined), { status: 200 });
+    const stub = stubFetch(() => stalled);
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 10);
+    const result = await jevAttemptOnce({ ...baseOptions(), fetchImpl: stub.fetchImpl, timeoutMs: 2000, signal: controller.signal });
+    expect(stub.calls()).toBe(1);
+    expect(result.outcome).toBe("stale");
+    if (result.outcome === "stale") expect(result.reason).toBe("aborted");
+  });
+});
+
 describe("stale-input helper is pure and authority-free (partial J-04)", () => {
   test("same version is current, changed version is stale", () => {
     expect(isStaleInput("v3", "v3")).toBe(false);

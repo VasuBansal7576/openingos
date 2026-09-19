@@ -24,8 +24,12 @@
  *   a probability-weighted `score` within tolerance, and finite confidence.
  * - `usage.input_tokens` / `usage.output_tokens` must be nonnegative safe
  *   integers; unknown charges stay unknown (never invented).
- * - Response bytes and latency are bounded; pre-aborted signals dispatch
- *   zero requests; redirects are refused, never followed.
+ * - Response bytes and the whole attempt latency are bounded: the same
+ *   timeout budget covers headers AND the body stream, a stalled body
+ *   reports `unavailable/timeout`, a rejected stream reports
+ *   `unavailable/body-error`, and an abort during the body cancels the
+ *   reader and reports `stale`. Pre-abort dispatches zero requests;
+ *   redirects are refused, never followed.
  * - Error results never embed the raw response body or the API key.
  *
  * Official schema sources checked 2026-09-19: https://docs.typesafe.ai/api
@@ -439,33 +443,111 @@ function parseRetryAfter(value: string | null): number | null {
   return Math.min(delta, JEV_MAX_RETRY_AFTER_MS);
 }
 
-async function readBoundedText(response: Response, maxBytes: number): Promise<{ ok: true; text: string } | { ok: false }> {
-  const direct = response.body;
-  if (direct === null) {
-    const text = await response.text();
-    if (new TextEncoder().encode(text).byteLength > maxBytes) return { ok: false };
-    return { ok: true, text };
+type BodyRead =
+  | { kind: "ok"; text: string }
+  | { kind: "too-large" }
+  | { kind: "timeout" }
+  | { kind: "aborted" }
+  | { kind: "error" };
+
+function isBodyMarker(value: unknown): value is BodyRead {
+  if (typeof value !== "object" || value === null) return false;
+  if (!("kind" in value)) return false;
+  const kind: unknown = value.kind;
+  return kind === "ok" || kind === "too-large" || kind === "timeout" || kind === "aborted" || kind === "error";
+}
+
+/**
+ * Read a response body under the attempt's remaining budget. Every stall,
+ * rejection, and abort during the body resolves to a typed marker instead
+ * of hanging the attempt or throwing a raw stream error.
+ */
+async function readBodyBounded(response: Response, maxBytes: number, budgetMs: number, signal?: AbortSignal): Promise<BodyRead> {
+  if (signal?.aborted === true) return { kind: "aborted" };
+
+  let onAbort: (() => void) | null = null;
+  const aborted = new Promise<BodyRead>((resolve) => {
+    if (signal === undefined) return;
+    onAbort = () => resolve({ kind: "aborted" });
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  let fireTimeout: () => void = () => undefined;
+  const expired = new Promise<BodyRead>((resolve) => {
+    fireTimeout = () => resolve({ kind: "timeout" });
+  });
+  const timeoutId = setTimeout(fireTimeout, Math.max(0, budgetMs));
+  const cleanup = (): void => {
+    clearTimeout(timeoutId);
+    if (signal !== undefined && onAbort !== null) signal.removeEventListener("abort", onAbort);
+  };
+  const racersFor = (pending: Promise<BodyRead>): Array<Promise<BodyRead>> =>
+    signal === undefined ? [pending, expired] : [pending, aborted, expired];
+
+  const stream = response.body;
+  if (stream === null) {
+    const pending = response.text().then(
+      (text): BodyRead => {
+        if (new TextEncoder().encode(text).byteLength > maxBytes) return { kind: "too-large" };
+        return { kind: "ok", text };
+      },
+      (): BodyRead => ({ kind: "error" }),
+    );
+    const result = await Promise.race(racersFor(pending));
+    void pending.then(
+      () => undefined,
+      () => undefined,
+    );
+    cleanup();
+    return result;
   }
-  const reader = direct.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  for (;;) {
-    const next = await reader.read();
-    if (next.done) break;
-    total += next.value.byteLength;
-    if (total > maxBytes) {
-      await reader.cancel().catch(() => undefined);
-      return { ok: false };
+
+  const reader = stream.getReader();
+  const cancelQuiet = (): void => {
+    void reader.cancel().then(
+      () => undefined,
+      () => undefined,
+    );
+  };
+  try {
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    for (;;) {
+      const pending = reader.read();
+      const racers: Array<Promise<BodyRead | ReadableStreamReadResult<Uint8Array>>> =
+        signal === undefined ? [pending, expired] : [pending, aborted, expired];
+      const next = await Promise.race(racers);
+      if (isBodyMarker(next)) {
+        void pending.then(
+          () => undefined,
+          () => undefined,
+        );
+        cancelQuiet();
+        cleanup();
+        return next;
+      }
+      if (next.done) break;
+      total += next.value.byteLength;
+      if (total > maxBytes) {
+        cancelQuiet();
+        cleanup();
+        return { kind: "too-large" };
+      }
+      chunks.push(next.value);
     }
-    chunks.push(next.value);
+    cleanup();
+    const merged = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      merged.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return { kind: "ok", text: new TextDecoder().decode(merged) };
+  } catch {
+    cancelQuiet();
+    cleanup();
+    if (signal?.aborted === true) return { kind: "aborted" };
+    return { kind: "error" };
   }
-  const merged = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    merged.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return { ok: true, text: new TextDecoder().decode(merged) };
 }
 
 /**
@@ -593,8 +675,18 @@ export async function jevAttemptOnce(options: JevAttemptOptions): Promise<JevAtt
     return { outcome: "unavailable", reason: `http-${String(status)}`, retry: { kind: "retryable", status, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: options.inputVersion };
   }
 
-  const bounded = await readBoundedText(response, maxBytes);
-  if (!bounded.ok) {
+  const budgetMs = Math.max(0, timeoutMs - (Date.now() - started));
+  const bounded = await readBodyBounded(response, maxBytes, budgetMs, options.signal);
+  if (bounded.kind === "timeout") {
+    return { outcome: "unavailable", reason: "timeout", retry: { kind: "retryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: options.inputVersion };
+  }
+  if (bounded.kind === "aborted") {
+    return { outcome: "stale", reason: "aborted", retry: none, latencyMs: Date.now() - started, inputVersion: options.inputVersion };
+  }
+  if (bounded.kind === "error") {
+    return { outcome: "unavailable", reason: "body-error", retry: { kind: "retryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: options.inputVersion };
+  }
+  if (bounded.kind === "too-large") {
     return { outcome: "needsReview", reason: "response-too-large", retry: { kind: "nonretryable", status, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: options.inputVersion };
   }
   let payload: unknown;
