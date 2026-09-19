@@ -316,6 +316,9 @@ function summarizeQuote(quote: Quote, selected: SelectionState | undefined): Quo
 
   for (const charge of quote.charges) {
     const application = chargeApplies(quote, charge, selected, allLines);
+    if (!application.applies && !application.unallocated) {
+      continue;
+    }
     if (charge.state.kind === "included") {
       const coverage = includedCoverage(quote, charge, selected, allLines);
       if (coverage !== "covered") {
@@ -409,7 +412,7 @@ function taxBasesCompatible(left: Quote, right: Quote): boolean {
   return left.taxBasis.kind === right.taxBasis.kind && left.taxBasis.basisId === right.taxBasis.basisId;
 }
 
-function comparisonScopesCompatible(left: Quote, right: Quote): boolean {
+function comparisonScopesCompatible(left: Quote, right: Quote, requireOfferedQuantities: boolean): boolean {
   const leftScope = left.comparisonScope;
   const rightScope = right.comparisonScope;
   if (leftScope === undefined || rightScope === undefined) {
@@ -426,7 +429,7 @@ function comparisonScopesCompatible(left: Quote, right: Quote): boolean {
     const rightItem = rightItems.get(leftItem.itemId);
     return rightItem !== undefined
       && leftItem.unit === rightItem.unit
-      && decimalCompare(leftItem.requiredQuantity, rightItem.requiredQuantity) === 0;
+      && (!requireOfferedQuantities || decimalCompare(leftItem.requiredQuantity, rightItem.requiredQuantity) === 0);
   });
 }
 
@@ -502,7 +505,11 @@ export function compareQuotes(left: Quote, right: Quote, options: CompareOptions
   if (!taxBasesCompatible(left, right)) {
     reasons.push("tax bases are not compatible");
   }
-  const scopesCompatible = comparisonScopesCompatible(left, right);
+  const scopesCompatible = comparisonScopesCompatible(
+    left,
+    right,
+    leftSummary.selectedAllLines && rightSummary.selectedAllLines,
+  );
   if (!scopesCompatible) {
     if (left.comparisonScope === undefined || right.comparisonScope === undefined) {
       reasons.push("comparison scopes are required for equivalent savings");

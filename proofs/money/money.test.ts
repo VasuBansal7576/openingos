@@ -210,6 +210,47 @@ describe("quote comparison", () => {
     expect(compareQuotes(localLeft, unitMismatch).equivalent).toBeUndefined();
   });
 
+  it("compares equivalent selected quantities despite differing offered quantities", () => {
+    const left = quote("offered-two", [line("a-machine", 10000, "2")], [
+      knownChargeForTest({
+        chargeId: "delivery-a",
+        label: "Delivery",
+        amount: 500,
+        scope: { kind: "allocated", lineId: "a-machine", method: "fixed" },
+      }),
+    ], undefined, {
+      requirementId: "req-selected",
+      scopeId: "scope-selected",
+      items: [{ itemId: "machine", lineId: "a-machine", unit: "piece", requiredQuantity: "2" }],
+    });
+    const right = quote("offered-three", [line("b-machine", 9000, "3")], [
+      knownChargeForTest({
+        chargeId: "delivery-b",
+        label: "Delivery",
+        amount: 500,
+        scope: { kind: "allocated", lineId: "b-machine", method: "fixed" },
+      }),
+    ], undefined, {
+      requirementId: "req-selected",
+      scopeId: "scope-selected",
+      items: [{ itemId: "machine", lineId: "b-machine", unit: "piece", requiredQuantity: "3" }],
+    });
+    const selected = compareQuotes(left, right, {
+      leftSelection: [{ lineId: "a-machine", itemId: "machine", unit: "piece", quantity: "1" }],
+      rightSelection: [{ lineId: "b-machine", itemId: "machine", unit: "piece", quantity: "1" }],
+    });
+    expect(selected.status).toBe("complete");
+    expect(selected.left.total?.minorUnits).toBe(10500);
+    expect(selected.right.total?.minorUnits).toBe(9500);
+    expect(selected.equivalent?.savings.minorUnits).toBe(1000);
+
+    const fullVersusPartial = compareQuotes(left, right, {
+      rightSelection: [{ lineId: "b-machine", itemId: "machine", unit: "piece", quantity: "1" }],
+    });
+    expect(fullVersusPartial.status).toBe("incompatible");
+    expect(fullVersusPartial.equivalent).toBeUndefined();
+  });
+
   it("keeps unresolved and unselected included coverage incomplete", () => {
     const unresolved = quote("unresolved", [line("machine", 1000)], [
       includedCharge({ chargeId: "freight", label: "Freight", coveringId: "missing" }),
@@ -227,6 +268,35 @@ describe("quote comparison", () => {
     });
     expect(partial.status).toBe("incomplete");
     expect(partial.reasons.join(" ")).toContain("unselected scope");
+
+    const excludedLineCharge = quote("excluded-charge", [line("machine", 1000), line("grinder", 1000)], [
+      includedCharge({
+        chargeId: "grinder-warranty",
+        label: "Grinder warranty",
+        coveringId: "grinder",
+        scope: { kind: "line", lineId: "grinder" },
+      }),
+    ]);
+    const excludedResult = compareQuotes(excludedLineCharge, excludedLineCharge, {
+      leftSelection: [{ lineId: "machine", itemId: "machine", unit: "piece", quantity: "1" }],
+      rightSelection: [{ lineId: "machine", itemId: "machine", unit: "piece", quantity: "1" }],
+    });
+    expect(excludedResult.status).toBe("complete");
+    expect(excludedResult.left.total?.minorUnits).toBe(1000);
+
+    const applicableUnresolved = quote("applicable-unresolved", [line("machine", 1000), line("grinder", 1000)], [
+      includedCharge({
+        chargeId: "shared-warranty",
+        label: "Shared warranty",
+        coveringId: "grinder",
+        scope: { kind: "quote" },
+      }),
+    ]);
+    const unresolvedPartial = compareQuotes(applicableUnresolved, applicableUnresolved, {
+      leftSelection: [{ lineId: "machine", itemId: "machine", unit: "piece", quantity: "1" }],
+      rightSelection: [{ lineId: "machine", itemId: "machine", unit: "piece", quantity: "1" }],
+    });
+    expect(unresolvedPartial.status).toBe("incomplete");
   });
 
   it("rejects included coverage cycles", () => {
