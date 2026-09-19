@@ -2,7 +2,7 @@
 
 - **Project:** OpeningOS
 - **Event:** Convex All Gas Hackathon
-- **What it does:** Planned café procurement and equipment coordination workspace for openings, supplier decisions, service, and replacement; application not implemented yet.
+- **What it does:** Café procurement and equipment coordination concept with three fixture-only frontend design walkthroughs; production application and backend not implemented yet.
 - **Live app:** not deployed
 - **Repo:** https://github.com/VasuBansal7576/openingos
 - **Frontend:** Codex Sites
@@ -12,7 +12,7 @@
 - **Auth:** none
 - **AI models:** none
 - **Started:** 2026-09-19T09:46:19Z
-- **Last updated:** 2026-09-19T13:37:32Z
+- **Last updated:** 2026-09-19T14:17:22Z
 
 ## Log
 
@@ -57,3 +57,11 @@ Clarified in `PRD.md` and `AGENTS.md` that a clearly unrelated customer request 
 Preserved all 52 acceptance criteria and launch-only sections; supported contextual follow-ups remain allowed and runtime enforcement is still unimplemented.
 Generated three further ChatGPT ImageGen concepts exploring an equipment-linked café scene, visual cost routes, and a document workbench; none has been selected or implemented.
 The spatial illustration is not a measured floor plan, and the document concept needs its evidence popup moved so it does not obscure a comparison total.
+
+### 2026-09-19 - working tree
+
+Built three exploratory frontend walkthroughs in `prototypes/openingos`: opening scene, price routes, and purchasing workbench, each with a matching landing page and shared sample purchasing flow.
+Added generated café, product and desk imagery, editable brief screens, research states, comparison, quote sources, simulated correspondence, selection, recovery and equipment service screens.
+Browser smoke checks exercised selection with unchanged committed/paid totals, revised quote display, recovery, service-case preparation and a scripted unrelated-request refusal; build passed locally.
+These are fictional, in-memory prototypes, not live research, model classification, supplier communication, production safeguards or Convex integration; nothing was deployed.
+The user clarified that this should remain a quick screen walkthrough rather than further application engineering; full design QA remains incomplete.

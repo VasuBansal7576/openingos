@@ -8,7 +8,8 @@ That is a tracked project skill, loaded through this file rather than a global i
 
 ## Current state
 
-The repository contains requirements and delivery preparation, not an implemented application.
+The repository contains requirements, delivery preparation, and three fixture-only frontend design walkthroughs in `prototypes/openingos` on the `codex/prototype-design-flows` branch.
+These are exploratory screens, not the implemented production application or a settled architecture.
 Visual concepts are proposals until the user chooses a direction.
 Do not treat proposed ADRs, a green tooling check, or demonstration fixtures as completed product behavior.
 

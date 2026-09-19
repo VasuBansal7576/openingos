@@ -3,7 +3,7 @@ name: Repository checks
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, codex/prototype-design-flows]
 
 permissions:
   contents: read
@@ -19,3 +19,17 @@ jobs:
           persist-credentials: false
       - name: Test the CI inspection helper, not the application
         run: node --test scripts/check-pr.test.mjs
+  prototype-build:
+    name: prototype-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    defaults:
+      run:
+        working-directory: prototypes/openingos
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - run: npm ci
+      - run: npm run build
+      - run: npm run test:sites
