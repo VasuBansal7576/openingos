@@ -11,6 +11,27 @@ claim of application access or of integrated J-03/J-04 completion.
 - `jev-boundary.test.ts` — Bun tests using only local stubbed fetch
   responses and the synthetic key `ts-test-synthetic-key-0000`.
 
+## Request snapshot and freshness
+
+- Timeout and byte configuration (finite positive timeout, safe-integer
+  byte bound) is validated before any dispatch; NaN/zero bounds are
+  rejected with zero requests and the tested hard bounds are unchanged.
+- A normalized immutable JSON snapshot of the exact sent bytes is built
+  before dispatch. Non-JSON evidence (NaN/Infinity, undefined, functions,
+  throwing or morphing `toJSON`) is rejected before dispatch, and the
+  response validates only against the sent snapshot with the snapshotted
+  input version echoed, so mid-flight caller mutation cannot smuggle an
+  unsent option or version past validation.
+- One absolute deadline is enforced after every await and before
+  acceptance, covering headers and body alike; aborts during or after the
+  body report `stale`.
+- `__proto__`/`constructor`/`prototype` IDs are rejected in request and
+  response keys, so no decided result can omit an own question key.
+- Ignored non-2xx/redirect bodies are cancelled without awaiting an
+  unbounded close; error results are unchanged.
+- A Retry-After above the 60 s policy horizon keeps its exact server
+  minimum with an exceeds-policy reason, never an earlier retry advice.
+
 ## Official schema verification (2026-09-19)
 
 Checked `https://docs.typesafe.ai/api` and `https://docs.typesafe.ai/models`:
@@ -65,5 +86,7 @@ Checked `https://docs.typesafe.ai/api` and `https://docs.typesafe.ai/models`:
 
 ## Evidence mode
 
-Controlled only. Run `bun test proofs/jev` plus
-`node --test scripts/check-pr.test.mjs scripts/check-workbench.test.mjs`.
+Controlled only. Run the shared strict compiler command, then
+`bun test proofs/jev` (43 tests) plus
+`node --test scripts/check-pr.test.mjs scripts/check-workbench.test.mjs`
+(23 tests).

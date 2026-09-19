@@ -13,6 +13,17 @@
  * - Pinned model `jev-1.13.0`; the versioned response model must match.
  *   The `jev-latest` alias is never sent (it can move between releases).
  * - Exactly one `fetch` per attempt; no hidden retry inside this module.
+ * - Finite positive timeout and safe-integer byte configuration are
+ *   validated before any dispatch; one absolute deadline is enforced after
+ *   every await and before acceptance, covering headers and body alike.
+ * - A normalized immutable JSON snapshot of the exact sent bytes is built
+ *   before dispatch; non-JSON evidence (NaN, undefined, functions, morphing
+ *   toJSON) is rejected and responses validate only against the sent
+ *   snapshot, so mid-flight caller mutation cannot smuggle unsent options.
+ * - Responses are parsed from `unknown` with exact key/type checks for
+ *   `noul`, `choice`, and `score` answers; `__proto__`/`constructor`/
+ *   `prototype` IDs are rejected in requests and responses so no decided
+ *   result can omit an own question key.
  * - Responses are parsed from `unknown` with exact key/type checks for
  *   `noul`, `choice`, and `score` answers.
  * - Noul answers carry NO confidence field (official schema: type + noul).
@@ -25,11 +36,12 @@
  * - `usage.input_tokens` / `usage.output_tokens` must be nonnegative safe
  *   integers; unknown charges stay unknown (never invented).
  * - Response bytes and the whole attempt latency are bounded: the same
- *   timeout budget covers headers AND the body stream, a stalled body
+ *   absolute deadline covers headers AND the body stream, a stalled body
  *   reports `unavailable/timeout`, a rejected stream reports
- *   `unavailable/body-error`, and an abort during the body cancels the
- *   reader and reports `stale`. Pre-abort dispatches zero requests;
- *   redirects are refused, never followed.
+ *   `unavailable/body-error`, and an abort during or after the body cancels
+ *   the reader and reports `stale`. Ignored non-2xx/redirect bodies are
+ *   cancelled without awaiting an unbounded close. Pre-abort dispatches
+ *   zero requests; redirects are refused, never followed.
  * - Error results never embed the raw response body or the API key.
  *
  * Official schema sources checked 2026-09-19: https://docs.typesafe.ai/api
@@ -42,6 +54,12 @@ export const JEV_DEFAULT_TIMEOUT_MS = 10_000;
 export const JEV_MAX_RESPONSE_BYTES = 256 * 1024;
 export const JEV_MAX_REQUEST_BYTES = 1024 * 1024;
 export const JEV_PROBABILITY_SUM_TOLERANCE = 1e-3;
+/**
+ * Policy horizon for server backoff advice. Retry-After values at or below
+ * this threshold are routine; larger values keep their exact server minimum
+ * and are reported with an exceeds-policy reason so the coordinator waits
+ * the full server delay instead of retrying early.
+ */
 export const JEV_MAX_RETRY_AFTER_MS = 60_000;
 
 export type JevQuestionType = "noul" | "choice" | "score";
@@ -162,6 +180,96 @@ function isAborted(signal: AbortSignal | undefined): boolean {
   return signal?.aborted === true;
 }
 
+/**
+ * IDs that must never appear as question, option, or answer keys. A plain
+ * `obj[key] = value` write with one of these names invokes a prototype
+ * setter instead of creating an own property, so a validated result could
+ * silently omit an own question key. Rejected in requests and responses.
+ */
+const RESERVED_KEYS: ReadonlySet<string> = new Set(["__proto__", "constructor", "prototype"]);
+
+function isReservedKey(key: string): boolean {
+  return RESERVED_KEYS.has(key);
+}
+
+/** True for values JSON can represent without loss (rejects NaN/Infinity, undefined, functions, symbols, bigints). */
+function isJsonValue(value: unknown): boolean {
+  if (value === null) return true;
+  if (typeof value === "string" || typeof value === "boolean") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (Array.isArray(value)) return value.every(isJsonValue);
+  if (isRecord(value)) return Object.keys(value).every((key) => isJsonValue(value[key]));
+  return false;
+}
+
+/** Instructions subtrees must survive JSON serialization without silent loss. */
+function instructionsJsonSafe(questions: Record<string, JevQuestion>): boolean {
+  for (const id of Object.keys(questions)) {
+    const question = questions[id];
+    if (question === undefined) return false;
+    if (!isJsonValue(question.instructions)) return false;
+  }
+  return true;
+}
+
+/**
+ * Deep snapshot of validated questions taken synchronously before dispatch.
+ * Later validation uses only this snapshot (and the re-parsed sent body),
+ * so a caller mutating `options.questions` mid-flight cannot smuggle an
+ * unsent option or type past response validation. Returns null on any
+ * unexpected runtime shape.
+ */
+function snapshotQuestions(questions: Record<string, JevQuestion>): Record<string, JevQuestion> | null {
+  const snap: Record<string, JevQuestion> = {};
+  for (const id of Object.keys(questions)) {
+    if (isReservedKey(id)) return null;
+    const question = questions[id];
+    if (question === undefined) return null;
+    if (question.type === "noul") {
+      if (!isInstructions(question.instructions)) return null;
+      const criteria = question.criteria;
+      if (criteria === undefined) {
+        snap[id] = { type: "noul", instructions: question.instructions };
+      } else {
+        if (!isRecord(criteria)) return null;
+        const copy: { true?: string; false?: string } = {};
+        for (const key of Object.keys(criteria)) {
+          if (key !== "true" && key !== "false") return null;
+          const text: unknown = criteria[key];
+          if (text === undefined) continue;
+          if (typeof text !== "string") return null;
+          if (key === "true") copy.true = text;
+          else copy.false = text;
+        }
+        snap[id] = { type: "noul", instructions: question.instructions, criteria: copy };
+      }
+    } else if (question.type === "choice") {
+      if (!isInstructions(question.instructions)) return null;
+      if (!isRecord(question.criteria)) return null;
+      const criteria: Record<string, string | null> = {};
+      for (const option of Object.keys(question.criteria)) {
+        if (option.length === 0 || isReservedKey(option)) return null;
+        const detail: unknown = question.criteria[option];
+        if (detail !== null && typeof detail !== "string") return null;
+        criteria[option] = detail;
+      }
+      snap[id] = { type: "choice", instructions: question.instructions, criteria };
+    } else if (question.type === "score") {
+      if (!isInstructions(question.instructions)) return null;
+      if (!Array.isArray(question.criteria)) return null;
+      const levels: string[] = [];
+      for (const level of question.criteria) {
+        if (typeof level !== "string" || level.length === 0) return null;
+        levels.push(level);
+      }
+      snap[id] = { type: "score", instructions: question.instructions, criteria: levels };
+    } else {
+      return null;
+    }
+  }
+  return snap;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -213,7 +321,7 @@ function validChoiceQuestionShape(entry: Record<string, unknown>): boolean {
   const keys = Object.keys(criteria);
   if (keys.length < 1) return false;
   for (const key of keys) {
-    if (key.length === 0) return false;
+    if (key.length === 0 || isReservedKey(key)) return false;
     const detail: unknown = criteria[key];
     if (detail !== null && typeof detail !== "string") return false;
   }
@@ -249,7 +357,7 @@ export function validChoiceQuestion(question: JevChoiceQuestion): boolean {
   const keys = Object.keys(question.criteria);
   if (keys.length < 1) return false;
   for (const key of keys) {
-    if (key.length === 0) return false;
+    if (key.length === 0 || isReservedKey(key)) return false;
     const detail: unknown = question.criteria[key];
     if (detail !== null && typeof detail !== "string") return false;
   }
@@ -271,7 +379,7 @@ function validQuestions(questions: unknown): questions is Record<string, JevQues
   const keys = Object.keys(questions);
   if (keys.length === 0) return false;
   for (const key of keys) {
-    if (key.length === 0) return false;
+    if (key.length === 0 || isReservedKey(key)) return false;
     const entry: unknown = questions[key];
     if (!isRecord(entry)) return false;
     const kind: unknown = entry["type"];
@@ -403,7 +511,11 @@ function validResponse(payload: unknown, questions: Record<string, JevQuestion>)
   if (payload["model"] !== JEV_PINNED_MODEL) return fail("model-mismatch");
   const answers: unknown = payload["answers"];
   if (!isRecord(answers)) return fail("answers-shape");
-  if (!sameKeySet(Object.keys(answers), Object.keys(questions))) return fail("answers-mismatch");
+  const answerIds = Object.keys(answers);
+  for (const id of answerIds) {
+    if (isReservedKey(id)) return fail("answer-reserved-id");
+  }
+  if (!sameKeySet(answerIds, Object.keys(questions))) return fail("answers-mismatch");
   const usage: unknown = payload["usage"];
   if (!isRecord(usage)) return fail("usage-shape");
   if (!sameKeySet(Object.keys(usage), ["input_tokens", "output_tokens"])) return fail("usage-keys");
@@ -439,6 +551,12 @@ function validResponse(payload: unknown, questions: Record<string, JevQuestion>)
   };
 }
 
+/**
+ * Parse a Retry-After value to an exact millisecond delay. The valid server
+ * minimum is always preserved: values above JEV_MAX_RETRY_AFTER_MS are
+ * returned whole so the coordinator never retries earlier than the server
+ * allows, and the caller reports the policy excess via a distinct reason.
+ */
 function parseRetryAfter(value: string | null): number | null {
   if (value === null) return null;
   const trimmed = value.trim();
@@ -446,13 +564,33 @@ function parseRetryAfter(value: string | null): number | null {
   if (/^\d+$/.test(trimmed)) {
     const seconds = Number.parseInt(trimmed, 10);
     if (!Number.isSafeInteger(seconds) || seconds < 0) return null;
-    return Math.min(seconds * 1000, JEV_MAX_RETRY_AFTER_MS);
+    const ms = seconds * 1000;
+    if (!Number.isSafeInteger(ms)) return null;
+    return ms;
   }
   const when = Date.parse(trimmed);
   if (Number.isNaN(when)) return null;
   const delta = when - Date.now();
-  if (delta <= 0) return null;
-  return Math.min(delta, JEV_MAX_RETRY_AFTER_MS);
+  if (!(delta > 0) || !Number.isFinite(delta)) return null;
+  return delta;
+}
+
+/**
+ * Release an ignored response body without awaiting an unbounded cancel, so
+ * completed non-2xx/redirect attempts retain no transport resources. Error
+ * results are unchanged.
+ */
+function discardBody(response: Response): void {
+  const stream = response.body;
+  if (stream === null) return;
+  try {
+    void stream.cancel().then(
+      () => undefined,
+      () => undefined,
+    );
+  } catch {
+    // Outcome already determined; a sync cancel failure changes nothing.
+  }
 }
 
 type BodyRead =
@@ -592,7 +730,9 @@ export function applyIfCurrent(result: JevAttemptResult, currentInputVersion: st
 /**
  * Perform exactly one bounded Jev attempt. Never retries internally: 429/529
  * outcomes are reported as `retryable` for the coordinator-owned execution
- * module, while 401/422 are reported as `nonretryable`.
+ * module, while 401/422 are reported as `nonretryable`. A Retry-After above
+ * the policy horizon keeps its exact server minimum with an exceeds-policy
+ * reason, never an earlier advice.
  */
 export async function jevAttemptOnce(options: JevAttemptOptions): Promise<JevAttemptResult> {
   const started = Date.now();
@@ -600,31 +740,71 @@ export async function jevAttemptOnce(options: JevAttemptOptions): Promise<JevAtt
   const maxBytes = options.maxResponseBytes ?? JEV_MAX_RESPONSE_BYTES;
   const fetchImpl: JevFetch = options.fetchImpl ?? ((input, init) => fetch(input, init));
   const none: JevRetryAdvice = { kind: "none", status: null, retryAfterMs: null };
+  // Snapshot the primitive version before dispatch; every later result echoes
+  // this value, never a reread of `options` after awaits.
+  const attemptedVersion = options.inputVersion;
+  // One absolute deadline for the whole attempt, enforced after every await
+  // and before acceptance.
+  const deadlineMs = started + timeoutMs;
 
   if (!isNonEmptyString(options.apiKey)) {
-    return { outcome: "needsReview", reason: "missing-api-key", retry: { kind: "nonretryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: options.inputVersion };
+    return { outcome: "needsReview", reason: "missing-api-key", retry: { kind: "nonretryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
   }
-  if (!isNonEmptyString(options.inputVersion)) {
+  if (!isNonEmptyString(attemptedVersion)) {
     return { outcome: "needsReview", reason: "missing-input-version", retry: { kind: "nonretryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: "" };
   }
+  if (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    return { outcome: "needsReview", reason: "invalid-timeout", retry: { kind: "nonretryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
+  }
+  if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
+    return { outcome: "needsReview", reason: "invalid-max-bytes", retry: { kind: "nonretryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
+  }
   if (!validState(options.state)) {
-    return { outcome: "needsReview", reason: "invalid-state", retry: { kind: "nonretryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: options.inputVersion };
+    return { outcome: "needsReview", reason: "invalid-state", retry: { kind: "nonretryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
+  }
+  if (!isJsonValue(options.state)) {
+    return { outcome: "needsReview", reason: "non-json-state", retry: { kind: "nonretryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
   }
   if (!validQuestions(options.questions)) {
-    return { outcome: "needsReview", reason: "invalid-questions", retry: { kind: "nonretryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: options.inputVersion };
+    return { outcome: "needsReview", reason: "invalid-questions", retry: { kind: "nonretryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
   }
-  if (options.signal?.aborted === true) {
-    return { outcome: "stale", reason: "pre-aborted", retry: none, latencyMs: Date.now() - started, inputVersion: options.inputVersion };
+  if (!instructionsJsonSafe(options.questions)) {
+    return { outcome: "needsReview", reason: "non-json-questions", retry: { kind: "nonretryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
+  }
+  if (isAborted(options.signal)) {
+    return { outcome: "stale", reason: "pre-aborted", retry: none, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
+  }
+  const snap = snapshotQuestions(options.questions);
+  if (snap === null) {
+    return { outcome: "needsReview", reason: "invalid-questions", retry: { kind: "nonretryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
   }
 
+  // Normalized immutable request snapshot: the exact bytes sent. Re-parsing
+  // catches decision-critical morphing (toJSON rewrites, silent drops) that
+  // the pre-serialization shape checks cannot see.
   let body: string;
   try {
-    body = JSON.stringify({ model: JEV_PINNED_MODEL, state: options.state, questions: options.questions });
+    body = JSON.stringify({ model: JEV_PINNED_MODEL, state: options.state, questions: snap });
   } catch {
-    return { outcome: "needsReview", reason: "request-serialize-failed", retry: { kind: "nonretryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: options.inputVersion };
+    return { outcome: "needsReview", reason: "request-serialize-failed", retry: { kind: "nonretryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
   }
   if (new TextEncoder().encode(body).byteLength > JEV_MAX_REQUEST_BYTES) {
-    return { outcome: "needsReview", reason: "request-too-large", retry: { kind: "nonretryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: options.inputVersion };
+    return { outcome: "needsReview", reason: "request-too-large", retry: { kind: "nonretryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
+  }
+  let normalized: unknown;
+  try {
+    normalized = JSON.parse(body);
+  } catch {
+    return { outcome: "needsReview", reason: "request-normalize-failed", retry: { kind: "nonretryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
+  }
+  if (!isRecord(normalized) || normalized["model"] !== JEV_PINNED_MODEL) {
+    return { outcome: "needsReview", reason: "request-normalize-failed", retry: { kind: "nonretryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
+  }
+  // The sent snapshot is the only authority for later validation; the live
+  // `options.questions` object is never consulted again.
+  const sent = normalized["questions"];
+  if (!validState(normalized["state"]) || !validQuestions(sent)) {
+    return { outcome: "needsReview", reason: "request-normalize-failed", retry: { kind: "nonretryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
   }
 
   const controller = new AbortController();
@@ -656,60 +836,83 @@ export async function jevAttemptOnce(options: JevAttemptOptions): Promise<JevAtt
     clearTimeout(timeoutId);
     options.signal?.removeEventListener("abort", onAbort);
     if (isAborted(options.signal) && !timedOut) {
-      return { outcome: "stale", reason: "aborted", retry: none, latencyMs, inputVersion: options.inputVersion };
+      return { outcome: "stale", reason: "aborted", retry: none, latencyMs, inputVersion: attemptedVersion };
     }
     if (timedOut) {
-      return { outcome: "unavailable", reason: "timeout", retry: { kind: "retryable", status: null, retryAfterMs: null }, latencyMs, inputVersion: options.inputVersion };
+      return { outcome: "unavailable", reason: "timeout", retry: { kind: "retryable", status: null, retryAfterMs: null }, latencyMs, inputVersion: attemptedVersion };
     }
-    return { outcome: "unavailable", reason: "transport-error", retry: { kind: "retryable", status: null, retryAfterMs: null }, latencyMs, inputVersion: options.inputVersion };
+    return { outcome: "unavailable", reason: "transport-error", retry: { kind: "retryable", status: null, retryAfterMs: null }, latencyMs, inputVersion: attemptedVersion };
   }
   clearTimeout(timeoutId);
   options.signal?.removeEventListener("abort", onAbort);
+  if (isAborted(options.signal)) {
+    discardBody(response);
+    return { outcome: "stale", reason: "aborted", retry: none, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
+  }
+  if (Date.now() > deadlineMs) {
+    discardBody(response);
+    return { outcome: "unavailable", reason: "timeout", retry: { kind: "retryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
+  }
 
   const status = response.status;
   if (status >= 300 && status < 400) {
-    return { outcome: "needsReview", reason: "redirect-refused", retry: { kind: "nonretryable", status, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: options.inputVersion };
+    discardBody(response);
+    return { outcome: "needsReview", reason: "redirect-refused", retry: { kind: "nonretryable", status, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
   }
   if (status === 401) {
-    return { outcome: "needsReview", reason: "http-401", retry: { kind: "nonretryable", status, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: options.inputVersion };
+    discardBody(response);
+    return { outcome: "needsReview", reason: "http-401", retry: { kind: "nonretryable", status, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
   }
   if (status === 422) {
-    return { outcome: "needsReview", reason: "http-422", retry: { kind: "nonretryable", status, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: options.inputVersion };
+    discardBody(response);
+    return { outcome: "needsReview", reason: "http-422", retry: { kind: "nonretryable", status, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
   }
   if (status === 429 || status === 529) {
-    return { outcome: "unavailable", reason: `http-${String(status)}`, retry: { kind: "retryable", status, retryAfterMs: parseRetryAfter(response.headers.get("retry-after")) }, latencyMs: Date.now() - started, inputVersion: options.inputVersion };
+    discardBody(response);
+    const retryAfterMs = parseRetryAfter(response.headers.get("retry-after"));
+    const exceedsPolicy = retryAfterMs !== null && retryAfterMs > JEV_MAX_RETRY_AFTER_MS;
+    const reason = exceedsPolicy ? `http-${String(status)}-retry-after-exceeds-policy` : `http-${String(status)}`;
+    return { outcome: "unavailable", reason, retry: { kind: "retryable", status, retryAfterMs }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
   }
   if (status >= 400 && status < 500) {
-    return { outcome: "needsReview", reason: `http-${String(status)}`, retry: { kind: "nonretryable", status, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: options.inputVersion };
+    discardBody(response);
+    return { outcome: "needsReview", reason: `http-${String(status)}`, retry: { kind: "nonretryable", status, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
   }
   if (status < 200 || status >= 300) {
-    return { outcome: "unavailable", reason: `http-${String(status)}`, retry: { kind: "retryable", status, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: options.inputVersion };
+    discardBody(response);
+    return { outcome: "unavailable", reason: `http-${String(status)}`, retry: { kind: "retryable", status, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
   }
 
-  const budgetMs = Math.max(0, timeoutMs - (Date.now() - started));
+  const budgetMs = Math.max(0, deadlineMs - Date.now());
   const bounded = await readBodyBounded(response, maxBytes, budgetMs, options.signal);
   if (bounded.kind === "timeout") {
-    return { outcome: "unavailable", reason: "timeout", retry: { kind: "retryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: options.inputVersion };
+    return { outcome: "unavailable", reason: "timeout", retry: { kind: "retryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
   }
   if (bounded.kind === "aborted") {
-    return { outcome: "stale", reason: "aborted", retry: none, latencyMs: Date.now() - started, inputVersion: options.inputVersion };
+    return { outcome: "stale", reason: "aborted", retry: none, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
   }
   if (bounded.kind === "error") {
-    return { outcome: "unavailable", reason: "body-error", retry: { kind: "retryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: options.inputVersion };
+    return { outcome: "unavailable", reason: "body-error", retry: { kind: "retryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
   }
   if (bounded.kind === "too-large") {
-    return { outcome: "needsReview", reason: "response-too-large", retry: { kind: "nonretryable", status, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: options.inputVersion };
+    return { outcome: "needsReview", reason: "response-too-large", retry: { kind: "nonretryable", status, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
+  }
+  if (isAborted(options.signal)) {
+    return { outcome: "stale", reason: "aborted", retry: none, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
+  }
+  if (Date.now() > deadlineMs) {
+    return { outcome: "unavailable", reason: "timeout", retry: { kind: "retryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
   }
   let payload: unknown;
   try {
     payload = JSON.parse(bounded.text);
   } catch {
-    return { outcome: "needsReview", reason: "response-not-json", retry: { kind: "nonretryable", status, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: options.inputVersion };
+    return { outcome: "needsReview", reason: "response-not-json", retry: { kind: "nonretryable", status, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
   }
-  const checked = validResponse(payload, options.questions);
+  const checked = validResponse(payload, sent);
   if (!checked.ok) {
     const invalid: Invalid = checked;
-    return { outcome: "needsReview", reason: invalid.reason, retry: { kind: "nonretryable", status, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: options.inputVersion };
+    return { outcome: "needsReview", reason: invalid.reason, retry: { kind: "nonretryable", status, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
   }
   return {
     outcome: "decided",
@@ -717,6 +920,6 @@ export async function jevAttemptOnce(options: JevAttemptOptions): Promise<JevAtt
     answers: checked.answers,
     usage: checked.usage,
     latencyMs: Date.now() - started,
-    inputVersion: options.inputVersion,
+    inputVersion: attemptedVersion,
   };
 }

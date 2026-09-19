@@ -61,6 +61,27 @@ function validPayload(): Record<string, unknown> {
   };
 }
 
+/** Fresh question set per test so mid-flight mutation never leaks across cases. */
+function freshQuestions(): Record<string, JevQuestion> {
+  return {
+    is_urgent: {
+      type: "noul",
+      instructions: "Does this convey urgency?",
+      criteria: { true: "Explicitly time-sensitive", false: "No urgency expressed" },
+    },
+    department: {
+      type: "choice",
+      instructions: "Which team should handle this?",
+      criteria: { billing: "Payments, invoicing, refunds", technical: "Bugs, outages, integrations", sales: "Pricing, upgrades, new accounts" },
+    },
+    frustration: {
+      type: "score",
+      instructions: "How frustrated is the customer?",
+      criteria: ["Calm", "Frustrated", "Very angry"],
+    },
+  };
+}
+
 /** Copy an unknown object value into a mutable table; null when not an object. */
 function asTable(value: unknown): Record<string, unknown> | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
@@ -418,6 +439,235 @@ describe("body-stream timeout, cancellation, and errors", () => {
     expect(stub.calls()).toBe(1);
     expect(result.outcome).toBe("stale");
     if (result.outcome === "stale") expect(result.reason).toBe("aborted");
+  });
+});
+
+describe("RJ1 mid-flight mutation cannot smuggle unsent options", () => {
+  test("mutated criteria and version after dispatch still reject the unsent option", async () => {
+    const qs = freshQuestions();
+    let attempted: JevAttemptOptions | null = null;
+    const stub = stubFetch(() => {
+      const dept = qs["department"];
+      if (dept !== undefined && dept.type === "choice") {
+        dept.criteria["notSent"] = "Later option";
+      }
+      if (attempted !== null) attempted.inputVersion = "v2";
+      return jsonResponse({
+        model: JEV_PINNED_MODEL,
+        answers: {
+          is_urgent: { type: "noul", noul: 0.9 },
+          department: {
+            type: "choice",
+            choice: "notSent",
+            probabilities: { billing: 0.05, technical: 0.05, sales: 0.05, notSent: 0.85 },
+            confidence: 0.8,
+          },
+          frustration: {
+            type: "score",
+            score: 1.6,
+            legend: { "0": "Calm", "1": "Frustrated", "2": "Very angry" },
+            probabilities: { "0": 0.05, "1": 0.3, "2": 0.65 },
+            confidence: 0.78,
+          },
+        },
+        usage: { input_tokens: 10, output_tokens: 5 },
+      });
+    });
+    attempted = baseOptions({ questions: qs, inputVersion: "v1", fetchImpl: stub.fetchImpl });
+    const result = await jevAttemptOnce(attempted);
+    expect(stub.calls()).toBe(1);
+    expect(result.outcome).toBe("needsReview");
+    if (result.outcome === "needsReview") expect(result.inputVersion).toBe("v1");
+    const first = stub.seen()[0];
+    const wire: unknown = JSON.parse(typeof first?.init?.body === "string" ? first.init.body : "{}");
+    const wireCriteria = asTable(asTable(asTable(asTable(wire)?.["questions"])?.["department"])?.["criteria"]);
+    expect(wireCriteria === null ? [] : Object.keys(wireCriteria).sort()).toEqual(["billing", "sales", "technical"]);
+  });
+});
+
+describe("RJ2 absolute deadline and cancellation before acceptance", () => {
+  test("abort delivered on EOF pull yields stale, not decided", async () => {
+    const controller = new AbortController();
+    const bytes = new TextEncoder().encode(JSON.stringify(validPayload()));
+    let delivered = false;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(c) {
+        if (!delivered) {
+          delivered = true;
+          c.enqueue(bytes);
+          return;
+        }
+        queueMicrotask(() => controller.abort());
+        c.close();
+      },
+    });
+    const stub = stubFetch(() => new Response(stream, { status: 200 }));
+    const result = await jevAttemptOnce({ ...baseOptions(), fetchImpl: stub.fetchImpl, signal: controller.signal, timeoutMs: 2000 });
+    expect(stub.calls()).toBe(1);
+    expect(result.outcome).toBe("stale");
+    if (result.outcome === "stale") expect(result.reason).toBe("aborted");
+  });
+
+  test("fetch resolving after the deadline cannot decide", async () => {
+    const stub = stubFetch(
+      () =>
+        new Promise<Response>((resolve) => {
+          setTimeout(() => resolve(jsonResponse(validPayload())), 20);
+        }),
+    );
+    const result = await jevAttemptOnce({ ...baseOptions(), fetchImpl: stub.fetchImpl, timeoutMs: 5 });
+    expect(stub.calls()).toBe(1);
+    expect(result.outcome).toBe("unavailable");
+    if (result.outcome === "unavailable") expect(result.reason).toBe("timeout");
+  });
+
+  test("body completing after the deadline cannot decide", async () => {
+    const text = JSON.stringify(validPayload());
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) {
+        setTimeout(() => {
+          c.enqueue(new TextEncoder().encode(text));
+          c.close();
+        }, 30);
+      },
+    });
+    const stub = stubFetch(() => new Response(stream, { status: 200 }));
+    const result = await jevAttemptOnce({ ...baseOptions(), fetchImpl: stub.fetchImpl, timeoutMs: 5 });
+    expect(stub.calls()).toBe(1);
+    expect(result.outcome).toBe("unavailable");
+    if (result.outcome === "unavailable") expect(result.reason).toBe("timeout");
+  });
+});
+
+describe("RJ3 timeout and byte configuration is validated before dispatch", () => {
+  test("NaN byte bound is rejected with zero requests", async () => {
+    const stub = stubFetch(() => jsonResponse(validPayload()));
+    const result = await jevAttemptOnce({ ...baseOptions(), fetchImpl: stub.fetchImpl, maxResponseBytes: NaN });
+    expect(result.outcome).toBe("needsReview");
+    if (result.outcome === "needsReview") expect(result.reason).toBe("invalid-max-bytes");
+    expect(stub.calls()).toBe(0);
+  });
+
+  test("NaN timeout is rejected with zero requests", async () => {
+    const stub = stubFetch(() => jsonResponse(validPayload()));
+    const result = await jevAttemptOnce({ ...baseOptions(), fetchImpl: stub.fetchImpl, timeoutMs: NaN });
+    expect(result.outcome).toBe("needsReview");
+    if (result.outcome === "needsReview") expect(result.reason).toBe("invalid-timeout");
+    expect(stub.calls()).toBe(0);
+  });
+
+  test("zero byte bound is rejected with zero requests", async () => {
+    const stub = stubFetch(() => jsonResponse(validPayload()));
+    const result = await jevAttemptOnce({ ...baseOptions(), fetchImpl: stub.fetchImpl, maxResponseBytes: 0 });
+    expect(result.outcome).toBe("needsReview");
+    if (result.outcome === "needsReview") expect(result.reason).toBe("invalid-max-bytes");
+    expect(stub.calls()).toBe(0);
+  });
+});
+
+describe("RJ4 reserved IDs cannot become own question keys", () => {
+  test("__proto__ question id is rejected before dispatch", async () => {
+    // JSON.parse preserves an own __proto__ data property; literals and
+    // assignments would invoke the prototype setter instead.
+    const qs: Record<string, JevQuestion> = JSON.parse('{"__proto__":{"type":"noul","instructions":"x"}}');
+    const stub = stubFetch(() => jsonResponse(validPayload()));
+    const result = await jevAttemptOnce({ ...baseOptions(), fetchImpl: stub.fetchImpl, questions: qs });
+    expect(result.outcome).toBe("needsReview");
+    expect(stub.calls()).toBe(0);
+  });
+
+  test("__proto__ choice option is rejected before dispatch", async () => {
+    const qs: Record<string, JevQuestion> = JSON.parse(
+      '{"pick":{"type":"choice","instructions":"x","criteria":{"__proto__":"evil","ok":"fine"}}}',
+    );
+    const stub = stubFetch(() => jsonResponse(validPayload()));
+    const result = await jevAttemptOnce({ ...baseOptions(), fetchImpl: stub.fetchImpl, questions: qs });
+    expect(result.outcome).toBe("needsReview");
+    expect(stub.calls()).toBe(0);
+  });
+
+  test("__proto__ answer key in the response cannot decide", async () => {
+    const table = answersOrThrow(validPayload());
+    const parts: string[] = ['"__proto__":{"type":"noul","noul":0.5}'];
+    for (const key of Object.keys(table)) {
+      parts.push(`${JSON.stringify(key)}:${JSON.stringify(table[key])}`);
+    }
+    const text = `{"model":"${JEV_PINNED_MODEL}","answers":{${parts.join(",")}},"usage":{"input_tokens":1,"output_tokens":1}}`;
+    const stub = stubFetch(() => new Response(text, { status: 200, headers: { "content-type": "application/json" } }));
+    const result = await jevAttemptOnce({ ...baseOptions(), fetchImpl: stub.fetchImpl });
+    expect(stub.calls()).toBe(1);
+    expect(result.outcome).toBe("needsReview");
+  });
+});
+
+describe("RJ5 server backoff minimum is never shortened", () => {
+  test("Retry-After 120 keeps 120000ms with an exceeds-policy reason and one attempt", async () => {
+    const stub = stubFetch(() => jsonResponse({ error: "slow down" }, 429, { "retry-after": "120" }));
+    const result = await jevAttemptOnce({ ...baseOptions(), fetchImpl: stub.fetchImpl });
+    expect(stub.calls()).toBe(1);
+    expect(result.outcome).toBe("unavailable");
+    if (result.outcome === "unavailable") {
+      expect(result.retry.kind).toBe("retryable");
+      expect(result.retry.status).toBe(429);
+      expect(result.retry.retryAfterMs).toBe(120000);
+      expect(result.reason).toBe("http-429-retry-after-exceeds-policy");
+    } else {
+      throw new Error("expected unavailable");
+    }
+  });
+});
+
+describe("RJ6 ignored error bodies are cancelled", () => {
+  test("never-closing 429 body is cancelled without changing the result", async () => {
+    let cancelled = false;
+    const stream = new ReadableStream<Uint8Array>({
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const stub = stubFetch(() => new Response(stream, { status: 429 }));
+    const result = await jevAttemptOnce({ ...baseOptions(), fetchImpl: stub.fetchImpl });
+    expect(stub.calls()).toBe(1);
+    expect(result.outcome).toBe("unavailable");
+    if (result.outcome === "unavailable") expect(result.retry.kind).toBe("retryable");
+    expect(cancelled).toBe(true);
+  });
+});
+
+describe("RJ7 non-JSON evidence is rejected before dispatch", () => {
+  test("state toJSON returning a number is rejected with zero requests", async () => {
+    class ToJsonNumber {
+      kind = "evidence";
+      toJSON(): number {
+        return 123;
+      }
+    }
+    const stub = stubFetch(() => jsonResponse(validPayload()));
+    const result = await jevAttemptOnce({ ...baseOptions(), fetchImpl: stub.fetchImpl, state: new ToJsonNumber() });
+    expect(result.outcome).toBe("needsReview");
+    expect(stub.calls()).toBe(0);
+  });
+
+  test("NaN state value is rejected with zero requests", async () => {
+    const stub = stubFetch(() => jsonResponse(validPayload()));
+    const result = await jevAttemptOnce({ ...baseOptions(), fetchImpl: stub.fetchImpl, state: { price: NaN } });
+    expect(result.outcome).toBe("needsReview");
+    if (result.outcome === "needsReview") expect(result.reason).toBe("non-json-state");
+    expect(stub.calls()).toBe(0);
+  });
+
+  test("throwing toJSON is a typed boundary failure with zero requests", async () => {
+    class ToJsonBoom {
+      kind = "evidence";
+      toJSON(): unknown {
+        throw new Error("boom");
+      }
+    }
+    const stub = stubFetch(() => jsonResponse(validPayload()));
+    const result = await jevAttemptOnce({ ...baseOptions(), fetchImpl: stub.fetchImpl, state: new ToJsonBoom() });
+    expect(result.outcome).toBe("needsReview");
+    if (result.outcome === "needsReview") expect(result.reason).toBe("request-serialize-failed");
+    expect(stub.calls()).toBe(0);
   });
 });
 

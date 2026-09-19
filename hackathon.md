@@ -12,7 +12,7 @@
 - **Auth:** none
 - **AI models:** none
 - **Started:** 2026-09-19T09:46:19Z
-- **Last updated:** 2026-09-19T19:03:14Z
+- **Last updated:** 2026-09-19T19:12:33Z
 
 ## Log
 
@@ -134,3 +134,9 @@ Pushed the combined contract proofs and verified all four expected jobs in the [
 A separate Astra session reviewed that fixed commit and reproduced 13 correctness defects plus one financial fixture-scale gap beyond the passing tests.
 Assigned the financial findings to Luna and the Jev findings to Muse Spark with exclusive file ownership and regression-test requirements.
 Repairs and a second fixed-commit review are pending; the green CI result does not approve these contracts for application use.
+
+### 2026-09-19 - working tree
+
+Integrated Muse Spark's pushed repair `c16b807` for request snapshots, deadlines, cancellation, JSON validation, reserved keys, retry advice and ignored response bodies.
+The combined checkout passes 56 controlled proof tests, 23 repository checks and strict TypeScript, including 15 new Jev regressions.
+Independent verification of RJ1–RJ7 and Luna's financial repairs remain pending; no live provider call or application capability is claimed.
