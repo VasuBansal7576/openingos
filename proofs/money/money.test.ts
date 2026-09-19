@@ -538,8 +538,87 @@ describe("forecast and commitment financial state", () => {
         estimated: { quantity: "0.25", unitPrice: money(EUR, 7) },
       }],
     });
+    const oneSettledRecord = calculateForecast({
+      currency: EUR,
+      lines: [{
+        lineId: "equipment",
+        requiredQuantity: "2",
+        ordered: {
+          quantity: "1",
+          unitPrice: money(EUR, 1),
+          settled: [{ quantity: "1", unitPrice: money(EUR, 1) }],
+        },
+        selected: { quantity: "1", unitPrice: money(EUR, 0) },
+      }],
+    });
+    const splitSettledRecords = calculateForecast({
+      currency: EUR,
+      lines: [{
+        lineId: "equipment",
+        requiredQuantity: "2",
+        ordered: {
+          quantity: "1",
+          unitPrice: money(EUR, 1),
+          settled: [
+            { quantity: "0.5", unitPrice: money(EUR, 1) },
+            { quantity: "0.5", unitPrice: money(EUR, 1) },
+          ],
+        },
+        selected: { quantity: "1", unitPrice: money(EUR, 0) },
+      }],
+    });
+    const unequalSettledRecords = calculateForecast({
+      currency: EUR,
+      lines: [{
+        lineId: "equipment",
+        requiredQuantity: "2",
+        ordered: {
+          quantity: "1",
+          unitPrice: money(EUR, 1),
+          settled: [
+            { quantity: "0.75", unitPrice: money(EUR, 1) },
+            { quantity: "0.25", unitPrice: money(EUR, 1) },
+          ],
+        },
+        selected: { quantity: "1", unitPrice: money(EUR, 0) },
+      }],
+    });
+    const reorderedSettledRecords = calculateForecast({
+      currency: EUR,
+      lines: [{
+        lineId: "equipment",
+        requiredQuantity: "2",
+        ordered: {
+          quantity: "1",
+          unitPrice: money(EUR, 1),
+          settled: [
+            { quantity: "0.25", unitPrice: money(EUR, 1) },
+            { quantity: "0.75", unitPrice: money(EUR, 1) },
+          ],
+        },
+        selected: { quantity: "1", unitPrice: money(EUR, 0) },
+      }],
+    });
+    const changedSettledPrices = calculateForecast({
+      currency: EUR,
+      lines: [{
+        lineId: "equipment",
+        requiredQuantity: "2",
+        ordered: {
+          quantity: "1",
+          unitPrice: money(EUR, 1),
+          settled: [
+            { quantity: "0.5", unitPrice: money(EUR, 1) },
+            { quantity: "0.5", unitPrice: money(EUR, 3) },
+          ],
+        },
+        selected: { quantity: "1", unitPrice: money(EUR, 0) },
+      }],
+    });
     const orderedAndSelectedLine = orderedAndSelected.lines[0];
     const allPartitionsLine = allPartitions.lines[0];
+    const splitSettledLine = splitSettledRecords.lines[0];
+    const changedSettledPricesLine = changedSettledPrices.lines[0];
     expect(before.projectedCompletionCost.minorUnits).toBe(1);
     expect(selectedBefore.projectedCompletionCost.minorUnits).toBe(1);
     expect(orderedAndSelected.projectedCompletionCost.minorUnits).toBe(1);
@@ -561,6 +640,35 @@ describe("forecast and commitment financial state", () => {
       : allPartitionsLine.orderedCurrentCost.minorUnits
         + allPartitionsLine.selectedForecastCost.minorUnits
         + allPartitionsLine.estimatedForecastCost.minorUnits).toBe(4);
+    expect(oneSettledRecord.projectedCompletionCost.minorUnits).toBe(1);
+    expect(oneSettledRecord.orderedCurrentCost.minorUnits).toBe(1);
+    expect(oneSettledRecord.settledCost.minorUnits).toBe(1);
+    expect(oneSettledRecord.selectedForecastCost.minorUnits).toBe(0);
+    expect(splitSettledRecords.projectedCompletionCost.minorUnits).toBe(1);
+    expect(splitSettledRecords.orderedCurrentCost.minorUnits).toBe(1);
+    expect(splitSettledRecords.settledCost.minorUnits).toBe(1);
+    expect(splitSettledRecords.selectedForecastCost.minorUnits).toBe(0);
+    expect(unequalSettledRecords.projectedCompletionCost.minorUnits).toBe(1);
+    expect(unequalSettledRecords.orderedCurrentCost.minorUnits).toBe(1);
+    expect(unequalSettledRecords.settledCost.minorUnits).toBe(1);
+    expect(unequalSettledRecords.selectedForecastCost.minorUnits).toBe(0);
+    expect(reorderedSettledRecords.projectedCompletionCost.minorUnits).toBe(1);
+    expect(reorderedSettledRecords.orderedCurrentCost.minorUnits).toBe(1);
+    expect(reorderedSettledRecords.settledCost.minorUnits).toBe(1);
+    expect(reorderedSettledRecords.selectedForecastCost.minorUnits).toBe(0);
+    expect(changedSettledPrices.projectedCompletionCost.minorUnits).toBe(2);
+    expect(changedSettledPrices.settledCost.minorUnits).toBe(2);
+    expect(changedSettledPrices.selectedForecastCost.minorUnits).toBe(0);
+    expect(splitSettledLine === undefined
+      ? undefined
+      : splitSettledLine.orderedCurrentCost.minorUnits
+        + splitSettledLine.selectedForecastCost.minorUnits
+        + splitSettledLine.estimatedForecastCost.minorUnits).toBe(1);
+    expect(changedSettledPricesLine === undefined
+      ? undefined
+      : changedSettledPricesLine.orderedCurrentCost.minorUnits
+        + changedSettledPricesLine.selectedForecastCost.minorUnits
+        + changedSettledPricesLine.estimatedForecastCost.minorUnits).toBe(2);
   });
 
   it("reports uncovered quantities instead of silently treating them as zero", () => {

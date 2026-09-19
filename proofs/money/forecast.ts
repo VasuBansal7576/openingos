@@ -111,14 +111,24 @@ interface CostFragment {
   readonly unitPrice: Money;
 }
 
+type CostComponent = CostFragment["kind"];
+
+const COST_COMPONENT_ORDER: readonly CostComponent[] = [
+  "settled",
+  "remainingOrdered",
+  "selected",
+  "estimated",
+];
+
 /**
- * Round one forecast line once across every priced quantity partition, then
- * allocate exact fragment products. Every fragment before the final one
- * receives its exact floor and the final supplied fragment receives the
- * residual, so unchanged quantity and price cannot gain a minor unit when a
- * quantity moves between settled, ordered, selected, or estimated states. A
- * price change remains visible in the exact line total before allocation, and
- * uncovered quantity is intentionally absent because it has no known price.
+ * Round one forecast line once across every priced quantity partition. Exact
+ * products are first aggregated by logical component, then each component is
+ * floored and the line residual is assigned by largest fractional remainder
+ * using COST_COMPONENT_ORDER (settled, remainingOrdered, selected, estimated)
+ * as the stable tie-breaker. This makes equivalent settlement-record splits
+ * and reorderings preserve component totals, while a changed price remains
+ * visible in the exact line total before allocation.
+ * Uncovered quantity is intentionally absent because it has no known price.
  */
 function allocateLineCost(currency: string, fragments: readonly CostFragment[]): readonly Money[] {
   if (fragments.length === 0) {
@@ -131,30 +141,79 @@ function allocateLineCost(currency: string, fragments: readonly CostFragment[]):
   );
   const denominator = 10n ** BigInt(commonScale);
   let numerator = 0n;
-  for (const fragment of fragments) {
+  const componentNumerators = new Map<CostComponent, bigint>();
+  const componentFragmentIndexes = new Map<CostComponent, number[]>();
+  for (const [index, fragment] of fragments.entries()) {
     const fragmentNumerator = BigInt(fragment.unitPrice.minorUnits) * fragment.quantity.coefficient;
-    numerator += fragmentNumerator * 10n ** BigInt(commonScale - fragment.quantity.scale);
+    const exactNumerator = fragmentNumerator * 10n ** BigInt(commonScale - fragment.quantity.scale);
+    numerator += exactNumerator;
+    componentNumerators.set(
+      fragment.kind,
+      (componentNumerators.get(fragment.kind) ?? 0n) + exactNumerator,
+    );
+    const indexes = componentFragmentIndexes.get(fragment.kind) ?? [];
+    indexes.push(index);
+    componentFragmentIndexes.set(fragment.kind, indexes);
   }
   const quotient = numerator / denominator;
   const remainder = numerator % denominator;
   const roundedTotal = remainder * 2n >= denominator ? quotient + 1n : quotient;
-  let residual = roundedTotal;
-  const allocated: Money[] = [];
-  for (let index = 0; index < fragments.length; index += 1) {
-    const fragment = fragments[index];
-    if (fragment === undefined) {
-      throw new Error("forecast line cost fragment is missing");
+  const componentKinds = COST_COMPONENT_ORDER.filter((kind) => componentNumerators.has(kind));
+  const componentAllocations = new Map<CostComponent, bigint>();
+  const componentRemainders = new Map<CostComponent, bigint>();
+  let allocatedBase = 0n;
+  for (const kind of componentKinds) {
+    const componentNumerator = componentNumerators.get(kind);
+    if (componentNumerator === undefined) {
+      throw new Error("forecast component numerator is missing");
     }
-    const isFinal = index === fragments.length - 1;
-    const amount = isFinal ? residual : (
-      BigInt(fragment.unitPrice.minorUnits)
-      * fragment.quantity.coefficient
-      * 10n ** BigInt(commonScale - fragment.quantity.scale)
-      / denominator
-    );
-    const allocatedAmount = money(currency, amount);
-    allocated.push(allocatedAmount);
-    residual -= amount;
+    const componentBase = componentNumerator / denominator;
+    componentAllocations.set(kind, componentBase);
+    componentRemainders.set(kind, componentNumerator % denominator);
+    allocatedBase += componentBase;
+  }
+
+  let residual = roundedTotal - allocatedBase;
+  if (residual < 0n || residual > BigInt(componentKinds.length)) {
+    throw new Error("forecast component residual is invalid");
+  }
+  const rankedKinds = componentKinds
+    .filter((kind) => (componentRemainders.get(kind) ?? 0n) > 0n)
+    .sort((left, right) => {
+      const leftRemainder = componentRemainders.get(left) ?? 0n;
+      const rightRemainder = componentRemainders.get(right) ?? 0n;
+      if (leftRemainder > rightRemainder) {
+        return -1;
+      }
+      if (leftRemainder < rightRemainder) {
+        return 1;
+      }
+      return COST_COMPONENT_ORDER.indexOf(left) - COST_COMPONENT_ORDER.indexOf(right);
+    });
+  for (const kind of rankedKinds) {
+    if (residual === 0n) {
+      break;
+    }
+    const componentBase = componentAllocations.get(kind);
+    if (componentBase === undefined) {
+      throw new Error("forecast component allocation is missing");
+    }
+    componentAllocations.set(kind, componentBase + 1n);
+    residual -= 1n;
+  }
+  if (residual !== 0n) {
+    throw new Error("forecast component residual has no fractional recipient");
+  }
+
+  const allocated: Money[] = [];
+  for (const [index, fragment] of fragments.entries()) {
+    const componentAmount = componentAllocations.get(fragment.kind);
+    const indexes = componentFragmentIndexes.get(fragment.kind);
+    if (componentAmount === undefined || indexes === undefined || indexes[0] !== index) {
+      allocated.push(moneyZero(currency));
+      continue;
+    }
+    allocated.push(money(currency, componentAmount));
   }
   return Object.freeze(allocated);
 }
