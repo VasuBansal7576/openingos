@@ -146,8 +146,20 @@ export interface JevAttemptOptions {
   inputVersion: string;
   timeoutMs?: number;
   maxResponseBytes?: number;
-  fetchImpl?: typeof fetch;
+  fetchImpl?: JevFetch;
   signal?: AbortSignal;
+}
+
+/**
+ * Precise single-request fetch boundary type. This avoids Bun's ambient
+ * `typeof fetch`, which carries extra members such as `preconnect` that a
+ * controlled stub must not be forced to implement.
+ */
+export type JevFetch = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
+
+/** Fresh abort check behind a function boundary (no stale narrowing across awaits). */
+function isAborted(signal: AbortSignal | undefined): boolean {
+  return signal?.aborted === true;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -513,8 +525,7 @@ async function readBodyBounded(response: Response, maxBytes: number, budgetMs: n
     let total = 0;
     for (;;) {
       const pending = reader.read();
-      const racers: Array<Promise<BodyRead | ReadableStreamReadResult<Uint8Array>>> =
-        signal === undefined ? [pending, expired] : [pending, aborted, expired];
+      const racers = signal === undefined ? [pending, expired] : [pending, aborted, expired];
       const next = await Promise.race(racers);
       if (isBodyMarker(next)) {
         void pending.then(
@@ -545,7 +556,7 @@ async function readBodyBounded(response: Response, maxBytes: number, budgetMs: n
   } catch {
     cancelQuiet();
     cleanup();
-    if (signal?.aborted === true) return { kind: "aborted" };
+    if (isAborted(signal)) return { kind: "aborted" };
     return { kind: "error" };
   }
 }
@@ -587,7 +598,7 @@ export async function jevAttemptOnce(options: JevAttemptOptions): Promise<JevAtt
   const started = Date.now();
   const timeoutMs = options.timeoutMs ?? JEV_DEFAULT_TIMEOUT_MS;
   const maxBytes = options.maxResponseBytes ?? JEV_MAX_RESPONSE_BYTES;
-  const fetchImpl = options.fetchImpl ?? fetch;
+  const fetchImpl: JevFetch = options.fetchImpl ?? ((input, init) => fetch(input, init));
   const none: JevRetryAdvice = { kind: "none", status: null, retryAfterMs: null };
 
   if (!isNonEmptyString(options.apiKey)) {
@@ -644,7 +655,7 @@ export async function jevAttemptOnce(options: JevAttemptOptions): Promise<JevAtt
     const latencyMs = Date.now() - started;
     clearTimeout(timeoutId);
     options.signal?.removeEventListener("abort", onAbort);
-    if (options.signal?.aborted === true && !timedOut) {
+    if (isAborted(options.signal) && !timedOut) {
       return { outcome: "stale", reason: "aborted", retry: none, latencyMs, inputVersion: options.inputVersion };
     }
     if (timedOut) {

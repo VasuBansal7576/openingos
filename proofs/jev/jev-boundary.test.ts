@@ -14,6 +14,7 @@ import {
   jevAttemptOnce,
   type JevAttemptOptions,
   type JevAttemptResult,
+  type JevFetch,
   type JevQuestion,
 } from "./jev-boundary.js";
 
@@ -99,10 +100,10 @@ interface SeenRequest {
   init: RequestInit | undefined;
 }
 
-function stubFetch(handler: (seen: SeenRequest) => Response | Promise<Response>): { fetchImpl: typeof fetch; calls: () => number; seen: () => SeenRequest[] } {
+function stubFetch(handler: (seen: SeenRequest) => Response | Promise<Response>): { fetchImpl: JevFetch; calls: () => number; seen: () => SeenRequest[] } {
   let count = 0;
   const requests: SeenRequest[] = [];
-  const fetchImpl: typeof fetch = (input, init) => {
+  const fetchImpl: JevFetch = (input, init) => {
     count += 1;
     const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
     requests.push({ url, init });
@@ -378,7 +379,7 @@ describe("transport bounds and secrecy", () => {
 
 describe("body-stream timeout, cancellation, and errors", () => {
   test("stalled body resolves to timeout within one request", async () => {
-    const stalled = new Response(new ReadableStream<Uint8Array>(() => undefined), { status: 200 });
+    const stalled = new Response(new ReadableStream<Uint8Array>(), { status: 200 });
     const stub = stubFetch(() => stalled);
     const result = await jevAttemptOnce({ ...baseOptions(), fetchImpl: stub.fetchImpl, timeoutMs: 30 });
     expect(stub.calls()).toBe(1);
@@ -409,7 +410,7 @@ describe("body-stream timeout, cancellation, and errors", () => {
   });
 
   test("abort after headers cancels the body read and returns stale", async () => {
-    const stalled = new Response(new ReadableStream<Uint8Array>(() => undefined), { status: 200 });
+    const stalled = new Response(new ReadableStream<Uint8Array>(), { status: 200 });
     const stub = stubFetch(() => stalled);
     const controller = new AbortController();
     setTimeout(() => controller.abort(), 10);
