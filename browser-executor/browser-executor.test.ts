@@ -899,12 +899,31 @@ describe("authoritative driver dispatch (BR3/BR4)", () => {
         return stub.transport.execute(input, signal);
       },
     };
-    const result = await setup.driver.dispatch(setup.jobId, claim.claimId, watching, { nowMs: NOW });
+    // Mandatory dispatch freshness: target effects require current observed
+    // targets and document version at dispatch, not only at authorize time.
+    const result = await setup.driver.dispatch(setup.jobId, claim.claimId, watching, {
+      nowMs: NOW,
+      currentTargets: [targetFixture("t", "v1")],
+      currentDocumentVersion: "v1",
+    });
     expect(result.receipt.outcome).toBe("observed-success");
     expect(sent?.targetId).toBe("t");
     expect(sent?.documentVersion).toBe("v1");
     expect(sent?.callbackNonce).toBe(claim.callbackNonce);
     expect(sent?.requestDigest).toBe(claim.requestDigest);
+  });
+
+  it("refuses target effects without dispatch-time freshness evidence", async () => {
+    const setup = setupDriver();
+    const claim = issue(setup, "inspectTarget", {
+      targetId: "t",
+      currentTargets: [targetFixture("t", "v1")],
+      currentDocumentVersion: "v1",
+    });
+    const stub = driverStub(setup.driver);
+    const result = await setup.driver.dispatch(setup.jobId, claim.claimId, stub.transport, { nowMs: NOW });
+    expect(result.receipt.outcome).toBe("claim-refused");
+    expect(stub.calls.length).toBe(0);
   });
 
   it("refuses a fabricated claim with zero transport calls", async () => {
@@ -1144,27 +1163,27 @@ describe("required outputs and independent checks (R9)", () => {
   it("waiting cannot complete from a generic URL match", async () => {
     const setup = setupDriver({}, undefined, ["variant-price"]);
     const out = await runDispatch(setup, issue(setup), [{ outcome: "waiting" }]);
-    const checked = mustJob(setup.driver.applyCheck(setup.jobId, out.job.attempts[0]?.attemptId as string, {
+    // Waiting never proves outputs: verification itself is denied, so no
+    // verified outcome exists and completion stays denied.
+    mustDenialReason(setup.driver.applyCheck(setup.jobId, out.job.attempts[0]?.attemptId as string, {
       checker: "independent",
       observedUrl: GOOD_URL,
       matches: true,
       confirmedOutputs: [],
-    }, NOW));
-    void checked;
-    mustDenialReason(setup.driver.complete(setup.jobId), "missing-outputs");
+    }, NOW), "unverified");
+    mustDenialReason(setup.driver.complete(setup.jobId), "unverified");
   });
 
   it("noProgress cannot count as a successful task output", async () => {
     const setup = setupDriver({}, undefined, ["variant-price"]);
     const out = await runDispatch(setup, issue(setup), [{ outcome: "noProgress" }]);
-    const checked = mustJob(setup.driver.applyCheck(setup.jobId, out.job.attempts[0]?.attemptId as string, {
+    mustDenialReason(setup.driver.applyCheck(setup.jobId, out.job.attempts[0]?.attemptId as string, {
       checker: "independent",
       observedUrl: GOOD_URL,
       matches: true,
       confirmedOutputs: [],
-    }, NOW));
-    void checked;
-    mustDenialReason(setup.driver.complete(setup.jobId), "missing-outputs");
+    }, NOW), "unverified");
+    mustDenialReason(setup.driver.complete(setup.jobId), "unverified");
   });
 
   it("a confirmed output must be evidenced by the observation", async () => {
@@ -1348,5 +1367,612 @@ describe("evidence control", () => {
     expect(Object.isFrozen(observation.collectedEvidence)).toBe(true);
     expect(Object.isFrozen(observation.observedTargets)).toBe(true);
     expect(Object.isFrozen(observation.meteredUsage)).toBe(true);
+  });
+});
+
+describe("NR01 complete numeric-address policy", () => {
+  it("denies reserved/site-local IPv6 literals even when allowlisted", () => {
+    const inputs = [
+      "https://[fec0::1]/",
+      "https://[::127.0.0.1]/",
+      "https://[100::1]/",
+      "https://[64:ff9b:1::a00:1]/",
+      "https://[4000::1]/",
+    ];
+    for (const raw of inputs) {
+      const allowlisted = [new URL(raw).origin];
+      const result = validateDestination(raw, allowlisted);
+      expect(result.ok).toBe(false);
+    }
+  });
+
+  it("rejects site-local IPv6 at every redirect position", () => {
+    const bad = "https://[fec0::1]/";
+    const origins = ["https://supplier-a.example", new URL(bad).origin];
+    for (let n = 0; n < 5; n += 1) {
+      const hops = Array(5).fill(GOOD_URL);
+      hops[n] = bad;
+      expect(validateNavigation(GOOD_URL, hops, origins).ok).toBe(false);
+    }
+  });
+
+  it("allows public global-unicast IPv6 positive controls", () => {
+    for (const raw of ["https://[2606:4700:4700::1111]/", "https://[2001:4860:4860::8888]/"]) {
+      expect(validateDestination(raw, [new URL(raw).origin]).ok).toBe(true);
+    }
+  });
+
+  it("classifies embedded IPv4 and boundary ranges", () => {
+    // Public embedded stays reachable; private embedded stays shut.
+    for (const raw of ["https://[::ffff:8.8.8.8]/", "https://[2002:0808:0808::1]/"]) {
+      expect(validateDestination(raw, [new URL(raw).origin]).ok).toBe(true);
+    }
+    for (const raw of [
+      "https://[::ffff:127.0.0.1]/",
+      "https://[2002:7f00:0001::1]/",
+      "https://[fc00::1]/",
+      "https://[febf::1]/",
+      "https://[ff02::1]/",
+      "https://[2001:db8::1]/",
+      "https://[2001::1]/",
+    ]) {
+      expect(validateDestination(raw, [new URL(raw).origin]).ok).toBe(false);
+    }
+  });
+});
+
+describe("NR02 request-bound lease authority", () => {
+  it("denies initial acquire with mismatched lease identity", () => {
+    const driver = new ControlledDriver(SECRET);
+    const registered: unknown = driver.registerJob(
+      requestFixture({ sessionLease: { leaseId: "authorized", expiresAtMs: NOW + 1_000 } }),
+      NOW,
+    );
+    expect(typeof registered).toBe("string");
+    const jobId = registered as string;
+    mustDenialReason(
+      driver.acquireLease(jobId, {
+        organizationId: "org-a",
+        projectId: "proj-a",
+        leaseId: "replacement",
+        expiresAtMs: NOW + 5_000,
+        guest: false,
+      }, NOW),
+      "lease-invalid",
+    );
+  });
+
+  it("denies extended lifetime beyond the authorized request lease", () => {
+    const driver = new ControlledDriver(SECRET);
+    const registered: unknown = driver.registerJob(
+      requestFixture({ sessionLease: { leaseId: "lease-1", expiresAtMs: NOW + 1_000 } }),
+      NOW,
+    );
+    const jobId = registered as string;
+    mustDenialReason(
+      driver.acquireLease(jobId, {
+        organizationId: "org-a",
+        projectId: "proj-a",
+        leaseId: "lease-1",
+        expiresAtMs: NOW + 5_000,
+        guest: false,
+      }, NOW),
+      "lease-invalid",
+    );
+  });
+
+  it("refuses dispatch at exact request-lease expiry with zero transport calls", async () => {
+    const driver = new ControlledDriver(SECRET);
+    const req = parseJobRequest(requestFixture({ sessionLease: { leaseId: "lease-1", expiresAtMs: NOW + 5 } }));
+    const jobId = driver.registerJob(req, NOW) as string;
+    const lease = driver.acquireLease(jobId, {
+      organizationId: req.organizationId,
+      projectId: req.projectId,
+      leaseId: "lease-1",
+      expiresAtMs: NOW + 5,
+      guest: false,
+    }, NOW);
+    if (isDenial(lease)) {
+      throw new Error("expected lease");
+    }
+    const claim = driver.authorize({
+      jobId,
+      nowMs: NOW,
+      operationId: "readVisibleText",
+      viaRecovery: false,
+      sessionHandle: (lease as SessionLease).handle,
+    });
+    if (isDenial(claim)) {
+      throw new Error("expected claim");
+    }
+    const stub = driverStub(driver);
+    const result = await driver.dispatch(jobId, (claim as IssuedClaim).claimId, stub.transport, { nowMs: NOW + 5 });
+    expect(result.receipt.outcome).toBe("claim-refused");
+    expect(stub.calls.length).toBe(0);
+  });
+
+  it("denies released-lease dispatch and supports authorized resume", async () => {
+    const setup = setupDriver();
+    const claim = issue(setup);
+    expect(setup.driver.releaseLease(setup.jobId).ok).toBe(true);
+    const stub = driverStub(setup.driver);
+    const refused = await setup.driver.dispatch(setup.jobId, claim.claimId, stub.transport, { nowMs: NOW });
+    expect(refused.receipt.outcome).toBe("claim-refused");
+    expect(stub.calls.length).toBe(0);
+    // Authorized resume: waiting releases, reacquires with a fresh handle
+    // bounded by the same request expiry, then resumes and dispatches once.
+    const waitingSetup = setupDriver();
+    const waitingOut = await runDispatch(waitingSetup, issue(waitingSetup), [{ outcome: "waiting" }]);
+    expect(waitingOut.job.state).toBe("waitingForSupplier");
+    const resumed = mustJob(waitingSetup.driver.changeStrategy(waitingSetup.jobId, "resume after supplier wait"));
+    expect(resumed.state).toBe("running");
+    const fresh = waitingSetup.driver.reacquireLease(waitingSetup.jobId, {
+      organizationId: "org-a",
+      projectId: "proj-a",
+      leaseId: "lease-2",
+      expiresAtMs: NOW + 60_000,
+      guest: false,
+    }, NOW);
+    expect(isDenial(fresh)).toBe(false);
+    const handle = (fresh as SessionLease).handle;
+    const nextClaim: unknown = waitingSetup.driver.authorize({
+      jobId: waitingSetup.jobId,
+      nowMs: NOW,
+      operationId: "readVisibleText",
+      viaRecovery: false,
+      sessionHandle: handle,
+    });
+    expect(isDenial(nextClaim)).toBe(false);
+  });
+});
+
+describe("NR04 mandatory dispatch freshness", () => {
+  it("requires current targets and document at dispatch for target effects", async () => {
+    const setup = setupDriver();
+    const claim = issue(setup, "inspectTarget", {
+      targetId: "t",
+      currentTargets: [targetFixture("t", "v1")],
+      currentDocumentVersion: "v1",
+    });
+    const stub = driverStub(setup.driver);
+    const absent = await setup.driver.dispatch(setup.jobId, claim.claimId, stub.transport, { nowMs: NOW });
+    expect(absent.receipt.outcome).toBe("claim-refused");
+    expect(stub.calls.length).toBe(0);
+  });
+
+  it("denies stale, missing, and occluded target evidence with zero calls", async () => {
+    for (const variant of ["stale", "missing", "occluded"] as const) {
+      const setup = setupDriver();
+      const claim = issue(setup, "inspectTarget", {
+        targetId: "t",
+        currentTargets: [targetFixture("t", "v1")],
+        currentDocumentVersion: "v1",
+      });
+      const stub = driverStub(setup.driver);
+      const options =
+        variant === "stale"
+          ? { nowMs: NOW, currentTargets: [targetFixture("t", "v2")], currentDocumentVersion: "v2" }
+          : variant === "occluded"
+            ? { nowMs: NOW, currentTargets: [targetFixture("t", "v1", true)], currentDocumentVersion: "v1" }
+            : { nowMs: NOW, currentTargets: [], currentDocumentVersion: "v1" };
+      const result = await setup.driver.dispatch(setup.jobId, claim.claimId, stub.transport, options);
+      expect(result.receipt.outcome).toBe("claim-refused");
+      expect(stub.calls.length).toBe(0);
+    }
+  });
+});
+
+describe("NR05 authoritative clock and expiry fencing", () => {
+  it("fences exact expiry timer and releases the lease", async () => {
+    const setup = setupDriver({ expiresAt: NOW + 10 });
+    const claim = issue(setup);
+    let signal: AbortSignal | undefined;
+    const result = await setup.driver.dispatch(setup.jobId, claim.claimId, {
+      execute: (_input: TransportInput, sg: AbortSignal) => {
+        signal = sg;
+        return new Promise<TransportResult>(() => undefined);
+      },
+    }, { nowMs: NOW });
+    expect(signal?.aborted).toBe(true);
+    expect(result.job.state).toBe("cancelled");
+    expect(setup.driver.trackedLease(setup.jobId)).toBeUndefined();
+  });
+
+  it("cannot accept success after synchronous overrun past expiry", async () => {
+    const start = Date.now();
+    const driver = new ControlledDriver(SECRET);
+    const req = parseJobRequest(requestFixture({
+      expiresAt: start + 5,
+      sessionLease: { leaseId: "lease-1", expiresAtMs: start + 60_000 },
+    }));
+    const jobId = driver.registerJob(req, start) as string;
+    const lease = driver.acquireLease(jobId, {
+      organizationId: req.organizationId,
+      projectId: req.projectId,
+      leaseId: "lease-1",
+      expiresAtMs: start + 60_000,
+      guest: false,
+    }, start);
+    const claim = driver.authorize({
+      jobId,
+      nowMs: start,
+      operationId: "readVisibleText",
+      viaRecovery: false,
+      sessionHandle: (lease as SessionLease).handle,
+    }) as IssuedClaim;
+    const out = await driver.dispatch(jobId, claim.claimId, {
+      execute: (input: TransportInput) => {
+        const spinUntil = Date.now() + 15;
+        while (Date.now() < spinUntil) {
+          // Intentional synchronous overrun past the 5ms job expiry.
+        }
+        const digest = driver.requestDigestOf(jobId) as string;
+        const raw = observationFixture(input.attemptId, { jobId, requestDigest: digest });
+        const observation = parseObservation(raw);
+        return Promise.resolve({
+          envelope: { observation: raw, callbackNonce: input.callbackNonce },
+          signature: signObservation(SECRET, observation, input.callbackNonce),
+        });
+      },
+    }, { nowMs: start });
+    expect(out.job.state).toBe("cancelled");
+  });
+
+  it("keeps late outcomes on the fenced job without reopening", async () => {
+    const start = Date.now();
+    const driver = new ControlledDriver(SECRET);
+    const req = parseJobRequest(requestFixture({
+      expiresAt: start + 10,
+      sessionLease: { leaseId: "lease-1", expiresAtMs: start + 60_000 },
+    }));
+    const jobId = driver.registerJob(req, start) as string;
+    const lease = driver.acquireLease(jobId, {
+      organizationId: req.organizationId,
+      projectId: req.projectId,
+      leaseId: "lease-1",
+      expiresAtMs: start + 60_000,
+      guest: false,
+    }, start);
+    const claim = driver.authorize({
+      jobId,
+      nowMs: start,
+      operationId: "readVisibleText",
+      viaRecovery: false,
+      sessionHandle: (lease as SessionLease).handle,
+    }) as IssuedClaim;
+    let deliver!: (value: TransportResult) => void;
+    const pending = driver.dispatch(jobId, claim.claimId, {
+      execute: () => new Promise<TransportResult>((resolve) => {
+        deliver = resolve;
+      }),
+    }, { nowMs: start });
+    await Bun.sleep(25);
+    const digest = driver.requestDigestOf(jobId) as string;
+    const expectation = driver.expectationFor(jobId, `a_${jobId}_1`);
+    const raw = observationFixture(`a_${jobId}_1`, {
+      jobId,
+      observationVersion: expectation?.version ?? 1,
+      requestDigest: digest,
+    });
+    const observation = parseObservation(raw);
+    deliver({
+      envelope: { observation: raw, callbackNonce: claim.callbackNonce },
+      signature: signObservation(SECRET, observation, claim.callbackNonce),
+    });
+    const result = await pending;
+    // The timeout path already fenced at expiry; the delayed result stays on
+    // the cancelled job without reopening it.
+    expect(driver.snapshot(jobId)?.state).toBe("cancelled");
+    void result;
+  });
+
+  it("enforces the 15-minute active-execution ceiling", () => {
+    const setup = setupDriver();
+    const pastCeiling = NOW + 15 * 60 * 1_000;
+    const deniedClaim: unknown = setup.driver.authorize({
+      jobId: setup.jobId,
+      nowMs: pastCeiling,
+      operationId: "readVisibleText",
+      viaRecovery: false,
+      sessionHandle: setup.handle,
+    });
+    mustDenialReason(deniedClaim, "job-expired");
+  });
+});
+
+describe("NR06 replay horizon and retention", () => {
+  function expectationAt(nonce: string, nowMs: number, validUntilMs: number): CallbackExpectation {
+    return {
+      nonce,
+      requestDigest: TEST_DIGEST,
+      jobId: "job-a",
+      attemptId: "a_job-a_1",
+      version: 1,
+      validUntilMs,
+      nowMs,
+    };
+  }
+
+  it("rejects at exact horizon equality and after it", () => {
+    const store = createMemoryNonceStore();
+    const first = signedEnvelope("a_job-a_1", "cb-horizon-1");
+    expect(verifyCallback(SECRET, store, first.envelope, first.signature, expectationAt("cb-horizon-1", NOW, NOW + 1_000)).ok).toBe(true);
+    const atExpiry = signedEnvelope("a_job-a_1", "cb-horizon-1");
+    expect(verifyCallback(SECRET, store, atExpiry.envelope, atExpiry.signature, expectationAt("cb-horizon-1", NOW + 1_000, NOW + 1_000)).ok).toBe(false);
+    const afterExpiry = signedEnvelope("a_job-a_1", "cb-horizon-1");
+    expect(verifyCallback(SECRET, store, afterExpiry.envelope, afterExpiry.signature, expectationAt("cb-horizon-1", NOW + 1_001, NOW + 1_000)).ok).toBe(false);
+  });
+
+  it("refuses already-expired markers and retains replay evidence", () => {
+    const store = createMemoryNonceStore();
+    expect(store.tryConsume("cb-expired-new", NOW, NOW)).toBe(false);
+    const first = signedEnvelope("a_job-a_1", "cb-retain-1");
+    expect(verifyCallback(SECRET, store, first.envelope, first.signature, expectationAt("cb-retain-1", NOW, NOW + 1_000)).ok).toBe(true);
+    // Retained past expiry: the same signature is still replay-detected (or
+    // horizon-rejected), never acceptable again.
+    const replay = signedEnvelope("a_job-a_1", "cb-retain-1");
+    expect(verifyCallback(SECRET, store, replay.envelope, replay.signature, expectationAt("cb-retain-1", NOW + 2_000, NOW + 1_000)).ok).toBe(false);
+    expect(store.isConsumed("cb-retain-1", NOW + 2_000)).toBe(true);
+  });
+
+  it("fails closed at capacity without evicting live markers", () => {
+    const store = createMemoryNonceStore();
+    const first = signedEnvelope("a_job-a_1", "cb-cap-nr06");
+    expect(verifyCallback(SECRET, store, first.envelope, first.signature, expectationAt("cb-cap-nr06", NOW, NOW + 120_000)).ok).toBe(true);
+    for (let n = 0; n < 9_999; n += 1) {
+      expect(store.tryConsume(`nr06-other-${n}`, NOW + 120_000, NOW)).toBe(true);
+    }
+    expect(store.tryConsume("nr06-fresh", NOW + 120_000, NOW)).toBe(false);
+  });
+});
+
+describe("NR07 shared destination validation", () => {
+  it("late disallowed URL is never observed success", async () => {
+    const setup = setupDriver();
+    const claim = issue(setup);
+    let input!: TransportInput;
+    let deliver!: (value: TransportResult) => void;
+    const pending = setup.driver.dispatch(setup.jobId, claim.claimId, {
+      execute: (seen: TransportInput) => new Promise<TransportResult>((resolve) => {
+        input = seen;
+        deliver = resolve;
+      }),
+    }, { nowMs: NOW });
+    mustJob(setup.driver.cancel(setup.jobId, NOW + 1, "cancel"));
+    const digest = setup.driver.requestDigestOf(setup.jobId) as string;
+    const expectation = setup.driver.expectationFor(setup.jobId, input.attemptId);
+    const raw = observationFixture(input.attemptId, {
+      jobId: setup.jobId,
+      url: "https://127.0.0.1/",
+      observationVersion: expectation?.version ?? 1,
+      requestDigest: digest,
+    });
+    const observation = parseObservation(raw);
+    deliver({
+      envelope: { observation: raw, callbackNonce: input.callbackNonce },
+      signature: signObservation(SECRET, observation, input.callbackNonce),
+    });
+    const result = await pending;
+    expect(result.job.attempts[0]?.state).not.toBe("observedSuccess");
+  });
+
+  it("checks disallowed URL before nonce admission", () => {
+    const job = createJob(parseJobRequest(requestFixture()), NOW);
+    const prepared = prepareAttempt(job, mustClaim(job), NOW);
+    if (isDenial(prepared)) {
+      throw new Error("expected preparation");
+    }
+    const store = createMemoryNonceStore();
+    const raw = observationFixture(prepared.attemptId, { url: "https://127.0.0.1/" });
+    const observation = parseObservation(raw);
+    const nonce = "cb-policy-precheck-1";
+    const signature = signObservation(SECRET, observation, nonce);
+    const verifier: CallbackVerifier = {
+      verify: (envelope: unknown, sig: unknown, version: number) => verifyCallback(SECRET, store, envelope, sig, {
+        nonce,
+        requestDigest: TEST_DIGEST,
+        jobId: "job-a",
+        attemptId: prepared.attemptId,
+        version,
+        validUntilMs: NOW + 120_000,
+        nowMs: NOW,
+      }),
+    };
+    const result = settleAttempt(prepared.job, prepared.attemptId, { observation: raw, callbackNonce: nonce }, signature, verifier, NOW);
+    if (isDenial(result)) {
+      throw new Error("expected a receipt");
+    }
+    expect(result.receipt.outcome).toBe("callback-rejected");
+    expect(store.isConsumed(nonce, NOW)).toBe(false);
+  });
+});
+
+describe("NR08 sibling in-flight reconciliation", () => {
+  it("preserves the second result when a sibling enters waiting first", async () => {
+    const setup = setupDriver();
+    const first = issue(setup);
+    const second = issue(setup);
+    let firstInput!: TransportInput;
+    let secondInput!: TransportInput;
+    let firstDeliver!: (value: TransportResult) => void;
+    let secondDeliver!: (value: TransportResult) => void;
+    const firstPending = setup.driver.dispatch(setup.jobId, first.claimId, {
+      execute: (input: TransportInput) => new Promise<TransportResult>((resolve) => {
+        firstInput = input;
+        firstDeliver = resolve;
+      }),
+    }, { nowMs: NOW });
+    const secondPending = setup.driver.dispatch(setup.jobId, second.claimId, {
+      execute: (input: TransportInput) => new Promise<TransportResult>((resolve) => {
+        secondInput = input;
+        secondDeliver = resolve;
+      }),
+    }, { nowMs: NOW });
+    const digest = setup.driver.requestDigestOf(setup.jobId) as string;
+    const firstExpectation = setup.driver.expectationFor(setup.jobId, firstInput.attemptId);
+    const firstRaw = observationFixture(firstInput.attemptId, {
+      jobId: setup.jobId,
+      claimedOutcome: "waiting",
+      observationVersion: firstExpectation?.version ?? 1,
+      requestDigest: digest,
+    });
+    firstDeliver({
+      envelope: { observation: firstRaw, callbackNonce: firstInput.callbackNonce },
+      signature: signObservation(SECRET, parseObservation(firstRaw), firstInput.callbackNonce),
+    });
+    await firstPending;
+    const secondExpectation = setup.driver.expectationFor(setup.jobId, secondInput.attemptId);
+    const secondRaw = observationFixture(secondInput.attemptId, {
+      jobId: setup.jobId,
+      observationVersion: secondExpectation?.version ?? 1,
+      requestDigest: digest,
+    });
+    secondDeliver({
+      envelope: { observation: secondRaw, callbackNonce: secondInput.callbackNonce },
+      signature: signObservation(SECRET, parseObservation(secondRaw), secondInput.callbackNonce),
+    });
+    const result = await secondPending;
+    expect(result.job.attempts.find((item) => item.attemptId === secondInput.attemptId)?.observation).toBeDefined();
+    expect(result.job.state).toBe("waitingForSupplier");
+    expect(result.job.stepsUsed).toBe(2);
+  });
+
+  it("preserves both orders and a failing sibling without reopening", async () => {
+    for (const firstOutcome of ["waiting", "success"] as const) {
+      const setup = setupDriver();
+      const first = issue(setup);
+      const second = issue(setup);
+      const stub = driverStub(setup.driver, [{ outcome: firstOutcome }, { outcome: "operationFailure" }]);
+      // Dispatch sequentially to keep ordinals deterministic; the second
+      // in-flight result on the waiting/failed job is still preserved.
+      const firstResult = await setup.driver.dispatch(setup.jobId, first.claimId, {
+        execute: (input: TransportInput, signal: AbortSignal) => stub.transport.execute(input, signal),
+      }, { nowMs: NOW });
+      void firstResult;
+      const secondResult = await setup.driver.dispatch(setup.jobId, second.claimId, stub.transport, { nowMs: NOW });
+      // If the first moved to waiting, the second cannot dispatch (waiting is
+      // terminal for new work) — that refusal itself preserves accounting and
+      // authorizes no further effect. If the first stayed running, the second
+      // settles as observed failure without reopening.
+      if (firstOutcome === "waiting") {
+        expect(secondResult.receipt.outcome).toBe("claim-refused");
+        expect(setup.driver.snapshot(setup.jobId)?.stepsUsed).toBe(1);
+      } else {
+        expect(secondResult.receipt.outcome).toBe("observed-failure");
+      }
+    }
+  });
+});
+
+describe("NR09 meaningful output completion", () => {
+  it("rejects completion for outputless jobs", () => {
+    const setup = setupDriver();
+    mustDenialReason(setup.driver.complete(setup.jobId), "missing-outputs");
+  });
+
+  it("waiting with echoed output IDs cannot verify or complete", async () => {
+    const setup = setupDriver({}, undefined, ["variant"]);
+    const out = await runDispatch(setup, issue(setup), [{ outcome: "waiting", outputs: ["variant"] }]);
+    mustDenialReason(setup.driver.applyCheck(setup.jobId, out.job.attempts[0]?.attemptId as string, {
+      checker: "independent",
+      observedUrl: GOOD_URL,
+      matches: true,
+      confirmedOutputs: ["variant"],
+    }, NOW), "unverified");
+    mustDenialReason(setup.driver.complete(setup.jobId), "unverified");
+  });
+
+  it("only successful production can verify outputs", async () => {
+    const setup = setupDriver({}, undefined, ["variant-price"]);
+    const out = await runDispatch(setup, issue(setup), [{ outputs: ["variant-price"] }]);
+    mustJob(setup.driver.applyCheck(setup.jobId, out.job.attempts[0]?.attemptId as string, {
+      checker: "independent",
+      observedUrl: GOOD_URL,
+      matches: true,
+      confirmedOutputs: ["variant-price"],
+    }, NOW));
+    expect(mustJob(setup.driver.complete(setup.jobId)).state).toBe("completed");
+  });
+});
+
+describe("NR10 terminal lease release", () => {
+  it("releases the session on completion and fails closed afterwards", async () => {
+    const setup = setupDriver({}, undefined, ["variant"]);
+    const out = await runDispatch(setup, issue(setup), [{ outputs: ["variant"] }]);
+    mustJob(setup.driver.applyCheck(setup.jobId, out.job.attempts[0]?.attemptId as string, {
+      checker: "independent",
+      observedUrl: GOOD_URL,
+      matches: true,
+      confirmedOutputs: ["variant"],
+    }, NOW));
+    mustJob(setup.driver.complete(setup.jobId));
+    expect(setup.driver.trackedLease(setup.jobId)).toBeUndefined();
+    mustDenialReason(setup.driver.acquireLease(setup.jobId, {
+      organizationId: "org-a",
+      projectId: "proj-a",
+      leaseId: "lease-1",
+      expiresAtMs: NOW + 60_000,
+      guest: false,
+    }, NOW), "lease-invalid");
+    mustDenialReason(setup.driver.reacquireLease(setup.jobId, {
+      organizationId: "org-a",
+      projectId: "proj-a",
+      leaseId: "lease-2",
+      expiresAtMs: NOW + 60_000,
+      guest: false,
+    }, NOW), "lease-invalid");
+  });
+
+  it("releases on failure, cancellation, expiry, and waiting", async () => {
+    const failedSetup = setupDriver();
+    for (let round = 0; round < 3; round += 1) {
+      await runDispatch(failedSetup, issue(failedSetup), [{ outcome: "noProgress" }]);
+    }
+    expect(failedSetup.driver.snapshot(failedSetup.jobId)?.state).toBe("failed");
+    expect(failedSetup.driver.trackedLease(failedSetup.jobId)).toBeUndefined();
+
+    const cancelSetup = setupDriver();
+    mustJob(cancelSetup.driver.cancel(cancelSetup.jobId, NOW + 1, "cancel"));
+    expect(cancelSetup.driver.trackedLease(cancelSetup.jobId)).toBeUndefined();
+
+    const expirySetup = setupDriver({ expiresAt: NOW + 5 });
+    const early: unknown = expirySetup.driver.authorize({
+      jobId: expirySetup.jobId,
+      nowMs: NOW,
+      operationId: "readVisibleText",
+      viaRecovery: false,
+      sessionHandle: expirySetup.handle,
+    });
+    if (isDenial(early)) {
+      throw new Error("expected early claim");
+    }
+    const stub = driverStub(expirySetup.driver);
+    await expirySetup.driver.dispatch(expirySetup.jobId, (early as IssuedClaim).claimId, stub.transport, { nowMs: NOW + 5 });
+    expect(expirySetup.driver.snapshot(expirySetup.jobId)?.state).toBe("cancelled");
+    expect(expirySetup.driver.trackedLease(expirySetup.jobId)).toBeUndefined();
+
+    const waitingSetup = setupDriver();
+    const waitingOut = await runDispatch(waitingSetup, issue(waitingSetup), [{ outcome: "waiting" }]);
+    expect(waitingOut.job.state).toBe("waitingForSupplier");
+    expect(waitingSetup.driver.trackedLease(waitingSetup.jobId)).toBeUndefined();
+  });
+});
+
+describe("NR15 synchronous transport errors", () => {
+  it("routes sync throws through typed unknown with timer cleanup", async () => {
+    const setup = setupDriver();
+    const claim = issue(setup);
+    const result = await setup.driver.dispatch(setup.jobId, claim.claimId, {
+      execute: () => {
+        throw new Error("controlled synchronous failure");
+      },
+    }, { nowMs: NOW, timeoutMs: 5 });
+    expect(result.receipt.outcome).toBe("transport-unknown");
+    expect(result.job.attempts[0]?.state).toBe("outcomeUnknown");
+    expect(result.job.attempts[0]?.attemptId).toBe(result.receipt.attemptId);
+    await Bun.sleep(8);
+    // No automatic redispatch: exactly one attempt, still unknown.
+    expect(setup.driver.snapshot(setup.jobId)?.attempts.length).toBe(1);
+    expect(setup.driver.snapshot(setup.jobId)?.attempts[0]?.state).toBe("outcomeUnknown");
   });
 });

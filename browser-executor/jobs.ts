@@ -33,7 +33,7 @@ import { denied, isDenial } from "./types.ts";
 import type { CallbackResult } from "./signing.ts";
 import { authorizeOperation } from "./operations.ts";
 import { checkTarget, validateDestination, validateNavigation } from "./policy.ts";
-import { parseRequiredOutputs } from "./validation.ts";
+import { parseObservation, parseRequiredOutputs } from "./validation.ts";
 
 /** ADR-0004 proposed default: three consecutive no-progress observations. */
 export const NON_PROGRESS_LIMIT = 3;
@@ -366,11 +366,103 @@ function classifyLateOutcome(
 }
 
 /**
+ * Shared destination precheck before replay admission: parses the unverified
+ * envelope and denies policy-forbidden URLs without consuming the rightful
+ * callback's nonce. Fail-closed: unparsable envelopes proceed to verification
+ * (which quarantines), allowed URLs proceed, disallowed URLs are quarantined
+ * with an explicit policy status and never become observed success.
+ */
+function precheckObservationDestination(
+  job: BrowserJob,
+  attemptId: string,
+  envelope: unknown,
+  nowMs: number,
+): { readonly job: BrowserJob; readonly receipt: { readonly attemptId: string; readonly outcome: "callback-rejected"; readonly detail: string } } | undefined {
+  let rawObservation: unknown;
+  try {
+    const fields = envelope as { readonly [key: string]: unknown };
+    if (typeof envelope !== "object" || envelope === null || Array.isArray(envelope)) {
+      return undefined;
+    }
+    rawObservation = fields.observation;
+    const parsed = parseObservation(rawObservation);
+    const check = validateDestination(parsed.url, job.request.allowedOrigins);
+    if (!check.ok) {
+      const held = quarantine(job, {
+        attemptId,
+        reason: check.reason,
+        detail: check.detail,
+        receivedAtMs: nowMs,
+      });
+      return {
+        job: held,
+        receipt: { attemptId, outcome: "callback-rejected", detail: `${check.reason}: ${check.detail}` },
+      };
+    }
+    return undefined;
+  } catch {
+    // Unparsable shape: let verification quarantine it without settling.
+    return undefined;
+  }
+}
+
+function failAttemptWithObservation(
+  job: BrowserJob,
+  attempt: AttemptRecord,
+  observation: BrowserObservation,
+): BrowserJob {
+  const failed: AttemptRecord = Object.freeze({
+    ...attempt,
+    state: "observedFailure" as AttemptState,
+    observation,
+  });
+  let current = replaceAttempt(job, failed);
+  current = Object.freeze({ ...current, nextObservationVersion: current.nextObservationVersion + 1 });
+  return current;
+}
+
+/**
+ * Reconcile an already-dispatched sibling outcome on a waiting/failed job
+ * without reopening the job or authorizing new work. The authenticated
+ * in-flight result is preserved with its truthful status, accounting and
+ * evidence are retained, and exactly one settlement per attempt is enforced
+ * by the dispatching/outcomeUnknown guard.
+ */
+function reconcileSiblingOutcome(
+  job: BrowserJob,
+  attempt: AttemptRecord,
+  observation: BrowserObservation,
+): { readonly job: BrowserJob; readonly failed: boolean } {
+  const failed =
+    observation.claimedOutcome === "blockedByPolicy" || observation.claimedOutcome === "operationFailure";
+  const settled: AttemptRecord = Object.freeze({
+    ...attempt,
+    state: (failed ? "observedFailure" : "observedSuccess") as AttemptState,
+    observation,
+    lateResult: false,
+  });
+  let current = replaceAttempt(job, settled);
+  current = Object.freeze({ ...current, nextObservationVersion: current.nextObservationVersion + 1 });
+  if (observation.claimedOutcome === "noProgress") {
+    current = Object.freeze({ ...current, consecutiveNoProgress: current.consecutiveNoProgress + 1 });
+  } else if (!failed) {
+    current = Object.freeze({ ...current, consecutiveNoProgress: 0 });
+  }
+  // Job state is deliberately unchanged: waiting stays waiting, failed stays
+  // failed. No new work is authorized by this reconciliation.
+  return { job: current, failed };
+}
+
+/**
  * Settle a dispatching attempt from its delivered callback. Verification,
  * binding, and replay failures are quarantined for inspection WITHOUT
  * settling the attempt, so a later valid callback can still be accepted
  * exactly once and no uncertain outcome is misreported as an observed
- * failure. A settled attempt on a job that has since been cancelled must go
+ * failure. Destination policy is shared with late settlement and checked
+ * BEFORE replay admission, so a policy-forbidden observation never consumes
+ * the rightful callback and never becomes observed success. Already-claimed
+ * sibling outcomes on waiting/failed jobs are reconciled without reopening
+ * the job. A settled attempt on a job that has since been cancelled must go
  * through recordLateObservation instead.
  */
 export function settleAttempt(
@@ -384,12 +476,20 @@ export function settleAttempt(
   if (job.state === "cancelled") {
     return denied("job-cancelled", "a cancelled job settles in-flight attempts via recordLateObservation");
   }
-  if (job.state !== "queued" && job.state !== "running") {
-    return terminalDenial(job.state);
-  }
   const attempt = job.attempts.find((item) => item.attemptId === attemptId);
   if (attempt === undefined || (attempt.state !== "dispatching" && attempt.state !== "outcomeUnknown")) {
     return denied("unknown-callback", `attempt "${attemptId}" is not awaiting a result`);
+  }
+  // Waiting/failed reconciliation still requires an awaiting attempt; the
+  // state check below separates live classification from sibling preservation.
+  const isLive = job.state === "queued" || job.state === "running";
+  if (!isLive && job.state !== "waitingForSupplier" && job.state !== "waitingForUser" && job.state !== "failed") {
+    return terminalDenial(job.state);
+  }
+
+  const prechecked = precheckObservationDestination(job, attemptId, envelope, nowMs);
+  if (prechecked !== undefined) {
+    return prechecked;
   }
 
   const verified = callbacks.verify(envelope, signature, job.nextObservationVersion);
@@ -418,13 +518,30 @@ export function settleAttempt(
       receipt: { attemptId, outcome: "callback-rejected", detail: "observation is bound to another job or attempt" },
     };
   }
+  // Defense in depth: precheck already denied forbidden URLs without consuming.
+  // If this ever triggers (allowlist changed mid-flight), retain the failure
+  // observation explicitly instead of dropping it, and never report success.
   const destinationCheck = validateDestination(observation.url, job.request.allowedOrigins);
   if (!destinationCheck.ok) {
-    const current = failAttempt(job, attemptId);
+    const current = failAttemptWithObservation(job, attempt, observation);
     return {
       job: current,
       receipt: { attemptId, outcome: "observed-failure", detail: `observed URL rejected: ${destinationCheck.detail}` },
     };
+  }
+
+  if (!isLive) {
+    const { job: current, failed } = reconcileSiblingOutcome(job, attempt, observation);
+    if (failed) {
+      return {
+        job: current,
+        receipt: { attemptId, outcome: "observed-failure", detail: `sibling in-flight result preserved as failure; job remains ${job.state}` },
+      };
+    }
+    if (observation.claimedOutcome === "noProgress") {
+      return { job: current, receipt: { attemptId, outcome: "observed-success", detail: "sibling no-progress preserved; job remains waiting/failed" } };
+    }
+    return { job: current, receipt: { attemptId, outcome: "observed-success", detail: `sibling in-flight result preserved; job remains ${job.state}` } };
   }
 
   const { job: current, failed } = classifyLiveOutcome(job, attempt, observation);
@@ -500,7 +617,9 @@ export interface LateReceipt {
  * Record a late read-only result for an in-flight attempt after
  * cancellation. The observation is preserved with its truthful status and
  * the job stays cancelled: no new work is authorized and no terminal
- * transition is applied.
+ * transition is applied. Destination policy is shared with normal settlement
+ * and checked BEFORE replay admission, so a policy-forbidden late observation
+ * never consumes the rightful callback and never becomes observed success.
  */
 export function recordLateObservation(
   job: BrowserJob,
@@ -520,6 +639,23 @@ export function recordLateObservation(
   if (attempt.state !== "dispatching" && attempt.state !== "outcomeUnknown") {
     return denied("invalid-transition", `attempt "${attemptId}" is already settled`);
   }
+  // Shared destination validation before replay admission.
+  try {
+    if (typeof envelope === "object" && envelope !== null && !Array.isArray(envelope)) {
+      const fields = envelope as { readonly [key: string]: unknown };
+      try {
+        const parsed = parseObservation(fields.observation);
+        const destCheck = validateDestination(parsed.url, job.request.allowedOrigins);
+        if (!destCheck.ok) {
+          return denied(destCheck.reason, `late observation destination rejected: ${destCheck.detail}`);
+        }
+      } catch {
+        // Unparsable: let verification handle it below.
+      }
+    }
+  } catch {
+    // Fall through to verification.
+  }
   const verified = callbacks.verify(envelope, signature, job.nextObservationVersion);
   if (!verified.ok) {
     return denied("bad-signature", `${verified.reason}: ${verified.detail}`);
@@ -527,6 +663,12 @@ export function recordLateObservation(
   const observation = verified.envelope.observation;
   if (observation.jobId !== job.request.jobId || observation.attemptId !== attemptId) {
     return denied("unknown-callback", "late observation is bound to another job or attempt");
+  }
+  // Defense in depth: precheck already denied forbidden late URLs without
+  // consuming. If this triggers, deny rather than recording success.
+  const lateDestCheck = validateDestination(observation.url, job.request.allowedOrigins);
+  if (!lateDestCheck.ok) {
+    return denied(lateDestCheck.reason, `late observation destination rejected: ${lateDestCheck.detail}`);
   }
   const next = classifyLateOutcome(job, attempt, observation);
   return {
@@ -545,9 +687,11 @@ export interface IndependentCheck {
 
 /**
  * Apply an independent result check. Only a separate independent check that
- * matches the recorded observation verifies an outcome, and every confirmed
- * output must appear in the observation's produced outputs; self-reported
- * success stays unverified and can never complete the job.
+ * matches a successful-production observation verifies an outcome: the
+ * observation must claim success (waiting/no-progress/blocked/failure never
+ * prove task outputs, even when producedOutputs echoes an ID), and every
+ * confirmed output must appear in the observation's produced outputs.
+ * Self-reported success stays unverified and can never complete the job.
  */
 export function applyIndependentCheck(
   job: BrowserJob,
@@ -561,6 +705,16 @@ export function applyIndependentCheck(
   }
   if (attempt.state !== "observedSuccess") {
     return denied("unverified", `attempt "${attemptId}" did not succeed`);
+  }
+  // Meaningful output semantics: only a successful production observation can
+  // evidence task outputs. Waiting/no-progress observations produce no outputs
+  // for completion, so a generic URL match or an echoed string ID on those
+  // states can never verify.
+  if (attempt.observation.claimedOutcome !== "success") {
+    return denied(
+      "unverified",
+      `attempt "${attemptId}" claimed "${attempt.observation.claimedOutcome}", not successful production; waiting/no-progress never prove outputs`,
+    );
   }
   if (check.checker !== "independent" || !check.matches || check.observedUrl !== attempt.observation.url) {
     return denied("unverified", "outcome lacks a matching independent check");
@@ -586,11 +740,15 @@ export function applyIndependentCheck(
 
 /**
  * Complete a job only with independently verified coverage of every
- * required output and no unsettled attempts. Waiting and no-progress
- * observations produce no outputs, so a generic URL match alone can never
- * complete a job that declares required outputs.
+ * required output and no unsettled attempts. Completion requires meaningful
+ * task outputs: outputless jobs (empty requiredOutputs) are explicitly
+ * rejected, and waiting/no-progress observations can never verify outputs, so
+ * a generic URL match alone can never complete any job.
  */
 export function tryComplete(job: BrowserJob): BrowserJob | Denial {
+  if (job.requiredOutputs.length === 0) {
+    return denied("missing-outputs", "completion requires meaningful task outputs; outputless jobs cannot complete");
+  }
   if (job.verifiedOutcomes.length === 0) {
     return denied("unverified", "completion needs at least one independently verified outcome");
   }

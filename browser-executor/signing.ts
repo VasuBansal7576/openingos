@@ -132,9 +132,11 @@ export interface CallbackEnvelope {
  * Bounded store of consumed callback nonces. Consumption is atomic:
  * tryConsume returns false when the nonce was already consumed or when no
  * capacity remains, and verification must treat false as a denial.
- * Markers are retained through their validity horizon; only expired markers
- * are purged, and purging never admits a still-valid replay because the
- * per-attempt version check independently rejects reused versions.
+ * Markers are retained through the entire allowed late-result horizon; an
+ * expired marker is never purged to re-admit the same signature. Purging only
+ * removes markers whose horizon plus the active-execution ceiling has passed,
+ * so replay stays denied at and after expiry while capacity stays bounded.
+ * A newly inserted already-expired marker is refused.
  */
 export interface NonceStore {
   isConsumed(nonce: string, nowMs: number): boolean;
@@ -143,11 +145,16 @@ export interface NonceStore {
 
 const NONCE_STORE_LIMIT = 10_000;
 
+/** Active-execution ceiling retained for late-result replay protection. */
+const NONCE_RETENTION_MS = 15 * 60 * 1_000;
+
 export function createMemoryNonceStore(): NonceStore {
   const seen = new Map<string, number>();
   function purge(nowMs: number): void {
     for (const [nonce, validUntilMs] of seen) {
-      if (validUntilMs <= nowMs) {
+      // Retain through the full late-result horizon: only purge markers whose
+      // validity plus retention has passed, never at validUntilMs itself.
+      if (validUntilMs + NONCE_RETENTION_MS <= nowMs) {
         seen.delete(nonce);
       }
     }
@@ -158,14 +165,19 @@ export function createMemoryNonceStore(): NonceStore {
       if (validUntilMs === undefined) {
         return false;
       }
-      if (validUntilMs <= nowMs) {
-        seen.delete(nonce);
-        return false;
-      }
+      // An expired-but-retained marker still counts as consumed: the same
+      // signed callback must never become acceptable again at/after expiry.
+      void nowMs;
+      void validUntilMs;
       return true;
     },
     tryConsume(nonce: string, validUntilMs: number, nowMs: number): boolean {
       if (nonce.trim().length === 0 || !Number.isFinite(validUntilMs)) {
+        return false;
+      }
+      // A newly inserted already-expired marker is refused: the acceptance
+      // horizon is [issue, validUntilMs), with exact equality already expired.
+      if (validUntilMs <= nowMs) {
         return false;
       }
       purge(nowMs);
@@ -219,8 +231,13 @@ function reject(reason: string, detail: string): CallbackResult {
  * Verify an executor callback. The expected issued nonce and the full
  * request/attempt context are validated before replay consumption, and
  * consumption is committed only together with acceptance: misrouted,
- * cross-tenant, stale, or forged callbacks leave the rightful result
- * consumable. A refused atomic consume fails closed.
+ * cross-tenant, stale, expired-horizon, or forged callbacks leave the rightful
+ * result consumable. A refused atomic consume fails closed. The acceptance
+ * horizon is [issue, validUntilMs): nowMs at or after validUntilMs is outside
+ * the horizon and rejected, and markers are retained past expiry so the same
+ * signature can never become acceptable again. Legitimate late reconciliation
+ * uses an explicitly retained expectation with its own horizon, never an
+ * indefinitely accepted expired callback.
  */
 export function verifyCallback(
   secret: string,
@@ -266,6 +283,14 @@ export function verifyCallback(
     return reject(
       "stale-callback",
       `version ${observation.observationVersion} does not match expected ${expected.version}`,
+    );
+  }
+  // Real callback/reconciliation acceptance horizon: reject at and after the
+  // horizon. Exact equality is already outside the horizon.
+  if (!Number.isFinite(expected.validUntilMs) || expected.nowMs >= expected.validUntilMs) {
+    return reject(
+      "stale-callback",
+      `callback outside acceptance horizon (now ${expected.nowMs} >= validUntil ${expected.validUntilMs})`,
     );
   }
   if (store.isConsumed(nonce, expected.nowMs)) {
