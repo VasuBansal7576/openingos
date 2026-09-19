@@ -166,11 +166,52 @@ function ipv6Verdict(host: string): NumericVerdict {
   }
   const g0 = groups[0] as number;
   const g1 = groups[1] as number;
+  const g2 = groups[2] as number;
+  const g3 = groups[3] as number;
+  const g4 = groups[4] as number;
+  const g5 = groups[5] as number;
   const allZero = groups.every((value) => value === 0);
   if (allZero) {
     return "private-network";
   }
   if (g0 === 0 && groups.slice(1, 7).every((value) => value === 0) && groups[7] === 1) {
+    return "private-network";
+  }
+  // IPv4-mapped ::ffff:0:0/96 — classify by the embedded IPv4 address so a
+  // public embedded address stays reachable while loopback/private stays shut.
+  if (
+    g0 === 0 &&
+    groups[2] === 0 &&
+    groups[3] === 0 &&
+    groups[4] === 0 &&
+    g5 === 0xffff
+  ) {
+    const embedded = (((groups[6] as number) * 65536 + (groups[7] as number)) >>> 0);
+    return ipv4Verdict(embedded);
+  }
+  // IPv4-compatible ::/96 (deprecated, includes ::127.0.0.1): reserved space.
+  // Unspecified and loopback are already denied above; anything else with the
+  // first 96 bits zero is reserved, never a public destination.
+  if (g0 === 0 && groups[1] === 0 && g2 === 0 && g3 === 0 && g4 === 0 && g5 === 0) {
+    return "private-network";
+  }
+  // 6to4 2002::/16 — classify by the embedded IPv4 address.
+  if (g0 === 0x2002) {
+    const embedded = (((g1 as number) * 65536 + (groups[2] as number)) >>> 0);
+    return ipv4Verdict(embedded);
+  }
+  // Discard-only 100::/64 (RFC 6666): 0100::/64, e.g. [100::1].
+  if (g0 === 0x0100 && g1 === 0 && g2 === 0 && g3 === 0) {
+    return "private-network";
+  }
+  // IPv4/IPv6 translation 0064:ff9b::/32 covers both the well-known
+  // 64:ff9b::/96 prefix and the local-use 64:ff9b:1::/48 prefix,
+  // e.g. [64:ff9b:1::a00:1]. Local-use translation space is never public.
+  if (g0 === 0x0064 && g1 === 0xff9b) {
+    return "private-network";
+  }
+  // Site-local fec0::/10 (deprecated, distinct from fe80::/10 link-local).
+  if ((g0 & 0xffc0) === 0xfec0) {
     return "private-network";
   }
   if ((g0 & 0xffc0) === 0xfe80) {
@@ -182,22 +223,27 @@ function ipv6Verdict(host: string): NumericVerdict {
   if ((g0 & 0xff00) === 0xff00) {
     return "private-network";
   }
+  // IETF protocol assignments 2001::/23 (Teredo, benchmarking, ORCHID, etc.).
+  if (g0 === 0x2001 && (g1 & 0xfe00) === 0x0000) {
+    return "private-network";
+  }
+  // Documentation 2001:db8::/32 (outside 2001::/23, inside global unicast).
   if (g0 === 0x2001 && g1 === 0x0db8) {
     return "private-network";
   }
-  if (
-    g0 === 0 &&
-    groups[2] === 0 &&
-    groups[3] === 0 &&
-    groups[4] === 0 &&
-    groups[5] === 0xffff
-  ) {
-    const embedded = (((groups[6] as number) * 65536 + (groups[7] as number)) >>> 0);
-    return ipv4Verdict(embedded);
+  // Explicit Teredo 2001::/32 guard (also covered by 2001::/23).
+  if (g0 === 0x2001 && g1 === 0x0000) {
+    return "private-network";
   }
-  if (g0 === 0x2002) {
-    const embedded = (((g1 as number) * 65536 + (groups[2] as number)) >>> 0);
-    return ipv4Verdict(embedded);
+  // Benchmarking 2001:2::/48 guard (also covered by 2001::/23).
+  if (g0 === 0x2001 && g1 === 0x0002 && g2 === 0x0000) {
+    return "private-network";
+  }
+  // Only global unicast 2000::/3 (001...) can be public. This fences
+  // reserved space such as 4000::/23 (010...), 5f00::/16 segment routing,
+  // and any other non-global range not explicitly listed above.
+  if ((g0 & 0xe000) !== 0x2000) {
+    return "private-network";
   }
   return "ok";
 }

@@ -75,7 +75,7 @@ export type {
   TransportResult,
   VerifiedOutcome,
 } from "./jobs.ts";
-export { ControlledDriver, DEFAULT_STEP_TIMEOUT_MS } from "./driver.ts";
+export { ControlledDriver, DEFAULT_STEP_TIMEOUT_MS, ACTIVE_JOB_CEILING_MS } from "./driver.ts";
 export type {
   ControlledDriverOptions,
   DriverAuthorizeInput,
