@@ -6,10 +6,10 @@ This file supplies order, not duplicate contracts or a running automation.
 
 ## Build order
 
-1. [ ] **Preflight.** Astra coordinates and verifies effective worker models, isolated worktrees, credentials and scoped native permission handling.
+1. [x] **Preflight.** The active OpeningOS orchestrator verifies effective worker models, isolated worktrees, credentials and scoped native permission handling.
    Load Orca's installed, version-matched orchestration guide.
-   Its inspected OpenCode route requires an explicit `opencode --model opencode-go/muse-spark-1.3-contributor` terminal, then supervised `worker-start --terminal` attachment after readiness.
-   Verify current support rather than using an unsupported OpenCode `--model` flag or unsupervised injection.
+   The verified OpenCode route supplies an `openingos-worker` agent through `OPENCODE_CONFIG_CONTENT`, starts `opencode --agent openingos-worker`, confirms `opencode-go/muse-spark-1.3-contributor` with the `high` variant in the TUI, then attaches it through supervised `worker-start --terminal`.
+   Codex workers and reviewers start in explicit normally sandboxed terminals before supervised attachment; do not use launch paths that add security-bypass flags.
    Test an innocuous worker question and an actual native approval path; Orca `ask/reply` alone is not sandbox approval.
 2. [ ] **F0, foundation proofs.** Configure OpenCode's official Convex skills/MCP and verify both workers can access the project skills.
    Once the app contains Convex, run `npx convex ai-files status`, install missing/stale managed AI files, and read the generated guidelines.
@@ -31,10 +31,10 @@ This file supplies order, not duplicate contracts or a running automation.
 ## Verified progress
 
 - [x] Read the project instructions, package plan, ADR register and installed Orca orchestration guide.
-- [x] Verify coordinator and separate reviewer sessions use OpenAI `gpt-6-astra`; both report `xhigh` effort.
-- [x] Verify Codex worker session metadata reports OpenAI `gpt-5.6-luna` with requested `max` effort.
+- [x] Verify the active coordinator is GPT-5.6 Sol and a separate normally sandboxed reviewer terminal reports OpenAI `gpt-6-astra` with `xhigh` effort.
+- [x] Verify the normally sandboxed Codex worker session metadata reports OpenAI `gpt-5.6-luna` with requested `max` effort and no security-bypass launch flag.
 - [x] Verify OpenCode session messages report `opencode-go/muse-spark-1.3-contributor` with `high` variant.
-- [x] Create isolated Luna and Muse Spark worktrees from `987b4ab`; both can read the tracked factory skill.
+- [x] Create isolated Luna and Muse Spark worktrees from reviewed checkpoint `3bbb1b7`; both can read the tracked factory skill.
 - [x] Exercise native scoped approvals: Codex's harmless print command and OpenCode's one-time shell approval.
 - [x] Exercise OpenCode's Orca question/reply round trip.
 - [x] Finish Codex's Orca question/reply and lifecycle round trip under scoped IPC approval.
@@ -45,6 +45,7 @@ This file supplies order, not duplicate contracts or a running automation.
 - [x] Have the independent Astra session review fixed commits, route findings to their owners and verify all M1–M7/RJ1–RJ7 repairs at `595d30c`.
 - [ ] Verify hosted environment, application credentials, provider allowances and owner recipient.
 - [x] Integrate and review the independent financial and Jev contract proofs.
+- [x] Integrate browser-executor controlled contract proof `714155f`; pass 51 tests for signed requests, replay and session isolation, target freshness, blocked write operations, cancellation, bounded recovery and independent completion checks.
 - [x] Shut down settled worker/reviewer sessions and remove both completed worker worktrees through Orca after verifying clean status and remote preservation.
 
 The completed wave contains controlled proofs only, reviewed at `595d30c` with no actionable findings remaining.
@@ -64,11 +65,13 @@ The next build gate needs a hosted environment, application credentials, provide
 - Push meaningful checkpoints, inspect every expected check on the latest remote commit, and fix failures.
 - Verify Greptile on the first authorized real PR and address its findings; its current green check does not enforce a confidence threshold.
 - Be the sole `hackathon.md` writer after verified integrated checkpoints and before pausing; workers supply evidence.
+- Keep these checkboxes current after each verified wave, and never convert controlled evidence into a live-provider or deployment claim.
+- Match the selected workbench prototype's visual polish, smoothness and user flow while sourcing every displayed outcome from real application state; inspect any later supplied recording and finish with Playwright or Computer Use at desktop and narrow widths.
 - Settle workers before safe worktree cleanup under `AGENTS.md`; preserve the active/main checkout and anything not backed up remotely.
 - On a genuine external blocker, continue independent work and report the exact missing authority or input once.
 
 ## Owner-supplied dependencies
 
 The owner handles the new Firecrawl account/credits, registration/eligibility, video, announcement and final submission.
-Astra handles integration setup and proof, but cannot invent a receiving mailbox, API credentials, paid-spend authority or publication approval.
+The coordinator handles integration setup and proof, but cannot invent a receiving mailbox, API credentials, paid-spend authority or publication approval.
 Use privately configured values; default to no paid overages and no live operation without a defensible authorized cost bound.
