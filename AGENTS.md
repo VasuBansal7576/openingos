@@ -8,9 +8,11 @@ That is a tracked project skill, loaded through this file rather than a global i
 
 ## Current state
 
-The repository contains requirements, delivery preparation, and three fixture-only frontend design walkthroughs in `prototypes/openingos` on the `codex/prototype-design-flows` branch.
-These are exploratory screens, not the implemented production application or a settled architecture.
-Visual concepts are proposals until the user chooses a direction.
+The user selected the purchasing workbench and rejected the opening-scene and price-route designs.
+The complete selected fixture prototype is preserved in `design/purchasing-workbench.html`, including its images, fonts and runtime.
+It is a design reference, not production application code or an approved architecture.
+Do not reintroduce rejected designs, a design switcher, or prototype build infrastructure.
+Keep future design explorations as lightweight clickable screens unless the user asks for application engineering.
 Do not treat proposed ADRs, a green tooling check, or demonstration fixtures as completed product behavior.
 
 ## Work boundaries

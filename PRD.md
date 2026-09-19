@@ -1,6 +1,6 @@
 # OpeningOS product requirements
 
-Revision: 6, September 19, 2026.
+Revision: 7, September 19, 2026.
 Status: proposed product specification, revised from the supplied PRD and its review.
 This document defines intended behavior, not implemented capabilities.
 The original numbered sections retain their subject and numbering.
@@ -23,7 +23,8 @@ It connects requirements, evidence, quotes, approvals, orders, equipment, and ac
 - Distinguished unrelated requests, relevant but unimplemented capabilities, and legitimate contextual follow-ups.
 - Required backend capability checks alongside request classification, with no expansion of authority through prompts, source content, or recovery.
 - Added D-17 for product-scope enforcement while preserving all 51 existing acceptance criteria and launch-only planning sections.
-- Reopened visual exploration with ChatGPT ImageGen; no concept or visual system is approved yet.
+- Recorded the user's selection of the purchasing workbench and rejection of the opening-scene and price-route alternatives.
+- Preserved the complete selected fixture flow in `design/purchasing-workbench.html`; this is not production architecture or live functionality.
 
 ### Scope of this revision
 
@@ -393,9 +394,13 @@ The first three exploratory concepts established possible screen structures but 
 A further ChatGPT ImageGen pass explores stronger visual identity, typography, and purposeful imagery while keeping comparison and source inspection central.
 Further exploration varies composition and interaction, including equipment-linked café imagery, visual cost comparisons, and a document workbench rather than only changing colors or fonts.
 Illustrative spatial scenes do not establish measured site fit or add a floor-plan editing requirement.
-No concept is accepted yet, and illustrative contents are not product data, exact copy, verified specifications, or additional requirements.
-Choose the primary direction with the user before UI implementation.
-Then settle navigation, comparison and evidence behavior, responsive layout, typography, colors, and required interface states in a small UI specification tied to the evaluator path.
+The user accepted the purchasing workbench on September 19, 2026 and rejected the opening-scene and price-route directions.
+The complete accepted flow is preserved as the self-contained `design/purchasing-workbench.html` reference.
+Use the sage desk, cream quote papers, forest-green controls, warm yellow actions, and editorial typography as the visual direction.
+Use real accessible text and controls, with focused stacked records on narrow screens, not a raster screenshot or mandatory drag-and-drop.
+Illustrative suppliers, prices, timestamps, copy and asset specifications are not verified product data or additional requirements.
+The prototype's fixture logic, research timing and scripted assistant are not production contracts.
+Production navigation, evidence handling and missing states must satisfy the evaluator path and the accepted ADRs.
 Validate the chosen flow with a clickable implementation and actual keyboard and narrow-screen checks; generated images cannot verify interaction or accessibility.
 
 ## 13. Requirement detail screen

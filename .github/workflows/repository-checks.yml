@@ -19,17 +19,13 @@ jobs:
           persist-credentials: false
       - name: Test the CI inspection helper, not the application
         run: node --test scripts/check-pr.test.mjs
-  prototype-build:
-    name: prototype-build
+  workbench-artifact-tests:
+    name: workbench-artifact-tests
     runs-on: ubuntu-24.04
     timeout-minutes: 5
-    defaults:
-      run:
-        working-directory: prototypes/openingos
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - run: npm ci
-      - run: npm run build
-      - run: npm run test:sites
+      - name: Validate the self-contained selected design, not production behavior
+        run: node --test scripts/check-workbench.test.mjs

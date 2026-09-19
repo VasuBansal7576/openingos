@@ -2,7 +2,7 @@
 
 - **Project:** OpeningOS
 - **Event:** Convex All Gas Hackathon
-- **What it does:** Café procurement and equipment coordination concept with three fixture-only frontend design walkthroughs; production application and backend not implemented yet.
+- **What it does:** Café procurement and equipment coordination concept with an accepted purchasing-workbench prototype; production application and backend not implemented yet.
 - **Live app:** not deployed
 - **Repo:** https://github.com/VasuBansal7576/openingos
 - **Frontend:** Codex Sites
@@ -12,7 +12,7 @@
 - **Auth:** none
 - **AI models:** none
 - **Started:** 2026-09-19T09:46:19Z
-- **Last updated:** 2026-09-19T14:17:22Z
+- **Last updated:** 2026-09-19T14:31:35Z
 
 ## Log
 
@@ -65,3 +65,11 @@ Added generated café, product and desk imagery, editable brief screens, researc
 Browser smoke checks exercised selection with unchanged committed/paid totals, revised quote display, recovery, service-case preparation and a scripted unrelated-request refusal; build passed locally.
 These are fictional, in-memory prototypes, not live research, model classification, supplier communication, production safeguards or Convex integration; nothing was deployed.
 The user clarified that this should remain a quick screen walkthrough rather than further application engineering; full design QA remains incomplete.
+
+### 2026-09-19 - working tree
+
+The user selected the purchasing workbench and rejected the other two designs.
+Preserved its complete fixture flow, images, fonts and runtime in `design/purchasing-workbench.html`, then removed the obsolete multi-design project, dependencies and build output from the workspace.
+The old source remains recoverable from Git commit `915844a`; the standalone artifact passed four structural checks and the existing 19 delivery-helper tests passed.
+Direct local-file browser verification was blocked by the browser tool's URL policy, so the export is not claimed as fully browser-retested.
+Recorded the accepted visual direction in `PRD.md` and `AGENTS.md`; production behavior and deployment remain unimplemented.
