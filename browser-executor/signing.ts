@@ -4,10 +4,16 @@
 // this proof, never a real credential). Signatures use HMAC-SHA256 over a
 // canonical JSON encoding of the validated payload so semantically identical
 // payloads always produce identical bytes.
+//
+// Callback verification validates the expected issued nonce and the full
+// request/attempt context BEFORE consuming replay state, and consumption is
+// committed atomically with acceptance: a callback routed to the wrong job,
+// another tenant, or an old grant/lease is rejected without burning the
+// rightful result's nonce. A refused atomic consume (already consumed or
+// store at capacity) fails closed.
 
 import { createHmac, timingSafeEqual } from "node:crypto";
-import type { BrowserJobRequest, BrowserObservation, Decision } from "./types.ts";
-import { denied } from "./types.ts";
+import type { BrowserJobRequest, BrowserObservation } from "./types.ts";
 import { parseJobRequest, parseObservation } from "./validation.ts";
 
 export const SIGNATURE_VERSION = "hmac-sha256-1";
@@ -20,7 +26,10 @@ function canonicalize(input: unknown, seen: Set<object>): string {
   if (kind === "string") {
     return JSON.stringify(input) as string;
   }
-  if (kind === "number" || kind === "boolean") {
+  if (kind === "boolean") {
+    return input ? "true" : "false";
+  }
+  if (kind === "number") {
     if (!Number.isFinite(input)) {
       throw new TypeError("canonical payload must contain only finite numbers");
     }
@@ -102,6 +111,15 @@ export function verifyJobRequest(
   return request;
 }
 
+/**
+ * Immutable digest of the authorized request's authority and versions
+ * (organization, project, grant, input, lease, catalog, origins, expiry).
+ * Observations echo it so a callback is bound to exactly one issued request.
+ */
+export function computeRequestDigest(secret: string, request: BrowserJobRequest): string {
+  return hmacHex(secret, `browser-request-digest\u0000${canonicalJson(request)}`);
+}
+
 export interface CallbackEnvelope {
   readonly jobId: string;
   readonly attemptId: string;
@@ -110,32 +128,54 @@ export interface CallbackEnvelope {
   readonly observation: BrowserObservation;
 }
 
-/** Bounded store of consumed callback nonces; injected so tests stay deterministic. */
+/**
+ * Bounded store of consumed callback nonces. Consumption is atomic:
+ * tryConsume returns false when the nonce was already consumed or when no
+ * capacity remains, and verification must treat false as a denial.
+ * Markers are retained through their validity horizon; only expired markers
+ * are purged, and purging never admits a still-valid replay because the
+ * per-attempt version check independently rejects reused versions.
+ */
 export interface NonceStore {
-  has(nonce: string): boolean;
-  /** Returns false when the nonce was already consumed (a replay). */
-  consume(nonce: string): boolean;
+  isConsumed(nonce: string, nowMs: number): boolean;
+  tryConsume(nonce: string, validUntilMs: number, nowMs: number): boolean;
 }
 
 const NONCE_STORE_LIMIT = 10_000;
 
 export function createMemoryNonceStore(): NonceStore {
   const seen = new Map<string, number>();
+  function purge(nowMs: number): void {
+    for (const [nonce, validUntilMs] of seen) {
+      if (validUntilMs <= nowMs) {
+        seen.delete(nonce);
+      }
+    }
+  }
   return {
-    has(nonce: string): boolean {
-      return seen.has(nonce);
+    isConsumed(nonce: string, nowMs: number): boolean {
+      const validUntilMs = seen.get(nonce);
+      if (validUntilMs === undefined) {
+        return false;
+      }
+      if (validUntilMs <= nowMs) {
+        seen.delete(nonce);
+        return false;
+      }
+      return true;
     },
-    consume(nonce: string): boolean {
+    tryConsume(nonce: string, validUntilMs: number, nowMs: number): boolean {
+      if (nonce.trim().length === 0 || !Number.isFinite(validUntilMs)) {
+        return false;
+      }
+      purge(nowMs);
       if (seen.has(nonce)) {
         return false;
       }
       if (seen.size >= NONCE_STORE_LIMIT) {
-        const oldest = seen.keys().next();
-        if (!oldest.done) {
-          seen.delete(oldest.value);
-        }
+        return false;
       }
-      seen.set(nonce, Date.now());
+      seen.set(nonce, validUntilMs);
       return true;
     },
   };
@@ -153,6 +193,17 @@ export function signObservation(
   return hmacHex(secret, `browser-observation\u0000${nonce}\u0000${canonical}`);
 }
 
+/** The issued context a callback must match before replay state is touched. */
+export interface CallbackExpectation {
+  readonly nonce: string;
+  readonly requestDigest: string;
+  readonly jobId: string;
+  readonly attemptId: string;
+  readonly version: number;
+  readonly validUntilMs: number;
+  readonly nowMs: number;
+}
+
 export interface CallbackAccept {
   readonly ok: true;
   readonly envelope: CallbackEnvelope;
@@ -160,54 +211,69 @@ export interface CallbackAccept {
 
 export type CallbackResult = CallbackAccept | { readonly ok: false; readonly reason: string; readonly detail: string };
 
+function reject(reason: string, detail: string): CallbackResult {
+  return { ok: false, reason, detail };
+}
+
 /**
- * Verify an executor callback: signature first, then replay protection, then
- * per-attempt version ordering (a stale observation version is rejected even
- * with a valid signature). `expectedVersion` is the next version the job
- * will accept for `attemptId`, tracked by the job module.
- *
- * The envelope carries the observation plus its one-time `callbackNonce`;
- * the nonce is covered by the signature but is not part of the observation.
+ * Verify an executor callback. The expected issued nonce and the full
+ * request/attempt context are validated before replay consumption, and
+ * consumption is committed only together with acceptance: misrouted,
+ * cross-tenant, stale, or forged callbacks leave the rightful result
+ * consumable. A refused atomic consume fails closed.
  */
 export function verifyCallback(
   secret: string,
   store: NonceStore,
   envelope: unknown,
   signature: unknown,
-  expectedVersion: number,
+  expected: CallbackExpectation,
 ): CallbackResult {
   if (typeof envelope !== "object" || envelope === null || Array.isArray(envelope)) {
-    return { ok: false, reason: "invalid-callback", detail: "envelope must be an object" };
+    return reject("invalid-callback", "envelope must be an object");
   }
   const fields = envelope as { readonly [key: string]: unknown };
   let observation: BrowserObservation;
   try {
     observation = parseObservation(fields.observation);
   } catch (error) {
-    return { ok: false, reason: "invalid-callback", detail: error instanceof Error ? error.message : "invalid" };
+    return reject("invalid-callback", error instanceof Error ? error.message : "invalid");
   }
   const nonce = fields.callbackNonce;
   if (typeof nonce !== "string" || nonce.trim().length === 0) {
-    return { ok: false, reason: "invalid-callback", detail: "callbackNonce missing" };
+    return reject("invalid-callback", "callbackNonce missing");
   }
-  const canonical = canonicalJson(observation);
-  const expected = hmacHex(secret, `browser-observation\u0000${nonce}\u0000${canonical}`);
-  if (!equalHex(expected, signature)) {
-    const decision: Decision = denied("bad-signature", "callback signature mismatch");
-    return { ok: false, reason: decision.reason, detail: decision.detail };
+  if (nonce !== expected.nonce) {
+    return reject("unknown-callback", "callback nonce was not issued for this attempt");
   }
-  if (store.has(nonce)) {
-    const decision: Decision = denied("replay-detected", `nonce "${nonce}" was already consumed`);
-    return { ok: false, reason: decision.reason, detail: decision.detail };
+  if (observation.requestDigest !== expected.requestDigest) {
+    return reject("unknown-callback", "callback answers a different authorized request");
   }
-  if (observation.observationVersion !== expectedVersion) {
-    const decision: Decision = denied(
+  if (observation.jobId !== expected.jobId || observation.attemptId !== expected.attemptId) {
+    return reject("unknown-callback", "callback is bound to another job or attempt");
+  }
+  let canonical: string;
+  try {
+    canonical = canonicalJson(observation);
+  } catch (error) {
+    return reject("invalid-callback", error instanceof Error ? error.message : "not canonicalizable");
+  }
+  const expectedSignature = hmacHex(secret, `browser-observation\u0000${nonce}\u0000${canonical}`);
+  if (!equalHex(expectedSignature, signature)) {
+    return reject("bad-signature", "callback signature mismatch");
+  }
+  if (observation.observationVersion !== expected.version) {
+    return reject(
       "stale-callback",
-      `version ${observation.observationVersion} does not match expected ${expectedVersion}`,
+      `version ${observation.observationVersion} does not match expected ${expected.version}`,
     );
-    return { ok: false, reason: decision.reason, detail: decision.detail };
   }
-  store.consume(nonce);
+  if (store.isConsumed(nonce, expected.nowMs)) {
+    return reject("replay-detected", `nonce was already consumed`);
+  }
+  if (!store.tryConsume(nonce, expected.validUntilMs, expected.nowMs)) {
+    return reject("nonce-store-full", "replay store refused admission; failing closed");
+  }
   const accepted: CallbackEnvelope = Object.freeze({
     jobId: observation.jobId,
     attemptId: observation.attemptId,

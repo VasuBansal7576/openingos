@@ -8,7 +8,7 @@
 // inherited from any developer machine; the registry only mints fresh
 // opaque handles.
 
-import type { Decision } from "./types.ts";
+import type { Decision, Denial } from "./types.ts";
 import { denied } from "./types.ts";
 
 export interface LeaseSpec {
@@ -42,13 +42,13 @@ interface LeaseEntry {
 }
 
 export interface SessionRegistry {
-  acquire(spec: LeaseSpec, nowMs: number): SessionLease | Decision;
-  resolve(handle: string, context: LeaseContext, nowMs: number): SessionLease | Decision;
+  acquire(spec: LeaseSpec, nowMs: number): SessionLease | Denial;
+  resolve(handle: string, context: LeaseContext, nowMs: number): SessionLease | Denial;
   release(handle: string, context: LeaseContext): Decision;
 }
 
-function isDecision(value: SessionLease | Decision): value is Decision {
-  return (value as Decision).ok === false;
+function isDecision(value: SessionLease | Denial): value is Denial {
+  return (value as Denial).ok === false;
 }
 
 export function createSessionRegistry(): SessionRegistry {
@@ -65,7 +65,7 @@ export function createSessionRegistry(): SessionRegistry {
   }
 
   return {
-    acquire(spec: LeaseSpec, nowMs: number): SessionLease | Decision {
+    acquire(spec: LeaseSpec, nowMs: number): SessionLease | Denial {
       if (nowMs >= spec.expiresAtMs) {
         return denied("lease-invalid", `lease "${spec.leaseId}" is already expired`);
       }
@@ -94,7 +94,7 @@ export function createSessionRegistry(): SessionRegistry {
       return lease;
     },
 
-    resolve(handle: string, context: LeaseContext, nowMs: number): SessionLease | Decision {
+    resolve(handle: string, context: LeaseContext, nowMs: number): SessionLease | Denial {
       const entry = byHandle.get(handle);
       if (entry === undefined) {
         return denied("lease-invalid", "unknown session handle");
@@ -143,6 +143,6 @@ export function createSessionRegistry(): SessionRegistry {
   };
 }
 
-export function isLeaseDecision(value: SessionLease | Decision): value is Decision {
+export function isLeaseDecision(value: SessionLease | Denial): value is Denial {
   return isDecision(value);
 }

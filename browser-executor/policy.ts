@@ -3,9 +3,12 @@
 // Model output never becomes a navigation destination unchecked: every URL
 // (including every redirect hop) must be https, outside private/reserved
 // network ranges and cloud metadata endpoints, and inside the job's allowed
-// origins. Interaction targets must originate in the current observed DOM
-// state: unknown target IDs (arbitrary selector strings), stale document
-// versions, and occluded targets are all denied.
+// origins. Numeric addresses are classified by complete CIDR rules after
+// WHATWG URL normalization (which already folds alternate IPv4 forms such as
+// octal, hexadecimal, and integer notation into dotted decimal).
+// Interaction targets must originate in the current observed DOM state:
+// unknown target IDs (arbitrary selector strings), stale document versions,
+// and occluded targets are all denied.
 
 import type { Decision, ObservedTarget } from "./types.ts";
 import { approved, denied } from "./types.ts";
@@ -29,9 +32,6 @@ function parseIpv4(host: string): number | undefined {
     if (!Number.isInteger(octet) || octet < 0 || octet > 255) {
       return undefined;
     }
-    if (part.length > 1 && part.startsWith("0")) {
-      return undefined;
-    }
     value = value * 256 + octet;
   }
   return value >>> 0;
@@ -42,71 +42,162 @@ function inRange(address: number, base: number, bits: number): boolean {
   return (address >>> shift) === (base >>> shift);
 }
 
-const IPV4_LOOPBACK = 0x7f000000;
-const IPV4_PRIVATE_10 = 0x0a000000;
-const IPV4_PRIVATE_172 = 0xac100000;
-const IPV4_LINK_LOCAL = 0xa9fe0000;
-const IPV4_THIS_NETWORK = 0x00000000;
-const IPV4_CGNAT = 0x64400000;
+type NumericVerdict = "ok" | "private-network" | "metadata-endpoint";
 
-function ipv4Verdict(address: number): "ok" | "private-network" | "metadata-endpoint" {
-  if (inRange(address, IPV4_THIS_NETWORK, 8)) {
+function ipv4Verdict(address: number): NumericVerdict {
+  if (inRange(address, 0x00000000, 8)) {
     return "private-network";
   }
-  if (inRange(address, IPV4_LOOPBACK, 8)) {
+  if (inRange(address, 0x7f000000, 8)) {
     return "private-network";
   }
-  if (inRange(address, IPV4_PRIVATE_10, 8)) {
+  if (inRange(address, 0x0a000000, 8)) {
     return "private-network";
   }
-  if (inRange(address, IPV4_PRIVATE_172, 12)) {
+  if (inRange(address, 0xac100000, 12)) {
     return "private-network";
   }
   if (inRange(address, 0xc0a80000, 16)) {
     return "private-network";
   }
-  if (inRange(address, IPV4_CGNAT, 10)) {
+  if (inRange(address, 0x64400000, 10)) {
     return "private-network";
   }
-  if (inRange(address, IPV4_LINK_LOCAL, 16)) {
+  if (inRange(address, 0xa9fe0000, 16)) {
     return "metadata-endpoint";
+  }
+  if (inRange(address, 0xe0000000, 4)) {
+    return "private-network";
+  }
+  if (inRange(address, 0xf0000000, 4)) {
+    return "private-network";
+  }
+  if (inRange(address, 0xc0000200, 24)) {
+    return "private-network";
+  }
+  if (inRange(address, 0xc6336400, 24)) {
+    return "private-network";
+  }
+  if (inRange(address, 0xcb007100, 24)) {
+    return "private-network";
+  }
+  if (inRange(address, 0xc6120000, 15)) {
+    return "private-network";
+  }
+  if (inRange(address, 0xc0000000, 24)) {
+    return "private-network";
   }
   return "ok";
 }
 
-function ipv6Verdict(host: string): "ok" | "private-network" | "metadata-endpoint" {
-  const lower = host.toLowerCase();
-  if (lower === "::1" || lower === "::" || lower === "::ffff:127.0.0.1") {
+function parseHextet(text: string): number | undefined {
+  if (text.length === 0 || text.length > 4 || !/^[0-9a-fA-F]+$/.test(text)) {
+    return undefined;
+  }
+  return Number.parseInt(text, 16);
+}
+
+/** Expand an IPv6 literal (brackets already stripped) into eight groups. */
+function expandIpv6(host: string): readonly number[] | undefined {
+  let working = host;
+  let tail: readonly number[] = [];
+  const dotIndex = working.lastIndexOf(".");
+  if (dotIndex !== -1) {
+    const colonBefore = working.lastIndexOf(":", dotIndex);
+    if (colonBefore === -1) {
+      return undefined;
+    }
+    const embedded = parseIpv4(working.slice(colonBefore + 1));
+    if (embedded === undefined) {
+      return undefined;
+    }
+    tail = [(embedded >>> 16) & 0xffff, embedded & 0xffff];
+    working = working.slice(0, colonBefore);
+    if (working.endsWith(":")) {
+      working = `${working}0`;
+    }
+  }
+  const halves = working.split("::");
+  if (halves.length > 2) {
+    return undefined;
+  }
+  const first = halves[0] as string;
+  const head = first === "" ? [] : first.split(":");
+  const rest = halves.length === 2 ? (halves[1] as string) : undefined;
+  const body = rest === undefined ? [] : rest === "" ? [] : rest.split(":");
+  if (halves.length === 1 && head.length + tail.length !== 8) {
+    return undefined;
+  }
+  const groups: number[] = [];
+  for (const text of head) {
+    const value = parseHextet(text);
+    if (value === undefined) {
+      return undefined;
+    }
+    groups.push(value);
+  }
+  const zeros = 8 - tail.length - groups.length - body.length;
+  if (halves.length === 2 && zeros < 0) {
+    return undefined;
+  }
+  for (let index = 0; index < zeros; index += 1) {
+    groups.push(0);
+  }
+  for (const text of body) {
+    const value = parseHextet(text);
+    if (value === undefined) {
+      return undefined;
+    }
+    groups.push(value);
+  }
+  for (const value of tail) {
+    groups.push(value);
+  }
+  if (groups.length !== 8) {
+    return undefined;
+  }
+  return groups;
+}
+
+function ipv6Verdict(host: string): NumericVerdict {
+  const groups = expandIpv6(host);
+  if (groups === undefined) {
     return "private-network";
   }
-  if (lower.startsWith("fe80:") || lower.startsWith("fe80::")) {
+  const g0 = groups[0] as number;
+  const g1 = groups[1] as number;
+  const allZero = groups.every((value) => value === 0);
+  if (allZero) {
+    return "private-network";
+  }
+  if (g0 === 0 && groups.slice(1, 7).every((value) => value === 0) && groups[7] === 1) {
+    return "private-network";
+  }
+  if ((g0 & 0xffc0) === 0xfe80) {
+    return "private-network";
+  }
+  if ((g0 & 0xfe00) === 0xfc00) {
+    return "private-network";
+  }
+  if ((g0 & 0xff00) === 0xff00) {
+    return "private-network";
+  }
+  if (g0 === 0x2001 && g1 === 0x0db8) {
     return "private-network";
   }
   if (
-    lower.startsWith("fc") ||
-    lower.startsWith("fd") ||
-    lower === "fc00::" ||
-    lower.startsWith("fc00:") ||
-    lower.startsWith("fd00:")
+    g0 === 0 &&
+    groups[2] === 0 &&
+    groups[3] === 0 &&
+    groups[4] === 0 &&
+    groups[5] === 0xffff
   ) {
-    const firstByte = Number.parseInt(lower.slice(0, 2), 16);
-    if (Number.isInteger(firstByte) && (firstByte & 0xfe) === 0xfc) {
-      return "private-network";
-    }
-  }
-  if (lower.startsWith("ff")) {
-    return "private-network";
-  }
-  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(lower);
-  if (mapped !== null) {
-    const embedded = parseIpv4(mapped[1] as string);
-    if (embedded === undefined) {
-      return "private-network";
-    }
+    const embedded = (((groups[6] as number) * 65536 + (groups[7] as number)) >>> 0);
     return ipv4Verdict(embedded);
   }
-  if (lower.includes(".")) {
-    return "private-network";
+  if (g0 === 0x2002) {
+    const embedded = (((g1 as number) * 65536 + (groups[2] as number)) >>> 0);
+    return ipv4Verdict(embedded);
   }
   return "ok";
 }
@@ -119,20 +210,34 @@ const BLOCKED_EXACT_HOSTS = new Set([
   "169.254.169.254",
 ]);
 
-function hostVerdict(hostname: string): "ok" | "blocked-host" | "private-network" | "metadata-endpoint" {
-  const host = hostname.toLowerCase();
+function normalizeHostname(raw: string): string {
+  let host = raw.toLowerCase();
+  if (host.endsWith(".")) {
+    host = host.slice(0, -1);
+  }
+  if (host.startsWith("[") && host.endsWith("]")) {
+    host = host.slice(1, -1);
+  }
+  return host;
+}
+
+function hostVerdict(rawHostname: string): "ok" | "blocked-host" | "private-network" | "metadata-endpoint" {
+  const host = normalizeHostname(rawHostname);
   if (host.length === 0) {
     return "blocked-host";
   }
   if (BLOCKED_EXACT_HOSTS.has(host)) {
     return host === "169.254.169.254" ? "metadata-endpoint" : "blocked-host";
   }
-  if (host.endsWith(".internal") || host.endsWith(".local") || host.endsWith(".internal.")) {
+  if (host.endsWith(".internal") || host.endsWith(".local")) {
     return "blocked-host";
   }
   const ipv4 = parseIpv4(host);
   if (ipv4 !== undefined) {
     return ipv4Verdict(ipv4);
+  }
+  if (/^[0-9.]+$/.test(host)) {
+    return "blocked-host";
   }
   if (host.includes(":")) {
     return ipv6Verdict(host);
@@ -173,7 +278,8 @@ function parseDestination(rawUrl: string): ParsedDestination | Decision {
 
 /**
  * Validate one navigation destination: https, permitted host, and membership
- * in the job's allowed origins (exact origin match).
+ * in the job's allowed origins (exact origin match). Numeric policy applies
+ * before the allowlist, so allowlisting a literal cannot admit it.
  */
 export function validateDestination(rawUrl: string, allowedOrigins: readonly string[]): Decision {
   const parsed = parseDestination(rawUrl);

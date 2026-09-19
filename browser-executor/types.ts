@@ -97,6 +97,22 @@ export interface BrowserObservation {
   readonly claimedOutcome: ClaimedOutcome;
   readonly verificationEvidence?: string;
   readonly meteredUsage: MeteredUsage;
+  /**
+   * HMAC digest of the immutable authorized request this observation answers.
+   * Binds the callback to one organization/project/grant/input/lease
+   * authority so same-ID jobs under other tenants cannot accept it.
+   */
+  readonly requestDigest: string;
+  /** Task outputs this observation claims to produce; checked independently. */
+  readonly producedOutputs?: readonly string[];
+}
+
+/** A rejected callback preserved for inspection without settling the attempt. */
+export interface QuarantinedCallback {
+  readonly attemptId: string;
+  readonly reason: string;
+  readonly detail: string;
+  readonly receivedAtMs: number;
 }
 
 /** Denial reasons returned instead of throwing for expected policy outcomes. */
@@ -134,7 +150,15 @@ export type DenialReason =
   | "bad-signature"
   | "unknown-callback"
   | "conflict"
-  | "invalid-transition";
+  | "invalid-transition"
+  | "missing-destination"
+  | "missing-target"
+  | "unknown-claim"
+  | "claim-reused"
+  | "claim-job-mismatch"
+  | "nonce-store-full"
+  | "missing-outputs"
+  | "unknown-job";
 
 export interface Denial {
   readonly ok: false;
@@ -154,4 +178,13 @@ export function denied(reason: DenialReason, detail: string): Denial {
 
 export function approved(): Approval {
   return { ok: true };
+}
+
+/** Narrow an unknown outcome to a denial (ok === false). */
+export function isDenial(value: unknown): value is Denial {
+  if (typeof value !== "object" || value === null || !("ok" in value)) {
+    return false;
+  }
+  const candidate = value as { readonly ok: unknown; readonly reason: unknown; readonly detail: unknown };
+  return candidate.ok === false && typeof candidate.reason === "string" && typeof candidate.detail === "string";
 }

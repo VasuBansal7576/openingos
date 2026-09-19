@@ -21,104 +21,104 @@ export interface CatalogEntry {
 }
 
 const ENTRIES: readonly CatalogEntry[] = Object.freeze([
-  {
+  Object.freeze({
     operationId: "navigate",
     effect: "read",
     permitted: true,
     denialReason: undefined,
     description: "Navigate to a policy-validated destination",
-  },
-  {
+  }),
+  Object.freeze({
     operationId: "readVisibleText",
     effect: "read",
     permitted: true,
     denialReason: undefined,
     description: "Read visible text of the current document",
-  },
-  {
+  }),
+  Object.freeze({
     operationId: "listTargets",
     effect: "read",
     permitted: true,
     denialReason: undefined,
     description: "List interactable targets of the current document",
-  },
-  {
+  }),
+  Object.freeze({
     operationId: "inspectTarget",
     effect: "read",
     permitted: true,
     denialReason: undefined,
     description: "Inspect one previously observed target",
-  },
-  {
+  }),
+  Object.freeze({
     operationId: "captureSnapshot",
     effect: "read",
     permitted: true,
     denialReason: undefined,
     description: "Capture a read-only snapshot of the current document",
-  },
-  {
+  }),
+  Object.freeze({
     operationId: "reobserve",
     effect: "read",
     permitted: true,
     denialReason: undefined,
     description: "Take a fresh observation after a stale document",
-  },
-  {
+  }),
+  Object.freeze({
     operationId: "submitContactForm",
     effect: "vendorWrite",
     permitted: false,
     denialReason: "vendor-write-blocked",
     description: "Vendor-facing contact form submission (disabled)",
-  },
-  {
+  }),
+  Object.freeze({
     operationId: "sendChatMessage",
     effect: "vendorWrite",
     permitted: false,
     denialReason: "vendor-write-blocked",
     description: "Vendor website chat message (disabled)",
-  },
-  {
+  }),
+  Object.freeze({
     operationId: "submitRfq",
     effect: "vendorWrite",
     permitted: false,
     denialReason: "vendor-write-blocked",
     description: "RFQ submission through a vendor page (disabled)",
-  },
-  {
+  }),
+  Object.freeze({
     operationId: "purchase",
     effect: "purchase",
     permitted: false,
     denialReason: "purchase-blocked",
     description: "Purchase or cart checkout (disabled)",
-  },
-  {
+  }),
+  Object.freeze({
     operationId: "createAccount",
     effect: "account",
     permitted: false,
     denialReason: "account-blocked",
     description: "Vendor account creation (disabled)",
-  },
-  {
+  }),
+  Object.freeze({
     operationId: "downloadFile",
     effect: "download",
     permitted: false,
     denialReason: "download-blocked",
     description: "File download with side effects (disabled)",
-  },
-  {
+  }),
+  Object.freeze({
     operationId: "runScript",
     effect: "script",
     permitted: false,
     denialReason: "script-blocked",
     description: "Arbitrary script execution (disabled)",
-  },
-  {
+  }),
+  Object.freeze({
     operationId: "selectArbitrary",
     effect: "script",
     permitted: false,
     denialReason: "arbitrary-selector-blocked",
     description: "Arbitrary selector input that bypasses observed targets (disabled)",
-  },
+  }),
 ]);
 
 const BY_ID: ReadonlyMap<string, CatalogEntry> = new Map(
