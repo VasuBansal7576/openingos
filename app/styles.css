@@ -1,0 +1,87 @@
+:root {
+  color: #f6f1e8;
+  background: #101a1b;
+  font-family: "Avenir Next", Avenir, "Segoe UI", sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+* { box-sizing: border-box; }
+
+body { margin: 0; min-width: 320px; }
+
+.shell {
+  min-height: 100vh;
+  padding: clamp(2rem, 7vw, 7rem) clamp(1.25rem, 7vw, 7.5rem);
+  background:
+    radial-gradient(circle at 15% 10%, rgba(197, 153, 84, 0.14), transparent 28rem),
+    linear-gradient(145deg, #102324 0%, #101a1b 55%, #1a2522 100%);
+}
+
+.hero { max-width: 58rem; }
+
+.eyebrow {
+  color: #d3a866;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+}
+
+h1, h2, h3, p { margin-top: 0; }
+
+h1 {
+  max-width: 52rem;
+  margin-bottom: 1.5rem;
+  font-family: Georgia, serif;
+  font-size: clamp(3rem, 8vw, 7.2rem);
+  font-weight: 400;
+  letter-spacing: -0.055em;
+  line-height: 0.94;
+}
+
+.lede {
+  max-width: 38rem;
+  color: #b5c4be;
+  font-size: clamp(1.05rem, 2vw, 1.35rem);
+  line-height: 1.6;
+}
+
+.status-card {
+  display: flex;
+  gap: 1rem;
+  align-items: flex-start;
+  max-width: 34rem;
+  margin-top: 3.5rem;
+  padding: 1.25rem;
+  border: 1px solid rgba(211, 168, 102, 0.24);
+  border-radius: 1rem;
+  background: rgba(20, 37, 36, 0.72);
+}
+
+.status-card strong { display: block; margin-bottom: 0.35rem; }
+.status-card p { margin-bottom: 0; color: #a7b7b0; line-height: 1.5; }
+
+.status-dot { width: 0.7rem; height: 0.7rem; margin-top: 0.3rem; border-radius: 50%; flex: none; }
+.status-dot.ready { background: #86c99d; box-shadow: 0 0 1rem rgba(134, 201, 157, 0.8); }
+.status-dot.pending { background: #d3a866; box-shadow: 0 0 1rem rgba(211, 168, 102, 0.65); }
+
+.principles {
+  display: grid;
+  grid-template-columns: minmax(14rem, 0.65fr) minmax(0, 1.35fr);
+  gap: 3rem;
+  margin-top: clamp(6rem, 14vw, 13rem);
+  padding-top: 2rem;
+  border-top: 1px solid rgba(181, 196, 190, 0.18);
+}
+
+h2 { max-width: 20rem; font-family: Georgia, serif; font-size: clamp(1.8rem, 3vw, 2.8rem); font-weight: 400; line-height: 1.05; }
+.principle-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; }
+.principle-grid article { padding: 0.25rem 0 0; }
+.principle-grid span { color: #d3a866; font-size: 0.75rem; }
+.principle-grid h3 { margin: 1.3rem 0 0.65rem; font-size: 1rem; }
+.principle-grid p { color: #a7b7b0; line-height: 1.55; }
+
+@media (max-width: 760px) {
+  .principles { grid-template-columns: 1fr; gap: 2rem; }
+  .principle-grid { grid-template-columns: 1fr; gap: 2rem; }
+}
