@@ -210,6 +210,67 @@ describe("quote comparison", () => {
     expect(compareQuotes(localLeft, unitMismatch).equivalent).toBeUndefined();
   });
 
+  it("compares equivalent selected quantities despite differing offered quantities", () => {
+    const left = quote("offered-two", [line("a-machine", 10000, "2")], [
+      knownChargeForTest({
+        chargeId: "delivery-a",
+        label: "Delivery",
+        amount: 500,
+        scope: { kind: "allocated", lineId: "a-machine", method: "fixed" },
+      }),
+    ], undefined, {
+      requirementId: "req-selected",
+      scopeId: "scope-selected",
+      items: [{ itemId: "machine", lineId: "a-machine", unit: "piece", requiredQuantity: "2" }],
+    });
+    const right = quote("offered-three", [line("b-machine", 9000, "3")], [
+      knownChargeForTest({
+        chargeId: "delivery-b",
+        label: "Delivery",
+        amount: 500,
+        scope: { kind: "allocated", lineId: "b-machine", method: "fixed" },
+      }),
+    ], undefined, {
+      requirementId: "req-selected",
+      scopeId: "scope-selected",
+      items: [{ itemId: "machine", lineId: "b-machine", unit: "piece", requiredQuantity: "3" }],
+    });
+    const selected = compareQuotes(left, right, {
+      leftSelection: [{ lineId: "a-machine", itemId: "machine", unit: "piece", quantity: "1" }],
+      rightSelection: [{ lineId: "b-machine", itemId: "machine", unit: "piece", quantity: "1" }],
+    });
+    expect(selected.status).toBe("complete");
+    expect(selected.left.total?.minorUnits).toBe(10500);
+    expect(selected.right.total?.minorUnits).toBe(9500);
+    expect(selected.equivalent?.savings.minorUnits).toBe(1000);
+
+    const mismatchedFullVersusPartial = compareQuotes(left, right, {
+      rightSelection: [{ lineId: "b-machine", itemId: "machine", unit: "piece", quantity: "1" }],
+    });
+    expect(mismatchedFullVersusPartial.status).toBe("incompatible");
+    expect(mismatchedFullVersusPartial.equivalent).toBeUndefined();
+
+    const fullOne = quote("full-one", [line("full-machine", 10000)], [
+      knownChargeForTest({
+        chargeId: "delivery-full",
+        label: "Delivery",
+        amount: 500,
+        scope: { kind: "allocated", lineId: "full-machine", method: "fixed" },
+      }),
+    ], undefined, {
+      requirementId: "req-selected",
+      scopeId: "scope-selected",
+      items: [{ itemId: "machine", lineId: "full-machine", unit: "piece", requiredQuantity: "1" }],
+    });
+    const fullVersusPartial = compareQuotes(fullOne, right, {
+      rightSelection: [{ lineId: "b-machine", itemId: "machine", unit: "piece", quantity: "1" }],
+    });
+    expect(fullVersusPartial.status).toBe("complete");
+    expect(fullVersusPartial.left.total?.minorUnits).toBe(10500);
+    expect(fullVersusPartial.right.total?.minorUnits).toBe(9500);
+    expect(fullVersusPartial.equivalent?.savings.minorUnits).toBe(1000);
+  });
+
   it("keeps unresolved and unselected included coverage incomplete", () => {
     const unresolved = quote("unresolved", [line("machine", 1000)], [
       includedCharge({ chargeId: "freight", label: "Freight", coveringId: "missing" }),
@@ -227,6 +288,56 @@ describe("quote comparison", () => {
     });
     expect(partial.status).toBe("incomplete");
     expect(partial.reasons.join(" ")).toContain("unselected scope");
+
+    const excludedLineCharge = quote("excluded-charge", [line("machine", 1000), line("grinder", 1000)], [
+      includedCharge({
+        chargeId: "grinder-warranty",
+        label: "Grinder warranty",
+        coveringId: "grinder",
+        scope: { kind: "line", lineId: "grinder" },
+      }),
+    ]);
+    const excludedResult = compareQuotes(excludedLineCharge, excludedLineCharge, {
+      leftSelection: [{ lineId: "machine", itemId: "machine", unit: "piece", quantity: "1" }],
+      rightSelection: [{ lineId: "machine", itemId: "machine", unit: "piece", quantity: "1" }],
+    });
+    expect(excludedResult.status).toBe("complete");
+    expect(excludedResult.left.total?.minorUnits).toBe(1000);
+
+    const applicableUnresolved = quote("applicable-unresolved", [line("machine", 1000), line("grinder", 1000)], [
+      includedCharge({
+        chargeId: "shared-warranty",
+        label: "Shared warranty",
+        coveringId: "grinder",
+        scope: { kind: "quote" },
+      }),
+    ]);
+    const unresolvedPartial = compareQuotes(applicableUnresolved, applicableUnresolved, {
+      leftSelection: [{ lineId: "machine", itemId: "machine", unit: "piece", quantity: "1" }],
+      rightSelection: [{ lineId: "machine", itemId: "machine", unit: "piece", quantity: "1" }],
+    });
+    expect(unresolvedPartial.status).toBe("incomplete");
+
+    const excludedIntermediate = quote("excluded-intermediate", [line("machine", 1000), line("grinder", 1000)], [
+      includedCharge({
+        chargeId: "installation",
+        label: "Installation",
+        coveringId: "service",
+        scope: { kind: "line", lineId: "machine" },
+      }),
+      includedCharge({
+        chargeId: "service",
+        label: "Service",
+        coveringId: "machine",
+        scope: { kind: "line", lineId: "grinder" },
+      }),
+    ]);
+    const excludedIntermediateResult = compareQuotes(excludedIntermediate, excludedIntermediate, {
+      leftSelection: [{ lineId: "machine", itemId: "machine", unit: "piece", quantity: "1" }],
+      rightSelection: [{ lineId: "machine", itemId: "machine", unit: "piece", quantity: "1" }],
+    });
+    expect(excludedIntermediateResult.status).toBe("incomplete");
+    expect(excludedIntermediateResult.reasons.join(" ")).toContain("Installation");
   });
 
   it("rejects included coverage cycles", () => {
@@ -362,7 +473,20 @@ describe("forecast and commitment financial state", () => {
     expect(result.projectedCompletionCost.minorUnits).toBe(1080);
   });
 
-  it("conserves line rounding when fractional quantities settle", () => {
+  it("conserves line rounding across fractional forecast state partitions", () => {
+    const selectedBefore = calculateForecast({
+      currency: EUR,
+      lines: [{ lineId: "equipment", requiredQuantity: "1", selected: { quantity: "1", unitPrice: money(EUR, 1) } }],
+    });
+    const orderedAndSelected = calculateForecast({
+      currency: EUR,
+      lines: [{
+        lineId: "equipment",
+        requiredQuantity: "1",
+        ordered: { quantity: "0.5", unitPrice: money(EUR, 1) },
+        selected: { quantity: "0.5", unitPrice: money(EUR, 1) },
+      }],
+    });
     const before = calculateForecast({
       currency: EUR,
       lines: [{ lineId: "equipment", requiredQuantity: "1", ordered: { quantity: "1", unitPrice: money(EUR, 1) } }],
@@ -391,10 +515,52 @@ describe("forecast and commitment financial state", () => {
         },
       }],
     });
+    const changedSelectedPrice = calculateForecast({
+      currency: EUR,
+      lines: [{
+        lineId: "equipment",
+        requiredQuantity: "1",
+        ordered: { quantity: "0.5", unitPrice: money(EUR, 1) },
+        selected: { quantity: "0.5", unitPrice: money(EUR, 3) },
+      }],
+    });
+    const allPartitions = calculateForecast({
+      currency: EUR,
+      lines: [{
+        lineId: "equipment",
+        requiredQuantity: "1",
+        ordered: {
+          quantity: "0.5",
+          unitPrice: money(EUR, 1),
+          settled: [{ quantity: "0.25", unitPrice: money(EUR, 3) }],
+        },
+        selected: { quantity: "0.25", unitPrice: money(EUR, 5) },
+        estimated: { quantity: "0.25", unitPrice: money(EUR, 7) },
+      }],
+    });
+    const orderedAndSelectedLine = orderedAndSelected.lines[0];
+    const allPartitionsLine = allPartitions.lines[0];
     expect(before.projectedCompletionCost.minorUnits).toBe(1);
+    expect(selectedBefore.projectedCompletionCost.minorUnits).toBe(1);
+    expect(orderedAndSelected.projectedCompletionCost.minorUnits).toBe(1);
+    expect(orderedAndSelectedLine === undefined
+      ? undefined
+      : orderedAndSelectedLine.orderedCurrentCost.minorUnits
+        + orderedAndSelectedLine.selectedForecastCost.minorUnits
+        + orderedAndSelectedLine.estimatedForecastCost.minorUnits).toBe(1);
     expect(after.projectedCompletionCost.minorUnits).toBe(1);
     expect(after.lines[0]?.settledCost.minorUnits).toBe(1);
     expect(changedPrice.projectedCompletionCost.minorUnits).toBe(95);
+    expect(changedSelectedPrice.projectedCompletionCost.minorUnits).toBe(2);
+    expect(allPartitions.projectedCompletionCost.minorUnits).toBe(4);
+    expect(allPartitionsLine === undefined
+      ? undefined
+      : allPartitionsLine.projectedCost.minorUnits).toBe(4);
+    expect(allPartitionsLine === undefined
+      ? undefined
+      : allPartitionsLine.orderedCurrentCost.minorUnits
+        + allPartitionsLine.selectedForecastCost.minorUnits
+        + allPartitionsLine.estimatedForecastCost.minorUnits).toBe(4);
   });
 
   it("reports uncovered quantities instead of silently treating them as zero", () => {

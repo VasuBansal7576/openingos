@@ -12,7 +12,7 @@
 - **Auth:** none
 - **AI models:** none
 - **Started:** 2026-09-19T09:46:19Z
-- **Last updated:** 2026-09-19T19:32:43Z
+- **Last updated:** 2026-09-19T19:51:01Z
 
 ## Log
 
@@ -149,3 +149,11 @@ Jev proofs now copy supported JSON defensively, preserve the original cancellati
 The combined checkout passes 75 controlled proof tests, all 23 repository checks, strict TypeScript and whitespace checks.
 The coordinator reproduced a delayed test-timer failure between suites and routed its repair to Muse Spark before this passing combined run.
 Independent review of this combined revision and its remote CI remain pending; hosted integrations and full foundation gates remain unverified.
+
+### 2026-09-19 - working tree
+
+Verified all four CI jobs on `85d8105`; its independent Astra review closed M3/M4/M5/M7 and RJ1–RJ7 behavior findings while reproducing remaining financial M1/M2/M6 defects.
+Integrated Luna’s pushed `a1972fb` for selected-scope comparison, applicable included-charge chains and forecast rounding across all quantity states, plus Muse Spark’s pushed `36d5ba9` for precise deadline and getter-invocation regressions.
+The combined checkout passes 77 controlled proof tests, all 23 repository checks, strict TypeScript and whitespace checks.
+Updated the delivery skill to require all four current CI jobs; these remain proof and repository checks rather than evidence of a deployed application.
+Independent review and remote CI for this combined revision remain pending; application credentials, provider allowances, owner recipient and hosted foundation gates remain unresolved.

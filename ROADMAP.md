@@ -50,11 +50,11 @@ The current implementation wave contains controlled proofs only.
 Luna owns `proofs/money/**`; Muse Spark owns `proofs/jev/**`.
 Astra owns shared tooling, dependencies, ADR amendments and progress files, and a separate Astra session reviews fixed commits.
 Neither proof authorizes dependent production features or passes the hosted F0 gates.
-The first independent review requires repairs M1–M7 from Luna and RJ1–RJ7 from Muse Spark, followed by a new fixed combined review.
-Passing tests on `897eea7` do not close those findings.
-The follow-up review of `86c4b19` closed RJ1 and RJ3–RJ6 but reproduced further RJ2/RJ7 cases.
-Luna’s `a7d4c61` and Muse Spark’s `29fed49` are now integrated with 75 passing controlled proof tests, 23 repository checks and strict TypeScript.
-The new fixed combined review and remote CI remain pending; neither the prior green CI nor the worker handoffs close review findings by themselves.
+The first independent review of `897eea7` found financial M1–M7 and adapter RJ1–RJ7 issues.
+The review of `85d8105` closed M3/M4/M5/M7 and all adapter behavior findings, while reproducing M1 selected-scope, M2 included-charge coverage and M6 rounding defects.
+All four CI jobs passed on `85d8105`; that result did not close those review findings.
+Luna’s pushed `a1972fb` and Muse Spark’s pushed `36d5ba9` are now integrated with 77 passing controlled proof tests, 23 repository checks and strict TypeScript.
+Independent verification of this new combined revision and its remote CI remain pending.
 
 ## Duties throughout
 

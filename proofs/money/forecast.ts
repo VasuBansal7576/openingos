@@ -15,7 +15,6 @@ import {
   money,
   moneyDifference,
   moneyZero,
-  multiplyMoneyByQuantity,
   normalizeMoney,
   subtractMoney,
   subtractMoneyOrZero,
@@ -107,17 +106,19 @@ function addSettledQuantity(segments: readonly SettledSegment[]): Quantity {
 }
 
 interface CostFragment {
-  readonly kind: "remainingOrdered" | "settled";
+  readonly kind: "remainingOrdered" | "settled" | "selected" | "estimated";
   readonly quantity: Quantity;
   readonly unitPrice: Money;
 }
 
 /**
- * Round one forecast line once, then allocate exact fragment products.
- * Every fragment before the final one receives its exact floor and the final
- * settled fragment receives the residual, so unchanged quantity and price
- * cannot gain a minor unit when a quantity moves to settled. A price change
- * remains visible in the exact line total before this residual allocation.
+ * Round one forecast line once across every priced quantity partition, then
+ * allocate exact fragment products. Every fragment before the final one
+ * receives its exact floor and the final supplied fragment receives the
+ * residual, so unchanged quantity and price cannot gain a minor unit when a
+ * quantity moves between settled, ordered, selected, or estimated states. A
+ * price change remains visible in the exact line total before allocation, and
+ * uncovered quantity is intentionally absent because it has no known price.
  */
 function allocateLineCost(currency: string, fragments: readonly CostFragment[]): readonly Money[] {
   if (fragments.length === 0) {
@@ -232,30 +233,6 @@ export function calculateForecast(input: ForecastInput): ForecastResult {
       throw new TypeError(`line ${lineId} settled quantity exceeds ordered quantity`);
     }
 
-    const remainingOrderedQuantity = decimalSubtract(orderedQuantity, settledQuantity);
-    const costFragments: CostFragment[] = [];
-    if (!remainingOrderedQuantity.isZero()) {
-      costFragments.push({ kind: "remainingOrdered", quantity: remainingOrderedQuantity, unitPrice: orderedUnitPrice });
-    }
-    for (const segment of settledSegments) {
-      costFragments.push({ kind: "settled", quantity: segment.quantity, unitPrice: segment.unitPrice });
-    }
-    const allocatedLineCosts = allocateLineCost(currency, costFragments);
-    let lineSettledCost = moneyZero(currency);
-    let remainingOrderedCost = moneyZero(currency);
-    for (const [index, fragment] of costFragments.entries()) {
-      const fragmentCost = allocatedLineCosts[index];
-      if (fragmentCost === undefined) {
-        throw new Error("forecast line cost allocation is incomplete");
-      }
-      if (fragment.kind === "settled") {
-        lineSettledCost = addMoney(lineSettledCost, fragmentCost);
-      } else {
-        remainingOrderedCost = addMoney(remainingOrderedCost, fragmentCost);
-      }
-    }
-    const lineOrderedCurrentCost = addMoney(lineSettledCost, remainingOrderedCost);
-
     const selectedInput = rawLine.selected;
     if (selectedInput !== undefined && !isRecord(selectedInput)) {
       throw new TypeError(`line ${lineId} selected data must be an object`);
@@ -270,8 +247,6 @@ export function calculateForecast(input: ForecastInput): ForecastResult {
     if (decimalCompare(selectedQuantity, remainingAfterOrdered) > 0) {
       throw new TypeError(`line ${lineId} selected quantity overlaps ordered quantity`);
     }
-    const lineSelectedCost = multiplyMoneyByQuantity(selectedUnitPrice, selectedQuantity);
-
     const estimatedInput = rawLine.estimated;
     if (estimatedInput !== undefined && !isRecord(estimatedInput)) {
       throw new TypeError(`line ${lineId} estimated data must be an object`);
@@ -286,8 +261,43 @@ export function calculateForecast(input: ForecastInput): ForecastResult {
     const estimatedUnitPrice = estimatedInput === undefined
       ? moneyZero(currency)
       : priceForCurrency(estimatedInput.unitPrice, currency, `line ${lineId} estimated unit price`);
-    const lineEstimatedCost = multiplyMoneyByQuantity(estimatedUnitPrice, estimatedQuantity);
     const lineUncoveredQuantity = decimalSubtract(remainingAfterSelection, estimatedQuantity);
+
+    const remainingOrderedQuantity = decimalSubtract(orderedQuantity, settledQuantity);
+    const costFragments: CostFragment[] = [];
+    if (!remainingOrderedQuantity.isZero()) {
+      costFragments.push({ kind: "remainingOrdered", quantity: remainingOrderedQuantity, unitPrice: orderedUnitPrice });
+    }
+    for (const segment of settledSegments) {
+      costFragments.push({ kind: "settled", quantity: segment.quantity, unitPrice: segment.unitPrice });
+    }
+    if (!selectedQuantity.isZero()) {
+      costFragments.push({ kind: "selected", quantity: selectedQuantity, unitPrice: selectedUnitPrice });
+    }
+    if (!estimatedQuantity.isZero()) {
+      costFragments.push({ kind: "estimated", quantity: estimatedQuantity, unitPrice: estimatedUnitPrice });
+    }
+    const allocatedLineCosts = allocateLineCost(currency, costFragments);
+    let lineSettledCost = moneyZero(currency);
+    let remainingOrderedCost = moneyZero(currency);
+    let lineSelectedCost = moneyZero(currency);
+    let lineEstimatedCost = moneyZero(currency);
+    for (const [index, fragment] of costFragments.entries()) {
+      const fragmentCost = allocatedLineCosts[index];
+      if (fragmentCost === undefined) {
+        throw new Error("forecast line cost allocation is incomplete");
+      }
+      if (fragment.kind === "settled") {
+        lineSettledCost = addMoney(lineSettledCost, fragmentCost);
+      } else if (fragment.kind === "remainingOrdered") {
+        remainingOrderedCost = addMoney(remainingOrderedCost, fragmentCost);
+      } else if (fragment.kind === "selected") {
+        lineSelectedCost = addMoney(lineSelectedCost, fragmentCost);
+      } else {
+        lineEstimatedCost = addMoney(lineEstimatedCost, fragmentCost);
+      }
+    }
+    const lineOrderedCurrentCost = addMoney(lineSettledCost, remainingOrderedCost);
     const lineProjectedCost = addMoney(addMoney(lineOrderedCurrentCost, lineSelectedCost), lineEstimatedCost);
 
     orderedCurrentCost = addMoney(orderedCurrentCost, lineOrderedCurrentCost);

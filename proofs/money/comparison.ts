@@ -261,17 +261,17 @@ function includedCoverage(
   if (coveringCharge === undefined || path.has(coveringId)) {
     return "unresolved";
   }
-  if (coveringCharge.state.kind === "included") {
-    const nextPath = new Set(path);
-    nextPath.add(coveringId);
-    return includedCoverage(quote, coveringCharge, selected, allLines, nextPath);
-  }
   const application = chargeApplies(quote, coveringCharge, selected, allLines);
   if (application.unallocated) {
     return "unresolved";
   }
   if (!application.applies) {
     return "unselected";
+  }
+  if (coveringCharge.state.kind === "included") {
+    const nextPath = new Set(path);
+    nextPath.add(coveringId);
+    return includedCoverage(quote, coveringCharge, selected, allLines, nextPath);
   }
   return coveringCharge.state.kind === "unknown" ? "unresolved" : "covered";
 }
@@ -316,6 +316,9 @@ function summarizeQuote(quote: Quote, selected: SelectionState | undefined): Quo
 
   for (const charge of quote.charges) {
     const application = chargeApplies(quote, charge, selected, allLines);
+    if (!application.applies && !application.unallocated) {
+      continue;
+    }
     if (charge.state.kind === "included") {
       const coverage = includedCoverage(quote, charge, selected, allLines);
       if (coverage !== "covered") {
@@ -409,7 +412,7 @@ function taxBasesCompatible(left: Quote, right: Quote): boolean {
   return left.taxBasis.kind === right.taxBasis.kind && left.taxBasis.basisId === right.taxBasis.basisId;
 }
 
-function comparisonScopesCompatible(left: Quote, right: Quote): boolean {
+function comparisonScopesCompatible(left: Quote, right: Quote, requireOfferedQuantities: boolean): boolean {
   const leftScope = left.comparisonScope;
   const rightScope = right.comparisonScope;
   if (leftScope === undefined || rightScope === undefined) {
@@ -417,6 +420,9 @@ function comparisonScopesCompatible(left: Quote, right: Quote): boolean {
   }
   if (leftScope.requirementId !== rightScope.requirementId || leftScope.scopeId !== rightScope.scopeId) {
     return false;
+  }
+  if (!requireOfferedQuantities) {
+    return true;
   }
   if (leftScope.items.length !== rightScope.items.length) {
     return false;
@@ -426,7 +432,7 @@ function comparisonScopesCompatible(left: Quote, right: Quote): boolean {
     const rightItem = rightItems.get(leftItem.itemId);
     return rightItem !== undefined
       && leftItem.unit === rightItem.unit
-      && decimalCompare(leftItem.requiredQuantity, rightItem.requiredQuantity) === 0;
+      && (!requireOfferedQuantities || decimalCompare(leftItem.requiredQuantity, rightItem.requiredQuantity) === 0);
   });
 }
 
@@ -436,6 +442,8 @@ function comparisonScopeText(scope: ComparisonScope): string {
 }
 
 function selectedScopesCompatible(
+  leftQuote: Quote,
+  rightQuote: Quote,
   leftSelection: SelectionState | undefined,
   rightSelection: SelectionState | undefined,
   leftAllLines: boolean,
@@ -445,10 +453,38 @@ function selectedScopesCompatible(
     return true;
   }
   if (leftAllLines || rightAllLines) {
-    return false;
+    const leftItems = selectedScopeItems(leftQuote, leftSelection, leftAllLines);
+    const rightItems = selectedScopeItems(rightQuote, rightSelection, rightAllLines);
+    return selectedScopeItemsEqual(leftItems, rightItems);
   }
-  const leftItems = leftSelection?.scopeItems;
-  const rightItems = rightSelection?.scopeItems;
+  return selectedScopeItemsEqual(leftSelection?.scopeItems, rightSelection?.scopeItems);
+}
+
+function selectedScopeItems(
+  quote: Quote,
+  selection: SelectionState | undefined,
+  allLines: boolean,
+): Map<string, SelectedScopeItem> | undefined {
+  if (!allLines) {
+    return selection?.scopeItems;
+  }
+  if (selection?.scopeItems !== undefined) {
+    return selection.scopeItems;
+  }
+  const scope = quote.comparisonScope;
+  if (scope === undefined) {
+    return undefined;
+  }
+  return new Map(scope.items.map((item) => [
+    item.itemId,
+    { itemId: item.itemId, unit: item.unit, quantity: item.requiredQuantity },
+  ]));
+}
+
+function selectedScopeItemsEqual(
+  leftItems: Map<string, SelectedScopeItem> | undefined,
+  rightItems: Map<string, SelectedScopeItem> | undefined,
+): boolean {
   if (leftItems === undefined || rightItems === undefined || leftItems.size !== rightItems.size) {
     return false;
   }
@@ -502,7 +538,11 @@ export function compareQuotes(left: Quote, right: Quote, options: CompareOptions
   if (!taxBasesCompatible(left, right)) {
     reasons.push("tax bases are not compatible");
   }
-  const scopesCompatible = comparisonScopesCompatible(left, right);
+  const scopesCompatible = comparisonScopesCompatible(
+    left,
+    right,
+    leftSummary.selectedAllLines && rightSummary.selectedAllLines,
+  );
   if (!scopesCompatible) {
     if (left.comparisonScope === undefined || right.comparisonScope === undefined) {
       reasons.push("comparison scopes are required for equivalent savings");
@@ -529,6 +569,8 @@ export function compareQuotes(left: Quote, right: Quote, options: CompareOptions
   }
 
   const selectedScopesMatch = selectedScopesCompatible(
+    left,
+    right,
     leftSelection,
     rightSelection,
     leftSummary.selectedAllLines,

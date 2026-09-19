@@ -818,11 +818,13 @@ describe("RJ2 signal swap and spent preparation budget", () => {
 describe("array own-data and deadline-equality regressions", () => {
   test("indexed accessor getter never runs and dispatches nothing", async () => {
     const marker = "PRIVATE_INDEX_MARKER_789";
+    let invocations = 0;
     const rigged: unknown[] = ["ok"];
     Object.defineProperty(rigged, "0", {
       enumerable: true,
       configurable: true,
       get() {
+        invocations += 1;
         throw new Error(marker);
       },
     });
@@ -831,6 +833,7 @@ describe("array own-data and deadline-equality regressions", () => {
     expect(result.outcome).toBe("needsReview");
     if (result.outcome === "needsReview") expect(result.reason).toBe("non-json-state");
     expect(stub.calls()).toBe(0);
+    expect(invocations).toBe(0);
     expect(JSON.stringify(result)).not.toContain(marker);
   });
 
@@ -857,6 +860,23 @@ describe("array own-data and deadline-equality regressions", () => {
       });
       const result = await jevAttemptOnce({ ...baseOptions(), fetchImpl: stub.fetchImpl, timeoutMs: timeout });
       expect(stub.calls()).toBe(1);
+      expect(result.outcome).toBe("unavailable");
+      if (result.outcome === "unavailable") expect(result.reason).toBe("timeout");
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  test("deadline equality at the pre-dispatch gate dispatches zero requests", async () => {
+    const realNow = Date.now;
+    const start = 2_000_000;
+    const timeout = 40;
+    let calls = 0;
+    Date.now = () => (calls++ === 0 ? start : start + timeout);
+    try {
+      const stub = stubFetch(() => jsonResponse(validPayload()));
+      const result = await jevAttemptOnce({ ...baseOptions(), fetchImpl: stub.fetchImpl, timeoutMs: timeout });
+      expect(stub.calls()).toBe(0);
       expect(result.outcome).toBe("unavailable");
       if (result.outcome === "unavailable") expect(result.reason).toBe("timeout");
     } finally {

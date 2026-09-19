@@ -73,11 +73,12 @@ Inspect and stage only in-scope files, and preserve unrelated edits and secrets.
 When PR creation is authorized, create a ready-for-review PR, not a draft.
 List the task's fixed expected check names in the PR and handoff before inspecting results.
 Do not remove a check from that set to get a pass.
-The current repository checks are `delivery-guard-tests` and `workbench-artifact-tests`; neither is an application test suite.
+The current expected checks are `delivery-guard-tests`, `workbench-artifact-tests`, `foundation-typecheck` and `foundation-contract-tests`.
+The foundation jobs verify controlled contract proofs; these four jobs do not establish a running application or live integrations.
 The application foundation must add and name its actual type, build, unit, integration, and user-path checks as applicable before feature workers rely on CI.
 
 1. Inspect the PR's current head and every reported CI check, not only Greptile.
-2. Run `node scripts/check-pr.mjs --repo VasuBansal7576/openingos --pr NUMBER --expect delivery-guard-tests --expect workbench-artifact-tests`, adding each agreed application check with another `--expect`.
+2. Run `node scripts/check-pr.mjs --repo VasuBansal7576/openingos --pr NUMBER --expect delivery-guard-tests --expect workbench-artifact-tests --expect foundation-typecheck --expect foundation-contract-tests`, adding each agreed application check with another `--expect`.
 3. If checks are pending or absent, retain ownership and wait with bounded polling or the available wait mechanism.
 4. For a failed check, read its job logs, reproduce at the closest practical boundary, fix the cause within scope, and run the relevant regression test.
 5. Push the repair under the standing task authorization, then inspect the new head again; an earlier green commit is not evidence for the new one.
