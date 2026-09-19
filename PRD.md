@@ -25,6 +25,7 @@ It connects requirements, evidence, quotes, approvals, orders, equipment, and ac
 - Added D-17 for product-scope enforcement while preserving all 51 existing acceptance criteria and launch-only planning sections.
 - Recorded the user's selection of the purchasing workbench and rejection of the opening-scene and price-route alternatives.
 - Preserved the complete selected fixture flow in `design/purchasing-workbench.html`; this is not production architecture or live functionality.
+- Added the [ADR registry](docs/adr/README.md), separating accepted design/platform constraints from technical proposals and blocking experiments.
 
 ### Scope of this revision
 
@@ -1526,7 +1527,9 @@ The decisions below determine how to implement them and must not be silently inv
 | Verification and environments | Representative supplier sites and task fixtures, independent outcome checks, missed-candidate tests, negotiation and review-routing cases, recovery faults, concurrent-spend checks, latency and cost targets, and isolated worker/test mailboxes and backend data |
 
 Resolve these through ADRs and explicit contracts before their dependent implementation packages run in parallel.
-This PRD revision does not select a mobile framework, implement billing, finalize paid-launch pricing, or create those ADRs.
+The [ADR registry](docs/adr/README.md) records the current drafts, their status and the remaining proof tasks.
+Drafting a recommendation does not make it accepted or implemented.
+This PRD revision does not select a mobile framework, implement billing or finalize paid-launch pricing.
 
 ### External dependencies and unresolved choices
 

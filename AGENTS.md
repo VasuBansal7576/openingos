@@ -3,6 +3,7 @@
 **Commit meaningful checkpoints frequently and push them to GitHub; do not leave assigned work only in local commits, and clean up completed task worktrees after verified handoff.**
 
 Read `PRD.md` before changing product behavior.
+Read `docs/adr/README.md` and the relevant decision records before production implementation; proposed records do not authorize dependent feature work.
 For implementation or delivery work, read and follow `skills/openingos-factory/SKILL.md`.
 That is a tracked project skill, loaded through this file rather than a global installation.
 

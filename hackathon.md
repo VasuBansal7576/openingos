@@ -12,7 +12,7 @@
 - **Auth:** none
 - **AI models:** none
 - **Started:** 2026-09-19T09:46:19Z
-- **Last updated:** 2026-09-19T14:31:35Z
+- **Last updated:** 2026-09-19T14:41:52Z
 
 ## Log
 
@@ -73,3 +73,5 @@ Preserved its complete fixture flow, images, fonts and runtime in `design/purcha
 The old source remains recoverable from Git commit `915844a`; the standalone artifact passed four structural checks and the existing 19 delivery-helper tests passed.
 Direct local-file browser verification was blocked by the browser tool's URL policy, so the export is not claimed as fully browser-retested.
 Recorded the accepted visual direction in `PRD.md` and `AGENTS.md`; production behavior and deployment remain unimplemented.
+Drafted eight ADRs and a registry in `docs/adr`, separating the accepted workbench/platform constraints from proposed data, execution, model, browser, identity and verification decisions.
+Documented the unresolved hosted-browser proof, published-origin integration, identity choice, supplier market, provider authority and model calibration; these are planning records, not live integrations or accepted implementation contracts.
