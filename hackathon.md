@@ -12,7 +12,7 @@
 - **Auth:** none
 - **AI models:** none
 - **Started:** 2026-09-19T09:46:19Z
-- **Last updated:** 2026-09-19T20:02:26Z
+- **Last updated:** 2026-09-19T20:07:33Z
 
 ## Log
 
@@ -164,3 +164,14 @@ All four CI jobs passed on `d9487df`, and independent Astra review closed M1/M2 
 Integrated Luna’s pushed `979fdca`, which groups exact costs by financial state and assigns rounding remainders deterministically without charging a zero-cost component.
 The combined checkout passes 77 controlled proof tests with 305 assertions, all 23 repository checks, strict TypeScript and whitespace checks.
 Independent verification of the final allocation repair and this revision’s remote CI remain pending; no hosted or live-provider outcome is claimed.
+
+### 2026-09-19 - 595d30c
+
+The separate Astra reviewer found no actionable issues in the fixed combined proof checkpoint and verified the final M6 allocation repair, closing the controlled M1–M7 and RJ1–RJ7 review findings.
+Verification passed: 77 proof tests with 305 assertions, 23 repository tests, strict TypeScript, whitespace checks, 1,144 independent exact allocation/changed-price cases and 1,760 settlement split/reordering checks.
+All four expected jobs passed in the [GitHub check run](https://github.com/VasuBansal7576/openingos/actions/runs/35466163046).
+Marked the controlled proof integration step complete in the roadmap and updated README status while retaining all full foundation and product gates as open.
+Shut down the settled implementation and reviewer sessions, verified clean worktrees and pushed branch heads, then removed both worker worktrees through Orca without force; their branches remain available on GitHub.
+Native OpenCode approvals were supervised directly, with scoped routine permissions verified after restart using the requested model and high variant.
+All evidence remains controlled; no live application, hosted identity, shared provider budget, owner-email run or publication was verified.
+The next foundation stage requires the privately configured application credentials, approved provider allowances and owner recipient that remain unresolved.

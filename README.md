@@ -51,6 +51,8 @@ node --test scripts/check-pr.test.mjs scripts/check-workbench.test.mjs
 These 23 tests validate the CI-inspection helper and saved prototype structure only.
 The independent contracts under `proofs/money` and `proofs/jev` use controlled data and injected HTTP responses.
 They exercise financial calculations and Jev transport validation without provider credentials or live calls.
+The controlled proof checkpoint `595d30c` passes 77 tests and independent Astra review with no remaining actionable findings.
+The roadmap records the separate hosted and application gates that remain open.
 Run them with the pinned Bun 1.3.11 toolchain:
 
 ```sh

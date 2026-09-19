@@ -41,22 +41,18 @@ This file supplies order, not duplicate contracts or a running automation.
 - [x] Install official Convex skills for OpenCode and verify its configured MCP connects.
 - [x] Verify a restarted OpenCode worker sees the twelve Convex MCP tools before backend work; none were invoked.
 - [x] Verify the restarted OpenCode session retains the requested model/high variant and runs its 28 controlled tests without a native approval prompt.
-- [x] Push combined proof checkpoint `897eea7`; pass 41 controlled contract tests, 23 repository checks, strict TypeScript and all four expected CI jobs.
-- [x] Have the independent Astra session review fixed `897eea7` and route its 13 correctness findings plus one fixture-scale gap to the implementation owners.
+- [x] Push reviewed proof checkpoint `595d30c`; pass 77 controlled contract tests with 305 assertions, 23 repository checks, strict TypeScript and all four expected CI jobs.
+- [x] Have the independent Astra session review fixed commits, route findings to their owners and verify all M1–M7/RJ1–RJ7 repairs at `595d30c`.
 - [ ] Verify hosted environment, application credentials, provider allowances and owner recipient.
-- [ ] Integrate and review the independent financial and Jev contract proofs.
+- [x] Integrate and review the independent financial and Jev contract proofs.
+- [x] Shut down settled worker/reviewer sessions and remove both completed worker worktrees through Orca after verifying clean status and remote preservation.
 
-The current implementation wave contains controlled proofs only.
-Luna owns `proofs/money/**`; Muse Spark owns `proofs/jev/**`.
-Astra owns shared tooling, dependencies, ADR amendments and progress files, and a separate Astra session reviews fixed commits.
-Neither proof authorizes dependent production features or passes the hosted F0 gates.
-The first independent review of `897eea7` found financial M1–M7 and adapter RJ1–RJ7 issues.
-The review of `85d8105` closed M3/M4/M5/M7 and all adapter behavior findings, while reproducing M1 selected-scope, M2 included-charge coverage and M6 rounding defects.
-All four CI jobs passed on `85d8105`; that result did not close those review findings.
-Luna’s pushed `a1972fb` and Muse Spark’s pushed `36d5ba9` are now integrated with 77 passing controlled proof tests, 23 repository checks and strict TypeScript.
-The independent review of `d9487df` closed M1/M2 but found one remaining M6 defect: splitting a settlement moved its rounding cost to a free selected component.
-Luna’s pushed `979fdca` groups exact costs by financial state before deterministic remainder allocation; the integrated checkout passes 77 controlled tests with 305 assertions, 23 repository checks and strict TypeScript.
-Independent verification and remote CI for this last repair remain pending.
+The completed wave contains controlled proofs only, reviewed at `595d30c` with no actionable findings remaining.
+Luna owned `proofs/money/**`; Muse Spark owned `proofs/jev/**`; Astra owned shared tooling, integration and progress files.
+The separate Astra reviewer also passed 1,144 exact allocation/changed-price cases and 1,760 settlement split/reordering checks.
+The worker branches remain on GitHub; their completed worktrees have been removed, and the coordinator checkout remains available.
+Neither this proof wave nor its green CI accepts the proposed architecture, passes full F0/F1 gates or authorizes dependent product features.
+The next build gate needs a hosted environment, application credentials, provider allowances and the private owner recipient; those facts remain unverified.
 
 ## Duties throughout
 
