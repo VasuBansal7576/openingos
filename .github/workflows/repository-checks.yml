@@ -42,6 +42,7 @@ jobs:
           bun-version: 1.3.11
       - run: bun install --frozen-lockfile
       - run: bun run typecheck:proofs
+      - run: bun run typecheck:browser
   foundation-contract-tests:
     name: foundation-contract-tests
     runs-on: ubuntu-24.04
@@ -56,3 +57,5 @@ jobs:
       - run: bun install --frozen-lockfile
       - name: Run controlled foundation contracts
         run: bun run test:proofs
+      - name: Run controlled browser-executor contracts
+        run: bun run test:browser
