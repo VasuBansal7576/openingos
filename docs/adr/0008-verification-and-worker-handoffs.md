@@ -35,6 +35,9 @@ Workers receive packages, not one ADR each, and may need several ADRs for one pa
 Do not dispatch dependent feature workers while their shared contracts are merely proposed.
 Use the [sponsor worker plan](../implementation/sponsor-integration-plan.md) for F0/F1/R1/C1/U1/V1 ownership, exact acceptance cases, command contracts and stop conditions.
 The plan adds detail to these packages without authorizing their execution or replacing unrelated PRD requirements.
+The [Orca handoff](../implementation/orca-handoff.md) records the user's requested implementation workers, independent reviewer, permission handling and startup checks.
+Use OpenCode Go Muse Spark 1.3 and Codex CLI GPT-5.6 Luna for implementation, with Codex CLI GPT-6 Astra for independent review.
+Resolve and verify the exact model IDs from that handoff rather than changing global defaults or accepting a silent fallback.
 
 ## Environments and realistic tests
 
@@ -60,9 +63,14 @@ Acceptance is based on observable outcomes and critical invariants, not a confid
 
 Follow `AGENTS.md` and `skills/openingos-factory/SKILL.md` for frequent pushed checkpoints, current-head CI repair and safe worktree cleanup.
 Use Orca's documented lifecycle when developer workers are authorized.
-Greptile is optional until installed with the user's authorization; its absence cannot be represented as a review pass.
+Greptile is enabled for OpeningOS as observed September 19, but the first actual PR review remains unverified.
+Its absence or lack of a current-head result cannot be represented as a review pass.
 Markdown instructions do not wake a stopped agent, so unattended CI repair requires a separately authorized runner.
 No such runner is claimed to exist.
+The active coordinator handles routine permissions within the approved scope and owns stuck-worker recovery under Orca's liveness rules.
+Native approval routing must be tested; an Orca question reply does not itself satisfy a worker's sandbox approval.
+The coordinator alone updates `hackathon.md` from verified integrated evidence and pushes it after meaningful checkpoints.
+Workers return evidence instead of concurrently editing the log.
 
 After integration, exercise the workbench at desktop and narrow widths, with keyboard-only navigation and all affected failure states.
 Deployment, production writes, access-policy changes, external outreach and submission retain their separate authorization gates.

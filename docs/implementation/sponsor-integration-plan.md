@@ -12,6 +12,10 @@ No package below has been implemented or verified yet.
 4. Confirm the assigned base commit, file ownership, environment, expected CI checks and permitted external actions.
 5. Report a conflict before coding against it; do not silently choose a different send path, retry policy or ownership model.
 
+For the model lane, read the [Jev contract](../integrations/jev-contract.md) and assign its J-cases alongside the existing S-cases.
+F0 proves the hosted API boundary, F1 owns shared model/result validation, and R1/C1 use the same adapter.
+Use the [Orca handoff](orca-handoff.md) for requested model roles, setup gaps, native permission routing and coordinator-owned build-log updates.
+
 The PRD owns product requirements.
 Accepted ADRs own architecture choices; their linked contracts define the selected interfaces.
 Proposed ADRs permit only explicitly authorized proof work, not independent feature implementation.

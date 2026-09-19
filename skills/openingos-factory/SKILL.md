@@ -18,6 +18,8 @@ If an unresolved choice changes shared contracts, resolve it before dependent im
 An ADR records a decision and its consequences; it is not a standalone worker ticket.
 One implementation package can depend on several ADRs, and one ADR can constrain several packages.
 For sponsor work, use `docs/integrations/sponsor-contracts.md` and the package details in `docs/implementation/sponsor-integration-plan.md`.
+For Jev work, use `docs/integrations/jev-contract.md` for the actual API boundary and pending J-cases.
+For coordinated builds, use `docs/implementation/orca-handoff.md` for the user's model roles, permission policy and startup proofs.
 The coordinator assigns the relevant S-cases and records their evidence mode before dispatch.
 Use proof packages to resolve proposed contracts; do not send feature workers to guess around them.
 
@@ -38,7 +40,8 @@ Confirm the worker base actually contains its prerequisites, including contracts
 Do not copy credentials or unrelated changes into a worker.
 Assign one owner to shared schemas, contract files, and the lockfile until changes are integrated.
 Parallelize packages only when their inputs and file ownership are stable.
-Use separate test data, controlled mail recipients, browser profiles, and ports where concurrent runs could interfere.
+Use separate test data, AgentMail project inboxes, browser profiles, and ports where concurrent runs could interfere.
+All live hackathon mail still targets the single owner-designated recipient; isolation does not authorize another external address.
 Worktrees do not isolate a shared Convex deployment or provider allowance.
 
 ## Build
@@ -70,11 +73,11 @@ Inspect and stage only in-scope files, and preserve unrelated edits and secrets.
 When PR creation is authorized, create a ready-for-review PR, not a draft.
 List the task's fixed expected check names in the PR and handoff before inspecting results.
 Do not remove a check from that set to get a pass.
-The initial repository check is `delivery-guard-tests`; it is not an application test suite.
+The current repository checks are `delivery-guard-tests` and `workbench-artifact-tests`; neither is an application test suite.
 The application foundation must add and name its actual type, build, unit, integration, and user-path checks as applicable before feature workers rely on CI.
 
 1. Inspect the PR's current head and every reported CI check, not only Greptile.
-2. Run `node scripts/check-pr.mjs --repo VasuBansal7576/openingos --pr NUMBER --expect delivery-guard-tests`, adding each agreed application check with another `--expect`.
+2. Run `node scripts/check-pr.mjs --repo VasuBansal7576/openingos --pr NUMBER --expect delivery-guard-tests --expect workbench-artifact-tests`, adding each agreed application check with another `--expect`.
 3. If checks are pending or absent, retain ownership and wait with bounded polling or the available wait mechanism.
 4. For a failed check, read its job logs, reproduce at the closest practical boundary, fix the cause within scope, and run the relevant regression test.
 5. Push the repair under the standing task authorization, then inspect the new head again; an earlier green commit is not evidence for the new one.
@@ -89,15 +92,16 @@ Separate pre-existing failures from regressions without treating either as green
 
 ## Greptile
 
-Greptile is optional until the user enables the GitHub integration for this repository.
-Its absence must be reported, not replaced with a fabricated review or score.
-As checked on September 19, 2026, Starter provides one active developer with 50 monthly credits; standard reviews cost one credit and TREX reviews cost three.
-Recheck pricing before activation; public commercial source does not establish eligibility for the separate free open-source offering.
+On September 19, 2026, the user's Greptile dashboard showed OpeningOS enabled, automatic reviews on all PR events and status checks enabled.
+It showed no completed reviews, and the repository had no PRs, so end-to-end review remains unverified.
+Recheck current repository settings and plan allowance at the first authorized PR rather than assuming signup proves review execution.
+If the integration is unavailable, report it rather than fabricating a review or score.
 Do not enable paid overages or spend beyond the user's plan allowance.
 Before requesting a review, check whether the current head already has one running or completed.
 Prefer the existing automatic review over duplicate requests.
 Limit an automatic repair session to three review rounds by default, then report remaining findings and allowance needs.
 Treat confidence scores as review signals, not proof of correctness.
+The observed configuration never fails its status check on confidence, so green CI does not replace reading and resolving findings.
 When enabled for the task, both the agreed CI checks and the current review findings must be settled before PR delivery is reported complete.
 
 ## Keep an owner until the work is settled
@@ -114,6 +118,17 @@ For Orca-managed resources, settle and release the worker through the documented
 Never assume that releasing a terminal also removed its worktree.
 Retain a worktree only when an active owner, pending repair, unpreserved data, or a user instruction requires it, and report the reason and owner.
 Do not automatically merge, force-push, remove an active or main checkout, or discard unpreserved work as cleanup.
+
+## Update public progress from verified evidence
+
+In a multi-worker run, the coordinator alone edits root `hackathon.md`.
+Workers return the pushed commit, behavior, exact test results, live versus controlled evidence and blockers with their handoff.
+After each verified integrated checkpoint, the coordinator loads the hackathon skill and log-format reference, updates the log, scans the whole file for private data and pushes the update.
+If `/hackathon` is unavailable, follow the installed skill directly; never run slash-command text as a shell command.
+Update README status and setup instructions when those facts change, and repeat the log check before pausing or submission.
+An unchanged checkpoint does not need a duplicate entry or timestamp refresh.
+Local ignored skill installations are not automatically present in worker worktrees; verify the read path before relying on one.
+These instructions define the active coordinator's duties, not a background runner that already exists.
 
 ## Provenance
 

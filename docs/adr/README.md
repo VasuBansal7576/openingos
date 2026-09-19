@@ -27,6 +27,7 @@ Do not let workers silently turn a proposal into an accepted contract.
 4. Confirm the hackathon research country, currency and representative supplier sites.
 5. Confirm application API access, the owner's designated recipient mailbox and a total provider allowance through secure configuration.
 6. Measure task-specific Jev thresholds and choose a tested OpenAI model snapshot.
+7. Prove the requested Orca worker models and native permission routing; complete OpenCode's Convex setup before assigning backend work.
 
 The Netherlands/EUR in the prototype is a fixture, not a chosen supplier market.
 No keys, account creation, provider purchases, external outreach, hosting changes or deployments are authorized by these documents.
@@ -43,6 +44,8 @@ For Firecrawl, AgentMail and Convex integration, read the [sponsor contracts](..
 The contracts distinguish source-verified behavior, selected implementation rules and unproven runtime behavior.
 ADR-0004 now specifies official-component collection and inbox handling, with outbound mail sent through the shared authorized workflow rather than a second independent queue.
 Its remaining checks are concrete acceptance cases, not permission for each worker to invent a different integration.
+For Jev transport and model proof, read the [Jev contract](../integrations/jev-contract.md).
+For model roles, coordinator-owned logging, permissions and the final ChatGPT Sites publication handoff, read the [Orca handoff](../implementation/orca-handoff.md).
 
 ## Current evidence
 

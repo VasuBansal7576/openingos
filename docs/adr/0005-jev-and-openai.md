@@ -5,6 +5,10 @@ Requirements: H-04, D-02, D-03, D-10, D-11, D-12, D-13, D-17.
 
 ## Decision
 
+The [Jev integration contract](../integrations/jev-contract.md) specifies the previously missing HTTP endpoint, backend secret, request/response validation, retry owner and J-01 through J-07 proof cases.
+The proposed first implementation uses server-side HTTP from a Convex action, with a tested SDK as an explicit alternative rather than a second competing client.
+Neither this decision nor a coding-agent subscription supplies TypeSafe application API access.
+
 Make Jev the first route for bounded decisions over observed options.
 Use it during collection, not merely after extraction.
 Start evaluation with pinned `jev-1.13.0`, which the official model page currently lists, and record the actual returned version.

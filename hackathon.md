@@ -12,7 +12,7 @@
 - **Auth:** none
 - **AI models:** none
 - **Started:** 2026-09-19T09:46:19Z
-- **Last updated:** 2026-09-19T15:18:07Z
+- **Last updated:** 2026-09-19T17:28:26Z
 
 ## Log
 
@@ -92,3 +92,12 @@ Updated agent instructions and sponsor contracts with recipient checks, thread b
 Added three pending acceptance cases for recipient enforcement, the live owner negotiation loop and counterparty provenance; preserved all 52 PRD requirement rows and all 21 earlier integration cases.
 All 23 existing repository tests passed, 30 local documentation links and anchors checked, and the full log passed the address/token redaction scan.
 This checkpoint changes documentation only; no email was sent, no live integration was tested and no application behavior was implemented.
+
+### 2026-09-19 - working tree
+
+Added the root README and an Orca handoff covering requested Muse Spark 1.3, GPT-5.6 Luna and GPT-6 Astra roles, scoped permissions, recovery, current-head review and coordinator-owned build-log updates.
+Added the missing Jev HTTP integration contract with backend-only credentials, pinned model, validated typed results, retry ownership and seven pending acceptance cases.
+Rechecked the original setup prompt and current event/setup pages; documented managed Convex AI files, missing OpenCode MCP configuration, ignored local skill portability and the ChatGPT Sites publication handoff.
+Verified that Greptile is enabled for OpeningOS with automatic PR reviews, but no review has run; verified Orca readiness and the requested model catalog entries without launching workers or changing account settings.
+All 23 existing repository tests passed, the delivery skill validated, 48 local links and anchors checked, and the synthetic Jev JSON example parsed with matching permitted options.
+All 52 product requirement rows and 24 earlier integration cases remain unchanged; application behavior, live model calls, native permission routing and end-to-end Greptile review are still unverified.
