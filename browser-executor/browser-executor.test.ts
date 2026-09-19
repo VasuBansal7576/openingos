@@ -1,47 +1,59 @@
 // Controlled contract tests for the browser-executor boundary.
 //
-// Every transport is an injected stub, every secret is synthetic, and every
-// clock is fixed. No live browser, provider, or network calls; no
+// Every transport is an injected stub, every secret is synthetic, every
+// clock is fixed, and every lease/claim/nonce lives in an in-memory
+// controlled store. No live browser, provider, or network calls; no
 // credentials; no claim of deployed D-04 success.
+//
+// Includes regression coverage for independent review findings BR1-BR9
+// (boolean-safe signing, numeric policy, single-use bound claims,
+// compare-and-set dispatch, callback quarantine, digest binding,
+// fail-closed replay store, operation-specific inputs, truthful late
+// outcomes) converted from the reviewer probes into repository tests.
 
 import { describe, expect, it } from "bun:test";
 import type {
   AuthorizeInput,
   BrowserJob,
   BrowserObservation,
+  CallbackExpectation,
   CallbackVerifier,
   ClaimedOutcome,
-  Decision,
-  Denial,
+  ControlledDriverOptions,
   DenialReason,
+  IssuedClaim,
   NonceStore,
   ObservedTarget,
+  SessionLease,
   StepClaim,
   StepTransport,
   TransportInput,
   TransportResult,
 } from "./index.ts";
 import {
+  ControlledDriver,
   OPERATION_CATALOG_VERSION,
-  applyIndependentCheck,
   authorizeOperation,
   authorizeStep,
   cancelJob,
+  canonicalJson,
   catalogEntries,
   changeStrategy,
   checkTarget,
+  computeRequestDigest,
   createJob,
   createMemoryNonceStore,
   createSessionRegistry,
-  dispatchStep,
   fenceExpired,
+  isDenial,
   isLeaseDecision,
   parseJobRequest,
   parseObservation,
   prepareAttempt,
   recordLateObservation,
-  signJobRequest,
+  settleAttempt,
   signObservation,
+  signJobRequest,
   tryComplete,
   validateDestination,
   validateNavigation,
@@ -73,6 +85,8 @@ function requestFixture(overrides: { readonly [key: string]: unknown } = {}): un
   };
 }
 
+const TEST_DIGEST = computeRequestDigest(SECRET, parseJobRequest(requestFixture()));
+
 function observationFixture(
   attemptId: string,
   overrides: { readonly [key: string]: unknown } = {},
@@ -88,6 +102,7 @@ function observationFixture(
     collectedEvidence: [],
     claimedOutcome: "success",
     meteredUsage: { operationsUsed: 1, millisUsed: 500 },
+    requestDigest: TEST_DIGEST,
     ...overrides,
   };
 }
@@ -96,112 +111,181 @@ function targetFixture(targetId: string, documentVersion: string, occluded = fal
   return { targetId, documentVersion, occluded };
 }
 
-function asDenial(value: unknown): Denial {
-  if (typeof value === "object" && value !== null && "ok" in value) {
-    const candidate = value as { readonly ok: unknown; readonly reason: unknown; readonly detail: unknown };
-    if (
-      candidate.ok === false &&
-      typeof candidate.reason === "string" &&
-      typeof candidate.detail === "string"
-    ) {
-      return candidate as Denial;
-    }
-  }
-  throw new Error("expected a denial");
-}
-
 function mustJob(value: unknown): BrowserJob {
-  if (typeof value === "object" && value !== null && "ok" in value) {
-    const denial = asDenial(value);
-    throw new Error(`expected job, got denial ${denial.reason}: ${denial.detail}`);
+  if (isDenial(value)) {
+    throw new Error(`expected job, got denial ${value.reason}: ${value.detail}`);
   }
   return value as BrowserJob;
 }
 
 function mustDenialReason(value: unknown, reason: DenialReason): string {
-  const denial = asDenial(value);
-  expect(denial.reason).toBe(reason);
-  return denial.detail;
+  if (!isDenial(value)) {
+    throw new Error("expected a denial");
+  }
+  expect(value.reason).toBe(reason);
+  return value.detail;
 }
 
-function setupJob(overrides: { readonly [key: string]: unknown } = {}): BrowserJob {
-  return createJob(parseJobRequest(requestFixture(overrides)), NOW);
-}
-
-function authorize(
-  job: BrowserJob,
-  operationId = "readVisibleText",
-  extra: Partial<AuthorizeInput> = {},
-): { readonly ok: true; readonly claim: StepClaim } | Decision {
-  const input: AuthorizeInput = {
+function mustClaim(job: BrowserJob, operationId = "readVisibleText", extra: Partial<AuthorizeInput> = {}): StepClaim {
+  const result: unknown = authorizeStep(job, {
     nowMs: NOW,
     operationId,
     viaRecovery: false,
     leaseOk: true,
     ...extra,
-  };
-  return authorizeStep(job, input);
-}
-
-function mustClaim(job: BrowserJob, operationId = "readVisibleText", extra: Partial<AuthorizeInput> = {}): StepClaim {
-  const result: unknown = authorize(job, operationId, extra);
-  if (typeof result === "object" && result !== null && "claim" in result) {
-    return (result as { readonly claim: StepClaim }).claim;
+  });
+  if (isDenial(result)) {
+    throw new Error(`expected claim, got denial ${result.reason}: ${result.detail}`);
   }
-  const denial = asDenial(result);
-  throw new Error(`expected claim, got denial ${denial.reason}: ${denial.detail}`);
+  return (result as { readonly claim: StepClaim }).claim;
 }
 
-interface StubStep {
+function strictVerifier(
+  store: NonceStore,
+  exp: { readonly nonce: string; readonly digest?: string; readonly jobId?: string; readonly attemptId?: string },
+): CallbackVerifier {
+  return {
+    verify: (envelope: unknown, signature: unknown, version: number) => {
+      const expectation: CallbackExpectation = {
+        nonce: exp.nonce,
+        requestDigest: exp.digest ?? TEST_DIGEST,
+        jobId: exp.jobId ?? "job-a",
+        attemptId: exp.attemptId ?? "a_job-a_1",
+        version,
+        validUntilMs: NOW + 120_000,
+        nowMs: NOW,
+      };
+      return verifyCallback(SECRET, store, envelope, signature, expectation);
+    },
+  };
+}
+
+function signedEnvelope(
+  attemptId: string,
+  nonce: string,
+  overrides: { readonly [key: string]: unknown } = {},
+  secret: string = SECRET,
+): { readonly envelope: unknown; readonly signature: unknown } {
+  const raw = observationFixture(attemptId, overrides);
+  const observation = parseObservation(raw);
+  return { envelope: { observation: raw, callbackNonce: nonce }, signature: signObservation(secret, observation, nonce) };
+}
+
+interface DriverSetup {
+  readonly driver: ControlledDriver;
+  readonly jobId: string;
+  readonly handle: string;
+}
+
+function setupDriver(
+  reqOverrides: { readonly [key: string]: unknown } = {},
+  options?: ControlledDriverOptions,
+  requiredOutputs: unknown = [],
+): DriverSetup {
+  const driver = new ControlledDriver(SECRET, options);
+  const request = parseJobRequest(requestFixture(reqOverrides));
+  const registered: unknown = driver.registerJob(request, NOW, requiredOutputs);
+  if (typeof registered !== "string") {
+    throw new Error(`registration failed: ${isDenial(registered) ? registered.detail : "unknown"}`);
+  }
+  const lease: unknown = driver.acquireLease(registered, {
+    organizationId: request.organizationId,
+    projectId: request.projectId,
+    leaseId: "lease-1",
+    expiresAtMs: NOW + 60_000,
+    guest: false,
+  }, NOW);
+  if (isDenial(lease)) {
+    throw new Error(`lease failed: ${lease.detail}`);
+  }
+  return { driver, jobId: registered, handle: (lease as SessionLease).handle };
+}
+
+function issue(
+  setup: DriverSetup,
+  operationId = "readVisibleText",
+  extra: Partial<Omit<DriverAuthorizeExtra, "jobId">> = {},
+): IssuedClaim {
+  const result: unknown = setup.driver.authorize({
+    jobId: setup.jobId,
+    nowMs: NOW,
+    operationId,
+    viaRecovery: false,
+    sessionHandle: setup.handle,
+    ...extra,
+  });
+  if (isDenial(result)) {
+    throw new Error(`expected claim: ${result.reason} ${result.detail}`);
+  }
+  return result as IssuedClaim;
+}
+
+interface DriverAuthorizeExtra {
+  readonly jobId: string;
+  readonly viaRecovery?: boolean;
+  readonly destination?: string;
+  readonly redirectHops?: readonly string[];
+  readonly targetId?: string;
+  readonly currentTargets?: readonly ObservedTarget[];
+  readonly currentDocumentVersion?: string;
+  readonly nowMs?: number;
+}
+
+interface StubDef {
   readonly url?: string;
   readonly outcome?: ClaimedOutcome;
   readonly version?: number;
   readonly targets?: readonly ObservedTarget[];
+  readonly outputs?: readonly string[];
+  readonly digest?: string;
+  readonly nonce?: string;
+  readonly badSecret?: boolean;
   readonly throws?: boolean;
 }
 
-function stubTransport(store: NonceStore, steps: readonly StubStep[], baseVersion: number): {
+function driverStub(driver: ControlledDriver, defs: readonly StubDef[] = [{}]): {
   readonly transport: StepTransport;
   readonly calls: TransportInput[];
-  readonly verifier: CallbackVerifier;
 } {
   const calls: TransportInput[] = [];
   let count = 0;
-  const verifier: CallbackVerifier = {
-    verify: (envelope, signature, expectedVersion) =>
-      verifyCallback(SECRET, store, envelope, signature, expectedVersion),
-  };
   const transport: StepTransport = {
-    async execute(input: TransportInput): Promise<TransportResult> {
+    execute: async (input: TransportInput): Promise<TransportResult> => {
       calls.push(input);
       count += 1;
-      const step = steps[Math.min(count - 1, steps.length - 1)] as StubStep;
-      if (step.throws === true) {
+      const def = defs[Math.min(count - 1, defs.length - 1)] as StubDef;
+      if (def.throws === true) {
         throw new Error("synthetic transport failure");
       }
-      const nonce = `cb-nonce-${count}-${input.attemptId}`;
+      const expectation = driver.expectationFor(input.jobId, input.attemptId);
       const raw = observationFixture(input.attemptId, {
-        url: step.url ?? GOOD_URL,
-        claimedOutcome: step.outcome ?? "success",
-        observationVersion: step.version ?? baseVersion + (count - 1),
-        ...(step.targets === undefined ? {} : { observedTargets: step.targets }),
+        url: def.url ?? GOOD_URL,
+        claimedOutcome: def.outcome ?? "success",
+        observationVersion: def.version ?? expectation?.version ?? 1,
+        requestDigest: def.digest ?? input.requestDigest,
+        ...(def.targets === undefined ? {} : { observedTargets: def.targets }),
+        ...(def.outputs === undefined ? {} : { producedOutputs: def.outputs }),
       });
-      const observation = parseObservation(raw) as BrowserObservation;
-      const signature = signObservation(SECRET, observation, nonce);
+      const observation = parseObservation(raw);
+      const nonce = def.nonce ?? input.callbackNonce;
+      const signature = signObservation(def.badSecret === true ? OTHER_SECRET : SECRET, observation, nonce);
       return { envelope: { observation: raw, callbackNonce: nonce }, signature };
     },
   };
-  return { transport, calls, verifier };
+  return { transport, calls };
 }
 
-async function dispatch(
-  job: BrowserJob,
-  claim: StepClaim,
-  store: NonceStore,
-  steps: readonly StubStep[],
+async function runDispatch(
+  setup: DriverSetup,
+  claim: IssuedClaim,
+  defs: readonly StubDef[] = [{}],
+  timeoutMs?: number,
 ): Promise<{ readonly job: BrowserJob; readonly outcome: string; readonly detail: string; readonly calls: number }> {
-  const stub = stubTransport(store, steps, job.nextObservationVersion);
-  const result = await dispatchStep(job, claim, stub.transport, stub.verifier, NOW);
+  const stub = driverStub(setup.driver, defs);
+  const result = await setup.driver.dispatch(setup.jobId, claim.claimId, stub.transport, {
+    nowMs: NOW,
+    ...(timeoutMs === undefined ? {} : { timeoutMs }),
+  });
   return { job: result.job, outcome: result.receipt.outcome, detail: result.receipt.detail, calls: stub.calls.length };
 }
 
@@ -243,81 +327,187 @@ describe("observation validation", () => {
   it("accepts a valid observation", () => {
     const observation = parseObservation(observationFixture("a_job-a_1"));
     expect(observation.claimedOutcome).toBe("success");
+    expect(observation.requestDigest).toBe(TEST_DIGEST);
   });
 
   it("rejects an unknown claimed outcome", () => {
     expect(() => parseObservation(observationFixture("a_job-a_1", { claimedOutcome: "done" }))).toThrow();
   });
+
+  it("rejects a missing request digest", () => {
+    const raw = observationFixture("a_job-a_1") as { [key: string]: unknown };
+    delete raw.requestDigest;
+    expect(() => parseObservation(raw)).toThrow();
+  });
 });
 
-describe("request signing", () => {
-  it("round-trips sign and verify", () => {
-    const request = parseJobRequest(requestFixture());
-    const signed = signJobRequest(SECRET, request);
-    const back = verifyJobRequest(SECRET, requestFixture(), signed.signature);
-    expect(back.jobId).toBe("job-a");
+describe("canonical signing (BR1)", () => {
+  it("serializes booleans separately from numbers", () => {
+    expect(canonicalJson({ occluded: false })).toBe('{"occluded":false}');
+    expect(canonicalJson({ occluded: true })).toBe('{"occluded":true}');
   });
 
-  it("rejects a tampered payload", () => {
+  it("round-trips observations with targets both occluded values", () => {
+    for (const occluded of [false, true]) {
+      const store = createMemoryNonceStore();
+      const raw = observationFixture("a_job-a_1", {
+        observationVersion: 1,
+        observedTargets: [{ targetId: "t", documentVersion: "v1", occluded }],
+      });
+      const observation = parseObservation(raw);
+      const nonce = `cb-target-${occluded}`;
+      const signature = signObservation(SECRET, observation, nonce);
+      const result = verifyCallback(SECRET, store, { observation: raw, callbackNonce: nonce }, signature, {
+        nonce,
+        requestDigest: TEST_DIGEST,
+        jobId: "job-a",
+        attemptId: "a_job-a_1",
+        version: 1,
+        validUntilMs: NOW + 120_000,
+        nowMs: NOW,
+      });
+      expect(result.ok).toBe(true);
+    }
+  });
+
+  it("settles a target-bearing observation through settleAttempt", () => {
+    const store = createMemoryNonceStore();
+    const job = createJob(parseJobRequest(requestFixture()), NOW);
+    const prepared = prepareAttempt(job, mustClaim(job), NOW);
+    if (isDenial(prepared)) {
+      throw new Error("expected preparation");
+    }
+    const nonce = "cb-settle-target-1";
+    const { envelope, signature } = signedEnvelope(prepared.attemptId, nonce, {
+      observedTargets: [{ targetId: "t", documentVersion: "v1", occluded: false }],
+    });
+    const settled = settleAttempt(prepared.job, prepared.attemptId, envelope, signature, strictVerifier(store, { nonce }), NOW);
+    if (isDenial(settled)) {
+      throw new Error(`expected settlement: ${settled.detail}`);
+    }
+    expect(settled.receipt.outcome).toBe("observed-success");
+    expect(settled.job.attempts[0]?.observation?.observedTargets.length).toBe(1);
+  });
+
+  it("keeps sorted-key equivalence and tamper rejection", () => {
     const request = parseJobRequest(requestFixture());
     const signed = signJobRequest(SECRET, request);
+    expect(verifyJobRequest(SECRET, requestFixture(), signed.signature).jobId).toBe("job-a");
     expect(() => verifyJobRequest(SECRET, requestFixture({ jobId: "job-b" }), signed.signature)).toThrow();
-  });
-
-  it("rejects the wrong secret", () => {
-    const request = parseJobRequest(requestFixture());
-    const signed = signJobRequest(SECRET, request);
     expect(() => verifyJobRequest(OTHER_SECRET, requestFixture(), signed.signature)).toThrow();
   });
+
+  it("still rejects non-finite numbers in canonicalization", () => {
+    expect(() => canonicalJson({ value: Number.NaN })).toThrow();
+    expect(() => canonicalJson({ value: Number.POSITIVE_INFINITY })).toThrow();
+  });
 });
 
-describe("callback verification", () => {
-  function signedCallback(version: number, nonce: string): { envelope: unknown; signature: unknown } {
-    const raw = observationFixture("a_job-a_1", { observationVersion: version });
-    const observation = parseObservation(raw);
-    const signature = signObservation(SECRET, observation, nonce);
-    return { envelope: { observation: raw, callbackNonce: nonce }, signature };
+describe("callback verification with issued expectations (BR6/BR7)", () => {
+  function expectation(nonce: string, overrides: Partial<CallbackExpectation> = {}): CallbackExpectation {
+    return {
+      nonce,
+      requestDigest: TEST_DIGEST,
+      jobId: "job-a",
+      attemptId: "a_job-a_1",
+      version: 1,
+      validUntilMs: NOW + 120_000,
+      nowMs: NOW,
+      ...overrides,
+    };
   }
 
   it("accepts a first valid callback", () => {
     const store = createMemoryNonceStore();
-    const { envelope, signature } = signedCallback(1, "cb-once-1");
-    const result = verifyCallback(SECRET, store, envelope, signature, 1);
-    expect(result.ok).toBe(true);
+    const { envelope, signature } = signedEnvelope("a_job-a_1", "cb-once-1");
+    expect(verifyCallback(SECRET, store, envelope, signature, expectation("cb-once-1")).ok).toBe(true);
   });
 
   it("rejects a replayed nonce", () => {
     const store = createMemoryNonceStore();
-    const { envelope, signature } = signedCallback(1, "cb-once-1");
-    expect(verifyCallback(SECRET, store, envelope, signature, 1).ok).toBe(true);
-    const replay = verifyCallback(SECRET, store, envelope, signature, 2);
+    const { envelope, signature } = signedEnvelope("a_job-a_1", "cb-once-1");
+    expect(verifyCallback(SECRET, store, envelope, signature, expectation("cb-once-1")).ok).toBe(true);
+    const replay = verifyCallback(SECRET, store, envelope, signature, expectation("cb-once-1"));
     expect(replay.ok).toBe(false);
     if (!replay.ok) {
       expect(replay.reason).toBe("replay-detected");
     }
   });
 
-  it("rejects a stale observation version without consuming the nonce", () => {
+  it("rejects a stale version without consuming the nonce", () => {
     const store = createMemoryNonceStore();
-    const { envelope, signature } = signedCallback(5, "cb-stale-1");
-    const stale = verifyCallback(SECRET, store, envelope, signature, 1);
+    const { envelope, signature } = signedEnvelope("a_job-a_1", "cb-stale-1", { observationVersion: 5 });
+    const stale = verifyCallback(SECRET, store, envelope, signature, expectation("cb-stale-1"));
     expect(stale.ok).toBe(false);
     if (!stale.ok) {
       expect(stale.reason).toBe("stale-callback");
     }
-    expect(store.has("cb-stale-1")).toBe(false);
+    expect(store.isConsumed("cb-stale-1", NOW)).toBe(false);
   });
 
   it("rejects a bad signature", () => {
     const store = createMemoryNonceStore();
-    const raw = observationFixture("a_job-a_1", { observationVersion: 1 });
-    const observation = parseObservation(raw);
-    const bad = signObservation(OTHER_SECRET, observation, "cb-bad-1");
-    const result = verifyCallback(SECRET, store, { observation: raw, callbackNonce: "cb-bad-1" }, bad, 1);
+    const { envelope } = signedEnvelope("a_job-a_1", "cb-bad-1");
+    const raw = observationFixture("a_job-a_1");
+    const bad = signObservation(OTHER_SECRET, parseObservation(raw), "cb-bad-1");
+    const result = verifyCallback(SECRET, store, envelope, bad, expectation("cb-bad-1"));
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.reason).toBe("bad-signature");
     }
+  });
+
+  it("rejects an unissued nonce without burning the rightful result", () => {
+    const store = createMemoryNonceStore();
+    const right = signedEnvelope("a_job-a_1", "cb-right-1");
+    const wrongRoute = verifyCallback(SECRET, store, right.envelope, right.signature, expectation("cb-other-1"));
+    expect(wrongRoute.ok).toBe(false);
+    if (!wrongRoute.ok) {
+      expect(wrongRoute.reason).toBe("unknown-callback");
+    }
+    expect(verifyCallback(SECRET, store, right.envelope, right.signature, expectation("cb-right-1")).ok).toBe(true);
+  });
+
+  it("rejects a callback answering another tenant's request", () => {
+    const store = createMemoryNonceStore();
+    const otherDigest = computeRequestDigest(SECRET, parseJobRequest(requestFixture({ organizationId: "org-guest", projectId: "proj-guest" })));
+    const { envelope, signature } = signedEnvelope("a_job-a_1", "cb-tenant-1", { requestDigest: otherDigest });
+    const result = verifyCallback(SECRET, store, envelope, signature, expectation("cb-tenant-1"));
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe("unknown-callback");
+    }
+  });
+
+  it("rejects a callback bound to another attempt", () => {
+    const store = createMemoryNonceStore();
+    const { envelope, signature } = signedEnvelope("a_job-a_9", "cb-attempt-1");
+    const result = verifyCallback(SECRET, store, envelope, signature, expectation("cb-attempt-1"));
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe("unknown-callback");
+    }
+  });
+
+  it("fails closed when the atomic consume is refused", () => {
+    const { envelope, signature } = signedEnvelope("a_job-a_1", "cb-refused-1");
+    const refusing: NonceStore = { isConsumed: () => false, tryConsume: () => false };
+    expect(verifyCallback(SECRET, refusing, envelope, signature, expectation("cb-refused-1")).ok).toBe(false);
+  });
+
+  it("retains replay markers at capacity instead of evicting them", () => {
+    const store = createMemoryNonceStore();
+    const { envelope, signature } = signedEnvelope("a_job-a_1", "cb-cap-1");
+    expect(verifyCallback(SECRET, store, envelope, signature, expectation("cb-cap-1")).ok).toBe(true);
+    for (let n = 0; n < 9_999; n += 1) {
+      expect(store.tryConsume(`other-${n}`, NOW + 120_000, NOW)).toBe(true);
+    }
+    const replay = verifyCallback(SECRET, store, envelope, signature, expectation("cb-cap-1"));
+    expect(replay.ok).toBe(false);
+    if (!replay.ok) {
+      expect(replay.reason).toBe("replay-detected");
+    }
+    expect(store.tryConsume("fresh-after-full", NOW + 120_000, NOW)).toBe(false);
   });
 });
 
@@ -335,8 +525,7 @@ describe("session leases", () => {
     if (isLeaseDecision(lease)) {
       return;
     }
-    const resolved = registry.resolve(lease.handle, contextA, NOW);
-    expect(isLeaseDecision(resolved)).toBe(false);
+    expect(isLeaseDecision(registry.resolve(lease.handle, contextA, NOW))).toBe(false);
   });
 
   it("rejects a second active lease for the same job", () => {
@@ -416,43 +605,60 @@ describe("session leases", () => {
       throw new Error("expected a lease");
     }
     expect(registry.release(first.handle, contextA).ok).toBe(true);
-    const second = registry.acquire(
+    expect(isLeaseDecision(registry.acquire(
       { organizationId: "org-a", projectId: "proj-a", jobId: "job-a", leaseId: "lease-2", expiresAtMs: NOW + 60_000, guest: false },
       NOW,
-    );
-    expect(isLeaseDecision(second)).toBe(false);
+    ))).toBe(false);
   });
 });
 
-describe("destination policy", () => {
+describe("destination policy (BR2)", () => {
   it("permits an allowed https origin", () => {
     expect(validateDestination(GOOD_URL, ORIGINS).ok).toBe(true);
   });
 
-  it("blocks non-https protocols", () => {
-    mustDenialReason(validateDestination("http://supplier-a.example/x", ORIGINS), "unsupported-protocol");
+  it("denies private IPv6 and reserved IPv4 literals even when allowlisted", () => {
+    const inputs = [
+      "https://[::1]/",
+      "https://[fd00::1]/",
+      "https://[fe80::1]/",
+      "https://[fe80::abcd]/",
+      "https://[::ffff:127.0.0.1]/",
+      "https://[::ffff:7f00:1]/",
+      "https://[ff02::1]/",
+      "https://[2001:db8::1]/",
+      "https://224.0.0.1/",
+      "https://240.0.0.1/",
+      "https://192.0.2.1/",
+      "https://198.51.100.7/",
+      "https://203.0.113.9/",
+      "https://127.0.0.1/",
+      "https://10.0.0.5/",
+      "https://192.168.1.20/",
+      "https://172.16.4.9/",
+      "https://169.254.169.254/",
+      "https://0x7f.0.0.1/",
+      "https://2130706433/",
+    ];
+    for (const raw of inputs) {
+      const allowlisted = [new URL(raw).origin];
+      const result = validateDestination(raw, allowlisted);
+      expect(result.ok).toBe(false);
+    }
   });
 
-  it("blocks private IPv4 ranges", () => {
-    mustDenialReason(validateDestination("https://10.0.0.5/admin", ORIGINS), "private-network");
-    mustDenialReason(validateDestination("https://192.168.1.20/admin", ORIGINS), "private-network");
-    mustDenialReason(validateDestination("https://172.16.4.9/admin", ORIGINS), "private-network");
-  });
-
-  it("blocks loopback", () => {
-    mustDenialReason(validateDestination("https://127.0.0.1/admin", ORIGINS), "private-network");
-  });
-
-  it("blocks cloud metadata destinations", () => {
+  it("denies metadata and blocked-host aliases including trailing dots", () => {
     mustDenialReason(validateDestination("https://169.254.169.254/latest/meta-data", ORIGINS), "metadata-endpoint");
     mustDenialReason(validateDestination("https://metadata.google.internal/x", ORIGINS), "blocked-host");
+    mustDenialReason(validateDestination("https://localhost./admin", ["https://localhost.:443"]), "blocked-host");
+    mustDenialReason(validateDestination("https://intranet/admin", ["https://intranet"]), "blocked-host");
   });
 
   it("blocks origins outside the allowlist", () => {
     mustDenialReason(validateDestination("https://evil.example/x", ORIGINS), "origin-not-allowed");
   });
 
-  it("validates redirect chains", () => {
+  it("validates every redirect position", () => {
     expect(
       validateNavigation("https://supplier-a.example/final", ["https://supplier-a.example/step"], ORIGINS).ok,
     ).toBe(true);
@@ -463,6 +669,10 @@ describe("destination policy", () => {
     mustDenialReason(
       validateNavigation("https://supplier-a.example/final", ["https://evil.example/step"], ORIGINS),
       "redirect-origin-not-allowed",
+    );
+    mustDenialReason(
+      validateNavigation("https://supplier-a.example/final", ["https://[::1]/step"], ORIGINS),
+      "private-network",
     );
     mustDenialReason(
       validateNavigation("https://supplier-a.example/final", ["http://supplier-a.example/step"], ORIGINS),
@@ -510,6 +720,10 @@ describe("operation catalog", () => {
     expect(catalogEntries().filter((entry) => entry.permitted).length).toBe(6);
   });
 
+  it("freezes every catalog entry at runtime", () => {
+    expect(catalogEntries().every((entry) => Object.isFrozen(entry))).toBe(true);
+  });
+
   it("denies unknown operations", () => {
     mustDenialReason(authorizeOperation("brewCoffee", OPERATION_CATALOG_VERSION, false), "unknown-operation");
   });
@@ -535,197 +749,604 @@ describe("operation catalog", () => {
   });
 });
 
-describe("job lifecycle", () => {
-  it("dispatches a step and records the observation", async () => {
-    const job = setupJob();
-    const store = createMemoryNonceStore();
-    const out = await dispatch(job, mustClaim(job), store, [{ outcome: "success" }]);
-    expect(out.outcome).toBe("observed-success");
-    expect(out.job.attempts.length).toBe(1);
-    expect(out.job.attempts[0]?.state).toBe("observedSuccess");
-    expect(out.job.attempts[0]?.observation?.url).toBe(GOOD_URL);
-    expect(out.calls).toBe(1);
+describe("authorizeStep static checks (BR3/BR8/BR10)", () => {
+  function baseJob(): BrowserJob {
+    return createJob(parseJobRequest(requestFixture()), NOW);
+  }
+
+  it("denies dispatch at exact expiry", () => {
+    const job = baseJob();
+    mustDenialReason(authorizeStep(job, { nowMs: job.request.expiresAt, operationId: "readVisibleText", viaRecovery: false, leaseOk: true }), "job-expired");
   });
 
-  it("marks an observation bound to another job as a failure", async () => {
-    const job = setupJob();
+  it("denies dispatch on an expired request session lease", () => {
+    const job = createJob(parseJobRequest(requestFixture({ sessionLease: { leaseId: "l", expiresAtMs: NOW - 1 } })), NOW - 2_000);
+    mustDenialReason(
+      authorizeStep(job, { nowMs: NOW, operationId: "readVisibleText", viaRecovery: false, leaseOk: true }),
+      "lease-invalid",
+    );
+  });
+
+  it("requires a destination for navigation", () => {
+    mustDenialReason(
+      authorizeStep(baseJob(), { nowMs: NOW, operationId: "navigate", viaRecovery: false, leaseOk: true }),
+      "missing-destination",
+    );
+  });
+
+  it("requires an observed target and document for inspection", () => {
+    mustDenialReason(
+      authorizeStep(baseJob(), { nowMs: NOW, operationId: "inspectTarget", viaRecovery: false, leaseOk: true }),
+      "missing-target",
+    );
+  });
+});
+
+describe("settle quarantine (BR5)", () => {
+  function prepared(): { readonly job: BrowserJob; readonly attemptId: string } {
+    const job = createJob(parseJobRequest(requestFixture()), NOW);
+    const result: unknown = prepareAttempt(job, mustClaim(job), NOW);
+    if (isDenial(result)) {
+      throw new Error("expected preparation");
+    }
+    return result as { readonly job: BrowserJob; readonly attemptId: string };
+  }
+
+  it("does not settle on a bad signature and accepts the later valid callback", () => {
     const store = createMemoryNonceStore();
-    const verifier: CallbackVerifier = {
-      verify: (envelope, signature, expectedVersion) =>
-        verifyCallback(SECRET, store, envelope, signature, expectedVersion),
-    };
-    const raw = observationFixture("a_job-a_1", { jobId: "job-other", observationVersion: 1 });
-    const observation = parseObservation(raw);
-    const nonce = "cb-foreign-1";
-    const transport: StepTransport = {
-      async execute(): Promise<TransportResult> {
-        return { envelope: { observation: raw, callbackNonce: nonce }, signature: signObservation(SECRET, observation, nonce) };
+    const { job, attemptId } = prepared();
+    const { envelope } = signedEnvelope(attemptId, "cb-quar-1");
+    const bad = signObservation(OTHER_SECRET, parseObservation(observationFixture(attemptId)), "cb-quar-1");
+    const verifier = strictVerifier(store, { nonce: "cb-quar-1", attemptId });
+    const rejected = settleAttempt(job, attemptId, envelope, bad, verifier, NOW);
+    if (isDenial(rejected)) {
+      throw new Error("expected a receipt");
+    }
+    expect(rejected.receipt.outcome).toBe("callback-rejected");
+    expect(rejected.job.attempts[0]?.state).toBe("dispatching");
+    expect(rejected.job.quarantined.length).toBe(1);
+    const valid = signedEnvelope(attemptId, "cb-quar-1");
+    const accepted = settleAttempt(rejected.job, attemptId, valid.envelope, valid.signature, verifier, NOW);
+    if (isDenial(accepted)) {
+      throw new Error("expected settlement");
+    }
+    expect(accepted.receipt.outcome).toBe("observed-success");
+  });
+
+  it("quarantines wrong-version callbacks without settling", () => {
+    const store = createMemoryNonceStore();
+    const { job, attemptId } = prepared();
+    const { envelope, signature } = signedEnvelope(attemptId, "cb-ver-1", { observationVersion: 7 });
+    const verifier = strictVerifier(store, { nonce: "cb-ver-1", attemptId });
+    const result = settleAttempt(job, attemptId, envelope, signature, verifier, NOW);
+    if (isDenial(result)) {
+      throw new Error("expected a receipt");
+    }
+    expect(result.receipt.outcome).toBe("callback-rejected");
+    expect(result.job.attempts[0]?.state).toBe("dispatching");
+  });
+
+  it("quarantines replays without settling", () => {
+    const store = createMemoryNonceStore();
+    const { job, attemptId } = prepared();
+    const first = signedEnvelope(attemptId, "cb-replay-1");
+    const verifier = strictVerifier(store, { nonce: "cb-replay-1", attemptId });
+    const accepted = settleAttempt(job, attemptId, first.envelope, first.signature, verifier, NOW);
+    if (isDenial(accepted)) {
+      throw new Error("expected settlement");
+    }
+    expect(accepted.receipt.outcome).toBe("observed-success");
+    const replay = settleAttempt(accepted.job, attemptId, first.envelope, first.signature, verifier, NOW);
+    if (isDenial(replay)) {
+      expect(replay.reason).toBe("unknown-callback");
+      return;
+    }
+    expect(replay.receipt.outcome).toBe("callback-rejected");
+  });
+
+  it("quarantines wrong-job callbacks and keeps the right attempt open", () => {
+    const store = createMemoryNonceStore();
+    const { job, attemptId } = prepared();
+    const foreign = signedEnvelope("a_job-a_9", "cb-foreign-1", { attemptId: "a_job-a_9" });
+    const strictForAttempt = strictVerifier(store, { nonce: "cb-foreign-1", attemptId });
+    const result = settleAttempt(job, attemptId, foreign.envelope, foreign.signature, strictForAttempt, NOW);
+    if (isDenial(result)) {
+      throw new Error("expected a receipt");
+    }
+    expect(result.receipt.outcome).toBe("callback-rejected");
+    expect(result.job.attempts[0]?.state).toBe("dispatching");
+    const valid = signedEnvelope(attemptId, "cb-foreign-2");
+    const accepted = settleAttempt(result.job, attemptId, valid.envelope, valid.signature, strictVerifier(store, { nonce: "cb-foreign-2", attemptId }), NOW);
+    if (isDenial(accepted)) {
+      throw new Error("expected settlement");
+    }
+    expect(accepted.receipt.outcome).toBe("observed-success");
+  });
+
+  it("rejects cross-tenant callbacks at the digest binding", () => {
+    const store = createMemoryNonceStore();
+    const guestRequest = parseJobRequest(requestFixture({ jobId: "job-a", organizationId: "org-guest", projectId: "proj-guest" }));
+    const guestJob = createJob(guestRequest, NOW);
+    const guestPrepared: unknown = prepareAttempt(guestJob, mustClaim(guestJob), NOW);
+    if (isDenial(guestPrepared)) {
+      throw new Error("expected preparation");
+    }
+    const { job, attemptId } = guestPrepared as { readonly job: BrowserJob; readonly attemptId: string };
+    const guestDigest = computeRequestDigest(SECRET, guestRequest);
+    const { envelope, signature } = signedEnvelope(attemptId, "cb-tenant-2", { requestDigest: TEST_DIGEST });
+    const verifier = strictVerifier(store, { nonce: "cb-tenant-2", digest: guestDigest, attemptId });
+    const result = settleAttempt(job, attemptId, envelope, signature, verifier, NOW);
+    if (isDenial(result)) {
+      throw new Error("expected a receipt");
+    }
+    expect(result.receipt.outcome).toBe("callback-rejected");
+  });
+});
+
+describe("authoritative driver dispatch (BR3/BR4)", () => {
+  it("dispatches a step and preserves inputs through the transport boundary", async () => {
+    const setup = setupDriver();
+    const claim = issue(setup, "inspectTarget", {
+      targetId: "t",
+      currentTargets: [targetFixture("t", "v1")],
+      currentDocumentVersion: "v1",
+    });
+    const stub = driverStub(setup.driver, [{ targets: [targetFixture("t", "v1")] }]);
+    let sent: TransportInput | undefined;
+    const watching: StepTransport = {
+      execute: async (input: TransportInput, signal: AbortSignal) => {
+        sent = input;
+        return stub.transport.execute(input, signal);
       },
     };
-    const result = await dispatchStep(job, mustClaim(job), transport, verifier, NOW);
-    expect(result.receipt.outcome).toBe("observed-failure");
-    expect(result.job.attempts[0]?.state).toBe("observedFailure");
+    const result = await setup.driver.dispatch(setup.jobId, claim.claimId, watching, { nowMs: NOW });
+    expect(result.receipt.outcome).toBe("observed-success");
+    expect(sent?.targetId).toBe("t");
+    expect(sent?.documentVersion).toBe("v1");
+    expect(sent?.callbackNonce).toBe(claim.callbackNonce);
+    expect(sent?.requestDigest).toBe(claim.requestDigest);
+  });
+
+  it("refuses a fabricated claim with zero transport calls", async () => {
+    const setup = setupDriver();
+    const stub = driverStub(setup.driver);
+    const result = await setup.driver.dispatch(setup.jobId, "claim_forged_1", stub.transport, { nowMs: NOW });
+    expect(result.receipt.outcome).toBe("claim-refused");
+    expect(stub.calls.length).toBe(0);
+  });
+
+  it("refuses a reused claim after the budget is spent", async () => {
+    const setup = setupDriver({ maximumSteps: 1 });
+    const claim = issue(setup);
+    const stub = driverStub(setup.driver);
+    const first = await setup.driver.dispatch(setup.jobId, claim.claimId, stub.transport, { nowMs: NOW });
+    expect(first.receipt.outcome).toBe("observed-success");
+    const second = await setup.driver.dispatch(setup.jobId, claim.claimId, stub.transport, { nowMs: NOW });
+    expect(second.receipt.outcome).toBe("claim-refused");
+    expect(stub.calls.length).toBe(1);
+  });
+
+  it("refuses a claim bound to another job", async () => {
+    const setupA = setupDriver();
+    const driverB = new ControlledDriver(SECRET);
+    const registered: unknown = driverB.registerJob(requestFixture({ jobId: "job-b", organizationId: "org-a", projectId: "proj-a" }), NOW);
+    if (typeof registered !== "string") {
+      throw new Error("expected registration");
+    }
+    const claim = issue(setupA);
+    const stub = driverStub(driverB);
+    const result = await driverB.dispatch("job-b", claim.claimId, stub.transport, { nowMs: NOW });
+    expect(result.receipt.outcome).toBe("claim-refused");
+    expect(stub.calls.length).toBe(0);
+  });
+
+  it("refuses dispatch on a released lease with zero transport calls", async () => {
+    const setup = setupDriver();
+    const claim = issue(setup);
+    expect(setup.driver.releaseLease(setup.jobId).ok).toBe(true);
+    const stub = driverStub(setup.driver);
+    const result = await setup.driver.dispatch(setup.jobId, claim.claimId, stub.transport, { nowMs: NOW });
+    expect(result.receipt.outcome).toBe("claim-refused");
+    expect(stub.calls.length).toBe(0);
+  });
+
+  it("refuses dispatch at exact expiry with zero transport calls", async () => {
+    const setup = setupDriver({ expiresAt: NOW });
+    const early: unknown = setup.driver.authorize({
+      jobId: setup.jobId,
+      nowMs: NOW - 1,
+      operationId: "readVisibleText",
+      viaRecovery: false,
+      sessionHandle: setup.handle,
+    });
+    if (isDenial(early)) {
+      throw new Error("expected an early claim");
+    }
+    const stub = driverStub(setup.driver);
+    const result = await setup.driver.dispatch(setup.jobId, (early as IssuedClaim).claimId, stub.transport, { nowMs: NOW });
+    expect(result.receipt.outcome).toBe("claim-refused");
+    expect(stub.calls.length).toBe(0);
+    expect(setup.driver.snapshot(setup.jobId)?.state).toBe("cancelled");
+  });
+
+  it("denies blocked operations at authorize time, including recovery", () => {
+    const setup = setupDriver();
+    const direct: unknown = setup.driver.authorize({
+      jobId: setup.jobId,
+      nowMs: NOW,
+      operationId: "submitContactForm",
+      viaRecovery: false,
+      sessionHandle: setup.handle,
+    });
+    mustDenialReason(direct, "vendor-write-blocked");
+    const recovery: unknown = setup.driver.authorize({
+      jobId: setup.jobId,
+      nowMs: NOW,
+      operationId: "sendChatMessage",
+      viaRecovery: true,
+      sessionHandle: setup.handle,
+    });
+    mustDenialReason(recovery, "vendor-write-blocked");
+    expect(setup.driver.snapshot(setup.jobId)?.stepsUsed).toBe(0);
+  });
+
+  it("executes concurrent claims once each with accurate accounting", async () => {
+    const setup = setupDriver();
+    const first = issue(setup);
+    const second = issue(setup);
+    const stub = driverStub(setup.driver);
+    const [a, b] = await Promise.all([
+      setup.driver.dispatch(setup.jobId, first.claimId, stub.transport, { nowMs: NOW }),
+      setup.driver.dispatch(setup.jobId, second.claimId, stub.transport, { nowMs: NOW }),
+    ]);
+    expect(a.receipt.outcome).toBe("observed-success");
+    expect(b.receipt.outcome).toBe("observed-success");
+    expect(stub.calls.length).toBe(2);
+    expect(stub.calls[0]?.attemptId).toBe("a_job-a_1");
+    expect(stub.calls[1]?.attemptId).toBe("a_job-a_2");
+    expect(setup.driver.snapshot(setup.jobId)?.stepsUsed).toBe(2);
+  });
+
+  it("runs one transport for a duplicated concurrent claim", async () => {
+    const setup = setupDriver();
+    const claim = issue(setup);
+    const stub = driverStub(setup.driver);
+    const ids: string[] = [];
+    const counting: StepTransport = {
+      execute: async (input: TransportInput, signal: AbortSignal) => {
+        ids.push(input.attemptId);
+        return stub.transport.execute(input, signal);
+      },
+    };
+    const [a, b] = await Promise.all([
+      setup.driver.dispatch(setup.jobId, claim.claimId, counting, { nowMs: NOW }),
+      setup.driver.dispatch(setup.jobId, claim.claimId, counting, { nowMs: NOW }),
+    ]);
+    expect(ids.length).toBe(1);
+    const outcomes = [a.receipt.outcome, b.receipt.outcome].sort();
+    expect(outcomes).toEqual(["claim-refused", "observed-success"]);
+  });
+
+  it("preserves cancellation across an awaiting dispatch and keeps the late outcome", async () => {
+    const setup = setupDriver();
+    const claim = issue(setup);
+    let deliver!: (value: TransportResult) => void;
+    const gated: StepTransport = {
+      execute: () => new Promise<TransportResult>((resolve) => {
+        deliver = resolve;
+      }),
+    };
+    const pending = setup.driver.dispatch(setup.jobId, claim.claimId, gated, { nowMs: NOW });
+    const cancelled = setup.driver.cancel(setup.jobId, NOW + 1, "cancel during transport");
+    expect((cancelled as BrowserJob).state).toBe("cancelled");
+    const raw = observationFixture("a_job-a_1", { requestDigest: setup.driver.requestDigestOf(setup.jobId) });
+    const observation = parseObservation(raw);
+    deliver({ envelope: { observation: raw, callbackNonce: claim.callbackNonce }, signature: signObservation(SECRET, observation, claim.callbackNonce) });
+    const result = await pending;
+    expect(result.job.state).toBe("cancelled");
+    expect(result.job.lateResults.length).toBe(1);
+    expect(result.job.attempts[0]?.lateResult).toBe(true);
   });
 
   it("records a throwing transport as unknown without losing the attempt", async () => {
-    const job = setupJob();
-    const store = createMemoryNonceStore();
-    const out = await dispatch(job, mustClaim(job), store, [{ throws: true }]);
+    const setup = setupDriver();
+    const claim = issue(setup);
+    const out = await runDispatch(setup, claim, [{ throws: true }]);
     expect(out.outcome).toBe("transport-unknown");
     expect(out.job.attempts[0]?.state).toBe("outcomeUnknown");
   });
 
-  it("cancellation before dispatch prevents any send", () => {
-    const job = setupJob();
-    const cancelled = mustJob(cancelJob(job, NOW, "user revoked authority"));
-    expect(cancelled.state).toBe("cancelled");
-    mustDenialReason(authorize(cancelled, "readVisibleText"), "job-cancelled");
-    expect(cancelled.attempts.length).toBe(0);
-    expect(cancelled.stepsUsed).toBe(0);
-  });
-
-  it("records a late read-only result after cancellation without reopening the job", async () => {
-    const store = createMemoryNonceStore();
-    const verifier: CallbackVerifier = {
-      verify: (envelope, signature, expectedVersion) =>
-        verifyCallback(SECRET, store, envelope, signature, expectedVersion),
-    };
-    // Claim an attempt, then cancel while it is in flight.
-    const opened = setupJob();
-    const prepared = prepareAttempt(opened, mustClaim(opened), NOW);
-    if ("ok" in prepared && prepared.ok === false) {
-      throw new Error("expected a prepared attempt");
-    }
-    const { job: inFlight, attemptId } = prepared as { readonly job: BrowserJob; readonly attemptId: string };
-    let job = mustJob(cancelJob(inFlight, NOW, "user revoked authority"));
-    expect(job.state).toBe("cancelled");
-    expect(job.attempts[0]?.state).toBe("dispatching");
-    // The in-flight executor delivery arrives late with a read-only result.
-    const raw = observationFixture(attemptId, { observationVersion: 1, claimedOutcome: "success" });
-    const observation = parseObservation(raw);
-    const envelope = { observation: raw, callbackNonce: "cb-late-1" };
-    const signature = signObservation(SECRET, observation, "cb-late-1");
-    const late: unknown = await recordLateObservation(job, attemptId, envelope, signature, verifier);
-    if (typeof late !== "object" || late === null || !("receipt" in late)) {
-      throw new Error(`expected a late receipt: ${asDenial(late).detail}`);
-    }
-    const settled = late as { readonly job: BrowserJob; readonly receipt: { readonly recorded: boolean } };
-    expect(settled.receipt.recorded).toBe(true);
-    job = settled.job;
-    expect(job.state).toBe("cancelled");
-    expect(job.lateResults.length).toBe(1);
-    expect(job.attempts[0]?.state).toBe("observedSuccess");
-    expect(job.attempts[0]?.lateResult).toBe(true);
-    // No new work may dispatch, and the same result cannot settle twice.
-    mustDenialReason(authorize(job, "readVisibleText"), "job-cancelled");
-    const again = await recordLateObservation(job, attemptId, envelope, signature, verifier);
-    expect("ok" in again && again.ok === false).toBe(true);
-  });
-
-  it("fences expired jobs and denies expired dispatches", () => {
-    const job = setupJob({ expiresAt: NOW - 1 });
-    mustDenialReason(authorize(job, "readVisibleText"), "job-expired");
-    const fenced = fenceExpired(job, NOW);
-    expect(fenced.state).toBe("cancelled");
-    expect(fenced.cancelReason).toBe("expired");
-  });
-
-  it("denies dispatch without a valid session lease", () => {
-    const job = setupJob();
-    mustDenialReason(authorize(job, "readVisibleText", { leaseOk: false }), "lease-invalid");
-  });
-
   it("fails after three consecutive no-progress observations with evidence preserved", async () => {
-    let job = setupJob();
-    const store = createMemoryNonceStore();
+    const setup = setupDriver();
+    let job = setup.driver.snapshot(setup.jobId) as BrowserJob;
     for (let round = 0; round < 3; round += 1) {
-      const out = await dispatch(job, mustClaim(job), store, [{ outcome: "noProgress" }]);
+      const out = await runDispatch(setup, issue(setup), [{ outcome: "noProgress" }]);
       job = out.job;
     }
     expect(job.state).toBe("failed");
     expect(job.consecutiveNoProgress).toBe(3);
     expect(job.attempts.length).toBe(3);
-    mustDenialReason(authorize(job, "readVisibleText"), "job-terminal");
   });
 
   it("changes strategy while preserving verified results", async () => {
-    let job = setupJob();
-    const store = createMemoryNonceStore();
-    const first = await dispatch(job, mustClaim(job), store, [{ outcome: "success" }]);
-    job = first.job;
+    const setup = setupDriver();
+    const first = await runDispatch(setup, issue(setup), [{ outputs: ["variant-price"] }]);
+    let job = first.job;
     const attemptId = job.attempts[0]?.attemptId as string;
-    job = mustJob(applyIndependentCheck(job, attemptId, { checker: "independent", observedUrl: GOOD_URL, matches: true }, NOW));
+    job = mustJob(setup.driver.applyCheck(setup.jobId, attemptId, {
+      checker: "independent",
+      observedUrl: GOOD_URL,
+      matches: true,
+      confirmedOutputs: ["variant-price"],
+    }, NOW));
     expect(job.verifiedOutcomes.length).toBe(1);
     for (let round = 0; round < 2; round += 1) {
-      const out = await dispatch(job, mustClaim(job), store, [{ outcome: "noProgress" }]);
+      const out = await runDispatch(setup, issue(setup), [{ outcome: "noProgress" }]);
       job = out.job;
     }
     expect(job.consecutiveNoProgress).toBe(2);
-    job = mustJob(changeStrategy(job, "switch to read-only extraction"));
+    job = mustJob(setup.driver.changeStrategy(setup.jobId, "switch to read-only extraction"));
     expect(job.state).toBe("running");
     expect(job.epoch).toBe(2);
     expect(job.consecutiveNoProgress).toBe(0);
     expect(job.verifiedOutcomes.length).toBe(1);
-    expect(job.attempts.length).toBe(3);
-    const resumed = await dispatch(job, mustClaim(job), store, [{ outcome: "success" }]);
+    const resumed = await runDispatch(setup, issue(setup));
     expect(resumed.outcome).toBe("observed-success");
   });
 
-  it("completes only with an independently verified outcome", async () => {
-    let job = setupJob();
-    const store = createMemoryNonceStore();
-    const out = await dispatch(job, mustClaim(job), store, [{ outcome: "success" }]);
-    job = out.job;
-    const attemptId = job.attempts[0]?.attemptId as string;
-    mustDenialReason(tryComplete(job), "unverified");
-    mustDenialReason(
-      applyIndependentCheck(job, attemptId, { checker: "self", observedUrl: GOOD_URL, matches: true }, NOW),
-      "unverified",
-    );
-    mustDenialReason(
-      applyIndependentCheck(job, attemptId, { checker: "independent", observedUrl: GOOD_URL, matches: false }, NOW),
-      "unverified",
-    );
-    job = mustJob(
-      applyIndependentCheck(job, attemptId, { checker: "independent", observedUrl: GOOD_URL, matches: true }, NOW),
-    );
-    expect(job.verifiedOutcomes.length).toBe(1);
-    job = mustJob(tryComplete(job));
-    expect(job.state).toBe("completed");
-  });
-
-  it("denies a self-reported claim as completion without an independent check", async () => {
-    let job = setupJob();
-    const store = createMemoryNonceStore();
-    const out = await dispatch(job, mustClaim(job), store, [{ outcome: "success" }]);
-    job = out.job;
-    mustDenialReason(tryComplete(job), "unverified");
-  });
-
-  it("enforces the step budget", async () => {
-    let job = setupJob({ maximumSteps: 1 });
-    const store = createMemoryNonceStore();
-    const out = await dispatch(job, mustClaim(job), store, [{ outcome: "success" }]);
-    job = out.job;
-    expect(job.stepsUsed).toBe(1);
-    mustDenialReason(authorize(job, "readVisibleText"), "steps-exhausted");
-  });
-
-  it("denies a blocked operation before any transport call", async () => {
-    const job = setupJob();
-    const store = createMemoryNonceStore();
-    mustDenialReason(authorize(job, "submitContactForm"), "vendor-write-blocked");
-    const stub = stubTransport(store, [{ outcome: "success" }], job.nextObservationVersion);
-    expect(stub.calls.length).toBe(0);
-    expect(job.stepsUsed).toBe(0);
+  it("enforces the step budget at the commit point", async () => {
+    const setup = setupDriver({ maximumSteps: 1 });
+    const firstClaim = issue(setup);
+    const secondClaim = issue(setup);
+    const stub = driverStub(setup.driver);
+    const first = await setup.driver.dispatch(setup.jobId, firstClaim.claimId, stub.transport, { nowMs: NOW });
+    expect(first.receipt.outcome).toBe("observed-success");
+    const second = await setup.driver.dispatch(setup.jobId, secondClaim.claimId, stub.transport, { nowMs: NOW });
+    expect(second.receipt.outcome).toBe("claim-refused");
+    expect(stub.calls.length).toBe(1);
+    expect(setup.driver.snapshot(setup.jobId)?.stepsUsed).toBe(1);
   });
 
   it("moves to waiting on a waiting outcome and suspends dispatch", async () => {
-    let job = setupJob();
-    const store = createMemoryNonceStore();
-    const out = await dispatch(job, mustClaim(job), store, [{ outcome: "waiting" }]);
-    job = out.job;
-    expect(job.state).toBe("waitingForSupplier");
-    mustDenialReason(authorize(job, "readVisibleText"), "job-terminal");
+    const setup = setupDriver();
+    const out = await runDispatch(setup, issue(setup), [{ outcome: "waiting" }]);
+    expect(out.job.state).toBe("waitingForSupplier");
+    const staleHandle: unknown = setup.driver.authorize({
+      jobId: setup.jobId,
+      nowMs: NOW,
+      operationId: "readVisibleText",
+      viaRecovery: false,
+      sessionHandle: setup.handle,
+    });
+    mustDenialReason(staleHandle, "lease-invalid");
+    const resumed = setup.driver.reacquireLease(setup.jobId, {
+      organizationId: "org-a",
+      projectId: "proj-a",
+      leaseId: "lease-2",
+      expiresAtMs: NOW + 60_000,
+      guest: false,
+    }, NOW);
+    if (isDenial(resumed)) {
+      throw new Error("expected reacquisition on a waiting job");
+    }
+    const suspended: unknown = setup.driver.authorize({
+      jobId: setup.jobId,
+      nowMs: NOW,
+      operationId: "readVisibleText",
+      viaRecovery: false,
+      sessionHandle: resumed.handle,
+    });
+    mustDenialReason(suspended, "job-terminal");
+  });
+});
+
+describe("required outputs and independent checks (R9)", () => {
+  it("waiting cannot complete from a generic URL match", async () => {
+    const setup = setupDriver({}, undefined, ["variant-price"]);
+    const out = await runDispatch(setup, issue(setup), [{ outcome: "waiting" }]);
+    const checked = mustJob(setup.driver.applyCheck(setup.jobId, out.job.attempts[0]?.attemptId as string, {
+      checker: "independent",
+      observedUrl: GOOD_URL,
+      matches: true,
+      confirmedOutputs: [],
+    }, NOW));
+    void checked;
+    mustDenialReason(setup.driver.complete(setup.jobId), "missing-outputs");
+  });
+
+  it("noProgress cannot count as a successful task output", async () => {
+    const setup = setupDriver({}, undefined, ["variant-price"]);
+    const out = await runDispatch(setup, issue(setup), [{ outcome: "noProgress" }]);
+    const checked = mustJob(setup.driver.applyCheck(setup.jobId, out.job.attempts[0]?.attemptId as string, {
+      checker: "independent",
+      observedUrl: GOOD_URL,
+      matches: true,
+      confirmedOutputs: [],
+    }, NOW));
+    void checked;
+    mustDenialReason(setup.driver.complete(setup.jobId), "missing-outputs");
+  });
+
+  it("a confirmed output must be evidenced by the observation", async () => {
+    const setup = setupDriver({}, undefined, ["variant-price"]);
+    const out = await runDispatch(setup, issue(setup));
+    mustDenialReason(setup.driver.applyCheck(setup.jobId, out.job.attempts[0]?.attemptId as string, {
+      checker: "independent",
+      observedUrl: GOOD_URL,
+      matches: true,
+      confirmedOutputs: ["variant-price"],
+    }, NOW), "unverified");
+  });
+
+  it("completes with verified coverage of every required output", async () => {
+    const setup = setupDriver({}, undefined, ["variant-price"]);
+    const out = await runDispatch(setup, issue(setup), [{ outputs: ["variant-price"] }]);
+    mustJob(setup.driver.applyCheck(setup.jobId, out.job.attempts[0]?.attemptId as string, {
+      checker: "independent",
+      observedUrl: GOOD_URL,
+      matches: true,
+      confirmedOutputs: ["variant-price"],
+    }, NOW));
+    const completed = mustJob(setup.driver.complete(setup.jobId));
+    expect(completed.state).toBe("completed");
+  });
+
+  it("denies self-reported checks", async () => {
+    const setup = setupDriver();
+    const out = await runDispatch(setup, issue(setup));
+    mustDenialReason(setup.driver.applyCheck(setup.jobId, out.job.attempts[0]?.attemptId as string, {
+      checker: "self",
+      observedUrl: GOOD_URL,
+      matches: true,
+      confirmedOutputs: [],
+    }, NOW), "unverified");
+  });
+});
+
+describe("late outcomes stay truthful (BR9/R13)", () => {
+  async function lateOutcome(outcome: ClaimedOutcome): Promise<BrowserJob> {
+    const setup = setupDriver();
+    const claim = issue(setup);
+    let deliver!: (value: TransportResult) => void;
+    const gated: StepTransport = {
+      execute: () => new Promise<TransportResult>((resolve) => {
+        deliver = resolve;
+      }),
+    };
+    const pending = setup.driver.dispatch(setup.jobId, claim.claimId, gated, { nowMs: NOW });
+    mustJob(setup.driver.cancel(setup.jobId, NOW + 1, "cancel"));
+    const digest = setup.driver.requestDigestOf(setup.jobId) as string;
+    const raw = observationFixture("a_job-a_1", { claimedOutcome: outcome, requestDigest: digest });
+    const observation = parseObservation(raw);
+    deliver({ envelope: { observation: raw, callbackNonce: claim.callbackNonce }, signature: signObservation(SECRET, observation, claim.callbackNonce) });
+    const result = await pending;
+    expect(result.job.state).toBe("cancelled");
+    return result.job;
+  }
+
+  it("records a late failure as observedFailure", async () => {
+    const job = await lateOutcome("operationFailure");
+    expect(job.attempts[0]?.state).toBe("observedFailure");
+    expect(job.attempts[0]?.lateResult).toBe(true);
+    expect(job.lateResults.length).toBe(1);
+  });
+
+  it("records a late blocked policy as observedFailure", async () => {
+    const job = await lateOutcome("blockedByPolicy");
+    expect(job.attempts[0]?.state).toBe("observedFailure");
+  });
+
+  it("records a late success as observedSuccess without reopening", async () => {
+    const job = await lateOutcome("success");
+    expect(job.attempts[0]?.state).toBe("observedSuccess");
+    expect(job.state).toBe("cancelled");
+  });
+
+  it("records late no-progress without a terminal transition", async () => {
+    const job = await lateOutcome("noProgress");
+    expect(job.attempts[0]?.state).toBe("observedSuccess");
+    expect(job.state).toBe("cancelled");
+    expect(job.consecutiveNoProgress).toBe(1);
+  });
+});
+
+describe("lease lifecycle on wait/cancel/expiry (R11)", () => {
+  const context = { organizationId: "org-a", projectId: "proj-a", jobId: "job-a" };
+
+  it("waiting releases the associated active session", async () => {
+    const setup = setupDriver();
+    const liveBefore = setup.driver.sessionsForTests().resolve(setup.handle, context, NOW);
+    expect(isDenial(liveBefore)).toBe(false);
+    const out = await runDispatch(setup, issue(setup), [{ outcome: "waiting" }]);
+    expect(out.job.state).toBe("waitingForSupplier");
+    expect(setup.driver.trackedLease(setup.jobId)).toBe(undefined);
+    mustDenialReason(setup.driver.sessionsForTests().resolve(setup.handle, context, NOW + 1), "lease-invalid");
+  });
+
+  it("reacquires after an authorized resume but not after cancellation", async () => {
+    const setup = setupDriver();
+    const out = await runDispatch(setup, issue(setup), [{ outcome: "waiting" }]);
+    expect(out.job.state).toBe("waitingForSupplier");
+    const resumed = mustJob(setup.driver.changeStrategy(setup.jobId, "resume after supplier wait"));
+    expect(resumed.state).toBe("running");
+    const second = setup.driver.reacquireLease(setup.jobId, {
+      organizationId: "org-a",
+      projectId: "proj-a",
+      leaseId: "lease-2",
+      expiresAtMs: NOW + 60_000,
+      guest: false,
+    }, NOW);
+    expect(isDenial(second)).toBe(false);
+    mustJob(setup.driver.cancel(setup.jobId, NOW + 2, "done"));
+    const afterCancel = setup.driver.reacquireLease(setup.jobId, {
+      organizationId: "org-a",
+      projectId: "proj-a",
+      leaseId: "lease-3",
+      expiresAtMs: NOW + 60_000,
+      guest: false,
+    }, NOW + 2);
+    mustDenialReason(afterCancel, "lease-invalid");
+  });
+});
+
+describe("bounded transport deadline (R14)", () => {
+  it("settles a never-settling transport at the deadline", async () => {
+    const setup = setupDriver({}, { stepTimeoutMs: 5 });
+    const claim = issue(setup);
+    const never: StepTransport = {
+      execute: () => new Promise<TransportResult>(() => undefined),
+    };
+    const raced = await Promise.race([
+      setup.driver.dispatch(setup.jobId, claim.claimId, never, { nowMs: NOW }),
+      Bun.sleep(200).then(() => "still-pending-after-budget" as const),
+    ]);
+    expect(raced).not.toBe("still-pending-after-budget");
+    if (typeof raced === "string") {
+      throw new Error("dispatch did not settle");
+    }
+    expect(raced.receipt.outcome).toBe("transport-timeout");
+    expect(raced.job.attempts[0]?.state).toBe("outcomeUnknown");
+    expect(raced.job.state).toBe("running");
+  });
+
+  it("late delivery after the deadline is recorded on the active job", async () => {
+    const setup = setupDriver({}, { stepTimeoutMs: 5 });
+    const claim = issue(setup);
+    let deliver!: (value: TransportResult) => void;
+    const lazy: StepTransport = {
+      execute: () => new Promise<TransportResult>((resolve) => {
+        deliver = resolve;
+      }),
+    };
+    const first = await setup.driver.dispatch(setup.jobId, claim.claimId, lazy, { nowMs: NOW });
+    expect(first.receipt.outcome).toBe("transport-timeout");
+    const digest = setup.driver.requestDigestOf(setup.jobId) as string;
+    const raw = observationFixture("a_job-a_1", { requestDigest: digest });
+    const observation = parseObservation(raw);
+    deliver({ envelope: { observation: raw, callbackNonce: claim.callbackNonce }, signature: signObservation(SECRET, observation, claim.callbackNonce) });
+    await Bun.sleep(10);
+    const job = setup.driver.snapshot(setup.jobId) as BrowserJob;
+    expect(job.attempts[0]?.state).toBe("observedSuccess");
+    expect(job.attempts[0]?.lateResult).toBe(false);
+    expect(job.attempts[0]?.observation?.url).toBe(GOOD_URL);
+  });
+});
+
+describe("registration authority (BR6)", () => {
+  it("rejects a duplicate jobId across tenants", () => {
+    const driver = new ControlledDriver(SECRET);
+    const first: unknown = driver.registerJob(requestFixture(), NOW);
+    expect(typeof first).toBe("string");
+    mustDenialReason(driver.registerJob(requestFixture({ organizationId: "org-guest" }), NOW), "conflict");
+  });
+});
+
+describe("evidence control", () => {
+  it("keeps parsed callback evidence deeply frozen", () => {
+    const observation = parseObservation(observationFixture("a_job-a_1"));
+    expect(Object.isFrozen(observation)).toBe(true);
+    expect(Object.isFrozen(observation.collectedEvidence)).toBe(true);
+    expect(Object.isFrozen(observation.observedTargets)).toBe(true);
+    expect(Object.isFrozen(observation.meteredUsage)).toBe(true);
   });
 });

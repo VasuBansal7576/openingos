@@ -236,9 +236,26 @@ export function parseObservation(input: unknown): BrowserObservation {
   );
   const claimedOutcome = parseClaimedOutcome(record.claimedOutcome);
   const meteredUsage = parseMeteredUsage(record.meteredUsage);
+  const requestDigest = requiredString(record.requestDigest, "requestDigest");
   const rawVerification = record.verificationEvidence;
   if (rawVerification !== undefined && typeof rawVerification !== "string") {
     throw new TypeError("verificationEvidence must be a string when present");
+  }
+  const rawOutputs = record.producedOutputs;
+  let producedOutputs: readonly string[] | undefined;
+  if (rawOutputs !== undefined) {
+    if (!Array.isArray(rawOutputs)) {
+      throw new TypeError("producedOutputs must be an array when present");
+    }
+    const outputs: string[] = [];
+    for (let index = 0; index < rawOutputs.length; index += 1) {
+      const item: unknown = rawOutputs[index];
+      if (typeof item !== "string" || item.trim().length === 0) {
+        throw new TypeError(`producedOutputs[${index}] must be a non-empty string`);
+      }
+      outputs.push(item);
+    }
+    producedOutputs = Object.freeze(outputs);
   }
   const base = {
     jobId,
@@ -251,8 +268,19 @@ export function parseObservation(input: unknown): BrowserObservation {
     collectedEvidence,
     claimedOutcome,
     meteredUsage,
+    requestDigest,
   };
+  const withVerification =
+    rawVerification === undefined ? base : { ...base, verificationEvidence: rawVerification };
   return Object.freeze(
-    rawVerification === undefined ? base : { ...base, verificationEvidence: rawVerification },
+    producedOutputs === undefined ? withVerification : { ...withVerification, producedOutputs },
   );
+}
+
+export function parseRequiredOutputs(input: unknown, label = "requiredOutputs"): readonly string[] {
+  if (input === undefined) {
+    return Object.freeze([]);
+  }
+  const values = requiredStringArray(input, label);
+  return Object.freeze([...values]);
 }

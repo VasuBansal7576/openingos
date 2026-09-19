@@ -1,0 +1,623 @@
+// Authoritative controlled driver for browser-job execution.
+//
+// The pure job primitives (authorize/prepare/settle) never invoke a
+// transport. This driver is the only path that does: it issues single-use,
+// immutable operation claims bound to one job/organization/project/grant/
+// input/lease/catalog/destination/target/document/request digest, holds the
+// authoritative job versions, and consumes each claim with a
+// compare-and-set commit immediately before external execution. Duplicate,
+// cross-job, released-lease, or exact-expiry dispatches are refused with
+// zero transport calls. After the await, settlement applies to the latest
+// authoritative version, so cancellation and expiry are never overwritten
+// and late outcomes are preserved on the settled job.
+//
+// Controlled proof only: in-memory maps stand in for the eventual durable
+// execution store (no Convex transactions, crash recovery, or hosted
+// sessions are claimed). Transports are injected; no network calls happen here.
+
+import type {
+  BrowserJobRequest,
+  Decision,
+  Denial,
+  ObservedTarget,
+} from "./types.ts";
+import { denied, isDenial } from "./types.ts";
+import type { CallbackExpectation, NonceStore } from "./signing.ts";
+import { computeRequestDigest, verifyCallback } from "./signing.ts";
+import { createMemoryNonceStore } from "./signing.ts";
+import type { LeaseContext, SessionLease, SessionRegistry } from "./sessions.ts";
+import { createSessionRegistry } from "./sessions.ts";
+import type {
+  AttemptRecord,
+  BrowserJob,
+  CallbackVerifier,
+  DispatchReceipt,
+  IndependentCheck,
+  StepClaim,
+  StepTransport,
+  TransportInput,
+} from "./jobs.ts";
+import {
+  applyIndependentCheck,
+  authorizeStep,
+  cancelJob,
+  changeStrategy,
+  createJob,
+  fenceExpired,
+  prepareAttempt,
+  recordLateObservation,
+  settleAttempt,
+  tryComplete,
+} from "./jobs.ts";
+import { checkTarget } from "./policy.ts";
+import { parseJobRequest } from "./validation.ts";
+
+/** Default per-step transport deadline for the controlled driver. */
+export const DEFAULT_STEP_TIMEOUT_MS = 30_000;
+
+export interface IssuedClaim {
+  readonly claimId: string;
+  readonly jobId: string;
+  readonly organizationId: string;
+  readonly projectId: string;
+  readonly grantVersion: string;
+  readonly inputVersion: string;
+  readonly leaseId: string;
+  readonly leaseHandle: string;
+  readonly operationCatalogVersion: string;
+  readonly operationId: string;
+  readonly destination: string | undefined;
+  readonly redirectHops: readonly string[];
+  readonly targetId: string | undefined;
+  readonly documentVersion: string | undefined;
+  readonly requestDigest: string;
+  readonly callbackNonce: string;
+  readonly issuedAtMs: number;
+  readonly expiresAtMs: number;
+  readonly viaRecovery: boolean;
+}
+
+export interface DriverAuthorizeInput {
+  readonly jobId: string;
+  readonly nowMs: number;
+  readonly operationId: string;
+  readonly viaRecovery: boolean;
+  readonly sessionHandle: string;
+  readonly destination?: string;
+  readonly redirectHops?: readonly string[];
+  readonly targetId?: string;
+  readonly currentTargets?: readonly ObservedTarget[];
+  readonly currentDocumentVersion?: string;
+}
+
+export interface DriverDispatchOptions {
+  readonly nowMs: number;
+  readonly timeoutMs?: number;
+  readonly currentTargets?: readonly ObservedTarget[];
+  readonly currentDocumentVersion?: string;
+}
+
+interface ClaimEntry {
+  readonly claim: IssuedClaim;
+  used: boolean;
+}
+
+interface AttemptExpectation {
+  readonly nonce: string;
+  readonly requestDigest: string;
+  readonly version: number;
+  readonly validUntilMs: number;
+}
+
+export interface ControlledDriverOptions {
+  readonly stepTimeoutMs?: number;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : "transport failed";
+}
+
+export class ControlledDriver {
+  private readonly secret: string;
+  private readonly sessions: SessionRegistry;
+  private readonly nonces: NonceStore;
+  private readonly stepTimeoutMs: number;
+  private readonly requests = new Map<string, { readonly request: BrowserJobRequest; readonly digest: string }>();
+  private readonly jobs = new Map<string, BrowserJob>();
+  private readonly claims = new Map<string, ClaimEntry>();
+  private readonly expectations = new Map<string, AttemptExpectation>();
+  private readonly leases = new Map<string, string>();
+  private claimSequence = 0;
+
+  constructor(secret: string, options?: ControlledDriverOptions, sessions?: SessionRegistry, nonces?: NonceStore) {
+    if (secret.length === 0) {
+      throw new TypeError("driver secret must not be empty");
+    }
+    this.secret = secret;
+    this.stepTimeoutMs = options?.stepTimeoutMs ?? DEFAULT_STEP_TIMEOUT_MS;
+    this.sessions = sessions ?? createSessionRegistry();
+    this.nonces = nonces ?? createMemoryNonceStore();
+  }
+
+  /** Register one authorized request. A duplicate jobId is a conflict. */
+  registerJob(payload: unknown, nowMs: number, requiredOutputs: unknown = []): string | Denial {
+    let request: BrowserJobRequest;
+    try {
+      request = parseJobRequest(payload);
+    } catch (error) {
+      return denied("invalid-transition", error instanceof Error ? error.message : "invalid request");
+    }
+    if (this.jobs.has(request.jobId)) {
+      return denied("conflict", `job "${request.jobId}" is already registered`);
+    }
+    const digest = computeRequestDigest(this.secret, request);
+    this.requests.set(request.jobId, { request, digest });
+    this.jobs.set(request.jobId, createJob(request, nowMs, requiredOutputs));
+    return request.jobId;
+  }
+
+  snapshot(jobId: string): BrowserJob | undefined {
+    return this.jobs.get(jobId);
+  }
+
+  requestDigestOf(jobId: string): string | undefined {
+    return this.requests.get(jobId)?.digest;
+  }
+
+  /** Acquire the session lease that later authorizations must present. */
+  acquireLease(
+    jobId: string,
+    spec: {
+      readonly organizationId: string;
+      readonly projectId: string;
+      readonly leaseId: string;
+      readonly expiresAtMs: number;
+      readonly guest: boolean;
+    },
+    nowMs: number,
+  ): SessionLease | Denial {
+    const record = this.requests.get(jobId);
+    if (record === undefined) {
+      return denied("unknown-job", `job "${jobId}" is not registered`);
+    }
+    if (spec.organizationId !== record.request.organizationId || spec.projectId !== record.request.projectId) {
+      return denied("lease-invalid", "lease triple does not match the registered job");
+    }
+    const lease = this.sessions.acquire({ ...spec, jobId }, nowMs);
+    if (isDenial(lease)) {
+      return lease;
+    }
+    this.leases.set(jobId, lease.handle);
+    return lease;
+  }
+
+  releaseLease(jobId: string): Decision {
+    const handle = this.leases.get(jobId);
+    const record = this.requests.get(jobId);
+    if (handle === undefined || record === undefined) {
+      return denied("lease-invalid", `job "${jobId}" holds no tracked lease`);
+    }
+    const context: LeaseContext = {
+      organizationId: record.request.organizationId,
+      projectId: record.request.projectId,
+      jobId,
+    };
+    const result = this.sessions.release(handle, context);
+    this.leases.delete(jobId);
+    return result;
+  }
+
+  /** Reacquire after an authorized resume; denied on terminal/cancelled/paused jobs. */
+  reacquireLease(
+    jobId: string,
+    spec: {
+      readonly organizationId: string;
+      readonly projectId: string;
+      readonly leaseId: string;
+      readonly expiresAtMs: number;
+      readonly guest: boolean;
+    },
+    nowMs: number,
+  ): SessionLease | Denial {
+    const job = this.jobs.get(jobId);
+    if (job === undefined) {
+      return denied("unknown-job", `job "${jobId}" is not registered`);
+    }
+    if (job.state !== "queued" && job.state !== "running" && job.state !== "waitingForSupplier" && job.state !== "waitingForUser") {
+      return denied("lease-invalid", `cannot reacquire a session for a ${job.state} job`);
+    }
+    return this.acquireLease(jobId, spec, nowMs);
+  }
+
+  private leaseContext(jobId: string): LeaseContext | undefined {
+    const record = this.requests.get(jobId);
+    if (record === undefined) {
+      return undefined;
+    }
+    return { organizationId: record.request.organizationId, projectId: record.request.projectId, jobId };
+  }
+
+  /**
+   * Issue one single-use operation claim after full authorization: job
+   * state, exact expiry, request lease expiry, live registry lease bound to
+   * this job's triple, catalog, budget, operation-specific inputs, and
+   * destination policy.
+   */
+  authorize(input: DriverAuthorizeInput): IssuedClaim | Denial {
+    const job = this.jobs.get(input.jobId);
+    const record = this.requests.get(input.jobId);
+    if (job === undefined || record === undefined) {
+      return denied("unknown-job", `job "${input.jobId}" is not registered`);
+    }
+    const context = this.leaseContext(input.jobId) as LeaseContext;
+    const live = this.sessions.resolve(input.sessionHandle, context, input.nowMs);
+    if (isDenial(live)) {
+      return denied("lease-invalid", "no live session lease for this organization/project/job");
+    }
+    const lease: SessionLease = live as SessionLease;
+    const checked = authorizeStep(job, {
+      nowMs: input.nowMs,
+      operationId: input.operationId,
+      viaRecovery: input.viaRecovery,
+      leaseOk: true,
+      ...(input.destination === undefined ? {} : { destination: input.destination }),
+      ...(input.redirectHops === undefined ? {} : { redirectHops: input.redirectHops }),
+      ...(input.targetId === undefined ? {} : { targetId: input.targetId }),
+      ...(input.currentTargets === undefined ? {} : { currentTargets: input.currentTargets }),
+      ...(input.currentDocumentVersion === undefined ? {} : { currentDocumentVersion: input.currentDocumentVersion }),
+    });
+    if ("ok" in checked) {
+      const denial = checked as Denial;
+      if (denial.ok === false) {
+        return denial;
+      }
+    }
+    const authorized = checked as { readonly ok: true; readonly claim: StepClaim };
+    this.claimSequence += 1;
+    const claimId = `claim_${input.jobId}_${this.claimSequence}`;
+    const expiresAtMs = Math.min(job.request.expiresAt, lease.expiresAtMs);
+    const claim: IssuedClaim = Object.freeze({
+      claimId,
+      jobId: input.jobId,
+      organizationId: record.request.organizationId,
+      projectId: record.request.projectId,
+      grantVersion: record.request.grantVersion,
+      inputVersion: record.request.inputVersion,
+      leaseId: lease.leaseId,
+      leaseHandle: lease.handle,
+      operationCatalogVersion: record.request.operationCatalogVersion,
+      operationId: authorized.claim.operationId,
+      destination: authorized.claim.destination,
+      redirectHops: Object.freeze([...(input.redirectHops ?? [])]),
+      targetId: authorized.claim.targetId,
+      documentVersion: input.currentDocumentVersion,
+      requestDigest: record.digest,
+      callbackNonce: `cb_${claimId}`,
+      issuedAtMs: input.nowMs,
+      expiresAtMs,
+      viaRecovery: authorized.claim.viaRecovery,
+    });
+    this.claims.set(claimId, { claim, used: false });
+    return claim;
+  }
+
+  private verifierFor(jobId: string, attemptId: string, nowMs: number): CallbackVerifier {
+    return {
+      verify: (envelope: unknown, signature: unknown, _version: number) => {
+        const expectation = this.expectations.get(`${jobId}\u0000${attemptId}`);
+        if (expectation === undefined) {
+          return { ok: false, reason: "unknown-callback", detail: "no callback was issued for this attempt" };
+        }
+        const full: CallbackExpectation = {
+          nonce: expectation.nonce,
+          requestDigest: expectation.requestDigest,
+          jobId,
+          attemptId,
+          version: expectation.version,
+          validUntilMs: expectation.validUntilMs,
+          nowMs,
+        };
+        return verifyCallback(this.secret, this.nonces, envelope, signature, full);
+      },
+    };
+  }
+
+  private trackLeaseRelease(job: BrowserJob): void {
+    if (
+      (job.state === "waitingForSupplier" || job.state === "waitingForUser" || job.state === "cancelled") &&
+      this.leases.has(job.request.jobId)
+    ) {
+      this.releaseLease(job.request.jobId);
+    }
+  }
+
+  /**
+   * Dispatch one issued claim. The commit consumes the single-use claim,
+   * rechecks state/expiry/lease/budget/target freshness against the latest
+   * authoritative version, and reserves a unique attempt ordinal before any
+   * transport call; settlement then applies to the latest version so
+   * cancellation and expiry survive the await.
+   */
+  async dispatch(
+    jobId: string,
+    claimId: string,
+    transport: StepTransport,
+    options: DriverDispatchOptions,
+  ): Promise<{ readonly job: BrowserJob; readonly receipt: DispatchReceipt }> {
+    const refused = (detail: string): { readonly job: BrowserJob; readonly receipt: DispatchReceipt } => {
+      const job = this.jobs.get(jobId);
+      if (job === undefined) {
+        throw new Error(`job "${jobId}" is not registered`);
+      }
+      return { job, receipt: { attemptId: "", outcome: "claim-refused", detail } };
+    };
+    const record = this.requests.get(jobId);
+    let job = this.jobs.get(jobId);
+    if (job === undefined || record === undefined) {
+      throw new Error(`job "${jobId}" is not registered`);
+    }
+    const entry = this.claims.get(claimId);
+    if (entry === undefined || entry.claim.jobId !== jobId) {
+      return refused("unknown claim for this job; zero transport calls");
+    }
+    if (entry.used) {
+      return refused(`claim "${claimId}" was already consumed; zero transport calls`);
+    }
+    if (job.state !== "queued" && job.state !== "running") {
+      return refused(`job is ${job.state}; no new work may dispatch`);
+    }
+    if (options.nowMs >= job.request.expiresAt || options.nowMs >= entry.claim.expiresAtMs) {
+      this.expire(jobId, options.nowMs);
+      return refused("job reached its expiry; fenced with zero transport calls");
+    }
+    const context = this.leaseContext(jobId) as LeaseContext;
+    const live = this.sessions.resolve(entry.claim.leaseHandle, context, options.nowMs);
+    if ("ok" in live) {
+      return refused("session lease is no longer live; zero transport calls");
+    }
+    if (job.stepsUsed >= job.request.maximumSteps) {
+      return refused(`step budget of ${job.request.maximumSteps} is exhausted`);
+    }
+    if (entry.claim.targetId !== undefined) {
+      if (
+        options.currentDocumentVersion !== undefined &&
+        entry.claim.documentVersion !== undefined &&
+        options.currentDocumentVersion !== entry.claim.documentVersion
+      ) {
+        return refused("document changed since authorization; re-observe before effect execution");
+      }
+      if (options.currentTargets !== undefined && options.currentDocumentVersion !== undefined) {
+        const recheck = checkTarget(options.currentTargets, options.currentDocumentVersion, entry.claim.targetId);
+        if (!recheck.ok) {
+          return refused(`target recheck failed: ${recheck.detail}`);
+        }
+      }
+    }
+
+    const prepared = prepareAttempt(job, {
+      operationId: entry.claim.operationId,
+      destination: entry.claim.destination,
+      targetId: entry.claim.targetId,
+      viaRecovery: entry.claim.viaRecovery,
+    }, options.nowMs);
+    if ("ok" in prepared) {
+      const denial = prepared as Denial;
+      if (denial.ok === false) {
+        return refused(`${denial.reason}: ${denial.detail}`);
+      }
+    }
+    const { job: claimed, attemptId } = prepared as { readonly job: BrowserJob; readonly attemptId: string };
+    entry.used = true;
+    this.expectations.set(`${jobId}\u0000${attemptId}`, {
+      nonce: entry.claim.callbackNonce,
+      requestDigest: entry.claim.requestDigest,
+      version: claimed.nextObservationVersion,
+      validUntilMs: entry.claim.expiresAtMs,
+    });
+    this.jobs.set(jobId, claimed);
+
+    const input: TransportInput = {
+      jobId,
+      attemptId,
+      operationId: entry.claim.operationId,
+      destination: entry.claim.destination,
+      targetId: entry.claim.targetId,
+      documentVersion: entry.claim.documentVersion,
+      callbackNonce: entry.claim.callbackNonce,
+      requestDigest: entry.claim.requestDigest,
+    };
+    const controller = new AbortController();
+    const budget = Math.max(
+      0,
+      Math.min(options.timeoutMs ?? this.stepTimeoutMs, entry.claim.expiresAtMs - options.nowMs),
+    );
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeoutPromise = new Promise<{ readonly timedOut: true }>((resolve) => {
+      timer = setTimeout(() => {
+        timer = undefined;
+        controller.abort();
+        resolve({ timedOut: true });
+      }, budget);
+    });
+    const transportPromise = transport.execute(input, controller.signal);
+    const raced = await Promise.race([
+      transportPromise.then(
+        (result) => ({ result }),
+        (error: unknown) => ({ transportError: errorMessage(error) }),
+      ),
+      timeoutPromise,
+    ]);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      timer = undefined;
+    }
+    if ("timedOut" in raced) {
+      const latest = this.jobs.get(jobId) as BrowserJob;
+      const stranded = latest.attempts.find((item) => item.attemptId === attemptId) as AttemptRecord;
+      this.jobs.set(jobId, Object.freeze({
+        ...latest,
+        attempts: Object.freeze(latest.attempts.map((item) =>
+          item.attemptId === attemptId ? { ...stranded, state: "outcomeUnknown" as const } : item,
+        )),
+      }));
+      const lateNowMs = options.nowMs;
+      void transportPromise.then(
+        (late) => {
+          void this.settleTransportResult(jobId, attemptId, late.envelope, late.signature, lateNowMs);
+        },
+        () => undefined,
+      );
+      const current = this.jobs.get(jobId) as BrowserJob;
+      return { job: current, receipt: { attemptId, outcome: "transport-timeout", detail: "transport deadline elapsed; attempt marked unknown" } };
+    }
+    if ("transportError" in raced) {
+      const latest = this.jobs.get(jobId) as BrowserJob;
+      const stranded = latest.attempts.find((item) => item.attemptId === attemptId) as AttemptRecord;
+      const current = Object.freeze({
+        ...latest,
+        attempts: Object.freeze(latest.attempts.map((item) =>
+          item.attemptId === attemptId ? { ...stranded, state: "outcomeUnknown" as const } : item,
+        )),
+      });
+      this.jobs.set(jobId, current);
+      return { job: current, receipt: { attemptId, outcome: "transport-unknown", detail: raced.transportError } };
+    }
+    return this.settleTransportResult(jobId, attemptId, raced.result.envelope, raced.result.signature, options.nowMs);
+  }
+
+  private settleTransportResult(
+    jobId: string,
+    attemptId: string,
+    envelope: unknown,
+    signature: unknown,
+    nowMs: number,
+  ): { readonly job: BrowserJob; readonly receipt: DispatchReceipt } {
+    let latest = this.jobs.get(jobId) as BrowserJob;
+    if (nowMs >= latest.request.expiresAt) {
+      this.expire(jobId, nowMs);
+      latest = this.jobs.get(jobId) as BrowserJob;
+    }
+    if (latest.state === "cancelled") {
+      const late = recordLateObservation(latest, attemptId, envelope, signature, this.verifierFor(jobId, attemptId, nowMs), nowMs);
+      if (isDenial(late)) {
+        return { job: latest, receipt: { attemptId, outcome: "callback-rejected", detail: `${late.reason}: ${late.detail}` } };
+      }
+      const settled = late as { readonly job: BrowserJob; readonly receipt: { readonly recorded: boolean; readonly detail: string } };
+      this.jobs.set(jobId, settled.job);
+      const attempt = settled.job.attempts.find((item) => item.attemptId === attemptId);
+      const truthful = attempt?.state === "observedFailure" ? "observed-failure" as const : "observed-success" as const;
+      return { job: settled.job, receipt: { attemptId, outcome: truthful, detail: settled.receipt.detail } };
+    }
+    const settled = settleAttempt(latest, attemptId, envelope, signature, this.verifierFor(jobId, attemptId, nowMs), nowMs);
+    if (isDenial(settled)) {
+      return { job: latest, receipt: { attemptId, outcome: "callback-rejected", detail: `${settled.reason}: ${settled.detail}` } };
+    }
+    const done = settled as { readonly job: BrowserJob; readonly receipt: DispatchReceipt };
+    this.jobs.set(jobId, done.job);
+    this.trackLeaseRelease(done.job);
+    return done;
+  }
+
+  cancel(jobId: string, nowMs: number, reason: string): BrowserJob | Denial {
+    const job = this.jobs.get(jobId);
+    if (job === undefined) {
+      return denied("unknown-job", `job "${jobId}" is not registered`);
+    }
+    const next = cancelJob(job, nowMs, reason);
+    if ("ok" in next) {
+      return next as Denial;
+    }
+    const cancelled = next as BrowserJob;
+    this.jobs.set(jobId, cancelled);
+    this.trackLeaseRelease(cancelled);
+    return cancelled;
+  }
+
+  expire(jobId: string, nowMs: number): BrowserJob {
+    const job = this.jobs.get(jobId);
+    if (job === undefined) {
+      throw new Error(`job "${jobId}" is not registered`);
+    }
+    const fenced = fenceExpired(job, nowMs);
+    this.jobs.set(jobId, fenced);
+    this.trackLeaseRelease(fenced);
+    return fenced;
+  }
+
+  recordLate(
+    jobId: string,
+    attemptId: string,
+    envelope: unknown,
+    signature: unknown,
+    nowMs: number,
+  ): { readonly job: BrowserJob; readonly recorded: boolean; readonly detail: string } | Denial {
+    const job = this.jobs.get(jobId);
+    if (job === undefined) {
+      return denied("unknown-job", `job "${jobId}" is not registered`);
+    }
+    const result = recordLateObservation(job, attemptId, envelope, signature, this.verifierFor(jobId, attemptId, nowMs), nowMs);
+    if ("ok" in result) {
+      return result as Denial;
+    }
+    const done = result as { readonly job: BrowserJob; readonly receipt: { readonly recorded: boolean; readonly detail: string } };
+    this.jobs.set(jobId, done.job);
+    return { job: done.job, recorded: done.receipt.recorded, detail: done.receipt.detail };
+  }
+
+  applyCheck(jobId: string, attemptId: string, check: IndependentCheck, nowMs: number): BrowserJob | Denial {
+    const job = this.jobs.get(jobId);
+    if (job === undefined) {
+      return denied("unknown-job", `job "${jobId}" is not registered`);
+    }
+    const next = applyIndependentCheck(job, attemptId, check, nowMs);
+    if ("ok" in next) {
+      return next as Denial;
+    }
+    const checked = next as BrowserJob;
+    this.jobs.set(jobId, checked);
+    return checked;
+  }
+
+  complete(jobId: string): BrowserJob | Denial {
+    const job = this.jobs.get(jobId);
+    if (job === undefined) {
+      return denied("unknown-job", `job "${jobId}" is not registered`);
+    }
+    const next = tryComplete(job);
+    if ("ok" in next) {
+      return next as Denial;
+    }
+    const completed = next as BrowserJob;
+    this.jobs.set(jobId, completed);
+    return completed;
+  }
+
+  changeStrategy(jobId: string, reason: string): BrowserJob | Denial {
+    const job = this.jobs.get(jobId);
+    if (job === undefined) {
+      return denied("unknown-job", `job "${jobId}" is not registered`);
+    }
+    const next = changeStrategy(job, reason);
+    if ("ok" in next) {
+      return next as Denial;
+    }
+    const resumed = next as BrowserJob;
+    this.jobs.set(jobId, resumed);
+    return resumed;
+  }
+
+  /** Test hook: the live callback expectation issued for one attempt. */
+  expectationFor(jobId: string, attemptId: string): { readonly nonce: string; readonly requestDigest: string; readonly version: number } | undefined {
+    return this.expectations.get(`${jobId}\u0000${attemptId}`);
+  }
+
+  /** Test hook: the session handle currently tracked for one job. */
+  trackedLease(jobId: string): string | undefined {
+    return this.leases.get(jobId);
+  }
+
+  /** Test hook: the controlled session registry backing this driver. */
+  sessionsForTests(): SessionRegistry {
+    return this.sessions;
+  }
+}

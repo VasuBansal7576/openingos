@@ -4,31 +4,42 @@
 // cancelled (ADR-0004 states); attempts move through prepared/dispatching/
 // observed outcomes separately. Cancellation before the dispatch claim
 // prevents the send; an already-dispatched request may still complete, and
-// its late read-only result is recorded as evidence without reopening the
-// job or authorizing new work. Three consecutive no-progress observations
-// fail the job with all verified evidence preserved, and a strategy change
-// starts a new operation epoch that keeps prior results. Completion
-// requires an independently verified outcome — a model's claim alone never
-// completes a job.
+// its late read-only result is recorded with its truthful status without
+// reopening the job or authorizing new work. Three consecutive no-progress
+// observations fail the job with all verified evidence preserved, and a
+// strategy change starts a new operation epoch that keeps prior results.
+// Completion requires independently verified coverage of the job's required
+// outputs — a model's claim alone never completes a job.
 //
-// The executor transport and the callback verifier are injected. This
+// Invalid callbacks are quarantined for inspection without settling the
+// awaiting attempt, so a later valid callback can still be accepted exactly
+// once. The executor transport and the callback verifier are injected. This
 // module performs no network calls and holds no secrets.
+//
+// Execution reaches a transport only through an authoritative driver that
+// consumes single-use operation claims (see driver.ts); the prepare/settle
+// primitives below never invoke a transport themselves.
 
 import type {
   AttemptState,
   BrowserJobRequest,
   BrowserObservation,
-  Decision,
+  Denial,
   JobState,
   ObservedTarget,
+  QuarantinedCallback,
 } from "./types.ts";
-import { denied } from "./types.ts";
+import { denied, isDenial } from "./types.ts";
 import type { CallbackResult } from "./signing.ts";
 import { authorizeOperation } from "./operations.ts";
 import { checkTarget, validateDestination, validateNavigation } from "./policy.ts";
+import { parseRequiredOutputs } from "./validation.ts";
 
 /** ADR-0004 proposed default: three consecutive no-progress observations. */
 export const NON_PROGRESS_LIMIT = 3;
+
+/** Bounded quarantine log per job; oldest entries are dropped past the cap. */
+export const QUARANTINE_LIMIT = 50;
 
 export interface AttemptRecord {
   readonly attemptId: string;
@@ -46,6 +57,7 @@ export interface VerifiedOutcome {
   readonly operationId: string;
   readonly url: string;
   readonly checkedAtMs: number;
+  readonly confirmedOutputs: readonly string[];
 }
 
 export interface BrowserJob {
@@ -54,6 +66,7 @@ export interface BrowserJob {
   readonly attempts: readonly AttemptRecord[];
   readonly verifiedOutcomes: readonly VerifiedOutcome[];
   readonly lateResults: readonly BrowserObservation[];
+  readonly quarantined: readonly QuarantinedCallback[];
   readonly consecutiveNoProgress: number;
   readonly epoch: number;
   readonly stepsUsed: number;
@@ -61,15 +74,21 @@ export interface BrowserJob {
   readonly createdAtMs: number;
   readonly nextAttempt: number;
   readonly nextObservationVersion: number;
+  readonly requiredOutputs: readonly string[];
 }
 
-export function createJob(request: BrowserJobRequest, nowMs: number): BrowserJob {
+export function createJob(
+  request: BrowserJobRequest,
+  nowMs: number,
+  requiredOutputs: unknown = [],
+): BrowserJob {
   return Object.freeze({
     request,
     state: "queued" as JobState,
     attempts: Object.freeze([]) as readonly AttemptRecord[],
     verifiedOutcomes: Object.freeze([]) as readonly VerifiedOutcome[],
     lateResults: Object.freeze([]) as readonly BrowserObservation[],
+    quarantined: Object.freeze([]) as readonly QuarantinedCallback[],
     consecutiveNoProgress: 0,
     epoch: 1,
     stepsUsed: 0,
@@ -77,6 +96,7 @@ export function createJob(request: BrowserJobRequest, nowMs: number): BrowserJob
     createdAtMs: nowMs,
     nextAttempt: 1,
     nextObservationVersion: 1,
+    requiredOutputs: parseRequiredOutputs(requiredOutputs),
   });
 }
 
@@ -99,27 +119,43 @@ export interface StepClaim {
   readonly viaRecovery: boolean;
 }
 
-function terminalDenial(state: JobState): Decision {
+function terminalDenial(state: JobState): Denial {
   if (state === "cancelled") {
     return denied("job-cancelled", "job is cancelled; no new work may dispatch");
   }
   return denied("job-terminal", `job is ${state}; no new work may dispatch`);
 }
 
+/** Operations that require a navigation destination. */
+function requiresDestination(operationId: string): boolean {
+  return operationId === "navigate";
+}
+
+/** Operations that require an observed target and document identity. */
+function requiresTarget(operationId: string): boolean {
+  return operationId === "inspectTarget";
+}
+
 /**
  * Authorize one dispatch claim. Checks run in fencing order: job state,
- * expiry, session lease, operation catalog (identical for recovery routes),
- * step budget, observed-target freshness, then destination policy.
+ * expiry (exact expiry denies), session-lease expiry from the authorized
+ * request, operation catalog (identical for recovery routes), step budget,
+ * operation-specific destination/target requirements, then destination
+ * policy. This static pre-check never dispatches; the authoritative driver
+ * re-verifies every invariant at the actual commit point.
  */
 export function authorizeStep(
   job: BrowserJob,
   input: AuthorizeInput,
-): { readonly ok: true; readonly claim: StepClaim } | Decision {
+): { readonly ok: true; readonly claim: StepClaim } | Denial {
   if (job.state !== "queued" && job.state !== "running") {
     return terminalDenial(job.state);
   }
-  if (input.nowMs > job.request.expiresAt) {
-    return denied("job-expired", "job passed its expiry; recheck authority before any dispatch");
+  if (input.nowMs >= job.request.expiresAt) {
+    return denied("job-expired", "job reached its expiry; recheck authority before any dispatch");
+  }
+  if (input.nowMs >= job.request.sessionLease.expiresAtMs) {
+    return denied("lease-invalid", "the authorized session lease reached its expiry");
   }
   if (!input.leaseOk) {
     return denied("lease-invalid", "no valid session lease for this organization/project/job");
@@ -130,6 +166,18 @@ export function authorizeStep(
   }
   if (job.stepsUsed >= job.request.maximumSteps) {
     return denied("steps-exhausted", `step budget of ${job.request.maximumSteps} is exhausted`);
+  }
+  if (requiresDestination(input.operationId) && input.destination === undefined) {
+    return denied("missing-destination", `operation "${input.operationId}" requires a validated destination`);
+  }
+  if (requiresTarget(input.operationId)) {
+    if (
+      input.targetId === undefined ||
+      input.currentTargets === undefined ||
+      input.currentDocumentVersion === undefined
+    ) {
+      return denied("missing-target", `operation "${input.operationId}" requires an observed target and document identity`);
+    }
   }
   if (input.targetId !== undefined) {
     if (input.currentTargets === undefined || input.currentDocumentVersion === undefined) {
@@ -156,41 +204,15 @@ export function authorizeStep(
   return { ok: true, claim };
 }
 
-/**
- * Claim one dispatch: recheck liveness and expiry at the commit point and
- * record a dispatching attempt. Cancellation before this claim prevents the
- * send; after it, the attempt is in flight and needs reconciliation.
- */
-export function prepareAttempt(
-  job: BrowserJob,
-  claim: StepClaim,
-  nowMs: number,
-): { readonly job: BrowserJob; readonly attemptId: string } | Decision {
-  if (job.state !== "queued" && job.state !== "running") {
-    return terminalDenial(job.state);
-  }
-  if (nowMs > job.request.expiresAt) {
-    return denied("job-expired", "job passed its expiry; recheck authority before any dispatch");
-  }
-  const attemptId = `a_${job.request.jobId}_${job.nextAttempt}`;
-  const prepared: AttemptRecord = Object.freeze({
-    attemptId,
-    operationId: claim.operationId,
-    epoch: job.epoch,
-    state: "dispatching" as AttemptState,
-    dispatchedAtMs: nowMs,
-    observation: undefined as BrowserObservation | undefined,
-    verified: false,
-    lateResult: false,
-  });
-  return { job: withAttempt(job, prepared), attemptId };
-}
-
 export interface TransportInput {
   readonly jobId: string;
   readonly attemptId: string;
   readonly operationId: string;
   readonly destination: string | undefined;
+  readonly targetId: string | undefined;
+  readonly documentVersion: string | undefined;
+  readonly callbackNonce: string;
+  readonly requestDigest: string;
 }
 
 export interface TransportResult {
@@ -199,14 +221,20 @@ export interface TransportResult {
 }
 
 export interface StepTransport {
-  execute(input: TransportInput): Promise<TransportResult>;
+  execute(input: TransportInput, signal: AbortSignal): Promise<TransportResult>;
 }
 
 export interface CallbackVerifier {
   verify(envelope: unknown, signature: unknown, expectedVersion: number): CallbackResult;
 }
 
-export type StepOutcome = "observed-success" | "observed-failure" | "transport-unknown" | "callback-rejected";
+export type StepOutcome =
+  | "observed-success"
+  | "observed-failure"
+  | "transport-unknown"
+  | "transport-timeout"
+  | "callback-rejected"
+  | "claim-refused";
 
 export interface DispatchReceipt {
   readonly attemptId: string;
@@ -239,12 +267,111 @@ function failAttempt(job: BrowserJob, attemptId: string): BrowserJob {
   return replaceAttempt(job, { ...current, state: "observedFailure" as AttemptState });
 }
 
+function quarantine(job: BrowserJob, entry: QuarantinedCallback): BrowserJob {
+  const kept = job.quarantined.length >= QUARANTINE_LIMIT
+    ? job.quarantined.slice(job.quarantined.length - QUARANTINE_LIMIT + 1)
+    : job.quarantined;
+  return Object.freeze({ ...job, quarantined: Object.freeze([...kept, entry]) });
+}
+
 /**
- * Settle a dispatching attempt from its delivered callback: verify the
- * signature, enforce replay and version protection, bind the observation to
- * this job and attempt, and apply the no-progress bound. A settled attempt
- * on a job that has since been cancelled must go through
- * recordLateObservation instead, so late effects stay explicit.
+ * Claim one dispatch: recheck liveness and expiry at the commit point and
+ * record a dispatching attempt. Cancellation before this claim prevents the
+ * send; after it, the attempt is in flight and needs reconciliation. This
+ * primitive checks only job state and expiry; full authority (lease
+ * registry, catalog binding, single-use claims) is enforced by the
+ * authoritative driver at its own commit point.
+ */
+export function prepareAttempt(
+  job: BrowserJob,
+  claim: StepClaim,
+  nowMs: number,
+): { readonly job: BrowserJob; readonly attemptId: string } | Denial {
+  if (job.state !== "queued" && job.state !== "running") {
+    return terminalDenial(job.state);
+  }
+  if (nowMs >= job.request.expiresAt) {
+    return denied("job-expired", "job reached its expiry; recheck authority before any dispatch");
+  }
+  const attemptId = `a_${job.request.jobId}_${job.nextAttempt}`;
+  const prepared: AttemptRecord = Object.freeze({
+    attemptId,
+    operationId: claim.operationId,
+    epoch: job.epoch,
+    state: "dispatching" as AttemptState,
+    dispatchedAtMs: nowMs,
+    observation: undefined as BrowserObservation | undefined,
+    verified: false,
+    lateResult: false,
+  });
+  return { job: withAttempt(job, prepared), attemptId };
+}
+
+function classifyLiveOutcome(
+  job: BrowserJob,
+  attempt: AttemptRecord,
+  observation: BrowserObservation,
+): { readonly job: BrowserJob; readonly failed: boolean } {
+  const accepted: AttemptRecord = Object.freeze({ ...attempt, state: "observedSuccess" as AttemptState, observation });
+  let current = replaceAttempt(job, accepted);
+  current = Object.freeze({ ...current, nextObservationVersion: current.nextObservationVersion + 1 });
+  if (observation.claimedOutcome === "noProgress") {
+    const consecutive = current.consecutiveNoProgress + 1;
+    current = Object.freeze({ ...current, consecutiveNoProgress: consecutive });
+    if (consecutive >= NON_PROGRESS_LIMIT) {
+      return { job: Object.freeze({ ...current, state: "failed" as JobState }), failed: true };
+    }
+    return { job: current, failed: false };
+  }
+  current = Object.freeze({ ...current, consecutiveNoProgress: 0 });
+  if (observation.claimedOutcome === "waiting") {
+    current = Object.freeze({ ...current, state: "waitingForSupplier" as JobState });
+    return { job: current, failed: false };
+  }
+  if (observation.claimedOutcome === "blockedByPolicy" || observation.claimedOutcome === "operationFailure") {
+    return { job: failAttempt(current, attempt.attemptId), failed: true };
+  }
+  return { job: current, failed: false };
+}
+
+/**
+ * Classify a late observation truthfully without any state transition: the
+ * job stays cancelled, but the attempt records its actual verified status
+ * under the same outcome rules as live settlement.
+ */
+function classifyLateOutcome(
+  job: BrowserJob,
+  attempt: AttemptRecord,
+  observation: BrowserObservation,
+): BrowserJob {
+  const failed =
+    observation.claimedOutcome === "blockedByPolicy" || observation.claimedOutcome === "operationFailure";
+  const settled: AttemptRecord = Object.freeze({
+    ...attempt,
+    state: (failed ? "observedFailure" : "observedSuccess") as AttemptState,
+    observation,
+    lateResult: true,
+  });
+  let current = replaceAttempt(job, settled);
+  current = Object.freeze({ ...current, nextObservationVersion: current.nextObservationVersion + 1 });
+  if (observation.claimedOutcome === "noProgress") {
+    current = Object.freeze({ ...current, consecutiveNoProgress: current.consecutiveNoProgress + 1 });
+  } else if (!failed) {
+    current = Object.freeze({ ...current, consecutiveNoProgress: 0 });
+  }
+  return Object.freeze({
+    ...current,
+    lateResults: Object.freeze([...current.lateResults, observation]),
+  });
+}
+
+/**
+ * Settle a dispatching attempt from its delivered callback. Verification,
+ * binding, and replay failures are quarantined for inspection WITHOUT
+ * settling the attempt, so a later valid callback can still be accepted
+ * exactly once and no uncertain outcome is misreported as an observed
+ * failure. A settled attempt on a job that has since been cancelled must go
+ * through recordLateObservation instead.
  */
 export function settleAttempt(
   job: BrowserJob,
@@ -252,7 +379,8 @@ export function settleAttempt(
   envelope: unknown,
   signature: unknown,
   callbacks: CallbackVerifier,
-): { readonly job: BrowserJob; readonly receipt: DispatchReceipt } | Decision {
+  nowMs: number,
+): { readonly job: BrowserJob; readonly receipt: DispatchReceipt } | Denial {
   if (job.state === "cancelled") {
     return denied("job-cancelled", "a cancelled job settles in-flight attempts via recordLateObservation");
   }
@@ -266,111 +394,60 @@ export function settleAttempt(
 
   const verified = callbacks.verify(envelope, signature, job.nextObservationVersion);
   if (!verified.ok) {
-    return { job: failAttempt(job, attemptId), receipt: { attemptId, outcome: "callback-rejected", detail: `${verified.reason}: ${verified.detail}` } };
+    const held = quarantine(job, {
+      attemptId,
+      reason: verified.reason,
+      detail: verified.detail,
+      receivedAtMs: nowMs,
+    });
+    return {
+      job: held,
+      receipt: { attemptId, outcome: "callback-rejected", detail: `${verified.reason}: ${verified.detail}` },
+    };
   }
   const observation = verified.envelope.observation;
   if (observation.jobId !== job.request.jobId || observation.attemptId !== attemptId) {
+    const held = quarantine(job, {
+      attemptId,
+      reason: "unknown-callback",
+      detail: "observation is bound to another job or attempt",
+      receivedAtMs: nowMs,
+    });
     return {
-      job: failAttempt(job, attemptId),
-      receipt: { attemptId, outcome: "observed-failure", detail: "observation is bound to another job or attempt" },
+      job: held,
+      receipt: { attemptId, outcome: "callback-rejected", detail: "observation is bound to another job or attempt" },
     };
   }
   const destinationCheck = validateDestination(observation.url, job.request.allowedOrigins);
   if (!destinationCheck.ok) {
+    const current = failAttempt(job, attemptId);
     return {
-      job: failAttempt(job, attemptId),
+      job: current,
       receipt: { attemptId, outcome: "observed-failure", detail: `observed URL rejected: ${destinationCheck.detail}` },
     };
   }
 
-  const accepted: AttemptRecord = Object.freeze({ ...attempt, state: "observedSuccess" as AttemptState, observation });
-  let current = replaceAttempt(job, accepted);
-  current = Object.freeze({ ...current, nextObservationVersion: current.nextObservationVersion + 1 });
-
-  if (observation.claimedOutcome === "noProgress") {
-    const consecutive = current.consecutiveNoProgress + 1;
-    current = Object.freeze({ ...current, consecutiveNoProgress: consecutive });
-    if (consecutive >= NON_PROGRESS_LIMIT) {
-      current = Object.freeze({ ...current, state: "failed" as JobState });
-      return {
-        job: current,
-        receipt: {
-          attemptId,
-          outcome: "observed-failure",
-          detail: `non-progress limit of ${NON_PROGRESS_LIMIT} reached; evidence preserved`,
-        },
-      };
-    }
-    return { job: current, receipt: { attemptId, outcome: "observed-success", detail: "no progress yet" } };
+  const { job: current, failed } = classifyLiveOutcome(job, attempt, observation);
+  if (failed && current.state === "failed") {
+    return {
+      job: current,
+      receipt: {
+        attemptId,
+        outcome: "observed-failure",
+        detail: `non-progress limit of ${NON_PROGRESS_LIMIT} reached; evidence preserved`,
+      },
+    };
   }
-
-  current = Object.freeze({ ...current, consecutiveNoProgress: 0 });
-  if (observation.claimedOutcome === "waiting") {
-    current = Object.freeze({ ...current, state: "waitingForSupplier" as JobState });
-  }
-  if (observation.claimedOutcome === "blockedByPolicy" || observation.claimedOutcome === "operationFailure") {
-    current = failAttempt(current, attemptId);
+  if (failed) {
     return {
       job: current,
       receipt: { attemptId, outcome: "observed-failure", detail: `executor reported ${observation.claimedOutcome}` },
     };
   }
+  if (observation.claimedOutcome === "noProgress") {
+    return { job: current, receipt: { attemptId, outcome: "observed-success", detail: "no progress yet" } };
+  }
   return { job: current, receipt: { attemptId, outcome: "observed-success", detail: "observation recorded" } };
-}
-
-/**
- * Dispatch one authorized claim through the injected transport and account
- * for its callback. The claim must come from authorizeStep; this function
- * never reopens a cancelled or expired job.
- */
-export async function dispatchStep(
-  job: BrowserJob,
-  claim: StepClaim,
-  transport: StepTransport,
-  callbacks: CallbackVerifier,
-  nowMs: number,
-): Promise<{ readonly job: BrowserJob; readonly receipt: DispatchReceipt }> {
-  const prepared = prepareAttempt(job, claim, nowMs);
-  if ("ok" in prepared) {
-    const denial = prepared as Decision;
-    if (denial.ok === false) {
-      return {
-        job,
-        receipt: { attemptId: "", outcome: "callback-rejected", detail: `${denial.reason}: ${denial.detail}` },
-      };
-    }
-  }
-  const { job: claimed, attemptId } = prepared as { readonly job: BrowserJob; readonly attemptId: string };
-
-  let delivered: TransportResult;
-  try {
-    delivered = await transport.execute({
-      jobId: job.request.jobId,
-      attemptId,
-      operationId: claim.operationId,
-      destination: claim.destination,
-    });
-  } catch (error) {
-    const stranded = claimed.attempts.find((item) => item.attemptId === attemptId) as AttemptRecord;
-    const current = replaceAttempt(claimed, { ...stranded, state: "outcomeUnknown" as AttemptState });
-    return {
-      job: current,
-      receipt: {
-        attemptId,
-        outcome: "transport-unknown",
-        detail: error instanceof Error ? error.message : "transport failed",
-      },
-    };
-  }
-
-  const settled = settleAttempt(claimed, attemptId, delivered.envelope, delivered.signature, callbacks);
-  if ("ok" in settled) {
-    const denial = settled as Decision;
-    if (denial.ok === false) {
-      return { job: claimed, receipt: { attemptId, outcome: "callback-rejected", detail: `${denial.reason}: ${denial.detail}` } };
-    }
-  }
-  return settled as { readonly job: BrowserJob; readonly receipt: DispatchReceipt };
 }
 
 /**
@@ -378,7 +455,7 @@ export async function dispatchStep(
  * already-dispatched in-flight attempt keeps its state for later
  * reconciliation through recordLateObservation — cancellation cannot unsend.
  */
-export function cancelJob(job: BrowserJob, nowMs: number, reason: string): BrowserJob | Decision {
+export function cancelJob(job: BrowserJob, nowMs: number, reason: string): BrowserJob | Denial {
   void nowMs;
   if (job.state === "completed" || job.state === "failed" || job.state === "cancelled") {
     return denied("invalid-transition", `cannot cancel a ${job.state} job`);
@@ -403,14 +480,14 @@ export function fenceExpired(job: BrowserJob, nowMs: number): BrowserJob {
     job.state === "waitingForSupplier" ||
     job.state === "waitingForUser" ||
     job.state === "pausedBudget";
-  if (!active || nowMs <= job.request.expiresAt) {
+  if (!active || nowMs < job.request.expiresAt) {
     return job;
   }
   const cancelled = cancelJob(job, nowMs, "expired");
-  if ("ok" in cancelled && cancelled.ok === false) {
+  if (isDenial(cancelled)) {
     return job;
   }
-  return cancelled as BrowserJob;
+  return cancelled;
 }
 
 export interface LateReceipt {
@@ -421,16 +498,18 @@ export interface LateReceipt {
 
 /**
  * Record a late read-only result for an in-flight attempt after
- * cancellation. The observation is preserved as evidence and the attempt is
- * marked, but the job stays cancelled and no new work is authorized.
+ * cancellation. The observation is preserved with its truthful status and
+ * the job stays cancelled: no new work is authorized and no terminal
+ * transition is applied.
  */
-export async function recordLateObservation(
+export function recordLateObservation(
   job: BrowserJob,
   attemptId: string,
   envelope: unknown,
   signature: unknown,
   callbacks: CallbackVerifier,
-): Promise<{ readonly job: BrowserJob; readonly receipt: LateReceipt } | Decision> {
+  nowMs: number,
+): { readonly job: BrowserJob; readonly receipt: LateReceipt } | Denial {
   if (job.state !== "cancelled") {
     return denied("invalid-transition", "late results apply only to cancelled jobs");
   }
@@ -449,20 +528,10 @@ export async function recordLateObservation(
   if (observation.jobId !== job.request.jobId || observation.attemptId !== attemptId) {
     return denied("unknown-callback", "late observation is bound to another job or attempt");
   }
-  const settled: AttemptRecord = Object.freeze({
-    ...attempt,
-    state: "observedSuccess" as AttemptState,
-    observation,
-    lateResult: true,
-  });
-  const next: BrowserJob = Object.freeze({
-    ...replaceAttempt(job, settled),
-    nextObservationVersion: job.nextObservationVersion + 1,
-    lateResults: Object.freeze([...job.lateResults, observation]),
-  });
+  const next = classifyLateOutcome(job, attempt, observation);
   return {
     job: next,
-    receipt: { attemptId, recorded: true, detail: "late result preserved as evidence; job remains cancelled" },
+    receipt: { attemptId, recorded: true, detail: "late result preserved with its status; job remains cancelled" },
   };
 }
 
@@ -470,11 +539,14 @@ export interface IndependentCheck {
   readonly checker: "independent" | "self";
   readonly observedUrl: string;
   readonly matches: boolean;
+  /** Required outputs this check confirms, each evidenced by the observation. */
+  readonly confirmedOutputs: readonly string[];
 }
 
 /**
  * Apply an independent result check. Only a separate independent check that
- * matches the recorded observation verifies an outcome; self-reported
+ * matches the recorded observation verifies an outcome, and every confirmed
+ * output must appear in the observation's produced outputs; self-reported
  * success stays unverified and can never complete the job.
  */
 export function applyIndependentCheck(
@@ -482,7 +554,7 @@ export function applyIndependentCheck(
   attemptId: string,
   check: IndependentCheck,
   nowMs: number,
-): BrowserJob | Decision {
+): BrowserJob | Denial {
   const attempt = job.attempts.find((item) => item.attemptId === attemptId);
   if (attempt === undefined || attempt.observation === undefined) {
     return denied("unknown-callback", `attempt "${attemptId}" has no recorded observation`);
@@ -493,11 +565,18 @@ export function applyIndependentCheck(
   if (check.checker !== "independent" || !check.matches || check.observedUrl !== attempt.observation.url) {
     return denied("unverified", "outcome lacks a matching independent check");
   }
+  const produced = attempt.observation.producedOutputs ?? Object.freeze([] as string[]);
+  for (const output of check.confirmedOutputs) {
+    if (!produced.includes(output)) {
+      return denied("unverified", `confirmed output "${output}" is not evidenced by the observation`);
+    }
+  }
   const outcome: VerifiedOutcome = Object.freeze({
     attemptId,
     operationId: attempt.operationId,
     url: attempt.observation.url,
     checkedAtMs: nowMs,
+    confirmedOutputs: Object.freeze([...check.confirmedOutputs]),
   });
   return Object.freeze({
     ...replaceAttempt(job, { ...attempt, verified: true }),
@@ -505,14 +584,30 @@ export function applyIndependentCheck(
   });
 }
 
-/** Complete a job only with a verified outcome and no unsettled attempts. */
-export function tryComplete(job: BrowserJob): BrowserJob | Decision {
+/**
+ * Complete a job only with independently verified coverage of every
+ * required output and no unsettled attempts. Waiting and no-progress
+ * observations produce no outputs, so a generic URL match alone can never
+ * complete a job that declares required outputs.
+ */
+export function tryComplete(job: BrowserJob): BrowserJob | Denial {
   if (job.verifiedOutcomes.length === 0) {
     return denied("unverified", "completion needs at least one independently verified outcome");
   }
   for (const attempt of job.attempts) {
     if (attempt.state === "prepared" || attempt.state === "dispatching" || attempt.state === "outcomeUnknown") {
       return denied("pending-attempts", `attempt "${attempt.attemptId}" is still unsettled`);
+    }
+  }
+  const covered = new Set<string>();
+  for (const outcome of job.verifiedOutcomes) {
+    for (const output of outcome.confirmedOutputs) {
+      covered.add(output);
+    }
+  }
+  for (const required of job.requiredOutputs) {
+    if (!covered.has(required)) {
+      return denied("missing-outputs", `required output "${required}" has no verified evidence`);
     }
   }
   if (job.state !== "running" && job.state !== "partial" && job.state !== "waitingForSupplier" && job.state !== "waitingForUser") {
@@ -522,13 +617,20 @@ export function tryComplete(job: BrowserJob): BrowserJob | Decision {
 }
 
 /**
- * Change strategy after weak progress: keep every verified outcome and
- * recorded observation, reset the no-progress counter, and continue in a
- * new operation epoch. Blocked operations stay blocked in the new epoch.
+ * Change strategy after weak progress — or resume after a wait: keep every
+ * verified outcome and recorded observation, reset the no-progress counter,
+ * and continue in a new operation epoch. Waiting jobs resume to running;
+ * blocked operations stay blocked in the new epoch.
  */
-export function changeStrategy(job: BrowserJob, reason: string): BrowserJob | Decision {
+export function changeStrategy(job: BrowserJob, reason: string): BrowserJob | Denial {
   void reason;
-  if (job.state !== "running" && job.state !== "partial" && job.state !== "failed") {
+  if (
+    job.state !== "running" &&
+    job.state !== "partial" &&
+    job.state !== "failed" &&
+    job.state !== "waitingForSupplier" &&
+    job.state !== "waitingForUser"
+  ) {
     return denied("invalid-transition", `cannot change strategy from ${job.state}`);
   }
   return Object.freeze({
