@@ -2,7 +2,7 @@
 
 - **Project:** OpeningOS
 - **Event:** Convex All Gas Hackathon
-- **What it does:** Planned café procurement assistant for researching equipment, comparing supplier quotes, and tracking opening risks; application not implemented yet.
+- **What it does:** Planned café procurement and equipment coordination workspace for openings, supplier decisions, service, and replacement; application not implemented yet.
 - **Live app:** not deployed
 - **Repo:** https://github.com/VasuBansal7576/openingos
 - **Frontend:** Codex Sites
@@ -12,13 +12,39 @@
 - **Auth:** none
 - **AI models:** none
 - **Started:** 2026-09-19T09:46:19Z
-- **Last updated:** 2026-09-19T10:07:23Z
+- **Last updated:** 2026-09-19T13:27:25Z
 
 ## Log
 
-### 2026-09-19 - working tree
+### 2026-09-19 - a8ee823
 Prepared the project for the Convex All Gas Hackathon with the project-local build-log and Codex Sites + Convex skills, and selected Codex Sites as the intended frontend host.
 Installed and verified the official Convex Codex plugin; activation of its MCP tools in the current session remains unverified.
 Recorded OpeningOS as the working product name from the supplied PRD, initialized Git, and created the public repository.
 Added Git ignore rules for credentials, local research, agent installations, and generated output.
 This entry records setup only; no application code, Convex deployment, or backend features exist yet.
+
+### 2026-09-19 - working tree
+Revised the product requirements in `PRD.md` to include professional repeat buyers, multiple locations, equipment history, and service or replacement cases in the initial scope.
+Defined separate financial states, evidence-based procurement readiness, supplier communication limits, and rules for missing or stale information.
+Added 24 product acceptance criteria and 11 hackathon delivery criteria without claiming that any are implemented or passed.
+The first supplier market remains undecided; this revision is planning work only.
+Extended the same uncommitted PRD to revision 3 with the vendor dashboard, contextual answers, Jev-led collection and decisions, integrated browser work, scoped approvals, and bounded recovery with verified outcomes.
+Added 10 project-specific hackathon checks and six unresolved technical decision areas, preserved launch-only sections and existing acceptance criteria, and rechecked the official build-log instructions; no application behavior or integration is claimed as implemented.
+Extended `PRD.md` to revision 4 with Jev-guided negotiation, research prioritization, uncertainty routing, supplier re-evaluation, task-level permissions, consequential-action checks, and shared provider-spend limits.
+Added six further project-specific acceptance checks and clarified the pending technical decisions while preserving the 45 existing criteria and launch-only sections; this remains specification work, not an implemented integration.
+
+### 2026-09-19 - working tree
+
+Extended `PRD.md` to revision 5 with a nine-step evaluator path, failure and usability checks, and an explicit pending UI choice while preserving all 51 acceptance criteria and launch-only sections.
+Adapted Ras Mic's delivery workflow in `AGENTS.md` and `skills/openingos-factory/SKILL.md`, including Orca ownership, private evidence handling, and CI and review follow-through.
+Added a read-only PR check helper, 19 passing local tests, a PR template, and a repository-check workflow; the skill validated and workflow YAML parsed locally.
+Generated three exploratory UI concepts for user selection; no interface has been implemented or accepted.
+Extended `PRD.md` to revision 6 with a supported-capability boundary, backend enforcement requirements, and D-17 scope tests, preserving the prior 51 criteria and launch-only sections; updated `AGENTS.md` to carry that boundary into implementation work.
+Generated a further three ChatGPT ImageGen concepts after visual feedback; design selection and runtime enforcement remain unimplemented.
+No application, live CI run, Greptile integration, unattended repair runner, commit, or deployment was completed in this session.
+
+### 2026-09-19 - working tree
+
+Made frequent GitHub-pushed checkpoints and safe completed-task worktree cleanup explicit requirements in `AGENTS.md` and the project delivery skill.
+Cleanup requires verified handoff, remote preservation, settled ownership, and protection of uncommitted or untracked work; the repository currently has only its main checkout, so nothing was removed.
+Prepared the accumulated PRD and delivery files for their first GitHub checkpoint; remote push and CI results are not yet recorded in this entry.
