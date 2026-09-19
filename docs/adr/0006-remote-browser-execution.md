@@ -43,14 +43,17 @@ The allowed target originates in the current observed DOM state.
 Before input, check document version, target identity, occlusion and operation effect.
 Re-observe if stale; model output never becomes arbitrary selectors, JavaScript, shell commands or URLs to private networks.
 Block internal/reserved network ranges, cloud metadata endpoints and unauthorized protocols; validate redirects and destinations too.
-Restrict the initial browser proof to read-only navigation and variant inspection.
-Form submissions require the same exact-recipient and disclosure grant as email.
+Restrict hackathon supplier browsing to read-only navigation and variant inspection.
+Disable vendor-facing contact forms, chat messages, RFQ submissions, account creation and purchases in the executor's operation catalog.
+The owner-only email restriction cannot be bypassed through browser recovery, another provider or a model-selected tool.
+Future launch support for browser outreach requires a separate accepted decision, with exact-recipient and disclosure checks.
 
 ## Recovery and handoff
 
 Use the job limits from ADR-0004 and release sessions when waiting for a human or supplier.
 Preserve evidence before trying a new method.
-When supported interaction fails, try an authorized API, Firecrawl extraction or approved supplier clarification.
+When supported interaction fails, try an authorized read-only API or Firecrawl extraction.
+An email clarification can go only to the owner acting as supplier and produces controlled demo terms, not verified facts about a real vendor.
 CAPTCHA/authentication handling depends on the provider and the site's permitted access; there is no universal bypass promise.
 Any necessary user handoff is private, short-lived and bound to the same session and grant.
 An unresolved handoff reports waiting, not completed.
@@ -66,5 +69,6 @@ Prefer a managed browser with a small controller if the adaptation proof passes;
 
 From a deployed job, inspect a real representative supplier variant using Jev, verify the selected variant independently, interrupt and resume once, and test two simultaneous isolated sessions.
 Cancel queued work, expire a lease, replay a callback and attempt a blocked destination.
+Attempt vendor contact-form submission and chat through direct and recovery paths; neither may execute.
 Capture actual model calls, browser events, timing and cost without publishing cookies or session links.
 A local Ultrafast recording does not pass this gate.

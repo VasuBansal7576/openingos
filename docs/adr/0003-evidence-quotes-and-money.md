@@ -52,6 +52,18 @@ Evidence completeness records transport truncation, missing bytes and unstored p
 Preserve the approved outbound payload, provider receipts and decision-linked source snapshots under the [sponsor contracts](../integrations/sponsor-contracts.md#evidence-lifetime).
 Provider component cleanup must not erase purchasing history.
 
+### Hackathon counterparty provenance
+
+The owner plays the supplier through real email; live transport does not make their terms a real vendor quote.
+Record execution evidence separately from counterparty provenance as specified in the [sponsor contracts](../integrations/sponsor-contracts.md#hackathon-owner-only-communication).
+Each owner-authored quote version retains `counterpartyRole: ownerStandIn` and its source message evidence.
+An optional researched-vendor reference supplies scenario context only, not authorship or commercial endorsement.
+Comparison, selection, assistant answers and exports preserve the controlled-demo label.
+Owner-authored terms must not overwrite researched vendor prices, public availability or genuine supplier performance records.
+An owner counteroffer can prove a demo negotiation improvement but cannot establish realized savings or a binding vendor commitment.
+
+### Financial state
+
 Selection changes only selected forecast.
 User-recorded external orders change commitments, payments change paid amounts, and commissioning creates installed equipment provenance.
 Projected completion cost counts each quantity once: ordered quantities at current order cost, remaining quantities at selected cost or estimate.

@@ -12,7 +12,7 @@
 - **Auth:** none
 - **AI models:** none
 - **Started:** 2026-09-19T09:46:19Z
-- **Last updated:** 2026-09-19T15:06:33Z
+- **Last updated:** 2026-09-19T15:18:07Z
 
 ## Log
 
@@ -83,3 +83,12 @@ Selected component-backed collection and inbox handling with outbound AgentMail 
 Added `docs/integrations/sponsor-contracts.md` and `docs/implementation/sponsor-integration-plan.md`, with package ownership, sequencing, stop conditions and 21 pending integration acceptance cases.
 Updated `AGENTS.md` and the project delivery skill to route workers to those contracts; all 52 existing requirement rows remained unchanged, local documentation links checked, the skill validated and all 23 existing repository tests passed.
 No application dependencies, live provider calls, credentials, deployment or sponsor integration tests were implemented by this documentation work.
+
+### 2026-09-19 - working tree
+
+Updated PRD revision 9 and ADR-0003 through ADR-0008 so all hackathon outreach targets the owner-designated mailbox, with the owner replying manually as the supplier.
+Required real research, model processing, AgentMail transport and Convex updates, while separating controlled commercial terms from genuine vendor evidence and blocking vendor contact through alternate channels.
+Updated agent instructions and sponsor contracts with recipient checks, thread binding, private-address handling and truthful waiting, failure and recorded-exchange states.
+Added three pending acceptance cases for recipient enforcement, the live owner negotiation loop and counterparty provenance; preserved all 52 PRD requirement rows and all 21 earlier integration cases.
+All 23 existing repository tests passed, 30 local documentation links and anchors checked, and the full log passed the address/token redaction scan.
+This checkpoint changes documentation only; no email was sent, no live integration was tested and no application behavior was implemented.

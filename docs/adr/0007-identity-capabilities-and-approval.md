@@ -46,6 +46,18 @@ An approval binds the exact payload or an explicit bounded communication mandate
 Recheck access, authority and the mandate before dispatch.
 Changed recipients, specifications, quantities, quoted scope or limits invalidate affected queued approvals.
 
+### Owner-only communication constraint
+
+The hackathon capability catalog permits outbound mail only under `communicationProfile: ownerRoleplay`.
+The owner supplies one approved mailbox through protected backend configuration; guests, project members and models cannot edit it through application inputs.
+Only that address can appear in `To`; CC and BCC remain empty, and incoming `Reply-To` cannot redirect a response.
+Both private and guest workspaces obey the restriction, even if a user prompt requests real-vendor outreach.
+Bind the recipient configuration version into every communication grant and reject stale versions before dispatch.
+Never silently replace a reviewed vendor recipient with the owner after approval.
+The approval UI names the owner-as-supplier role and masks the private address for public guests.
+Keep project isolation and disclosure checks in force even though multiple conversations share one recipient.
+The [sponsor contract](../integrations/sponsor-contracts.md#hackathon-owner-only-communication) defines the remaining recipient and thread checks.
+
 ## Scope behavior
 
 Clearly unrelated requests receive a brief refusal and create no execution job or retry.
@@ -58,7 +70,7 @@ Jev helps classify and route uncertainty under ADR-0005; backend allowlists rema
 ## Guest controls and acceptance
 
 Guests can inspect seeded records and perform bounded real research once an owner-funded allowance is configured.
-Outbound recipients are controlled demonstration mailboxes only, enforced server-side.
+Outbound mail can reach only the owner-designated mailbox, enforced server-side for guests and private sessions alike.
 Guest job grants expire, provider sessions are cleaned up, and global rate/spend limits prevent endless new guest sessions bypassing per-user limits.
 An unavailable allowance shows a truthful state rather than a fake live run.
 

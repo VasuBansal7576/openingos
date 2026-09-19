@@ -16,6 +16,9 @@ The PRD owns product requirements.
 Accepted ADRs own architecture choices; their linked contracts define the selected interfaces.
 Proposed ADRs permit only explicitly authorized proof work, not independent feature implementation.
 Keep requirement identifiers unchanged and record contrary evidence before amending a decision.
+All hackathon mail targets the owner's privately configured mailbox, with the owner playing the supplier.
+Read the [owner-only communication contract](../integrations/sponsor-contracts.md#hackathon-owner-only-communication) before implementing any provider write or recovery path.
+Do not contact real vendors or substitute scripted supplier replies for the real owner exchange.
 
 ## Follow the package order
 
@@ -38,6 +41,8 @@ Do not require completed feature work to approve the contracts it needs.
 R1, C1 and U1 may run in parallel only after F1's shared contracts are committed and accepted.
 Only the foundation owner changes registration, routes, schema, shared validators or the lockfile.
 Feature workers request those changes with the required signature and test, rather than editing shared files concurrently.
+F1 owns the owner-only policy and provenance schemas, C1 owns transport and inbound binding, and U1 owns truthful labels and redacted public projections.
+F1 and C1 return S-22 results; U1 and C1 return S-24 results; V1 owns the live S-23 proof.
 
 ## Complete F0 without inventing API support
 
@@ -51,6 +56,10 @@ Feature workers request those changes with the required signature and test, rath
 8. Record a pricing basis and a defensible maximum charge for each enabled operation, including hidden transport retries.
 9. Keep live sends and live paid operations disabled when their authority or cost bound is absent.
 10. Report package drift and amend the contract before adopting different behavior.
+
+Before a live mail check, obtain the owner's designated recipient privately, confirm that it does not forward tests to vendors, and bind its configuration version to the test grant.
+Do not infer the address from Git, account profiles or discovered contacts.
+Use synthetic addresses and controlled transport responses for ordinary CI; no actual mailbox value belongs in test files or logs.
 
 Do not copy unauthenticated README example endpoints into the product.
 Do not enable AgentMail component send methods or Firecrawl bulk-crawl creation as shortcuts around the chosen contracts.
@@ -85,10 +94,15 @@ Controlled fault injection proves local behavior, not actual provider delivery.
 | S-19 | Supplier HTML/instructions, new CC recipients and expiring attachment URLs cannot leak information or silently create approved evidence | Controlled malicious/incomplete input |
 | S-20 | Workbench distinguishes queued, sent, delivered, unknown, partial and paused states; reload and reconnect preserve server truth | Browser, controlled backend |
 | S-21 | Real Firecrawl research, useful Jev decisions, OpenAI extraction/drafting, authorized AgentMail send and reply, versioned quote and reactive UI work in one published project | Live controlled recipients |
+| S-22 | Guest and private direct calls, model output, Reply-To/CC injection, retries and recovery cannot contact any address except the configured owner or submit vendor forms/chat; missing configuration and changed recipient versions block new claims | Controlled API, transport and browser boundary |
+| S-23 | Owner receives a real RFQ, replies manually with an unscripted counteroffer, and receives a real model-generated response within the mandate; signed inbound processing updates the correct Convex quote and reactive workbench; absent reply stays waiting and unavailable providers never fall back to fake success | Live owner round trip; controlled absence/outage cases |
+| S-24 | Two scenario threads sharing the owner mailbox cannot cross projects; owner-authored terms stay labeled through comparison, selection, answers and exports, never overwrite real vendor facts or become realized savings; public projections/downloads do not expose the owner's address or raw headers; recorded exchanges never appear newly live | Controlled records, API and browser |
 
 Map S-01/S-02/S-21 to H-03, H-04 and H-07.
 Map S-04/S-10/S-19 to P-16, D-09, D-14 and D-17.
 Map S-05 through S-09 and S-11 through S-18 to the relevant P-05, P-17 and D-05 through D-16 checks in each package.
+Map S-22 through S-24 to P-05, P-06, P-16, H-04, H-08, D-07, D-12 and D-13 as applicable.
+S-02 and S-21 use the same owner-only recipient rule; "controlled" does not authorize a second external test recipient.
 These tests supplement the PRD, including document, financial, browser, recovery and equipment cases; they do not replace it.
 
 ## Establish commands and CI before feature work
@@ -112,7 +126,7 @@ Those 23 tests do not execute the planned sponsor integrations.
 
 | Condition | Required action |
 | --- | --- |
-| Missing credentials, provider allowance, test recipients or deployment authority | Report the exact missing item to the coordinator; continue controlled tests without real calls |
+| Missing credentials, provider allowance, owner-designated recipient or deployment authority | Report the exact missing item to the coordinator; continue controlled tests without real calls |
 | Published Sites cannot reach Convex or identity isolation fails | Stop dependent live work; retain the failure evidence and repair F0 |
 | Package lacks the documented interface or behavior | Stop the affected integration; return the inspected version, source location and failing contract test |
 | Firecrawl bulk-start idempotency or cost remains unproven | Keep bulk start disabled; continue the selected bounded one-shot research path |

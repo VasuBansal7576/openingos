@@ -2,7 +2,7 @@
 
 Status: Proposed; integration design specified, controlled and live verification pending.
 Requirements: P-05, P-13, P-14, P-17, P-23, D-05, D-06, D-07, D-12, D-13, D-16.
-Amended September 19, 2026 after inspecting the sponsor components' source.
+Amended September 19, 2026 after inspecting the sponsor components' source and adopting the user's owner-only hackathon communication constraint.
 
 ## Decision
 
@@ -71,6 +71,23 @@ An approved communication grant names recipients, permissible disclosures, nonbi
 Covered clarification can proceed without another approval; new recipients or changed authority cannot.
 A supplier reply stops obsolete queued follow-ups before dispatch.
 Signatures and event IDs, not email subject alone, identify the ingestion route.
+
+### Owner-only hackathon transport
+
+The user has accepted the recipient restriction; implementation of its enforcement remains pending.
+Every hackathon conversation sends only to the owner's privately configured mailbox, with empty CC and BCC, under the existing bounded grant.
+Discovered vendor contacts are read-only research data and cannot become destinations.
+The approved snapshot binds `communicationProfile: ownerRoleplay`, the actual recipient and its configuration version, not a vendor address later rewritten in transport.
+The dispatch claim and adapter validate that binding against the current configuration.
+A configuration change prevents subsequent claims under an old grant; an already dispatched request retains the cancellation semantics above.
+Missing configuration, recipient mismatch or an attempted alternate outreach channel produces a typed denial with no send.
+The [owner-only contract](../integrations/sponsor-contracts.md#hackathon-owner-only-communication) also covers headers, private-address display and thread binding.
+
+The owner replies manually in their email client.
+The signed inbound callback, real Jev/OpenAI processing and Convex writes drive the next permitted message and quote revision.
+Do not insert a simulated supplier response when the owner or a provider is unavailable.
+Use `waitingForSupplier` with the visible label "Waiting for demo supplier" and release active browser/model resources while waiting.
+Cancellation, takeover, expiry and round limits still stop the conversation.
 
 ## One owner for every retry
 

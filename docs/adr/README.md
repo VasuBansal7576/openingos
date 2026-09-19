@@ -1,8 +1,10 @@
 # OpeningOS architecture decisions
 
-Drafted September 19, 2026; integration contracts clarified against PRD revision 8.
+Drafted September 19, 2026; integration contracts clarified against PRD revision 9.
 These documents specify implementation choices, not completed capabilities.
 The user accepted the purchasing workbench and the existing hackathon platform direction.
+The user also requires all hackathon outreach to go only to their designated mailbox, with real provider execution and the user playing the supplier.
+This accepted product constraint applies to ADR-0003 through ADR-0008 even while their technical proposals await proof.
 Other recommendations remain proposed until reviewed and their blocking experiments pass.
 Do not let workers silently turn a proposal into an accepted contract.
 
@@ -23,7 +25,7 @@ Do not let workers silently turn a proposal into an accepted contract.
 2. Prove a hosted Jev-guided browser operation with two isolated sessions, cancellation and an independent result check.
 3. Approve the proposed identity choice and prove guest/private isolation on the published origin.
 4. Confirm the hackathon research country, currency and representative supplier sites.
-5. Confirm application API access, permitted test recipients and a total provider allowance through secure configuration.
+5. Confirm application API access, the owner's designated recipient mailbox and a total provider allowance through secure configuration.
 6. Measure task-specific Jev thresholds and choose a tested OpenAI model snapshot.
 
 The Netherlands/EUR in the prototype is a fixture, not a chosen supplier market.

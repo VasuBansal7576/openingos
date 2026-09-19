@@ -23,6 +23,8 @@ Do not treat proposed ADRs, a green tooling check, or demonstration fixtures as 
 - Draft and resolve cross-cutting ADRs before their dependent workers implement them.
 - Give workers implementation packages with acceptance criteria and file ownership, not one ADR each.
 - Use the sponsor plan's named retry owners, outbound send path and evidence rules; report incompatible package behavior before changing a shared contract.
+- All hackathon outreach goes only to the owner's privately configured mailbox, with the owner playing the supplier; block real-vendor email, contact forms and alternate channels in every workspace.
+- Use real providers for live runs and preserve honest waiting/failure states; label owner-authored terms as controlled demo evidence, never genuine vendor quotes or realized savings.
 - Use Orca for developer orchestration when authorized; it is not the customer application's runtime.
 - Preserve existing uncommitted work and stable P-, H-, and D- requirement meanings.
 - Keep the customer assistant limited to shipped, enabled OpeningOS workflows; see the PRD's product capability boundary and D-17.

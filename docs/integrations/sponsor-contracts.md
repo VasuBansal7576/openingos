@@ -52,7 +52,8 @@ Generated `components` references come from Convex code generation, never hand-w
 | `AGENTMAIL_WEBHOOK_SECRET` | Backend secret configuration | Required for the verified inbound webhook handler |
 | `AGENTMAIL_BASE_URL` | Reviewed backend configuration | One permitted provider origin, never a user-supplied URL |
 | Convex client deployment URL | Frontend public configuration | Hosted `.convex.cloud` endpoint; no deployment or admin key |
-| Provider allowance and test recipients | Protected application configuration | Disabled until the owner supplies an explicit allowance and controlled recipient list |
+| Provider allowance | Protected application configuration | Live calls disabled until the owner supplies an explicit allowance |
+| `HACKATHON_OWNER_RECIPIENT` | Protected backend configuration | One owner-designated mailbox, never a vendor address from research; no value in Git or frontend configuration |
 
 The AgentMail HTTP handler belongs in `convex/http.ts` at `POST /agentmail/webhook` and delegates signature verification to `agentmail.handleWebhook`.
 The actual registered URL uses the backend's public `.convex.site` HTTP origin, not the frontend's `chatgpt.site` URL.
@@ -66,6 +67,51 @@ A hosted smoke test verifies the effective callback URL rather than assuming loc
 
 No keys appear in frontend bundles, request arguments, Git, screenshots or logs.
 Test configuration contains variable names and placeholders only.
+
+## Hackathon owner-only communication
+
+This is the user's required hackathon behavior for every workspace, not an optional guest restriction.
+The owner plays the supplier and replies manually from their normal email client.
+AgentMail sends and receives real messages; live Jev/OpenAI processing and Convex updates use those actual replies.
+Research still collects real public vendor information through the approved provider paths.
+Only the counterparty's role and commercial terms are controlled for the demonstration.
+
+The communication module owns a single profile, `ownerRoleplay`.
+It resolves the recipient from `HACKATHON_OWNER_RECIPIENT` before presenting a draft for approval.
+It parses exactly one mailbox using a maintained address parser and preserves its local-part semantics; it does not infer equivalence by stripping dots or plus tags.
+The effective outbound payload has exactly that mailbox in `To` and empty `Cc` and `Bcc`.
+Both the dispatch claim and transport adapter check this invariant, the approved payload hash and the recipient configuration version.
+Missing or invalid configuration blocks dispatch, with no vendor-address fallback.
+Changing the setting invalidates queued grants and requires approval against the new version.
+An already claimed request follows ADR-0004's in-flight cancellation and reconciliation rules.
+
+Clients and models cannot set recipient headers, select another communication profile or change this backend configuration.
+Incoming `Reply-To`, reply-all expansion, new CC addresses, forwarded-message instructions and researched vendor contacts never become destinations.
+The application must not send to vendor forms, website chats or another outreach service, including during recovery.
+The designated owner mailbox must not be configured to forward these tests to vendors; verify this with the owner before the live proof.
+OpeningOS cannot guarantee what a recipient does after receiving an email and must not claim control over downstream forwarding.
+
+An AgentMail project inbox is the application-side sender, distinct from the owner's receiving mailbox.
+Multiple scenarios may share the owner recipient, but each thread binds to one project and purchasing conversation.
+A matching sender address alone cannot choose a project or quote.
+Bind replies through verified inbox/thread/message relationships and the expected counterparty mailbox; quarantine unknown or conflicting messages.
+Do not fabricate a reply, auto-generate a supplier counteroffer or run a scripted responder to complete a live demonstration.
+If the owner has not replied, show "Waiting for demo supplier" and suspend active execution until a reply, cancellation or the bounded timeout.
+
+The approved snapshot and conversation record carry `communicationProfile`, `recipientConfigVersion`, `counterpartyRole: ownerStandIn` and the actual recipient in protected storage.
+An optional `researchedVendorId` is scenario context only; the vendor did not author the owner's reply.
+Each evidence record distinguishes `executionMode: live | recorded | fixture` from counterparty role.
+Preserve the original live transport trace when presenting a recorded exchange, but never emit that replay as a new inbound event.
+Quote versions, calculations, assistant answers and exports inherit the owner-stand-in provenance.
+These terms cannot overwrite public vendor prices, stock or genuine supplier performance records.
+Display "Live email · Demo supplier" only when live transport is evidenced and "Recorded demo exchange" for replays.
+A negotiated delta is a demo improvement, not realized savings or an independently obtained vendor offer.
+
+Approval screens disclose that the recipient is the owner playing the supplier; there is no silent post-approval recipient rewrite.
+Public guests receive a role label and redacted message projections, never the owner's address, raw headers or private provider IDs.
+Raw messages and attachments stay protected; any guest download needs a redacted derivative or is unavailable.
+No credentials, actual recipient address or private reply content enters Git or public verification evidence.
+The existing standalone prototype remains a fixture and does not pass these live requirements.
 
 ## OpeningOS interfaces
 
@@ -108,7 +154,7 @@ Provider errors are mapped to these domain results without exposing credentials 
 | Reservation | Integer maximum cost, pricing basis, request multiplicity, spent amount and unresolved charge amount |
 | Processed event | Provider, environment, stable event ID, processing version and outcome; duplicate callback has no second product effect |
 | Evidence snapshot | Source kind, provider IDs or URL, capture time, hash, protected storage reference, completeness and provenance |
-| Outbound snapshot | Approved recipients, body, attachment hashes, grant, purpose and input versions, saved before dispatch |
+| Outbound snapshot | Approved recipients, recipient configuration version, communication profile, counterparty role, body, attachment hashes, grant, purpose and input versions, saved before dispatch |
 
 Physical table names are selected by F1 and then frozen for dependent workers.
 These fields must not be silently omitted or split into incompatible worker-specific schemas.
@@ -139,7 +185,8 @@ Evidence completeness is `complete`, `partial` or `unavailable`, separate from w
 Complete describes the captured source payload, not the whole website or supplier market.
 The component's `truncated` flag and crawl `unstored` count are preserved in the product projection.
 A partial source may support an exact visible fact but cannot prove that an omitted condition does not exist.
-For a decision-critical missing term, a bounded targeted fetch, permitted supplier inquiry or user review supplies the missing evidence.
+For a decision-critical missing vendor fact, use a bounded targeted fetch or user review and retain unknown when the fact remains unsupported.
+An inquiry to the owner can supply controlled demo terms but cannot verify a real vendor's missing commercial terms.
 The original incomplete record remains in history.
 
 `startCrawl` is not enabled in the initial adapter.

@@ -1,6 +1,6 @@
 # OpeningOS product requirements
 
-Revision: 8, September 19, 2026.
+Revision: 9, September 19, 2026.
 Status: proposed product specification, revised from the supplied PRD and its review.
 This document defines intended behavior, not implemented capabilities.
 The original numbered sections retain their subject and numbering.
@@ -28,6 +28,8 @@ It connects requirements, evidence, quotes, approvals, orders, equipment, and ac
 - Added the [ADR registry](docs/adr/README.md), separating accepted design/platform constraints from technical proposals and blocking experiments.
 - Clarified incomplete web evidence, durable correspondence history and the distinction between provider-owned storage and application-owned authority.
 - Linked source-checked sponsor contracts and worker acceptance cases without changing the 52 existing requirement rows or launch-only scope.
+- Restricted all hackathon outreach to the owner's designated mailbox, with the owner replying as the supplier through real email.
+- Required live research, model calls, email transport and Convex updates while labeling owner-provided commercial terms as controlled demo evidence.
 
 ### Scope of this revision
 
@@ -37,6 +39,8 @@ Existing launch-market, monetization, retention, and future-roadmap sections rem
 The initial-product scope remains recorded rather than being silently reduced to the demonstration.
 Section 52 defines the hackathon delivery boundary and identifies technical decisions still needed before implementation.
 Platform constraints and conceptual records in this PRD are not a completed architecture or a substitute for ADRs and implementation contracts.
+For the hackathon, the owner plays the supplier under the [owner-only communication rule](#hackathon-owner-only-communication).
+This restriction takes precedence over general supplier-contact capabilities described elsewhere in this PRD and applies to guest and private workspaces.
 
 ## 1. Executive summary
 
@@ -307,8 +311,8 @@ It must never imply that illustrative vendors are real discoveries or that a rec
 | 2. Project brief | Reviews equipment, location constraints, budget, deadline, and allowed research spend, then starts research | Editable assumptions and a bounded research job appear without unrelated onboarding questions | P-01, P-02, D-14, D-16 |
 | 3. Vendors | Watches results arrive and opens a supplier row | Sources, exact variants, coverage, freshness, missing charges, and compatibility findings are inspectable while other research continues | P-03, P-04, D-01, D-03, D-04 |
 | 4. Comparison and assistant | Selects two offers and asks why one costs more | The answer uses the selected current quotes and cites their evidence without asking for the project again | P-07, D-02, D-08 |
-| 5. Outreach review | Reviews the controlled recipients, permitted disclosure, and communication brief, then approves | A real permitted AgentMail send has a traceable status; later covered clarification does not require repeated approval | P-05, D-07, D-14 |
-| 6. Supplier reply | Opens the controlled reply and its extracted terms | A new quote version appears with its original evidence; permitted clarification or negotiation shows a sent message and either a verified reply or an honest waiting state | P-06, P-23, D-12, D-13 |
+| 5. Outreach review | Reviews the owner-as-supplier destination, permitted disclosure, and communication brief, then approves | AgentMail sends to the configured owner mailbox only; the workbench labels the controlled counterparty and tracks the real send | P-05, D-07, D-14 |
+| 6. Supplier reply | Opens the owner's actual email reply and its extracted terms | A demo quote version appears from that reply; permitted clarification or negotiation uses live models and sends back to the owner, or shows an honest waiting state | P-06, P-23, D-12, D-13 |
 | 7. Decision | Compares equivalent totals and selects an exact offer version | The selected forecast changes, while committed and paid totals remain unchanged; the interface says no order was placed | P-07, P-08 |
 | 8. Recovery | Runs a clearly labeled demonstration fault or opens a controlled delivery-change event | Completed results remain, a bounded recovery attempt is visible, and any substitute needs approval without erasing the old selection or order history | P-12, P-17, D-05, D-06, D-15 |
 | 9. Equipment and return visit | Opens a labeled seeded installed-equipment record, starts a service case, and reloads the project | Purchase and warranty evidence remains accessible; the case and prior work persist without turning the newly selected offer into an installed asset | P-18, H-03, H-07 |
@@ -318,7 +322,10 @@ The equivalent-scope difference is €550; an incomplete third offer is not rank
 Include an incompatible variant and a suitable vendor with an unpublished price in the evaluator dataset.
 Show what Jev decided and what a subsequent independent check observed, without exposing private reasoning or credentials.
 Do not require external suppliers to respond within the video duration.
-Use a controlled responder for the demonstrated round trip and keep the real integration trace available; any previously captured exchange is labeled as recorded.
+The owner replies manually from their designated mailbox, acting as the supplier.
+Keep the real integration trace available; label any previously captured exchange as recorded rather than live.
+If the owner is unavailable, the visitor can continue research and comparison while the conversation waits.
+Do not substitute an automatic supplier simulator or a scripted reply to manufacture a completed live negotiation.
 The sub-three-minute video can present selected moments from this path, but it does not impose a three-minute limit on asynchronous provider work.
 
 ### Companion failure and usability checks
@@ -327,7 +334,7 @@ These checks extend the main path and do not replace or renumber existing accept
 
 - Interrupt research after partial results, retry the failed branch, and verify that completed results survive without duplicate messages or records.
 - Change a quote after it is displayed and verify that old approvals cannot execute and the assistant no longer treats its cached answer as current.
-- Revoke outreach authority before a queued send and verify that no message leaves; requesting a new external recipient must require review.
+- Revoke outreach authority before a queued send and verify that no message leaves; a recipient outside the configured owner mailbox remains blocked even if requested in chat.
 - Exercise provider exhaustion, cancellation, and an unrecoverable failure; each must display a truthful state and retain useful completed work.
 - Open two guest sessions and a private test project; verify isolation through backend calls as well as the interface.
 - Complete the comparison and approval steps by keyboard and on a narrow viewport, including loading, empty, missing-evidence, error, and recovery states.
@@ -635,8 +642,9 @@ The selected tool performs the network request or browser action; Jev does not r
 Firecrawl must continue to perform observable product work for the hackathon.
 
 Customers do not install browser plugins, provide model-provider keys, or run a local developer process to use the deployed product.
-Interactive work can include navigating supplier catalogs, selecting variants, reading dynamic terms, and submitting an authorized inquiry.
-Treat browser form submission as external communication subject to the same scope, disclosure, and recipient checks as email.
+Hackathon browser work can navigate supplier catalogs, inspect variants, and read dynamic terms.
+Vendor contact forms, website chat, inquiry submissions and other vendor-facing writes are disabled, including as recovery paths.
+Any later launch support for browser outreach requires a separate decision and the same scope, disclosure, and recipient checks as email.
 Choose a browser execution environment reachable from the deployed application; a developer's logged-in Chrome is not a customer runtime.
 The specific hosted service or isolated executor, supported browser interactions, and fallback route require a technical decision before implementation.
 
@@ -653,8 +661,32 @@ Use the official `@agentmail/convex` component when it meets the required behavi
 ADR-0004 selects the component for inbox and verified inbound processing, while the shared application workflow controls outbound AgentMail requests.
 Component-level retries cannot bypass current permissions, duplicate an ambiguous send or hide a confirmed send after cancellation.
 
+### Hackathon owner-only communication
+
+All hackathon RFQs, clarifications, negotiations and service messages go to one owner-designated mailbox, never to discovered vendors.
+The owner receives real AgentMail messages and replies through their normal email client while playing the supplier.
+The backend permits only that configured address in `To`, with empty `Cc` and `Bcc`.
+Research results, model output, incoming `Reply-To` headers, prompts and browser tools cannot change this destination.
+The actual mailbox is supplied privately during setup and stays out of Git, frontend configuration and public evidence.
+Public visitors see a controlled-counterparty label, not the owner's private address.
+Missing or invalid configuration disables sending; there is no fallback to a vendor address.
+Changing the configured mailbox invalidates queued grants and requires new approval before another send.
+
+The approval screen makes the actual owner-as-supplier destination clear before approval rather than silently redirecting an approved vendor email.
+Discovered vendor contacts remain research data, not permitted recipients.
+The backend enforces this rule for every hackathon workspace, including owner/private sessions, retries and recovery.
+Follow-ups remain bounded by the original mandate, provider allowance and conversation limits.
+
+Research uses real public sources, Jev makes actual permitted decisions, and OpenAI extracts and drafts from the current evidence.
+AgentMail carries the real messages, and Convex stores the resulting conversation and quote versions and updates the workbench.
+The owner supplies the counterparty's commercial terms; the system must not invent the owner's reply or hide a provider failure behind fixtures.
+Label these terms as a controlled demo quote and any improvement as a demo negotiation result, not a genuine vendor offer or realized saving.
+Keep owner-authored terms separate from verified vendor facts, public availability and commercial history.
+The [sponsor contracts](docs/integrations/sponsor-contracts.md#hackathon-owner-only-communication) define transport checks, evidence labels and conversation binding.
+
 Before the first message, the user approves the recipient, represented business, disclosed details, and purpose.
 One review can authorize a named set of recipients and routine clarification or follow-up within an explicit brief and limit.
+For the hackathon, that set contains only the configured owner mailbox; a review cannot enable real-vendor outreach.
 Do not ask for a new approval for each message already covered by that brief.
 New recipients, sensitive disclosures, or material changes outside the brief require a fresh review.
 The message asks for the exact variant, quantity, freight, installation, tax basis, lead-time basis, warranty, validity, and exclusions relevant to that decision.
@@ -719,6 +751,7 @@ OpenAI drafts the message for that move, and the application checks the draft ag
 Amounts, concessions, and recipients must remain within the approved limits regardless of model confidence.
 Record the move, sent message, subsequent reply, and resulting quote version so the user can inspect what changed.
 Count a negotiated improvement only when the supplier's revised terms support it on a comparable basis.
+For the hackathon, that supplier role is played by the owner, so the result remains explicitly a demo negotiation even when every model and transport step is live.
 
 ## 25. Recommendation model
 
@@ -1085,7 +1118,8 @@ These controls cover internal provider usage and do not introduce customer billi
 ### Data and demonstration integrity
 
 Customer records and communication are private by default.
-Guest evaluation sessions cannot access real customer records or send unrestricted supplier email.
+Guest evaluation sessions cannot access real customer records.
+Every hackathon session is restricted to the owner-only communication rule, not just guest sessions.
 Exports and account closure have a defined data-retention policy before paid launch.
 
 Any demonstrated supplier response or stock change that is controlled for testing is labeled as such.
@@ -1165,10 +1199,11 @@ Keep unknown installation or service information visible.
 
 ### Scene 3: supplier communication, 0:45–1:15
 
-Approve an RFQ to a controlled demonstration supplier inbox.
-Show a real AgentMail round trip and the reply becoming a structured quote through OpenAI and Convex.
-Use a controlled reply with a missing commercial term to show Jev selecting a covered clarification or negotiation move without another approval prompt.
-Show the revised terms when a follow-up reply exists, or an honest awaiting-supplier state when it does not.
+Approve an RFQ addressed to the owner's designated mailbox, visibly labeled as the owner playing the supplier.
+Show the owner receiving the real AgentMail message and replying from their email client.
+Show that reply becoming a controlled demo quote through live OpenAI processing and Convex updates.
+Have the owner reply with a missing term or counteroffer to show Jev choosing a covered move and OpenAI drafting the next real email without another approval prompt.
+Show revised terms when the owner replies again, or an honest waiting-for-demo-supplier state when they do not.
 If the reply was received before recording, identify it as a recorded test exchange.
 Do not imply that a real supplier answered within the compressed demonstration time.
 
@@ -1178,7 +1213,8 @@ Compare €7,950 with delivery and installation explicitly included against €7
 Use the same tax basis and equivalent quantities.
 Show the supported €550 difference.
 Approve a selection and show selected forecast changing while committed expenditure remains unchanged.
-Call the result a quote comparison rather than a negotiated saving unless an actual negotiation produced the change.
+Call the result a quote comparison, or a demo negotiation improvement if the owner's actual counteroffer produced the change.
+Neither the arithmetic example nor the owner exchange proves real vendor savings.
 
 ### Scene 5: recover from a disruption, 1:40–2:15
 
@@ -1478,7 +1514,9 @@ The required submission URL is a confirmed public `chatgpt.site` address.
 | H-11 | The build log identifies implemented behavior, stack, live URL, and demo link and is updated after meaningful progress |
 
 H-06 requires public evaluation access, not public access to real customer work.
-Use an isolated guest session with restricted outbound recipients and bounded provider usage.
+Use an isolated guest session with the owner-only communication restriction and bounded provider usage.
+P-05 and D-12 require real email and model processing with the owner playing the supplier, not a simulated transport or independent vendor participation.
+Any recorded exchange remains labeled as recorded; a visitor can continue research and comparison while a live conversation waits for the owner.
 Authentication remains necessary for private customer projects even though the event does not mandate a particular auth system.
 
 ### Project-specific hackathon behavior
@@ -1549,11 +1587,11 @@ This PRD revision does not select a mobile framework, implement billing or final
 - Confirm Luma registration and eligibility through the participant.
 - Confirm available Firecrawl credits and usable OpenAI and AgentMail application access without exposing credentials.
 - Verify usable Jev API access and a deployable browser execution route, including any separate provider allowance or access requirement.
-- Confirm actual outreach recipients and job-spend authority before enabling external customer actions; guest evaluation remains restricted.
+- Obtain the owner's designated mailbox privately and confirm job-spend authority before enabling live hackathon email; real-vendor outreach remains disabled in every workspace.
 - Verify activation of the installed Convex plugin after the required restart.
 - Provision and verify the intended hosted Convex backend during the authorized build and publication workflow.
 - Sign in to Vibe Apps before the final submission.
-- Obtain real supplier and customer evidence separately from controlled demonstration exchanges.
+- Obtain real supplier and customer validation separately from controlled demonstration exchanges; this future validation does not authorize vendor outreach in the hackathon build.
 
 The submission deadline is September 22, 2026, at 12:00 PM Pacific.
 That is September 23, 2026, at 12:30 AM India Standard Time.

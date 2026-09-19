@@ -38,12 +38,17 @@ The plan adds detail to these packages without authorizing their execution or re
 
 ## Environments and realistic tests
 
-Use separate namespaces or deployments for workers, separate controlled inboxes and separate browser sessions.
+Use separate namespaces or deployments for workers, separate AgentMail project inboxes and separate browser sessions.
+Every live outbound test targets the same approved owner recipient; worker isolation does not authorize new external mailboxes.
 A Git worktree does not isolate Convex data or a provider balance.
 Keep a labeled source set with compatible, incompatible, unpublished-price, stale, conflicting and incomplete candidates from the agreed market.
 Add scanned/text documents, multi-item quotes, changed grants, delayed replies and injected transient failures.
 
-The combined path proves real Firecrawl collection, a real OpenAI extraction, useful Jev decisions, a deployed browser operation and a real controlled AgentMail round trip.
+The combined path proves real Firecrawl collection, a real OpenAI extraction, useful Jev decisions, a deployed browser operation and a real AgentMail round trip with the owner playing the supplier.
+The owner receives an RFQ in their email client, supplies a counteroffer, and receives a model-generated follow-up based on that actual reply.
+Verify with an unscripted term change that the agent uses the new input within its mandate and that Convex updates the correct project.
+Record a live transport separately from the controlled counterparty, and label a replay of the exchange as recorded.
+No reply means waiting; no model/provider access means unavailable, not a hidden mock fallback.
 It then proves comparison, exact-version selection, unchanged committed/paid totals, bounded recovery, an equipment case and persistence after reload.
 Keep the original PRD's additional acceptance cases as explicit tests or unimplemented requirements; never redefine them to match the demo.
 

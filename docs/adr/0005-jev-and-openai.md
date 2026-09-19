@@ -61,6 +61,10 @@ Retain originals, reject unsupported or oversized input with an explanation, and
 Never execute macros or document instructions.
 An extracted fact is a proposal until its evidence and required review are satisfied.
 Answers receive only authorized current records and cached results keyed by their exact versions.
+For the live hackathon negotiation, these records include the owner's actual email replies, labeled as controlled counterparty evidence.
+Jev chooses from permitted moves and OpenAI extracts or drafts using the latest reply, not a predetermined demonstration transcript.
+A provider outage or unreadable reply produces the documented failure or review state, never a fixture presented as a successful model call.
+Neither model may invent the owner's next reply or describe an owner-provided price as a confirmed vendor offer.
 
 ## Alternatives and acceptance
 
