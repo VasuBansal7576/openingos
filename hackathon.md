@@ -12,7 +12,7 @@
 - **Auth:** none
 - **AI models:** none
 - **Started:** 2026-09-19T09:46:19Z
-- **Last updated:** 2026-09-19T18:28:18Z
+- **Last updated:** 2026-09-19T18:53:40Z
 
 ## Log
 
@@ -118,3 +118,12 @@ Verified actual session metadata for OpenAI GPT-5.6 Luna at max effort, OpenCode
 Exercised scoped native approvals and worker question routing; recovered an update-blocked launch and diagnosed Codex sandbox IPC restrictions without enabling unrestricted worker permissions.
 Converted the coordinator roadmap to checkboxes, recording verified substeps separately from pending foundation and live-provider gates.
 All 23 existing repository tests pass; these checks and preflight evidence do not establish application behavior or live integrations.
+
+### 2026-09-19 - working tree
+
+Integrated Luna's pushed financial proof `884a70b` and Muse Spark's pushed Jev proof `03ffe2e`, covering equivalent quote costs, incomplete charges, distinct financial states and validated single-attempt HTTP results.
+The combined checkout passes 41 controlled contract tests, all 23 repository checks and strict TypeScript; coordinator findings prompted timeout/body-stream and compiler repairs by the responsible workers.
+Added pinned Bun/TypeScript tooling and two foundation CI jobs; independent review of the fixed combined commit and its latest remote checks are still pending.
+Installed OpenCode's official Convex skills and MCP, verified twelve tools after restart without invoking them, and confirmed the requested Muse Spark model/high variant from session metadata.
+Handled ongoing native approvals and verified that scoped routine tests and assigned-file edits execute without repeated prompts after restart.
+All contract evidence uses controlled inputs or injected HTTP responses; hosted identity, shared provider allowances, backend authority, live integrations and publication remain unverified.

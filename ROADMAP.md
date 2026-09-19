@@ -39,7 +39,8 @@ This file supplies order, not duplicate contracts or a running automation.
 - [x] Exercise OpenCode's Orca question/reply round trip.
 - [x] Finish Codex's Orca question/reply and lifecycle round trip under scoped IPC approval.
 - [x] Install official Convex skills for OpenCode and verify its configured MCP connects.
-- [ ] Verify a restarted OpenCode worker sees the Convex MCP before backend work.
+- [x] Verify a restarted OpenCode worker sees the twelve Convex MCP tools before backend work; none were invoked.
+- [x] Verify the restarted OpenCode session retains the requested model/high variant and runs its 28 controlled tests without a native approval prompt.
 - [ ] Verify hosted environment, application credentials, provider allowances and owner recipient.
 - [ ] Integrate and review the independent financial and Jev contract proofs.
 
@@ -51,6 +52,9 @@ Neither proof authorizes dependent production features or passes the hosted F0 g
 ## Duties throughout
 
 - Own worker questions, scoped approvals and stuck-worker recovery; never use blind approvals or disable security to unblock work.
+- Check native worker approval prompts before and after coordinator work batches while workers are active; Orca inbox messages do not replace terminal checks.
+  Approve inspected requests within the assigned package directly, and verify execution resumes.
+  Validate scoped OpenCode permissions before launch; configuration changes require a verified session restart before claiming they affect a running worker.
 - Preserve an uncertain worker's ownership; use Orca's documented recovery only after proving its state.
 - Push meaningful checkpoints, inspect every expected check on the latest remote commit, and fix failures.
 - Verify Greptile on the first authorized real PR and address its findings; its current green check does not enforce a confidence threshold.

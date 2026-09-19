@@ -5,7 +5,7 @@ The planned product connects requirements, source evidence, quote versions, appr
 
 ## Current state
 
-This repository contains the agreed PRD, architecture proposals, delivery tooling and selected clickable design.
+This repository contains the agreed PRD, architecture proposals, controlled foundation proofs, delivery tooling and selected clickable design.
 It does not contain an implemented application or deployed Convex backend yet.
 There is no live site or production start command.
 
@@ -48,9 +48,18 @@ These checks do not require installing application packages:
 node --test scripts/check-pr.test.mjs scripts/check-workbench.test.mjs
 ```
 
-The 23 current tests validate the CI-inspection helper and saved prototype structure only.
-A pinned Bun/TypeScript toolchain supports the independent controlled proofs being implemented under `proofs/`.
-Use `bun install --frozen-lockfile`, then `bun run test:proofs` and `bun run typecheck:proofs` once those proof packages are integrated.
+These 23 tests validate the CI-inspection helper and saved prototype structure only.
+The independent contracts under `proofs/money` and `proofs/jev` use controlled data and injected HTTP responses.
+They exercise financial calculations and Jev transport validation without provider credentials or live calls.
+Run them with the pinned Bun 1.3.11 toolchain:
+
+```sh
+bun install --frozen-lockfile
+bun run typecheck:proofs
+bun run test
+```
+
+CI requires `delivery-guard-tests`, `workbench-artifact-tests`, `foundation-typecheck` and `foundation-contract-tests`.
 Application typechecking, build, backend tests and live integration checks remain foundation deliverables, not passing checks today.
 Use Bun for the application unless the selected Sites starter specifies another package manager.
 
