@@ -28,6 +28,9 @@ import type {
 export interface LineSelectionInput {
   readonly lineId: unknown;
   readonly quantity: unknown;
+  /** Stable requirement item mapping required before a partial saving is claimed. */
+  readonly itemId?: unknown;
+  readonly unit?: unknown;
 }
 
 export interface CompareOptions {
@@ -93,13 +96,26 @@ export interface ComparisonResult {
   readonly reasons: readonly string[];
 }
 
-function selectionMap(quote: Quote, input: readonly LineSelectionInput[] | undefined): Map<string, Quantity> | undefined {
+interface SelectedScopeItem {
+  readonly itemId: string;
+  readonly unit: string;
+  readonly quantity: Quantity;
+}
+
+interface SelectionState {
+  readonly quantities: Map<string, Quantity>;
+  readonly scopeItems?: Map<string, SelectedScopeItem>;
+}
+
+function selectionMap(quote: Quote, input: readonly LineSelectionInput[] | undefined): SelectionState | undefined {
   if (input === undefined) {
     return undefined;
   }
 
   const lineIds = new Set(quote.lines.map((line) => line.lineId));
   const selected = new Map<string, Quantity>();
+  const scopeItems = new Map<string, SelectedScopeItem>();
+  let hasScopeItems = true;
   for (const item of input) {
     if (typeof item.lineId !== "string" || !lineIds.has(item.lineId)) {
       throw new TypeError("line selection references an unknown quote line");
@@ -107,7 +123,21 @@ function selectionMap(quote: Quote, input: readonly LineSelectionInput[] | undef
     if (selected.has(item.lineId)) {
       throw new TypeError(`duplicate line selection ${item.lineId}`);
     }
-    selected.set(item.lineId, parsePositiveQuantity(item.quantity, `selection ${item.lineId} quantity`));
+    const selectedQuantity = parsePositiveQuantity(item.quantity, `selection ${item.lineId} quantity`);
+    selected.set(item.lineId, selectedQuantity);
+    if (item.itemId === undefined || item.unit === undefined) {
+      hasScopeItems = false;
+      continue;
+    }
+    const itemId = typeof item.itemId === "string" ? item.itemId.trim() : "";
+    const unit = typeof item.unit === "string" ? item.unit.trim() : "";
+    if (itemId.length === 0 || unit.length === 0) {
+      throw new TypeError(`selection ${item.lineId} stable itemId and unit must be non-empty strings`);
+    }
+    if (scopeItems.has(itemId)) {
+      throw new TypeError(`duplicate selected comparison item ${itemId}`);
+    }
+    scopeItems.set(itemId, { itemId, unit, quantity: selectedQuantity });
   }
 
   for (const line of quote.lines) {
@@ -117,17 +147,34 @@ function selectionMap(quote: Quote, input: readonly LineSelectionInput[] | undef
     }
   }
 
-  return selected;
+  if (!hasScopeItems) {
+    return { quantities: selected };
+  }
+  if (quote.comparisonScope !== undefined) {
+    for (const [lineId, selectedQuantity] of selected) {
+      const mappedItem = quote.comparisonScope.items.find((item) => item.lineId === lineId);
+      if (mappedItem === undefined) {
+        throw new TypeError(`selection ${lineId} has no comparison item mapping`);
+      }
+      const selectedItem = scopeItems.get(mappedItem.itemId);
+      if (selectedItem === undefined
+        || selectedItem.unit !== mappedItem.unit
+        || decimalCompare(selectedItem.quantity, selectedQuantity) !== 0) {
+        throw new TypeError(`selection ${lineId} stable item mapping does not match the quote scope`);
+      }
+    }
+  }
+  return { quantities: selected, scopeItems };
 }
 
 function selectedQuantity(
   line: QuoteLine,
-  selected: Map<string, Quantity> | undefined,
+  selected: SelectionState | undefined,
 ): Quantity {
-  return selected === undefined ? line.quantity : selected.get(line.lineId) ?? decimalZero();
+  return selected === undefined ? line.quantity : selected.quantities.get(line.lineId) ?? decimalZero();
 }
 
-function isAllLinesSelected(quote: Quote, selected: Map<string, Quantity> | undefined): boolean {
+function isAllLinesSelected(quote: Quote, selected: SelectionState | undefined): boolean {
   if (selected === undefined) {
     return true;
   }
@@ -172,7 +219,7 @@ function ratioMoney(valueInput: Money, numerator: Decimal, denominator: Decimal)
 function chargeApplies(
   quote: Quote,
   charge: QuoteCharge,
-  selected: Map<string, Quantity> | undefined,
+  selected: SelectionState | undefined,
   allLines: boolean,
 ): { readonly applies: boolean; readonly unallocated: boolean } {
   if (allLines) {
@@ -197,7 +244,7 @@ type CoverageStatus = "covered" | "unselected" | "unresolved";
 function includedCoverage(
   quote: Quote,
   charge: QuoteCharge,
-  selected: Map<string, Quantity> | undefined,
+  selected: SelectionState | undefined,
   allLines: boolean,
   path: ReadonlySet<string> = new Set([charge.chargeId]),
 ): CoverageStatus {
@@ -233,7 +280,7 @@ function allocatedStateRange(
   state: ChargeState,
   quote: Quote,
   charge: QuoteCharge,
-  selected: Map<string, Quantity> | undefined,
+  selected: SelectionState | undefined,
 ): MoneyRange | undefined {
   const range = stateRange(state);
   const scope = charge.scope;
@@ -251,7 +298,7 @@ function allocatedStateRange(
   };
 }
 
-function summarizeQuote(quote: Quote, selected: Map<string, Quantity> | undefined): QuoteCostSummary {
+function summarizeQuote(quote: Quote, selected: SelectionState | undefined): QuoteCostSummary {
   const allLines = isAllLinesSelected(quote, selected);
   let knownSubtotal = moneyZero(quote.currency);
   let estimatedRange: MoneyRange | undefined;
@@ -388,6 +435,31 @@ function comparisonScopeText(scope: ComparisonScope): string {
   return `${scope.requirementId}/${scope.scopeId} [${items}]`;
 }
 
+function selectedScopesCompatible(
+  leftSelection: SelectionState | undefined,
+  rightSelection: SelectionState | undefined,
+  leftAllLines: boolean,
+  rightAllLines: boolean,
+): boolean {
+  if (leftAllLines && rightAllLines) {
+    return true;
+  }
+  if (leftAllLines || rightAllLines) {
+    return false;
+  }
+  const leftItems = leftSelection?.scopeItems;
+  const rightItems = rightSelection?.scopeItems;
+  if (leftItems === undefined || rightItems === undefined || leftItems.size !== rightItems.size) {
+    return false;
+  }
+  return [...leftItems.values()].every((leftItem) => {
+    const rightItem = rightItems.get(leftItem.itemId);
+    return rightItem !== undefined
+      && rightItem.unit === leftItem.unit
+      && decimalCompare(rightItem.quantity, leftItem.quantity) === 0;
+  });
+}
+
 function deltaRange(left: QuoteCostSummary, right: QuoteCostSummary): MoneyDeltaRange | undefined {
   if (left.estimatedRange === undefined && right.estimatedRange === undefined) {
     return undefined;
@@ -456,8 +528,14 @@ export function compareQuotes(left: Quote, right: Quote, options: CompareOptions
     return comparisonResult("estimated", leftSummary, rightSummary, knownDelta, estimatedDeltaRange, reasons);
   }
 
-  if (!scopesCompatible || !leftSummary.selectedAllLines || !rightSummary.selectedAllLines) {
-    if (!leftSummary.selectedAllLines || !rightSummary.selectedAllLines) {
+  const selectedScopesMatch = selectedScopesCompatible(
+    leftSelection,
+    rightSelection,
+    leftSummary.selectedAllLines,
+    rightSummary.selectedAllLines,
+  );
+  if (!scopesCompatible || !selectedScopesMatch) {
+    if (!selectedScopesMatch) {
       reasons.push("partial selections require explicit per-item quantities before savings");
     }
     return comparisonResult("incompatible", leftSummary, rightSummary, knownDelta, estimatedDeltaRange, reasons);

@@ -254,6 +254,81 @@ describe("quote comparison", () => {
     expect(partial.right.estimatedRange?.minimum.minorUnits).toBe(50);
   });
 
+  it("compares explicitly mapped partial scopes with proportional and fixed allocations", () => {
+    const left = quote("partial-left", [line("supplier-a-machine", 500, "2")], [
+      knownChargeForTest({
+        chargeId: "freight",
+        label: "Allocated freight",
+        amount: 200,
+        scope: { kind: "allocated", lineId: "supplier-a-machine", method: "proportional" },
+      }),
+    ], undefined, {
+      requirementId: "req-partial",
+      scopeId: "scope-partial",
+      items: [{ itemId: "machine", lineId: "supplier-a-machine", unit: "piece", requiredQuantity: "2" }],
+    });
+    const right = quote("partial-right", [line("supplier-b-equipment", 550, "2")], [
+      knownChargeForTest({
+        chargeId: "installation",
+        label: "Fixed installation",
+        amount: 100,
+        scope: { kind: "allocated", lineId: "supplier-b-equipment", method: "fixed" },
+      }),
+    ], undefined, {
+      requirementId: "req-partial",
+      scopeId: "scope-partial",
+      items: [{ itemId: "machine", lineId: "supplier-b-equipment", unit: "piece", requiredQuantity: "2" }],
+    });
+    const result = compareQuotes(left, right, {
+      leftSelection: [{ lineId: "supplier-a-machine", itemId: "machine", unit: "piece", quantity: "1" }],
+      rightSelection: [{ lineId: "supplier-b-equipment", itemId: "machine", unit: "piece", quantity: "1" }],
+    });
+    expect(result.status).toBe("complete");
+    expect(result.left.total?.minorUnits).toBe(600);
+    expect(result.right.total?.minorUnits).toBe(650);
+    expect(result.equivalent?.delta.minorUnits).toBe(-50);
+    expect(result.equivalent?.savings.minorUnits).toBe(50);
+
+    const inferred = compareQuotes(left, right, {
+      leftSelection: [{ lineId: "supplier-a-machine", quantity: "1" }],
+      rightSelection: [{ lineId: "supplier-b-equipment", quantity: "1" }],
+    });
+    expect(inferred.status).toBe("incompatible");
+    expect(inferred.equivalent).toBeUndefined();
+  });
+
+  it("rejects partial scope quantity and item composition mismatches", () => {
+    const left = quote("partial-left", [line("a-machine", 1000, "2"), line("a-grinder", 400, "1")], [], undefined, {
+      requirementId: "req-partial",
+      scopeId: "scope-partial",
+      items: [
+        { itemId: "machine", lineId: "a-machine", unit: "piece", requiredQuantity: "2" },
+        { itemId: "grinder", lineId: "a-grinder", unit: "piece", requiredQuantity: "1" },
+      ],
+    });
+    const right = quote("partial-right", [line("b-machine", 1100, "2"), line("b-grinder", 400, "1")], [], undefined, {
+      requirementId: "req-partial",
+      scopeId: "scope-partial",
+      items: [
+        { itemId: "machine", lineId: "b-machine", unit: "piece", requiredQuantity: "2" },
+        { itemId: "grinder", lineId: "b-grinder", unit: "piece", requiredQuantity: "1" },
+      ],
+    });
+    const differingQuantity = compareQuotes(left, right, {
+      leftSelection: [{ lineId: "a-machine", itemId: "machine", unit: "piece", quantity: "1" }],
+      rightSelection: [{ lineId: "b-machine", itemId: "machine", unit: "piece", quantity: "1.5" }],
+    });
+    expect(differingQuantity.status).toBe("incompatible");
+    expect(differingQuantity.equivalent).toBeUndefined();
+
+    const mixedItems = compareQuotes(left, right, {
+      leftSelection: [{ lineId: "a-machine", itemId: "machine", unit: "piece", quantity: "1" }],
+      rightSelection: [{ lineId: "b-grinder", itemId: "grinder", unit: "piece", quantity: "1" }],
+    });
+    expect(mixedItems.status).toBe("incompatible");
+    expect(mixedItems.equivalent).toBeUndefined();
+  });
+
   it("does not compare mixed tax bases as equivalent", () => {
     const left = quote("left", [line("equipment", 1000)], [], inclusiveTaxBasis("NL-EUR-INCLUSIVE"));
     const right = quote("right", [line("equipment", 1000)], [], exclusiveTaxBasis("NL-EUR-EXCLUSIVE"));
