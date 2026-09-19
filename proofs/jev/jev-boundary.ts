@@ -192,82 +192,79 @@ function isReservedKey(key: string): boolean {
   return RESERVED_KEYS.has(key);
 }
 
-/** True for values JSON can represent without loss (rejects NaN/Infinity, undefined, functions, symbols, bigints). */
-function isJsonValue(value: unknown): boolean {
-  if (value === null) return true;
-  if (typeof value === "string" || typeof value === "boolean") return true;
-  if (typeof value === "number") return Number.isFinite(value);
-  if (Array.isArray(value)) return value.every(isJsonValue);
-  if (isRecord(value)) return Object.keys(value).every((key) => isJsonValue(value[key]));
-  return false;
-}
+/** Maximum nesting accepted by the defensive JSON copy (cycles and deeper graphs are rejected). */
+const MAX_JSON_COPY_DEPTH = 64;
 
-/** Instructions subtrees must survive JSON serialization without silent loss. */
-function instructionsJsonSafe(questions: Record<string, JevQuestion>): boolean {
-  for (const id of Object.keys(questions)) {
-    const question = questions[id];
-    if (question === undefined) return false;
-    if (!isJsonValue(question.instructions)) return false;
-  }
-  return true;
-}
+type JsonCopy = { ok: true; value: unknown } | { ok: false };
 
 /**
- * Deep snapshot of validated questions taken synchronously before dispatch.
- * Later validation uses only this snapshot (and the re-parsed sent body),
- * so a caller mutating `options.questions` mid-flight cannot smuggle an
- * unsent option or type past response validation. Returns null on any
- * unexpected runtime shape.
+ * Bounded defensive copy of plain JSON data. Only null-prototype or
+ * Object-prototype objects and dense arrays are accepted; inherited or
+ * non-enumerable serialization hooks are never consulted because the copy
+ * is built from validated own data, and accessors are rejected without
+ * being invoked. Cycles and over-deep graphs fail closed instead of
+ * throwing. The caller-owned original is never serialized.
  */
-function snapshotQuestions(questions: Record<string, JevQuestion>): Record<string, JevQuestion> | null {
-  const snap: Record<string, JevQuestion> = {};
-  for (const id of Object.keys(questions)) {
-    if (isReservedKey(id)) return null;
-    const question = questions[id];
-    if (question === undefined) return null;
-    if (question.type === "noul") {
-      if (!isInstructions(question.instructions)) return null;
-      const criteria = question.criteria;
-      if (criteria === undefined) {
-        snap[id] = { type: "noul", instructions: question.instructions };
-      } else {
-        if (!isRecord(criteria)) return null;
-        const copy: { true?: string; false?: string } = {};
-        for (const key of Object.keys(criteria)) {
-          if (key !== "true" && key !== "false") return null;
-          const text: unknown = criteria[key];
-          if (text === undefined) continue;
-          if (typeof text !== "string") return null;
-          if (key === "true") copy.true = text;
-          else copy.false = text;
-        }
-        snap[id] = { type: "noul", instructions: question.instructions, criteria: copy };
+function copyJsonData(value: unknown, depth: number, ancestors: Set<object>): JsonCopy {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return { ok: true, value };
+  if (typeof value === "number") return Number.isFinite(value) ? { ok: true, value } : { ok: false };
+  if (depth > MAX_JSON_COPY_DEPTH) return { ok: false };
+  if (Array.isArray(value)) {
+    if (ancestors.has(value)) return { ok: false };
+    ancestors.add(value);
+    const out: unknown[] = [];
+    for (let index = 0; index < value.length; index += 1) {
+      if (!(index in value)) {
+        ancestors.delete(value);
+        return { ok: false };
       }
-    } else if (question.type === "choice") {
-      if (!isInstructions(question.instructions)) return null;
-      if (!isRecord(question.criteria)) return null;
-      const criteria: Record<string, string | null> = {};
-      for (const option of Object.keys(question.criteria)) {
-        if (option.length === 0 || isReservedKey(option)) return null;
-        const detail: unknown = question.criteria[option];
-        if (detail !== null && typeof detail !== "string") return null;
-        criteria[option] = detail;
+      const element: unknown = value[index];
+      const copied = copyJsonData(element, depth + 1, ancestors);
+      if (!copied.ok) {
+        ancestors.delete(value);
+        return { ok: false };
       }
-      snap[id] = { type: "choice", instructions: question.instructions, criteria };
-    } else if (question.type === "score") {
-      if (!isInstructions(question.instructions)) return null;
-      if (!Array.isArray(question.criteria)) return null;
-      const levels: string[] = [];
-      for (const level of question.criteria) {
-        if (typeof level !== "string" || level.length === 0) return null;
-        levels.push(level);
-      }
-      snap[id] = { type: "score", instructions: question.instructions, criteria: levels };
-    } else {
-      return null;
+      out.push(copied.value);
     }
+    ancestors.delete(value);
+    return { ok: true, value: out };
   }
-  return snap;
+  if (typeof value === "object") {
+    const proto: unknown = Object.getPrototypeOf(value);
+    if (proto !== Object.prototype && proto !== null) return { ok: false };
+    if (ancestors.has(value)) return { ok: false };
+    ancestors.add(value);
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(value)) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined) {
+        ancestors.delete(value);
+        return { ok: false };
+      }
+      if (!("value" in descriptor)) {
+        ancestors.delete(value);
+        return { ok: false };
+      }
+      const entry: unknown = descriptor.value;
+      const copied = copyJsonData(entry, depth + 1, ancestors);
+      if (!copied.ok) {
+        ancestors.delete(value);
+        return { ok: false };
+      }
+      if (key === "__proto__") {
+        Object.defineProperty(out, key, { value: copied.value, enumerable: true, writable: true, configurable: true });
+      } else {
+        out[key] = copied.value;
+      }
+    }
+    ancestors.delete(value);
+    return { ok: true, value: out };
+  }
+  return { ok: false };
+}
+
+function copyJson(value: unknown): JsonCopy {
+  return copyJsonData(value, 0, new Set<object>());
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -740,14 +737,19 @@ export async function jevAttemptOnce(options: JevAttemptOptions): Promise<JevAtt
   const maxBytes = options.maxResponseBytes ?? JEV_MAX_RESPONSE_BYTES;
   const fetchImpl: JevFetch = options.fetchImpl ?? ((input, init) => fetch(input, init));
   const none: JevRetryAdvice = { kind: "none", status: null, retryAfterMs: null };
-  // Snapshot the primitive version before dispatch; every later result echoes
-  // this value, never a reread of `options` after awaits.
+  // Snapshot the primitive version and the abort signal before dispatch; every
+  // later registration, cleanup, body read, freshness echo, and final check
+  // uses these values, never a reread of `options` after awaits.
   const attemptedVersion = options.inputVersion;
-  // One absolute deadline for the whole attempt, enforced after every await
-  // and before acceptance.
+  const attemptedSignal = options.signal;
+  // One absolute deadline for the whole attempt, enforced after every await,
+  // immediately before dispatch, and before acceptance.
   const deadlineMs = started + timeoutMs;
 
-  if (!isNonEmptyString(options.apiKey)) {
+  let body: string;
+  let sent: Record<string, JevQuestion>;
+  try {
+    if (!isNonEmptyString(options.apiKey)) {
     return { outcome: "needsReview", reason: "missing-api-key", retry: { kind: "nonretryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
   }
   if (!isNonEmptyString(attemptedVersion)) {
@@ -762,32 +764,32 @@ export async function jevAttemptOnce(options: JevAttemptOptions): Promise<JevAtt
   if (!validState(options.state)) {
     return { outcome: "needsReview", reason: "invalid-state", retry: { kind: "nonretryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
   }
-  if (!isJsonValue(options.state)) {
-    return { outcome: "needsReview", reason: "non-json-state", retry: { kind: "nonretryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
-  }
-  if (!validQuestions(options.questions)) {
-    return { outcome: "needsReview", reason: "invalid-questions", retry: { kind: "nonretryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
-  }
-  if (!instructionsJsonSafe(options.questions)) {
-    return { outcome: "needsReview", reason: "non-json-questions", retry: { kind: "nonretryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
-  }
-  if (isAborted(options.signal)) {
-    return { outcome: "stale", reason: "pre-aborted", retry: none, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
-  }
-  const snap = snapshotQuestions(options.questions);
-  if (snap === null) {
-    return { outcome: "needsReview", reason: "invalid-questions", retry: { kind: "nonretryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
-  }
+    // Defensive copies first: only plain JSON data survives, inherited or
+    // non-enumerable serialization hooks are never consulted, accessors are
+    // rejected without invocation, and cycles/deep graphs fail closed. The
+    // caller-owned originals are never serialized.
+    const stateCopy = copyJson(options.state);
+    if (!stateCopy.ok) {
+      return { outcome: "needsReview", reason: "non-json-state", retry: { kind: "nonretryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
+    }
+    const questionsCopy = copyJson(options.questions);
+    if (!questionsCopy.ok) {
+      return { outcome: "needsReview", reason: "non-json-questions", retry: { kind: "nonretryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
+    }
+    if (!validQuestions(questionsCopy.value)) {
+      return { outcome: "needsReview", reason: "invalid-questions", retry: { kind: "nonretryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
+    }
+    if (isAborted(attemptedSignal)) {
+      return { outcome: "stale", reason: "pre-aborted", retry: none, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
+    }
 
-  // Normalized immutable request snapshot: the exact bytes sent. Re-parsing
-  // catches decision-critical morphing (toJSON rewrites, silent drops) that
-  // the pre-serialization shape checks cannot see.
-  let body: string;
-  try {
-    body = JSON.stringify({ model: JEV_PINNED_MODEL, state: options.state, questions: snap });
-  } catch {
-    return { outcome: "needsReview", reason: "request-serialize-failed", retry: { kind: "nonretryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
-  }
+    // Normalized immutable request snapshot: the exact bytes sent. Re-parsing
+    // proves the sent bytes carry the validated shape.
+    try {
+      body = JSON.stringify({ model: JEV_PINNED_MODEL, state: stateCopy.value, questions: questionsCopy.value });
+    } catch {
+      return { outcome: "needsReview", reason: "request-serialize-failed", retry: { kind: "nonretryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
+    }
   if (new TextEncoder().encode(body).byteLength > JEV_MAX_REQUEST_BYTES) {
     return { outcome: "needsReview", reason: "request-too-large", retry: { kind: "nonretryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
   }
@@ -800,16 +802,28 @@ export async function jevAttemptOnce(options: JevAttemptOptions): Promise<JevAtt
   if (!isRecord(normalized) || normalized["model"] !== JEV_PINNED_MODEL) {
     return { outcome: "needsReview", reason: "request-normalize-failed", retry: { kind: "nonretryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
   }
-  // The sent snapshot is the only authority for later validation; the live
-  // `options.questions` object is never consulted again.
-  const sent = normalized["questions"];
-  if (!validState(normalized["state"]) || !validQuestions(sent)) {
-    return { outcome: "needsReview", reason: "request-normalize-failed", retry: { kind: "nonretryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
+    // The sent snapshot is the only authority for later validation; the live
+    // `options.questions` object is never consulted again.
+    const wireQuestions: unknown = normalized["questions"];
+    if (!validState(normalized["state"]) || !validQuestions(wireQuestions)) {
+      return { outcome: "needsReview", reason: "request-normalize-failed", retry: { kind: "nonretryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
+    }
+    sent = wireQuestions;
+  } catch {
+    return { outcome: "needsReview", reason: "request-validate-failed", retry: { kind: "nonretryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
+  }
+
+  // Preparation counts against the deadline: never dispatch once it is spent.
+  if (isAborted(attemptedSignal)) {
+    return { outcome: "stale", reason: "aborted", retry: none, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
+  }
+  if (Date.now() > deadlineMs) {
+    return { outcome: "unavailable", reason: "timeout", retry: { kind: "retryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
   }
 
   const controller = new AbortController();
   const onAbort = (): void => controller.abort();
-  options.signal?.addEventListener("abort", onAbort, { once: true });
+  attemptedSignal?.addEventListener("abort", onAbort, { once: true });
   let timedOut = false;
   let fireTimeout: () => void = () => undefined;
   const timeoutFired = new Promise<never>((_, reject) => {
@@ -819,7 +833,8 @@ export async function jevAttemptOnce(options: JevAttemptOptions): Promise<JevAtt
       reject(new Error("jev-timeout"));
     };
   });
-  const timeoutId = setTimeout(fireTimeout, timeoutMs);
+  // Header wait uses only the budget remaining after preparation.
+  const timeoutId = setTimeout(fireTimeout, Math.max(0, deadlineMs - Date.now()));
 
   let response: Response;
   try {
@@ -834,8 +849,8 @@ export async function jevAttemptOnce(options: JevAttemptOptions): Promise<JevAtt
   } catch {
     const latencyMs = Date.now() - started;
     clearTimeout(timeoutId);
-    options.signal?.removeEventListener("abort", onAbort);
-    if (isAborted(options.signal) && !timedOut) {
+    attemptedSignal?.removeEventListener("abort", onAbort);
+    if (isAborted(attemptedSignal) && !timedOut) {
       return { outcome: "stale", reason: "aborted", retry: none, latencyMs, inputVersion: attemptedVersion };
     }
     if (timedOut) {
@@ -844,8 +859,8 @@ export async function jevAttemptOnce(options: JevAttemptOptions): Promise<JevAtt
     return { outcome: "unavailable", reason: "transport-error", retry: { kind: "retryable", status: null, retryAfterMs: null }, latencyMs, inputVersion: attemptedVersion };
   }
   clearTimeout(timeoutId);
-  options.signal?.removeEventListener("abort", onAbort);
-  if (isAborted(options.signal)) {
+  attemptedSignal?.removeEventListener("abort", onAbort);
+  if (isAborted(attemptedSignal)) {
     discardBody(response);
     return { outcome: "stale", reason: "aborted", retry: none, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
   }
@@ -884,7 +899,7 @@ export async function jevAttemptOnce(options: JevAttemptOptions): Promise<JevAtt
   }
 
   const budgetMs = Math.max(0, deadlineMs - Date.now());
-  const bounded = await readBodyBounded(response, maxBytes, budgetMs, options.signal);
+  const bounded = await readBodyBounded(response, maxBytes, budgetMs, attemptedSignal);
   if (bounded.kind === "timeout") {
     return { outcome: "unavailable", reason: "timeout", retry: { kind: "retryable", status: null, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
   }
@@ -897,7 +912,7 @@ export async function jevAttemptOnce(options: JevAttemptOptions): Promise<JevAtt
   if (bounded.kind === "too-large") {
     return { outcome: "needsReview", reason: "response-too-large", retry: { kind: "nonretryable", status, retryAfterMs: null }, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
   }
-  if (isAborted(options.signal)) {
+  if (isAborted(attemptedSignal)) {
     return { outcome: "stale", reason: "aborted", retry: none, latencyMs: Date.now() - started, inputVersion: attemptedVersion };
   }
   if (Date.now() > deadlineMs) {

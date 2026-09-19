@@ -17,11 +17,20 @@ claim of application access or of integrated J-03/J-04 completion.
   byte bound) is validated before any dispatch; NaN/zero bounds are
   rejected with zero requests and the tested hard bounds are unchanged.
 - A normalized immutable JSON snapshot of the exact sent bytes is built
-  before dispatch. Non-JSON evidence (NaN/Infinity, undefined, functions,
-  throwing or morphing `toJSON`) is rejected before dispatch, and the
-  response validates only against the sent snapshot with the snapshotted
-  input version echoed, so mid-flight caller mutation cannot smuggle an
-  unsent option or version past validation.
+  before dispatch. Only plain JSON data (Object/null prototypes, dense
+  arrays) is defensively copied; inherited or non-enumerable serialization
+  hooks are never consulted, accessors are rejected without invocation, and
+  cycles, sparse arrays, or over-deep graphs fail closed with a generic
+  typed no-dispatch failure. Non-JSON evidence is rejected before dispatch,
+  and the response validates only against the sent snapshot with the
+  snapshotted input version echoed, so mid-flight caller mutation cannot
+  smuggle an unsent option or version past validation.
+- One absolute deadline is enforced after every await, immediately before
+  dispatch (preparation counts against it), and before acceptance, covering
+  headers and body alike; header waits use only the remaining budget.
+  The snapshotted abort signal drives registration, cleanup, body reads,
+  and final checks, so swapping `options.signal` mid-flight cannot escape
+  the original cancellation.
 - One absolute deadline is enforced after every await and before
   acceptance, covering headers and body alike; aborts during or after the
   body report `stale`.
@@ -87,6 +96,6 @@ Checked `https://docs.typesafe.ai/api` and `https://docs.typesafe.ai/models`:
 ## Evidence mode
 
 Controlled only. Run the shared strict compiler command, then
-`bun test proofs/jev` (43 tests) plus
+`bun test proofs/jev` (52 tests) plus
 `node --test scripts/check-pr.test.mjs scripts/check-workbench.test.mjs`
 (23 tests).
