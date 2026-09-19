@@ -190,6 +190,11 @@ Finding a previously unknown supplier within an approved research task is allowe
 
 Unrelated requests such as homework, writing arbitrary code, general entertainment, personal errands, or browsing for an unrelated purpose receive a brief explanation of the product's scope and a relevant supported next step.
 The assistant does not fulfill the unrelated task before adding a disclaimer.
+For a clearly out-of-scope request, that response ends the request without research, browsing, outbound messages, or another execution job.
+Do not treat the refusal as a recoverable agent failure, retry it through another model, or silently turn it into a different task.
+A supported next step may be suggested, but the user must choose it before new work starts.
+For example: "That is outside OpeningOS's scope. I can help with purchasing, suppliers, quotes, and equipment."
+This is a guardrail around the existing product, not a reason to narrow its supported workflows or reject natural contextual follow-ups.
 A relevant but unimplemented capability is identified as unavailable, not simulated or improvised as a new workflow.
 Only shipped and enabled capabilities may execute; roadmap descriptions in this PRD do not make those capabilities available at runtime.
 
@@ -323,6 +328,7 @@ These checks extend the main path and do not replace or renumber existing accept
 - Open two guest sessions and a private test project; verify isolation through backend calls as well as the interface.
 - Complete the comparison and approval steps by keyboard and on a narrow viewport, including loading, empty, missing-evidence, error, and recovery states.
 - Check D-17 with an unrelated request, a relevant but unavailable feature, a legitimate short follow-up, a mixed request, a direct unsupported backend operation, and a supplier document that tries to redirect the task.
+- For an entirely unrelated request, verify that the brief refusal ends that request with no execution job or recovery retry, while an independent legitimate job continues unaffected.
 
 Tests record the relevant existing requirement IDs, environment, commit, fixture or live source, action, expected outcome, actual outcome, and evidence.
 The complete integration path must run against the combined application, not only separate worker mocks.
@@ -385,6 +391,8 @@ On a narrow viewport, keep the same records and actions accessible through focus
 
 The first three exploratory concepts established possible screen structures but were not selected.
 A further ChatGPT ImageGen pass explores stronger visual identity, typography, and purposeful imagery while keeping comparison and source inspection central.
+Further exploration varies composition and interaction, including equipment-linked café imagery, visual cost comparisons, and a document workbench rather than only changing colors or fonts.
+Illustrative spatial scenes do not establish measured site fit or add a floor-plan editing requirement.
 No concept is accepted yet, and illustrative contents are not product data, exact copy, verified specifications, or additional requirements.
 Choose the primary direction with the user before UI implementation.
 Then settle navigation, comparison and evidence behavior, responsive layout, typography, colors, and required interface states in a small UI specification tied to the evaluator path.

@@ -19,6 +19,7 @@ Do not treat proposed ADRs, a green tooling check, or demonstration fixtures as 
 - Use Orca for developer orchestration when authorized; it is not the customer application's runtime.
 - Preserve existing uncommitted work and stable P-, H-, and D- requirement meanings.
 - Keep the customer assistant limited to shipped, enabled OpeningOS workflows; see the PRD's product capability boundary and D-17.
+- A clearly out-of-scope customer request receives a brief refusal and stops; do not answer it, launch tools for it, or retry it as an agent failure.
 - Enforce capability and job authority in backend code, not only prompts or model classification.
 - Do not mistake roadmap capabilities, general-purpose provider tools, or a recovery attempt for permission to add unrelated customer workflows.
 - Keep launch-only planning outside the hackathon implementation unless requested.

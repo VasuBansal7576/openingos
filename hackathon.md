@@ -12,7 +12,7 @@
 - **Auth:** none
 - **AI models:** none
 - **Started:** 2026-09-19T09:46:19Z
-- **Last updated:** 2026-09-19T13:29:45Z
+- **Last updated:** 2026-09-19T13:37:32Z
 
 ## Log
 
@@ -50,3 +50,10 @@ Cleanup requires verified handoff, remote preservation, settled ownership, and p
 Committed and pushed the accumulated PRD and delivery files in `f1dd4e5`, then verified the exact commit on GitHub.
 All 19 local CI-helper tests passed, the skill validated, and the [GitHub repository-check run](https://github.com/VasuBansal7576/openingos/actions/runs/35445899698) succeeded for that commit.
 This verifies delivery tooling only; application behavior, Greptile integration, and unattended repair remain unimplemented.
+
+### 2026-09-19 - working tree
+
+Clarified in `PRD.md` and `AGENTS.md` that a clearly unrelated customer request receives a brief refusal and stops without tool execution, recovery retries, or an automatic substitute task.
+Preserved all 52 acceptance criteria and launch-only sections; supported contextual follow-ups remain allowed and runtime enforcement is still unimplemented.
+Generated three further ChatGPT ImageGen concepts exploring an equipment-linked café scene, visual cost routes, and a document workbench; none has been selected or implemented.
+The spatial illustration is not a measured floor plan, and the document concept needs its evidence popup moved so it does not obscure a comparison total.
