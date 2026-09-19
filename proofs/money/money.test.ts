@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import {
   AdjustmentIdempotencyConflictError,
+  AdjustmentIdentityConflictError,
   calculateCommitmentFinancials,
   calculateForecast,
   compareQuotes,
@@ -21,7 +22,7 @@ import {
   quoteLine,
   unknownCharge,
 } from "./index";
-import type { ChargeInput, FinancialAdjustmentInput } from "./index";
+import type { ChargeInput, ComparisonScopeInput, FinancialAdjustmentInput } from "./index";
 
 const source = (id: string) => evidenceRef({ sourceId: id, version: "v1", locator: "controlled" });
 
@@ -40,6 +41,12 @@ function quote(
   lines: readonly ReturnType<typeof line>[],
   charges: readonly ChargeInput[] = [],
   tax = inclusiveTaxBasis("NL-EUR-INCLUSIVE", [source(`${quoteId}-source`)]),
+  scope: ComparisonScopeInput = {
+    requirementId: "req-purchase",
+    scopeId: "scope-purchase",
+    unit: "piece",
+    requiredQuantity: "1",
+  },
 ) {
   return createQuote({
     quoteId,
@@ -48,6 +55,7 @@ function quote(
     lines,
     charges,
     taxBasis: tax,
+    comparisonScope: scope,
     evidenceRefs: [source(`${quoteId}-source`)],
   });
 }
@@ -70,7 +78,7 @@ function knownChargeForTest(input: {
 describe("deterministic EUR money", () => {
   it("uses exact minor units and documented half-up quantity rounding", () => {
     expect(multiplyMoneyByQuantity(money(EUR, 100), quantity("1.005")).minorUnits).toBe(101);
-    expect(multiplyMoneyByQuantity(money(EUR, 7950), quantity("1.25")).minorUnits).toBe(9938);
+    expect(multiplyMoneyByQuantity(money(EUR, 795000), quantity("1.25")).minorUnits).toBe(993750);
     expect(decimalToString(quantity("2.5000"))).toBe("2.5");
   });
 
@@ -85,38 +93,38 @@ describe("deterministic EUR money", () => {
 
 describe("quote comparison", () => {
   it("does not imply a saving when installation is unknown", () => {
-    const left = quote("left", [line("equipment", 7950)], [
+    const left = quote("left", [line("equipment", 795000)], [
       includedCharge({ chargeId: "freight", label: "Freight", coveringId: "equipment", evidenceRefs: [source("freight")] }),
       unknownCharge({ chargeId: "installation", label: "Installation", reason: "supplier did not state it", evidenceRefs: [source("installation")] }),
     ]);
-    const right = quote("right", [line("equipment", 8500)], [
+    const right = quote("right", [line("equipment", 850000)], [
       includedCharge({ chargeId: "freight", label: "Freight", coveringId: "equipment" }),
       includedCharge({ chargeId: "installation", label: "Installation", coveringId: "equipment" }),
     ]);
 
     const result = compareQuotes(left, right);
     expect(result.status).toBe("incomplete");
-    expect(result.left.knownTotal.minorUnits).toBe(7950);
+    expect(result.left.knownTotal.minorUnits).toBe(795000);
     expect(result.equivalent).toBeUndefined();
     expect(result.reasons.join(" ")).toContain("Installation");
   });
 
   it("calculates a deterministic delta only for equivalent complete offers", () => {
-    const left = quote("left", [line("equipment", 7950)], [
+    const left = quote("left", [line("equipment", 795000)], [
       includedCharge({ chargeId: "freight", label: "Freight", coveringId: "equipment" }),
       includedCharge({ chargeId: "installation", label: "Installation", coveringId: "equipment" }),
     ]);
-    const right = quote("right", [line("equipment", 7500)], [
-      knownChargeForTest({ chargeId: "freight", label: "Freight", amount: 600 }),
-      knownChargeForTest({ chargeId: "installation", label: "Installation", amount: 400 }),
+    const right = quote("right", [line("equipment", 750000)], [
+      knownChargeForTest({ chargeId: "freight", label: "Freight", amount: 60000 }),
+      knownChargeForTest({ chargeId: "installation", label: "Installation", amount: 40000 }),
     ]);
 
     const result = compareQuotes(left, right);
     expect(result.status).toBe("complete");
-    expect(result.left.total?.minorUnits).toBe(7950);
-    expect(result.right.total?.minorUnits).toBe(8500);
-    expect(result.equivalent?.delta.minorUnits).toBe(-550);
-    expect(result.equivalent?.savings.minorUnits).toBe(550);
+    expect(result.left.total?.minorUnits).toBe(795000);
+    expect(result.right.total?.minorUnits).toBe(850000);
+    expect(result.equivalent?.delta.minorUnits).toBe(-55000);
+    expect(result.equivalent?.savings.minorUnits).toBe(55000);
     expect(result.equivalent?.cheaperQuoteId).toBe("left");
   });
 
@@ -139,6 +147,51 @@ describe("quote comparison", () => {
     expect(partial.status).toBe("incomplete");
     expect(partial.left.knownTotal.minorUnits).toBe(1000);
     expect(partial.reasons.join(" ")).toContain("explicit allocation");
+  });
+
+  it("requires an explicit stable scope before calling different quantities equivalent", () => {
+    const one = quote("one", [line("machine", 10000)], [], undefined, {
+      requirementId: "req-machine",
+      scopeId: "scope-machine",
+      unit: "piece",
+      requiredQuantity: "1",
+    });
+    const two = quote("two", [line("machine-a", 9000), line("machine-b", 9000)], [], undefined, {
+      requirementId: "req-machine",
+      scopeId: "scope-machine",
+      unit: "piece",
+      requiredQuantity: "2",
+    });
+    const result = compareQuotes(one, two);
+    expect(result.status).toBe("incompatible");
+    expect(result.equivalent).toBeUndefined();
+    expect(result.reasons.join(" ")).toContain("comparison scopes are not compatible");
+  });
+
+  it("keeps unresolved and unselected included coverage incomplete", () => {
+    const unresolved = quote("unresolved", [line("machine", 1000)], [
+      includedCharge({ chargeId: "freight", label: "Freight", coveringId: "missing" }),
+    ]);
+    const unresolvedResult = compareQuotes(unresolved, unresolved);
+    expect(unresolvedResult.status).toBe("incomplete");
+    expect(unresolvedResult.reasons.join(" ")).toContain("coverage is unresolved");
+
+    const selectedOnly = quote("selected-only", [line("machine", 1000), line("grinder", 1000)], [
+      includedCharge({ chargeId: "freight", label: "Freight", coveringId: "grinder" }),
+    ]);
+    const partial = compareQuotes(selectedOnly, selectedOnly, {
+      leftSelection: [{ lineId: "machine", quantity: "1" }],
+      rightSelection: [{ lineId: "machine", quantity: "1" }],
+    });
+    expect(partial.status).toBe("incomplete");
+    expect(partial.reasons.join(" ")).toContain("unselected scope");
+  });
+
+  it("rejects included coverage cycles", () => {
+    expect(() => quote("cycle", [line("machine", 1000)], [
+      includedCharge({ chargeId: "freight", label: "Freight", coveringId: "installation" }),
+      includedCharge({ chargeId: "installation", label: "Installation", coveringId: "freight" }),
+    ])).toThrow("coverage cycle");
   });
 
   it("supports explicit proportional allocation and distinguishes estimates", () => {
@@ -191,6 +244,41 @@ describe("forecast and commitment financial state", () => {
     expect(result.projectedCompletionCost.minorUnits).toBe(1080);
   });
 
+  it("conserves line rounding when fractional quantities settle", () => {
+    const before = calculateForecast({
+      currency: EUR,
+      lines: [{ lineId: "equipment", requiredQuantity: "1", ordered: { quantity: "1", unitPrice: money(EUR, 1) } }],
+    });
+    const after = calculateForecast({
+      currency: EUR,
+      lines: [{
+        lineId: "equipment",
+        requiredQuantity: "1",
+        ordered: {
+          quantity: "1",
+          unitPrice: money(EUR, 1),
+          settled: [{ quantity: "0.5", unitPrice: money(EUR, 1) }],
+        },
+      }],
+    });
+    const changedPrice = calculateForecast({
+      currency: EUR,
+      lines: [{
+        lineId: "equipment",
+        requiredQuantity: "1",
+        ordered: {
+          quantity: "1",
+          unitPrice: money(EUR, 100),
+          settled: [{ quantity: "0.5", unitPrice: money(EUR, 90) }],
+        },
+      }],
+    });
+    expect(before.projectedCompletionCost.minorUnits).toBe(1);
+    expect(after.projectedCompletionCost.minorUnits).toBe(1);
+    expect(after.lines[0]?.settledCost.minorUnits).toBe(1);
+    expect(changedPrice.projectedCompletionCost.minorUnits).toBe(95);
+  });
+
   it("reports uncovered quantities instead of silently treating them as zero", () => {
     const result = calculateForecast({
       currency: EUR,
@@ -207,37 +295,78 @@ describe("forecast and commitment financial state", () => {
   });
 
   it("applies deposit, credit, and linked refund exactly once", () => {
+    const depositOnly = calculateCommitmentFinancials({
+      currency: EUR,
+      orderId: "order-1",
+      amount: money(EUR, 850000),
+      adjustments: [
+        { id: "deposit-1", idempotencyKey: "deposit-key", orderId: "order-1", kind: "deposit", amount: money(EUR, 200000) },
+      ],
+    });
+    expect(depositOnly.outstanding.minorUnits).toBe(650000);
+
+    const withCredit = calculateCommitmentFinancials({
+      currency: EUR,
+      orderId: "order-1",
+      amount: money(EUR, 850000),
+      adjustments: [
+        { id: "deposit-1", idempotencyKey: "deposit-key", orderId: "order-1", kind: "deposit", amount: money(EUR, 200000) },
+        { id: "credit-1", idempotencyKey: "credit-key", orderId: "order-1", kind: "credit", amount: money(EUR, 50000) },
+      ],
+    });
+    expect(withCredit.obligation.minorUnits).toBe(800000);
+    expect(withCredit.outstanding.minorUnits).toBe(600000);
+
     const result = calculateCommitmentFinancials({
       currency: EUR,
       orderId: "order-1",
-      amount: money(EUR, 8500),
+      amount: money(EUR, 850000),
       adjustments: [
-        { id: "deposit-1", idempotencyKey: "deposit-key", orderId: "order-1", kind: "deposit", amount: money(EUR, 2000) },
-        { id: "credit-1", idempotencyKey: "credit-key", orderId: "order-1", kind: "credit", amount: money(EUR, 500) },
-        { id: "refund-1", idempotencyKey: "refund-key", orderId: "order-1", kind: "cashRefund", amount: money(EUR, 500), linkedAdjustmentId: "credit-1" },
+        { id: "deposit-1", idempotencyKey: "deposit-key", orderId: "order-1", kind: "deposit", amount: money(EUR, 200000) },
+        { id: "credit-1", idempotencyKey: "credit-key", orderId: "order-1", kind: "credit", amount: money(EUR, 50000) },
+        { id: "refund-1", idempotencyKey: "refund-key", orderId: "order-1", kind: "cashRefund", amount: money(EUR, 50000), linkedAdjustmentId: "credit-1" },
       ],
     });
-    expect(result.obligation.minorUnits).toBe(8000);
-    expect(result.appliedPayments.minorUnits).toBe(1500);
-    expect(result.outstanding.minorUnits).toBe(6500);
-    expect(result.actualAcquisitionCost.minorUnits).toBe(8000);
+    expect(result.obligation.minorUnits).toBe(800000);
+    expect(result.appliedPayments.minorUnits).toBe(150000);
+    expect(result.outstanding.minorUnits).toBe(650000);
+    expect(result.actualAcquisitionCost).toBeUndefined();
+
+    const settled = calculateCommitmentFinancials({
+      currency: EUR,
+      orderId: "order-1",
+      amount: money(EUR, 850000),
+      settlement: { amount: money(EUR, 800000), evidenceRefs: [source("settlement")] },
+    });
+    expect(settled.actualAcquisitionCost?.minorUnits).toBe(800000);
+    expect(settled.settlementEvidence).toHaveLength(1);
   });
 
   it("deduplicates identical adjustments and rejects changed duplicates", () => {
-    const duplicate = { id: "deposit-1", idempotencyKey: "same-key", orderId: "order-1", kind: "deposit", amount: money(EUR, 2000) } satisfies FinancialAdjustmentInput;
+    const duplicate = { id: "deposit-1", idempotencyKey: "same-key", orderId: "order-1", kind: "deposit", amount: money(EUR, 200000) } satisfies FinancialAdjustmentInput;
     const result = calculateCommitmentFinancials({
       currency: EUR,
       orderId: "order-1",
-      amount: money(EUR, 8500),
+      amount: money(EUR, 850000),
       adjustments: [duplicate, { ...duplicate }],
     });
-    expect(result.grossPayments.minorUnits).toBe(2000);
+    expect(result.grossPayments.minorUnits).toBe(200000);
     expect(() => calculateCommitmentFinancials({
       currency: EUR,
       orderId: "order-1",
-      amount: money(EUR, 8500),
+      amount: money(EUR, 850000),
       adjustments: [duplicate, { ...duplicate, amount: money(EUR, 2100) }],
     })).toThrow(AdjustmentIdempotencyConflictError);
+
+    expect(() => calculateCommitmentFinancials({
+      currency: EUR,
+      orderId: "order-1",
+      amount: money(EUR, 850000),
+      adjustments: [
+        { ...duplicate, idempotencyKey: "key-1", amount: money(EUR, 50000), kind: "credit" },
+        { ...duplicate, idempotencyKey: "key-2", amount: money(EUR, 50000), kind: "credit" },
+      ],
+    })).toThrow(AdjustmentIdentityConflictError);
   });
 
   it("rejects overlapping quantities, mismatched currencies, and invalid credits", () => {
@@ -269,5 +398,32 @@ describe("forecast and commitment financial state", () => {
     const result = compareQuotes(left, left);
     expect(result.status).toBe("complete");
     expect(result.left.total?.minorUnits).toBe(1000);
+  });
+
+  it("freezes decimal and quote snapshot state", () => {
+    const callerQuantity = quantity("1");
+    const callerLines = [quoteLine({ lineId: "equipment", description: "equipment", quantity: callerQuantity, unitPrice: money(EUR, 1000) })];
+    const snapshot = createQuote({
+      quoteId: "snapshot",
+      version: "v1",
+      currency: EUR,
+      lines: callerLines,
+      charges: [],
+      taxBasis: inclusiveTaxBasis("NL-EUR-INCLUSIVE"),
+      comparisonScope: {
+        requirementId: "req-purchase",
+        scopeId: "scope-purchase",
+        unit: "piece",
+        requiredQuantity: "1",
+      },
+      evidenceRefs: [],
+    });
+    expect(Object.isFrozen(callerQuantity)).toBe(true);
+    expect(() => Object.assign(callerQuantity, { coefficient: 2n })).toThrow();
+    callerLines[0] = line("equipment", 2000);
+    expect(snapshot.lines[0]?.unitPrice.minorUnits).toBe(1000);
+    expect(Object.isFrozen(snapshot.lines)).toBe(true);
+    expect(Object.isFrozen(snapshot.charges)).toBe(true);
+    expect(snapshot.lines[0]?.quantity.toString()).toBe("1");
   });
 });

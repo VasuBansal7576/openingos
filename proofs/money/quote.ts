@@ -58,6 +58,20 @@ export type TaxBasis =
   | Readonly<{ kind: "inclusive" | "exclusive"; basisId: string; evidenceRefs: readonly EvidenceRef[] }>
   | Readonly<{ kind: "unknown"; reason: string; evidenceRefs: readonly EvidenceRef[] }>;
 
+export interface ComparisonScopeInput {
+  readonly requirementId: unknown;
+  readonly scopeId: unknown;
+  readonly unit: unknown;
+  readonly requiredQuantity: unknown;
+}
+
+export interface ComparisonScope {
+  readonly requirementId: string;
+  readonly scopeId: string;
+  readonly unit: string;
+  readonly requiredQuantity: Quantity;
+}
+
 export interface TaxBasisInput {
   readonly kind: unknown;
   readonly basisId?: unknown;
@@ -72,6 +86,7 @@ export interface QuoteInput {
   readonly lines: readonly QuoteLineInput[];
   readonly charges?: readonly ChargeInput[];
   readonly taxBasis: TaxBasisInput;
+  readonly comparisonScope?: unknown;
   readonly evidenceRefs?: unknown;
 }
 
@@ -82,28 +97,29 @@ export interface Quote {
   readonly lines: readonly QuoteLine[];
   readonly charges: readonly QuoteCharge[];
   readonly taxBasis: TaxBasis;
+  readonly comparisonScope?: ComparisonScope;
   readonly evidenceRefs: readonly EvidenceRef[];
 }
 
 function parseScope(input: unknown): ChargeScope {
   if (input === undefined || input === "quote") {
-    return { kind: "quote" };
+    return Object.freeze({ kind: "quote" });
   }
   if (!isRecord(input) || typeof input.kind !== "string") {
     throw new TypeError("charge scope must be quote, line, or allocated");
   }
   if (input.kind === "quote") {
-    return { kind: "quote" };
+    return Object.freeze({ kind: "quote" });
   }
   const lineId = requiredString(input.lineId, "charge scope lineId");
   if (input.kind === "line") {
-    return { kind: "line", lineId };
+    return Object.freeze({ kind: "line", lineId });
   }
   if (input.kind === "allocated") {
     if (input.method !== "fixed" && input.method !== "proportional") {
       throw new TypeError("allocated charge scope method must be fixed or proportional");
     }
-    return { kind: "allocated", lineId, method: input.method };
+    return Object.freeze({ kind: "allocated", lineId, method: input.method });
   }
   throw new TypeError("charge scope kind is invalid");
 }
@@ -114,16 +130,16 @@ function parseChargeState(input: unknown): ChargeState {
   }
 
   if (input.kind === "known") {
-    return { kind: "known", amount: normalizeMoney(input.amount, "known charge amount") };
+    return Object.freeze({ kind: "known", amount: normalizeMoney(input.amount, "known charge amount") });
   }
   if (input.kind === "included") {
-    return { kind: "included", coveringId: requiredString(input.coveringId, "included coveringId") };
+    return Object.freeze({ kind: "included", coveringId: requiredString(input.coveringId, "included coveringId") });
   }
   if (input.kind === "unknown") {
-    return { kind: "unknown", reason: requiredString(input.reason, "unknown charge reason") };
+    return Object.freeze({ kind: "unknown", reason: requiredString(input.reason, "unknown charge reason") });
   }
   if (input.kind === "notApplicable") {
-    return { kind: "notApplicable", reason: requiredString(input.reason, "notApplicable charge reason") };
+    return Object.freeze({ kind: "notApplicable", reason: requiredString(input.reason, "notApplicable charge reason") });
   }
   if (input.kind === "estimated") {
     const estimate = input.estimate;
@@ -131,10 +147,10 @@ function parseChargeState(input: unknown): ChargeState {
       throw new TypeError("estimated charge requires a point or range estimate");
     }
     if (estimate.kind === "point") {
-      return {
+      return Object.freeze({
         kind: "estimated",
-        estimate: { kind: "point", amount: normalizeMoney(estimate.amount, "estimated charge amount") },
-      };
+        estimate: Object.freeze({ kind: "point", amount: normalizeMoney(estimate.amount, "estimated charge amount") }),
+      });
     }
     if (estimate.kind === "range") {
       const minimum = normalizeMoney(estimate.minimum, "estimated charge minimum");
@@ -142,7 +158,7 @@ function parseChargeState(input: unknown): ChargeState {
       if (minimum.currency !== maximum.currency || minimum.minorUnits > maximum.minorUnits) {
         throw new TypeError("estimated charge range is invalid");
       }
-      return { kind: "estimated", estimate: { kind: "range", minimum, maximum } };
+      return Object.freeze({ kind: "estimated", estimate: Object.freeze({ kind: "range", minimum, maximum }) });
     }
   }
 
@@ -257,6 +273,18 @@ export function quoteLine(input: QuoteLineInput): QuoteLine {
   });
 }
 
+export function comparisonScope(input: ComparisonScopeInput): ComparisonScope {
+  const requirementId = requiredString(input.requirementId, "comparison requirementId");
+  const scopeId = requiredString(input.scopeId, "comparison scopeId");
+  const unit = requiredString(input.unit, "comparison unit");
+  return Object.freeze({
+    requirementId,
+    scopeId,
+    unit,
+    requiredQuantity: parsePositiveQuantity(input.requiredQuantity, "comparison required quantity"),
+  });
+}
+
 export function taxBasis(input: TaxBasisInput): TaxBasis {
   const evidenceRefs = parseEvidenceRefs(input.evidenceRefs, "tax basis evidenceRefs");
   if (input.kind === "inclusive" || input.kind === "exclusive") {
@@ -297,7 +325,7 @@ export function createQuote(input: QuoteInput): Quote {
     throw new TypeError("quote must contain at least one line");
   }
 
-  const lines = rawLines.map((value, index) => {
+  const lines = Object.freeze(rawLines.map((value, index) => {
     if (!isRecord(value)) {
       throw new TypeError(`quote lines[${index}] must be an object`);
     }
@@ -312,7 +340,7 @@ export function createQuote(input: QuoteInput): Quote {
       throw new TypeError(`line ${line.lineId} currency does not match quote currency`);
     }
     return line;
-  });
+  }));
 
   const lineIds = new Set<string>();
   for (const line of lines) {
@@ -323,7 +351,7 @@ export function createQuote(input: QuoteInput): Quote {
   }
 
   const rawCharges = input.charges ?? [];
-  const charges = rawCharges.map((value, index) => {
+  const charges = Object.freeze(rawCharges.map((value, index) => {
     if (!isRecord(value)) {
       throw new TypeError(`quote charges[${index}] must be an object`);
     }
@@ -349,7 +377,7 @@ export function createQuote(input: QuoteInput): Quote {
       throw new TypeError(`charge ${parsed.chargeId} references an unknown line`);
     }
     return parsed;
-  });
+  }));
 
   const chargeIds = new Set<string>();
   for (const parsed of charges) {
@@ -359,8 +387,46 @@ export function createQuote(input: QuoteInput): Quote {
     chargeIds.add(parsed.chargeId);
   }
 
+  const chargesById = new Map(charges.map((parsed) => [parsed.chargeId, parsed]));
+  const resolveCoverage = (coveringId: string, path: ReadonlySet<string>): void => {
+    if (lineIds.has(coveringId)) {
+      return;
+    }
+    const coveringCharge = chargesById.get(coveringId);
+    if (coveringCharge === undefined) {
+      return;
+    }
+    if (coveringCharge.state.kind !== "included") {
+      return;
+    }
+    if (path.has(coveringCharge.chargeId)) {
+      throw new TypeError(`included charge coverage cycle includes ${coveringCharge.chargeId}`);
+    }
+    const nextPath = new Set(path);
+    nextPath.add(coveringCharge.chargeId);
+    resolveCoverage(coveringCharge.state.coveringId, nextPath);
+  };
+  for (const parsed of charges) {
+    if (parsed.state.kind === "included") {
+      resolveCoverage(parsed.state.coveringId, new Set([parsed.chargeId]));
+    }
+  }
+
   const parsedTaxBasis = taxBasis(input.taxBasis);
-  return Object.freeze({
+  const parsedComparisonScope = input.comparisonScope === undefined
+    ? undefined
+    : (() => {
+      if (!isRecord(input.comparisonScope)) {
+        throw new TypeError("comparisonScope must be an object");
+      }
+      return comparisonScope({
+        requirementId: input.comparisonScope.requirementId,
+        scopeId: input.comparisonScope.scopeId,
+        unit: input.comparisonScope.unit,
+        requiredQuantity: input.comparisonScope.requiredQuantity,
+      });
+    })();
+  const base = {
     quoteId,
     version,
     currency,
@@ -368,7 +434,10 @@ export function createQuote(input: QuoteInput): Quote {
     charges,
     taxBasis: parsedTaxBasis,
     evidenceRefs: parseEvidenceRefs(input.evidenceRefs, `quote ${quoteId} evidenceRefs`),
-  });
+  };
+  return parsedComparisonScope === undefined
+    ? Object.freeze(base)
+    : Object.freeze({ ...base, comparisonScope: parsedComparisonScope });
 }
 
 export function quoteEvidenceRef(sourceId: unknown, version: unknown, locator?: unknown): EvidenceRef {

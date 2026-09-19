@@ -17,6 +17,7 @@ export class Decimal {
   private constructor(coefficient: bigint, scale: number) {
     this.coefficient = coefficient;
     this.scale = scale;
+    Object.freeze(this);
   }
 
   public static fromParts(coefficient: bigint, scale: number): Decimal {
