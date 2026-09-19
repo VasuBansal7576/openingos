@@ -12,7 +12,7 @@
 - **Auth:** none
 - **AI models:** none
 - **Started:** 2026-09-19T09:46:19Z
-- **Last updated:** 2026-09-19T19:51:01Z
+- **Last updated:** 2026-09-19T20:02:26Z
 
 ## Log
 
@@ -157,3 +157,10 @@ Integrated Luna’s pushed `a1972fb` for selected-scope comparison, applicable i
 The combined checkout passes 77 controlled proof tests, all 23 repository checks, strict TypeScript and whitespace checks.
 Updated the delivery skill to require all four current CI jobs; these remain proof and repository checks rather than evidence of a deployed application.
 Independent review and remote CI for this combined revision remain pending; application credentials, provider allowances, owner recipient and hosted foundation gates remain unresolved.
+
+### 2026-09-19 - working tree
+
+All four CI jobs passed on `d9487df`, and independent Astra review closed M1/M2 while identifying one remaining M6 component-allocation defect through settlement splitting.
+Integrated Luna’s pushed `979fdca`, which groups exact costs by financial state and assigns rounding remainders deterministically without charging a zero-cost component.
+The combined checkout passes 77 controlled proof tests with 305 assertions, all 23 repository checks, strict TypeScript and whitespace checks.
+Independent verification of the final allocation repair and this revision’s remote CI remain pending; no hosted or live-provider outcome is claimed.

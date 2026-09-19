@@ -54,7 +54,9 @@ The first independent review of `897eea7` found financial M1–M7 and adapter RJ
 The review of `85d8105` closed M3/M4/M5/M7 and all adapter behavior findings, while reproducing M1 selected-scope, M2 included-charge coverage and M6 rounding defects.
 All four CI jobs passed on `85d8105`; that result did not close those review findings.
 Luna’s pushed `a1972fb` and Muse Spark’s pushed `36d5ba9` are now integrated with 77 passing controlled proof tests, 23 repository checks and strict TypeScript.
-Independent verification of this new combined revision and its remote CI remain pending.
+The independent review of `d9487df` closed M1/M2 but found one remaining M6 defect: splitting a settlement moved its rounding cost to a free selected component.
+Luna’s pushed `979fdca` groups exact costs by financial state before deterministic remainder allocation; the integrated checkout passes 77 controlled tests with 305 assertions, 23 repository checks and strict TypeScript.
+Independent verification and remote CI for this last repair remain pending.
 
 ## Duties throughout
 
