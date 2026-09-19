@@ -6,10 +6,12 @@
   "scripts": {
     "test:repository": "node --test scripts/check-pr.test.mjs scripts/check-workbench.test.mjs",
     "test:proofs": "bun test proofs",
+    "test:browser": "bun test browser-executor",
     "typecheck:proofs": "tsc --noEmit",
+    "typecheck:browser": "tsc -p tsconfig.browser-executor.json",
     "typecheck": "tsc --noEmit",
     "build": "vite build",
-    "test": "bun run test:repository && bun run test:proofs && bun test app/tests/application.test.ts",
+    "test": "bun run test:repository && bun run test:proofs && bun run test:browser && bun test app/tests/application.test.ts",
     "test:provider-contracts": "bun test app/tests/provider-contracts.test.ts",
     "test:user-path": "bun test app/tests/user-path.test.ts"
   },
