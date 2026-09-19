@@ -17,6 +17,9 @@ Read the PRD requirements relevant to the task and the accepted ADRs it depends 
 If an unresolved choice changes shared contracts, resolve it before dependent implementation starts.
 An ADR records a decision and its consequences; it is not a standalone worker ticket.
 One implementation package can depend on several ADRs, and one ADR can constrain several packages.
+For sponsor work, use `docs/integrations/sponsor-contracts.md` and the package details in `docs/implementation/sponsor-integration-plan.md`.
+The coordinator assigns the relevant S-cases and records their evidence mode before dispatch.
+Use proof packages to resolve proposed contracts; do not send feature workers to guess around them.
 
 Each package must name:
 

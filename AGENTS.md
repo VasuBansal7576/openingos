@@ -4,6 +4,8 @@
 
 Read `PRD.md` before changing product behavior.
 Read `docs/adr/README.md` and the relevant decision records before production implementation; proposed records do not authorize dependent feature work.
+For provider integration work, read `docs/integrations/sponsor-contracts.md` and take an assigned package from `docs/implementation/sponsor-integration-plan.md`.
+Do not infer application API behavior from a coding-agent plugin or copy provider example endpoints without the required access checks.
 For implementation or delivery work, read and follow `skills/openingos-factory/SKILL.md`.
 That is a tracked project skill, loaded through this file rather than a global installation.
 
@@ -20,6 +22,7 @@ Do not treat proposed ADRs, a green tooling check, or demonstration fixtures as 
 
 - Draft and resolve cross-cutting ADRs before their dependent workers implement them.
 - Give workers implementation packages with acceptance criteria and file ownership, not one ADR each.
+- Use the sponsor plan's named retry owners, outbound send path and evidence rules; report incompatible package behavior before changing a shared contract.
 - Use Orca for developer orchestration when authorized; it is not the customer application's runtime.
 - Preserve existing uncommitted work and stable P-, H-, and D- requirement meanings.
 - Keep the customer assistant limited to shipped, enabled OpeningOS workflows; see the PRD's product capability boundary and D-17.

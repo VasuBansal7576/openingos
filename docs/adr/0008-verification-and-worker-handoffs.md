@@ -12,7 +12,7 @@ The accepted design file is never a substitute for the production demo.
 
 The current checks are `delivery-guard-tests` and `workbench-artifact-tests`.
 They validate the helper and saved artifact only.
-The production foundation adds `app-typecheck`, `app-build`, `app-tests` and `app-user-path` before feature workers depend on it.
+The production foundation adds `app-typecheck`, `app-build`, `app-tests`, `app-provider-contracts` and `app-user-path` before feature workers depend on it.
 Name the fixed expected checks in every implementation package and inspect the latest remote commit, not a previous green run.
 
 ## Package map
@@ -33,6 +33,8 @@ Independent financial/schema contract tests may proceed while F0 resolves hostin
 One coordinator owns shared schemas, dependencies and integration.
 Workers receive packages, not one ADR each, and may need several ADRs for one package.
 Do not dispatch dependent feature workers while their shared contracts are merely proposed.
+Use the [sponsor worker plan](../implementation/sponsor-integration-plan.md) for F0/F1/R1/C1/U1/V1 ownership, exact acceptance cases, command contracts and stop conditions.
+The plan adds detail to these packages without authorizing their execution or replacing unrelated PRD requirements.
 
 ## Environments and realistic tests
 

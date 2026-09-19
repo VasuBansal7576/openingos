@@ -1,6 +1,6 @@
 # OpeningOS product requirements
 
-Revision: 7, September 19, 2026.
+Revision: 8, September 19, 2026.
 Status: proposed product specification, revised from the supplied PRD and its review.
 This document defines intended behavior, not implemented capabilities.
 The original numbered sections retain their subject and numbering.
@@ -26,6 +26,8 @@ It connects requirements, evidence, quotes, approvals, orders, equipment, and ac
 - Recorded the user's selection of the purchasing workbench and rejection of the opening-scene and price-route alternatives.
 - Preserved the complete selected fixture flow in `design/purchasing-workbench.html`; this is not production architecture or live functionality.
 - Added the [ADR registry](docs/adr/README.md), separating accepted design/platform constraints from technical proposals and blocking experiments.
+- Clarified incomplete web evidence, durable correspondence history and the distinction between provider-owned storage and application-owned authority.
+- Linked source-checked sponsor contracts and worker acceptance cases without changing the 52 existing requirement rows or launch-only scope.
 
 ### Scope of this revision
 
@@ -610,11 +612,13 @@ Retain source URL, capture time, exact variant, extraction outcome, and supporti
 
 Use the official `@firecrawl/firecrawl-convex` component when its current documented behavior fits the implementation.
 Durable crawls should expose progress and usable partial results through Convex.
+The [sponsor contracts](docs/integrations/sponsor-contracts.md) specify bounded one-shot collection and the proof required before enabling bulk-crawl creation.
 
 ### Failure and freshness behavior
 
 - A failed or blocked page check records an error or unknown result, not an out-of-stock transition.
 - A stale result remains accessible with its last successful capture time.
+- Truncated pages, omitted extracted data and pages that could not be stored remain explicitly incomplete; omitted terms are not treated as absent.
 - Rate limits and transient failures receive bounded retries.
 - Exhausted credits stop additional work and give the user a clear recovery action.
 - Duplicate research requests reuse appropriate recent evidence within the same organization's permissions.
@@ -646,6 +650,8 @@ Browser Use Cloud capabilities and the open-source Jev Ultrafast implementation 
 
 AgentMail manages supplier RFQs, clarification, bounded negotiation, service inquiries, and replies.
 Use the official `@agentmail/convex` component when it meets the required behavior.
+ADR-0004 selects the component for inbox and verified inbound processing, while the shared application workflow controls outbound AgentMail requests.
+Component-level retries cannot bypass current permissions, duplicate an ambiguous send or hide a confirmed send after cancellation.
 
 Before the first message, the user approves the recipient, represented business, disclosed details, and purpose.
 One review can authorize a named set of recipients and routine clarification or follow-up within an explicit brief and limit.
@@ -663,6 +669,8 @@ Track queued, sent, delivered where reported, bounced, and failed messages disti
 Use stable identifiers to prevent duplicate sends on retries.
 Validate inbound webhooks and deduplicate events before changing application state.
 Route conversations to their authorized organization and project without relying only on the email subject.
+Preserve the approved outgoing message, attachments used as evidence, provider receipts and material delivery events independently of temporary component records.
+Provider cleanup must not remove the correspondence needed to explain a retained quote, approval or purchasing decision.
 
 ### Negotiation and service communication
 
@@ -881,6 +889,9 @@ Prefer suitable maintained Convex components for Firecrawl, AgentMail, durable w
 Verify the current component contracts before implementation.
 The intended sponsor packages are `@firecrawl/firecrawl-convex` and `@agentmail/convex`.
 The actual installed and registered components are recorded in the build log only after implementation.
+The [sponsor contracts](docs/integrations/sponsor-contracts.md) define component registration, callback routing, ownership, dispatch and evidence lifetime.
+The [implementation plan](docs/implementation/sponsor-integration-plan.md) assigns shared-file ownership, implementation order and pending integration tests.
+Development plugins and connected research tools do not replace these runtime integrations.
 
 Authentication is required for private customer work, but a specific auth provider is not selected in this PRD.
 The hackathon guest experience must use a separate, limited evaluation workspace.
@@ -892,7 +903,8 @@ Queries cover workspace decisions, project requirements, candidate comparison, f
 Mutations cover approved project edits, requirement approval, decisions, quote corrections, order recording, delivery acceptance, equipment handover, service outcomes, and risk resolution.
 Approvals and financial transitions enforce the invariants in sections 17 and 35.
 
-Actions perform Firecrawl, AgentMail, OpenAI, Jev, document-processing, and external browser-service coordination.
+Actions perform Firecrawl, direct authorized AgentMail transport, OpenAI, Jev, document-processing, and external browser-service coordination.
+Internal mutations accept validated provider callbacks and perform atomic permission, operation-claim and spending checks.
 External results are validated before mutations write them to application state.
 Provider ingestion and privileged processing use internal functions where public access is unnecessary.
 

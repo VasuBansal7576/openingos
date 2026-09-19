@@ -12,7 +12,7 @@
 - **Auth:** none
 - **AI models:** none
 - **Started:** 2026-09-19T09:46:19Z
-- **Last updated:** 2026-09-19T14:41:52Z
+- **Last updated:** 2026-09-19T15:06:33Z
 
 ## Log
 
@@ -75,3 +75,11 @@ Direct local-file browser verification was blocked by the browser tool's URL pol
 Recorded the accepted visual direction in `PRD.md` and `AGENTS.md`; production behavior and deployment remain unimplemented.
 Drafted eight ADRs and a registry in `docs/adr`, separating the accepted workbench/platform constraints from proposed data, execution, model, browser, identity and verification decisions.
 Documented the unresolved hosted-browser proof, published-origin integration, identity choice, supplier market, provider authority and model calibration; these are planning records, not live integrations or accepted implementation contracts.
+
+### 2026-09-19 - working tree
+
+Clarified PRD revision 8 and ADR-0004 using inspected Firecrawl and AgentMail source, with explicit configuration, ownership, dispatch, retry and evidence contracts.
+Selected component-backed collection and inbox handling with outbound AgentMail requests controlled by the shared Convex workflow; documented incomplete source handling and purchasing history independent of component cleanup.
+Added `docs/integrations/sponsor-contracts.md` and `docs/implementation/sponsor-integration-plan.md`, with package ownership, sequencing, stop conditions and 21 pending integration acceptance cases.
+Updated `AGENTS.md` and the project delivery skill to route workers to those contracts; all 52 existing requirement rows remained unchanged, local documentation links checked, the skill validated and all 23 existing repository tests passed.
+No application dependencies, live provider calls, credentials, deployment or sponsor integration tests were implemented by this documentation work.

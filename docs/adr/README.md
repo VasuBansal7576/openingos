@@ -1,6 +1,6 @@
 # OpeningOS architecture decisions
 
-Drafted September 19, 2026 against PRD revision 7.
+Drafted September 19, 2026; integration contracts clarified against PRD revision 8.
 These documents specify implementation choices, not completed capabilities.
 The user accepted the purchasing workbench and the existing hackathon platform direction.
 Other recommendations remain proposed until reviewed and their blocking experiments pass.
@@ -36,6 +36,11 @@ An ADR is a shared decision, not an individual worker ticket.
 Implementation packages name user-visible behavior, owned files, input/output contracts, dependencies and tests.
 The package map in ADR-0008 permits parallel work only after those inputs are stable.
 New evidence updates a decision through a dated amendment or a superseding ADR; requirement identifiers keep their original meaning.
+
+For Firecrawl, AgentMail and Convex integration, read the [sponsor contracts](../integrations/sponsor-contracts.md), then follow the [worker plan](../implementation/sponsor-integration-plan.md).
+The contracts distinguish source-verified behavior, selected implementation rules and unproven runtime behavior.
+ADR-0004 now specifies official-component collection and inbox handling, with outbound mail sent through the shared authorized workflow rather than a second independent queue.
+Its remaining checks are concrete acceptance cases, not permission for each worker to invent a different integration.
 
 ## Current evidence
 

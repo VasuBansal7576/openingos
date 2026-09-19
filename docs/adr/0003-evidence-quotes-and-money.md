@@ -48,6 +48,9 @@ Use ordinary Convex records and indexes for the logical concepts in PRD section 
 Group provider-specific messages in their official component storage when suitable; keep product references and evidence links locally.
 Append material project events for audit and change explanations, not as the only way to reconstruct every screen.
 Keep original documents in protected storage and user corrections as overlays with actor and reason.
+Evidence completeness records transport truncation, missing bytes and unstored pages separately from claim verification.
+Preserve the approved outbound payload, provider receipts and decision-linked source snapshots under the [sponsor contracts](../integrations/sponsor-contracts.md#evidence-lifetime).
+Provider component cleanup must not erase purchasing history.
 
 Selection changes only selected forecast.
 User-recorded external orders change commitments, payments change paid amounts, and commissioning creates installed equipment provenance.
