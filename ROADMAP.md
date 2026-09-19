@@ -40,6 +40,7 @@ This file supplies order, not duplicate contracts or a running automation.
 - [x] Exercise OpenCode's Orca question/reply round trip.
 - [x] Finish Codex's Orca question/reply and lifecycle round trip under scoped IPC approval.
 - [x] Install official Convex skills for OpenCode and verify its configured MCP connects.
+- [x] Install the official project-managed Convex AI files, verify `convex ai-files status` reports enabled, and read the generated guideline; this is tooling guidance, not hosted deployment evidence.
 - [x] Verify a restarted OpenCode worker sees the twelve Convex MCP tools before backend work; none were invoked.
 - [x] Verify the restarted OpenCode session retains the requested model/high variant and runs its 28 controlled tests without a native approval prompt.
 - [x] Push reviewed proof checkpoint `595d30c`; pass 77 controlled contract tests with 305 assertions, 23 repository checks, strict TypeScript and all four expected CI jobs.

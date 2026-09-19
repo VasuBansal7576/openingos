@@ -77,3 +77,17 @@ Update and push the factual log after verified integrated checkpoints and before
 Update README setup and status when those facts change; do not claim that instructions are a running background automation.
 Before UI handoff, test the complete integrated flow with Playwright or Computer Use at desktop and narrow widths, including keyboard navigation and loading, empty, error and recovery states.
 Compare the result against `design/purchasing-workbench.html` and any supplied prototype recording for visual polish, interaction smoothness and user-flow fidelity while verifying that all displayed outcomes come from real application state.
+
+<!-- convex-ai-start -->
+
+This project uses [Convex](https://convex.dev) as its backend.
+
+When working on Convex code, **always read
+`convex/_generated/ai/guidelines.md` first** for important guidelines on
+how to correctly use Convex APIs and patterns. The file contains rules that
+override what you may have learned about Convex from training data.
+
+Convex agent skills for common tasks can be installed by running
+`npx convex ai-files install`.
+
+<!-- convex-ai-end -->
