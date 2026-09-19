@@ -362,7 +362,20 @@ describe("forecast and commitment financial state", () => {
     expect(result.projectedCompletionCost.minorUnits).toBe(1080);
   });
 
-  it("conserves line rounding when fractional quantities settle", () => {
+  it("conserves line rounding across fractional forecast state partitions", () => {
+    const selectedBefore = calculateForecast({
+      currency: EUR,
+      lines: [{ lineId: "equipment", requiredQuantity: "1", selected: { quantity: "1", unitPrice: money(EUR, 1) } }],
+    });
+    const orderedAndSelected = calculateForecast({
+      currency: EUR,
+      lines: [{
+        lineId: "equipment",
+        requiredQuantity: "1",
+        ordered: { quantity: "0.5", unitPrice: money(EUR, 1) },
+        selected: { quantity: "0.5", unitPrice: money(EUR, 1) },
+      }],
+    });
     const before = calculateForecast({
       currency: EUR,
       lines: [{ lineId: "equipment", requiredQuantity: "1", ordered: { quantity: "1", unitPrice: money(EUR, 1) } }],
@@ -391,10 +404,52 @@ describe("forecast and commitment financial state", () => {
         },
       }],
     });
+    const changedSelectedPrice = calculateForecast({
+      currency: EUR,
+      lines: [{
+        lineId: "equipment",
+        requiredQuantity: "1",
+        ordered: { quantity: "0.5", unitPrice: money(EUR, 1) },
+        selected: { quantity: "0.5", unitPrice: money(EUR, 3) },
+      }],
+    });
+    const allPartitions = calculateForecast({
+      currency: EUR,
+      lines: [{
+        lineId: "equipment",
+        requiredQuantity: "1",
+        ordered: {
+          quantity: "0.5",
+          unitPrice: money(EUR, 1),
+          settled: [{ quantity: "0.25", unitPrice: money(EUR, 3) }],
+        },
+        selected: { quantity: "0.25", unitPrice: money(EUR, 5) },
+        estimated: { quantity: "0.25", unitPrice: money(EUR, 7) },
+      }],
+    });
+    const orderedAndSelectedLine = orderedAndSelected.lines[0];
+    const allPartitionsLine = allPartitions.lines[0];
     expect(before.projectedCompletionCost.minorUnits).toBe(1);
+    expect(selectedBefore.projectedCompletionCost.minorUnits).toBe(1);
+    expect(orderedAndSelected.projectedCompletionCost.minorUnits).toBe(1);
+    expect(orderedAndSelectedLine === undefined
+      ? undefined
+      : orderedAndSelectedLine.orderedCurrentCost.minorUnits
+        + orderedAndSelectedLine.selectedForecastCost.minorUnits
+        + orderedAndSelectedLine.estimatedForecastCost.minorUnits).toBe(1);
     expect(after.projectedCompletionCost.minorUnits).toBe(1);
     expect(after.lines[0]?.settledCost.minorUnits).toBe(1);
     expect(changedPrice.projectedCompletionCost.minorUnits).toBe(95);
+    expect(changedSelectedPrice.projectedCompletionCost.minorUnits).toBe(2);
+    expect(allPartitions.projectedCompletionCost.minorUnits).toBe(4);
+    expect(allPartitionsLine === undefined
+      ? undefined
+      : allPartitionsLine.projectedCost.minorUnits).toBe(4);
+    expect(allPartitionsLine === undefined
+      ? undefined
+      : allPartitionsLine.orderedCurrentCost.minorUnits
+        + allPartitionsLine.selectedForecastCost.minorUnits
+        + allPartitionsLine.estimatedForecastCost.minorUnits).toBe(4);
   });
 
   it("reports uncovered quantities instead of silently treating them as zero", () => {
