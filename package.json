@@ -1,0 +1,16 @@
+{
+  "name": "openingos",
+  "private": true,
+  "type": "module",
+  "packageManager": "bun@1.3.11",
+  "scripts": {
+    "test:repository": "node --test scripts/check-pr.test.mjs scripts/check-workbench.test.mjs",
+    "test:proofs": "bun test proofs",
+    "typecheck:proofs": "tsc --noEmit",
+    "test": "bun run test:repository && bun run test:proofs"
+  },
+  "devDependencies": {
+    "@types/bun": "1.3.11",
+    "typescript": "7.0.2"
+  }
+}

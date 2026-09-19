@@ -49,7 +49,9 @@ node --test scripts/check-pr.test.mjs scripts/check-workbench.test.mjs
 ```
 
 The 23 current tests validate the CI-inspection helper and saved prototype structure only.
-Application typechecking, build, backend tests and live integration checks are foundation deliverables, not passing checks today.
+A pinned Bun/TypeScript toolchain supports the independent controlled proofs being implemented under `proofs/`.
+Use `bun install --frozen-lockfile`, then `bun run test:proofs` and `bun run typecheck:proofs` once those proof packages are integrated.
+Application typechecking, build, backend tests and live integration checks remain foundation deliverables, not passing checks today.
 Use Bun for the application unless the selected Sites starter specifies another package manager.
 
 ## Configuration and publication

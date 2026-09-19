@@ -37,8 +37,9 @@ This file supplies order, not duplicate contracts or a running automation.
 - [x] Create isolated Luna and Muse Spark worktrees from `987b4ab`; both can read the tracked factory skill.
 - [x] Exercise native scoped approvals: Codex's harmless print command and OpenCode's one-time shell approval.
 - [x] Exercise OpenCode's Orca question/reply round trip.
-- [ ] Finish Codex's Orca question/reply and lifecycle round trip under scoped IPC approval.
-- [ ] Finish OpenCode Convex skills/MCP setup and verify a restarted worker sees both.
+- [x] Finish Codex's Orca question/reply and lifecycle round trip under scoped IPC approval.
+- [x] Install official Convex skills for OpenCode and verify its configured MCP connects.
+- [ ] Verify a restarted OpenCode worker sees the Convex MCP before backend work.
 - [ ] Verify hosted environment, application credentials, provider allowances and owner recipient.
 - [ ] Integrate and review the independent financial and Jev contract proofs.
 

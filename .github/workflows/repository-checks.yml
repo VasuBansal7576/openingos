@@ -3,7 +3,7 @@ name: Repository checks
 on:
   pull_request:
   push:
-    branches: [main, codex/prototype-design-flows]
+    branches: ['**']
 
 permissions:
   contents: read
