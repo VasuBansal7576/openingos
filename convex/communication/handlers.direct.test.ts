@@ -4,8 +4,10 @@ import { describe, expect, test } from "vitest";
 import schema from "../schema.js";
 import type { Id } from "../_generated/dataModel.js";
 import * as callbacks from "./callbacks.js";
+import * as cleanup from "./cleanup.js";
 import * as send from "./send.js";
 import { canonicalJson, payloadHash } from "../shared/hashing.js";
+import { OUTBOUND_RETENTION_MS } from "./contracts.js";
 
 const rawModules = import.meta.glob([
   "../access/**/*.ts",
@@ -58,6 +60,11 @@ const prepareRef = makeFunctionReference<
   MutationArgs<typeof send.prepareOutboundSnapshot>,
   MutationReturn<typeof send.prepareOutboundSnapshot>
 >("communication/send:prepareOutboundSnapshot");
+const cleanupRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof cleanup.cleanupFinalizedProviderRows>,
+  MutationReturn<typeof cleanup.cleanupFinalizedProviderRows>
+>("communication/cleanup:cleanupFinalizedProviderRows");
 
 const DRAFT = {
   profile: "ownerRoleplay",
@@ -168,6 +175,13 @@ const inbound = (messageId: string, threadId: string, html = "", from = "owner@e
 });
 
 describe("C1 Convex callback handlers", () => {
+  test("locks provider cleanup to seven days before touching component rows", async () => {
+    const f = await fixture();
+    expect(OUTBOUND_RETENTION_MS).toBe(7 * 24 * 60 * 60 * 1_000);
+    const invalid = await f.t.mutation(cleanupRef, { retentionMs: OUTBOUND_RETENTION_MS - 1 });
+    expect(invalid).toMatchObject({ ok: false, code: "invalid-payload" });
+  });
+
   test("creates one exact outbound snapshot under concurrent replay and rejects stale authority", async () => {
     const f = await fixture("prepared");
     const results = await Promise.all([
@@ -361,6 +375,17 @@ describe("C1 Convex callback handlers", () => {
       executionMode: "recorded",
     });
     expect(quoteReplay).toMatchObject({ ok: true, deduplicated: true });
+    const changedQuote = quoteJson.replace("1_000", "2_000").replace("1000", "2000");
+    const conflictingReplay = await f.t.mutation(ingestQuoteRef, {
+      organizationId: f.organizationId,
+      projectId: f.projectId,
+      conversationId: f.conversationId,
+      providerMessageId: "reply-1",
+      extractionVersion: "extract-v1",
+      quoteJson: changedQuote,
+      executionMode: "recorded",
+    });
+    expect(conflictingReplay).toMatchObject({ ok: false, code: "invalid-payload" });
     const evidence = await f.t.run(async (ctx) => (await ctx.db.query("productEvidence").collect()).filter((row) => row.projectId === f.projectId && row.idempotencyKey === "agentmail:reply-1:source:1"));
     expect(evidence.filter((row) => row.idempotencyKey === "agentmail:reply-1:source:1")).toHaveLength(1);
     const extraction = await f.t.run(async (ctx) => (await ctx.db.query("productEvidence").collect()).filter((row) => row.projectId === f.projectId && row.idempotencyKey === "agentmail:reply-1:extract:extract-v1"));

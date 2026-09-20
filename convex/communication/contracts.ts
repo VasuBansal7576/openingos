@@ -214,7 +214,7 @@ export function validateOutboundPayload(
   const profile = value["profile"];
   const subject = value["subject"];
   const body = value["body"];
-  const replyTo = value["replyTo"];
+  const replyTo = value["replyTo"] ?? value["reply_to"];
   if (!nonEmptyString(to)) return denial("invalid-payload", "recipient is required");
   if (cc === null) return denial("cc-not-empty", "CC must be an explicit empty array");
   if (bcc === null) return denial("bcc-not-empty", "BCC must be an explicit empty array");
@@ -234,7 +234,7 @@ export function validateOutboundPayload(
   }
   if (!nonEmptyString(body)) return denial("invalid-payload", "message body is required");
   if (bytes(body) > MAX_MESSAGE_BODY_BYTES) return denial("invalid-payload", "message body exceeds the size bound");
-  if (/<(?:script|iframe|object|embed|form)\b/i.test(body) || /(?:javascript:|on[a-z]+\s*=)/i.test(body)) {
+  if (/<(?:script|iframe|object|embed|form)\b/i.test(body) || /<[a-z][^>]*>/i.test(body) || /(?:javascript:|on[a-z]+\s*=)/i.test(body)) {
     return denial("malicious-content", "unsafe HTML or instructions cannot be sent");
   }
   if (/\b(?:ignore|disregard)\s+(?:all|any|the|previous|prior)(?:\s+(?:all|any|the|previous|prior))*\s+instructions\b/i.test(body)) {

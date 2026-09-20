@@ -49,6 +49,10 @@ function safeOperationLabel(value: string): boolean {
   return /^[A-Za-z0-9._:-]{1,160}$/.test(value);
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 async function boundedResponseText(response: Response): Promise<string | null> {
   const text = await response.text();
   if (new TextEncoder().encode(text).byteLength > MAX_PROVIDER_RESPONSE_BYTES) return null;
@@ -64,6 +68,14 @@ async function boundedResponseText(response: Response): Promise<string | null> {
 export async function sendAgentMailOneShot(input: AgentMailTransportInput): Promise<AgentMailTransportResult> {
   if (input.apiKey.trim().length === 0) return failure("provider-rejection", "AgentMail is not configured");
   if (input.inboxId.trim().length === 0) return failure("invalid-payload", "inbox id is required");
+  if (!isRecord(input.payload) || typeof input.payload["to"] !== "string" || !Array.isArray(input.payload["cc"]) || !Array.isArray(input.payload["bcc"])) {
+    return failure("invalid-payload", "transport payload shape is invalid");
+  }
+  const allowedKeys = new Set(["to", "cc", "bcc", "subject", "text", "attachments"]);
+  for (const key of Object.keys(input.payload)) {
+    if (key === "replyTo" || key === "reply_to") return failure("reply-to-redirect", "transport Reply-To is denied");
+    if (!allowedKeys.has(key)) return failure("invalid-payload", "transport payload contains unsupported fields");
+  }
   if (!isValidSingleMailbox(input.ownerMailbox) || normalizeMailbox(input.payload.to) !== normalizeMailbox(input.ownerMailbox)) {
     return failure("recipient-mismatch", "transport recipient is not the configured owner mailbox");
   }

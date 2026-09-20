@@ -48,6 +48,15 @@ function nonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
 
+function parseObject(value: string): Record<string, unknown> | null {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return isRecord(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
 function denial(code: CommunicationDenial["code"], message: string): CommunicationDenial {
   return { ok: false, code, message };
 }
@@ -125,6 +134,7 @@ async function operationForProviderMessage(
   ctx: F1MutationCtx,
   messageId: string | undefined,
   threadId: string | undefined,
+  inboxId: string | undefined,
 ): Promise<{ operationId: Id<"operations">; token: string } | null> {
   // This helper is inlined by `ingestEvent`; its intentionally tiny bounded
   // scan avoids claiming a project from a sender or subject alone.
@@ -136,7 +146,8 @@ async function operationForProviderMessage(
     if (
       binding === null ||
       (messageId !== undefined && binding.messageId !== messageId) ||
-      (threadId !== undefined && binding.threadId !== threadId)
+      (threadId !== undefined && binding.threadId !== threadId) ||
+      (inboxId !== undefined && binding.inboxId !== inboxId)
     ) continue;
     const operation = await ctx.db.get(row.operationId);
     if (operation?.attemptToken !== undefined) return { operationId: operation._id, token: operation.attemptToken };
@@ -165,7 +176,7 @@ export const ingestEvent = f1InternalMutation({
     if (existing !== null) return { ok: true as const, deduplicated: true, applied: existing.applicationState === "observedSuccess", quarantined: existing.organizationId === undefined };
 
     const now = Date.now();
-    const binding = await operationForProviderMessage(ctx, parsed.messageId, parsed.threadId);
+    const binding = await operationForProviderMessage(ctx, parsed.messageId, parsed.threadId, parsed.inboxId);
     const isSuccessEvent = parsed.eventType === "message.sent" || parsed.eventType === "message.delivered";
     let applied = false;
     if (binding !== null && isSuccessEvent) {
@@ -392,6 +403,9 @@ export const ingestQuote = f1InternalMutation({
     if (source.version !== "source:1") return denial("malicious-content", "quote source requires manual review");
     const content = sanitizeInboundContent({ text: source.normalizedValue, html: "" });
     if (content.needsReview) return denial("malicious-content", "supplier instructions require manual review");
+    const bounded = parseBoundedPayloadJson(args.quoteJson);
+    if (!bounded.ok || !isRecord(bounded.payload.value)) return denial("invalid-payload", "quote extraction is not valid bounded JSON");
+    const extractionHash = payloadHash(bounded.payload.value);
     const extractionKey = `agentmail:${args.providerMessageId}:extract:${args.extractionVersion}`;
     const extractionRows = await ctx.db
       .query("productEvidence")
@@ -399,6 +413,10 @@ export const ingestQuote = f1InternalMutation({
       .take(2);
     if (extractionRows.length > 1) return denial("invalid-payload", "duplicate extraction markers detected");
     if (extractionRows[0] !== undefined) {
+      const marker = parseObject(extractionRows[0].normalizedValue);
+      if (!isRecord(marker) || marker["extractionHash"] !== extractionHash) {
+        return denial("invalid-payload", "replayed extraction conflicts with the stored result");
+      }
       const quoteRows = await ctx.db
         .query("quotes")
         .withIndex("by_project", (q) => q.eq("projectId", args.projectId))
@@ -407,13 +425,13 @@ export const ingestQuote = f1InternalMutation({
       if (quote !== undefined) return { ok: true as const, quoteId: quote._id, deduplicated: true, executionMode: quote.executionMode };
       return denial("invalid-payload", "extraction marker has no linked quote");
     }
-    const bounded = parseBoundedPayloadJson(args.quoteJson);
-    if (!bounded.ok || !isRecord(bounded.payload.value)) return denial("invalid-payload", "quote extraction is not valid bounded JSON");
     const quoteValue = bounded.payload.value;
     const version = typeof quoteValue["version"] === "string" && quoteValue["version"].trim().length > 0
       ? quoteValue["version"]
       : `${args.providerMessageId}:${args.extractionVersion}`;
     const sourceRefs = [{ sourceId: `agentmail:${args.providerMessageId}`, version: args.extractionVersion, locator: `message:${args.providerMessageId}` }];
+    // `parseBoundedPayloadJson` proves the size, depth and canonical JSON
+    // boundary; F1's provider validator is the authoritative field schema.
     const quoteArgs = {
       organizationId: args.organizationId,
       projectId: args.projectId,
@@ -441,7 +459,7 @@ export const ingestQuote = f1InternalMutation({
       sourceKind: "agentmail.message",
       capturedAt: Date.now(),
       originalValue: bounded.payload.canonical.slice(0, 8_000),
-      normalizedValue: JSON.stringify({ quoteId: recorded.quoteId, contentHash: recorded.contentHash }),
+      normalizedValue: JSON.stringify({ quoteId: recorded.quoteId, contentHash: recorded.contentHash, extractionHash }),
       verification: "unverified",
       freshness: "fresh",
       counterpartyRole: "ownerStandIn",
