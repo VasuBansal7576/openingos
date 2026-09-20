@@ -61,6 +61,16 @@ const jobViewValidator = v.object({
 const CANCELLATION_PAGE_SIZE = 16;
 const CANCELLATION_UNRESOLVED_SAMPLE_LIMIT = 16;
 
+// An omitted grant may only create the bounded automatic research/read
+// authority. Record-changing operations remain valid when the caller carries
+// an explicit, version-bound grant, but never receive authority from a free
+// operation ID on the automatic path.
+const AUTOMATIC_OPERATION_IDS: ReadonlySet<string> = new Set([
+  "research.collect",
+  "research.read",
+  "comparison.read",
+]);
+
 type CancellationPhase = "operations" | "reservations" | "complete";
 
 type CancellationJobProgress = {
@@ -140,6 +150,32 @@ type UnresolvedSummary = {
   readonly count: number;
   readonly ids: Id<"operations">[];
 };
+
+/**
+ * Return an exact current unresolved set when it fits in the durable sample.
+ * The bounded probes avoid a full scan and let a completed reconciliation
+ * page replace a stale aggregate when an unsampled operation resolved between
+ * pages. More than the sample limit stays explicitly incomplete and is
+ * rebuilt by the next resumable pass.
+ */
+async function boundedCurrentUnresolvedSnapshot(
+  ctx: F1MutationCtx,
+  jobId: Id<"jobs">,
+): Promise<Id<"operations">[] | null> {
+  const [dispatching, outcomeUnknown] = await Promise.all([
+    ctx.db
+      .query("operations")
+      .withIndex("by_job_and_state", (q) => q.eq("jobId", jobId).eq("state", "dispatching"))
+      .take(CANCELLATION_UNRESOLVED_SAMPLE_LIMIT + 1),
+    ctx.db
+      .query("operations")
+      .withIndex("by_job_and_state", (q) => q.eq("jobId", jobId).eq("state", "outcomeUnknown"))
+      .take(CANCELLATION_UNRESOLVED_SAMPLE_LIMIT + 1),
+  ]);
+  const unresolved = [...dispatching, ...outcomeUnknown];
+  if (unresolved.length > CANCELLATION_UNRESOLVED_SAMPLE_LIMIT) return null;
+  return unresolved.map((operation) => operation._id);
+}
 
 function unresolvedSummary(job: CancellationJobProgress): UnresolvedSummary {
   return {
@@ -423,7 +459,18 @@ async function processReconciliationPage(
       summary = recordUnresolved(summary, operation._id);
     }
   }
-  const reconciliationComplete = page.isDone && summary.count === 0;
+  let currentSnapshot: Id<"operations">[] | null = null;
+  if (page.isDone) {
+    currentSnapshot = await boundedCurrentUnresolvedSnapshot(ctx, job._id);
+    if (currentSnapshot !== null) {
+      summary = { count: currentSnapshot.length, ids: [...currentSnapshot] };
+    }
+  }
+  // An exact empty snapshot is required before declaring reconciliation
+  // complete. If more than the durable sample remains, the public result is
+  // explicitly incomplete and the null cursor starts another bounded pass.
+  const reconciliationComplete =
+    page.isDone && currentSnapshot !== null && currentSnapshot.length === 0;
   const nextCursor = page.isDone ? null : page.continueCursor;
   await ctx.db.patch(job._id, {
     state: "cancelled",
@@ -702,6 +749,13 @@ export const start = f1Mutation({
     } else if (kind === "communication") {
       return { ok: false as const, code: "denied-capability", message: "communication requires a grant" };
     } else {
+      if (!AUTOMATIC_OPERATION_IDS.has(operationId)) {
+        return {
+          ok: false as const,
+          code: "denied-capability",
+          message: "record-changing operations require an explicit grant",
+        };
+      }
       const automaticAuthority = defaultWorkflowAuthority(operationId, args.projectId);
       if (
         automaticAuthority === null ||
