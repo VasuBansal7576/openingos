@@ -11,6 +11,14 @@
  * every quote row in the project (302 rows with 300 unrelated quotes).
  * It now uses the narrow `by_project_and_supersedes` index with `.first()`
  * (at most one row read), with identical deny/allow behavior.
+ *
+ * Handler-level bound: the last two tests below run the ACTUAL
+ * recordSelection/decideApproval handlers inside a tight
+ * `transactionLimits.documentsRead` budget with 300 unrelated quotes
+ * present. The pre-fix `collect()` of the 302-row project history cannot
+ * fit that budget and throws `Scanned too many documents` instead of
+ * returning; the indexed `.first()` probe keeps each handler well under
+ * it on both the allow and fenced-deny paths.
  */
 import { convexTest } from "convex-test";
 import { describe, expect, test } from "vitest";
@@ -101,6 +109,11 @@ const decideApprovalRef = makeFunctionReference<
 
 const OWNER = { tokenIdentifier: "successor-bounded-owner" };
 const UNRELATED_COUNT = 300;
+// Handler-level read budget: the pre-fix successor check collected the
+// whole 302-row project history (300 unrelated + 2 revisions) in one
+// handler transaction, so it cannot fit this budget. The indexed
+// `.first()` probe keeps each handler transaction well under it.
+const BOUNDED_DOCUMENT_BUDGET = 64;
 
 async function sha256Hex(text: string): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
@@ -318,6 +331,103 @@ describe("bounded quote-successor reads", () => {
     expect(fenced.ok).toBe(false);
     if (!fenced.ok) expect(fenced.code).toBe("stale-approval-basis");
 
+    const currentCanonical = JSON.stringify({ quoteId: v2.quoteId, contentHash: v2.contentHash });
+    const currentApproval = await asOwner.mutation(recordApprovalRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      scope: "selection",
+      quoteId: v2.quoteId,
+      snapshotCanonical: currentCanonical,
+      snapshotHash: await sha256Hex(currentCanonical),
+    });
+    if (!currentApproval.ok) throw new Error("current approval setup failed");
+    const decided = await asOwner.mutation(decideApprovalRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      approvalId: currentApproval.approvalId,
+      decision: "approved",
+    });
+    expect(decided.ok).toBe(true);
+  });
+
+  test("recordSelection handler stays within a tight document budget with 300 unrelated quotes", async () => {
+    const t = convexTest({ schema, modules, transactionLimits: { documentsRead: BOUNDED_DOCUMENT_BUDGET } });
+    const project = await setupProject(t, "successor-bounded-select-budget");
+    const asOwner = t.withIdentity(OWNER);
+    const graph = await setupGraph(t, project, "main");
+    const v1 = await asOwner.mutation(recordQuoteRef, quoteArgs(project, "v1-target"));
+    if (!v1.ok) throw new Error("v1 failed");
+    await seedUnrelatedQuotes(t, project, UNRELATED_COUNT);
+    const v2 = await asOwner.mutation(recordQuoteRef, quoteArgs(project, "v2-successor", { supersedes: v1.contentHash }));
+    if (!v2.ok) throw new Error("v2 failed");
+
+    // The ACTUAL handler fences the superseded terms without exceeding
+    // the budget: a full-history collect (302 rows) would throw
+    // `Scanned too many documents` instead of returning this denial.
+    const fenced = await asOwner.mutation(recordSelectionRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      requirementId: graph.requirementId,
+      candidateId: graph.candidateId,
+      quoteId: v1.quoteId,
+      quoteVersion: "v1-target",
+      quantity: "1",
+      requirementVersion: 1,
+      idempotencyKey: "bounded-budget-fenced-key",
+    });
+    expect(fenced.ok).toBe(false);
+    if (!fenced.ok) expect(fenced.code).toBe("stale-quote-version");
+
+    // The ACTUAL handler still selects the current revision under the
+    // same budget with the same 300 unrelated rows present.
+    const current = await asOwner.mutation(recordSelectionRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      requirementId: graph.requirementId,
+      candidateId: graph.candidateId,
+      quoteId: v2.quoteId,
+      quoteVersion: "v2-successor",
+      quantity: "1",
+      requirementVersion: 1,
+      idempotencyKey: "bounded-budget-current-key",
+    });
+    expect(current.ok).toBe(true);
+  });
+
+  test("decideApproval handler stays within a tight document budget with 300 unrelated quotes", async () => {
+    const t = convexTest({ schema, modules, transactionLimits: { documentsRead: BOUNDED_DOCUMENT_BUDGET } });
+    const project = await setupProject(t, "successor-bounded-approve-budget");
+    const asOwner = t.withIdentity(OWNER);
+    await setupGraph(t, project, "main");
+    const v1 = await asOwner.mutation(recordQuoteRef, quoteArgs(project, "v1-target"));
+    if (!v1.ok) throw new Error("v1 failed");
+    const staleCanonical = JSON.stringify({ quoteId: v1.quoteId, contentHash: v1.contentHash });
+    const staleApproval = await asOwner.mutation(recordApprovalRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      scope: "selection",
+      quoteId: v1.quoteId,
+      snapshotCanonical: staleCanonical,
+      snapshotHash: await sha256Hex(staleCanonical),
+    });
+    if (!staleApproval.ok) throw new Error("stale approval setup failed");
+    await seedUnrelatedQuotes(t, project, UNRELATED_COUNT);
+    const v2 = await asOwner.mutation(recordQuoteRef, quoteArgs(project, "v2-successor", { supersedes: v1.contentHash }));
+    if (!v2.ok) throw new Error("v2 failed");
+
+    // The ACTUAL handler fences the stale basis without exceeding the
+    // budget: a per-basis full-history collect would throw instead.
+    const fenced = await asOwner.mutation(decideApprovalRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      approvalId: staleApproval.approvalId,
+      decision: "approved",
+    });
+    expect(fenced.ok).toBe(false);
+    if (!fenced.ok) expect(fenced.code).toBe("stale-approval-basis");
+
+    // The ACTUAL handler still decides the current terms under the same
+    // budget with the same 300 unrelated rows present.
     const currentCanonical = JSON.stringify({ quoteId: v2.quoteId, contentHash: v2.contentHash });
     const currentApproval = await asOwner.mutation(recordApprovalRef, {
       organizationId: project.orgId,
