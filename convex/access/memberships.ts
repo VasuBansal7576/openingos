@@ -196,6 +196,52 @@ export const grantProjectAccess = f1Mutation({
     if (!roleSatisfies(access.value, args.role)) {
       return { ok: false as const, code: "denied-capability", message: "cannot grant a role above your own" };
     }
+
+    // A temporary authority cannot mint a longer-lived membership, including
+    // a grant back to the same identity. `checkProjectAccess` returns the
+    // highest current role, so only memberships at that effective role can
+    // authorize this grant; a non-expiring membership at that role keeps the
+    // authority non-expiring, while several temporary rows use the latest
+    // expiry that still supplies the effective role.
+    const project = await ctx.db.get(args.projectId);
+    if (project === null || project.organizationId !== args.organizationId) {
+      return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
+    }
+    const granterRows = await ctx.db
+      .query("memberships")
+      .withIndex("by_organization_and_identity", (q) =>
+        q.eq("organizationId", args.organizationId).eq("identity", identity),
+      )
+      .collect();
+    const effectiveRows = granterRows.filter(
+      (row) =>
+        row.status === "active" &&
+        (row.expiresAt === undefined || row.expiresAt > now) &&
+        (project.visibility === "restricted"
+          ? row.projectId === args.projectId
+          : row.projectId === undefined || row.projectId === args.projectId),
+    );
+    const authorityRows = effectiveRows.filter((row) => row.role === access.value);
+    if (authorityRows.length === 0) {
+      return { ok: false as const, code: "denied-capability", message: "granting authority is no longer current" };
+    }
+    const hasNonExpiringAuthority = authorityRows.some((row) => row.expiresAt === undefined);
+    const finiteAuthorityExpiries = authorityRows.flatMap((row) =>
+      row.expiresAt === undefined ? [] : [row.expiresAt],
+    );
+    const authorityExpiry = hasNonExpiringAuthority
+      ? undefined
+      : Math.max(...finiteAuthorityExpiries);
+    if (
+      authorityExpiry !== undefined &&
+      (args.expiresAt === undefined || args.expiresAt > authorityExpiry)
+    ) {
+      return {
+        ok: false as const,
+        code: "invalid-payload",
+        message: "membership expiry cannot exceed the granter authority expiry",
+      };
+    }
     const membershipId = await ctx.db.insert("memberships", {
       organizationId: args.organizationId,
       projectId: args.projectId,
