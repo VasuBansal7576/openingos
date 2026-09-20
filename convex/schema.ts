@@ -258,6 +258,23 @@ export default defineSchema({
     .index("by_requirement", ["requirementId"])
     .index("by_project_and_key", ["projectId", "idempotencyKey"]),
 
+  /**
+   * F1R-06 migration-safe reverse index for compatibility findings.
+   * New compatibility writes record one child row per cited evidence row,
+   * so invalidation reads only the sparse dependent set instead of scanning
+   * every candidate under a requirement. Existing candidate rows remain
+   * valid without a binding and are handled by the bounded legacy fallback.
+   */
+  compatibilityEvidenceBindings: defineTable({
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    candidateId: v.id("candidates"),
+    evidenceId: v.id("productEvidence"),
+    evidenceVersion: v.string(),
+  })
+    .index("by_evidence", ["evidenceId"])
+    .index("by_candidate_and_evidence", ["candidateId", "evidenceId"]),
+
   rfqs: defineTable({
     organizationId: v.id("organizations"),
     projectId: v.id("projects"),

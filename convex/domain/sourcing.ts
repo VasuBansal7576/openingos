@@ -25,7 +25,11 @@ import {
   vendorContactInputValidator,
   vendorInputValidator,
 } from "../shared/domainContracts.js";
-import { f1InternalMutation, type F1MutationCtx } from "../server.js";
+import {
+  f1InternalMutation,
+  type F1MutationCtx,
+  type F1QueryCtx,
+} from "../server.js";
 import { decimalCompare, decimalToString, decimalZero, quantity } from "../../proofs/money/decimal.js";
 import { canonicalJson } from "../shared/hashing.js";
 import type { Id } from "../_generated/dataModel.js";
@@ -277,6 +281,13 @@ export const verifyCompatibility = f1Mutation({
     if (args.evidenceRefs.length === 0) {
       return { ok: false as const, code: "invalid-payload", message: "verification requires evidence" };
     }
+    if (args.evidenceRefs.length > MAX_COMPATIBILITY_FANOUT) {
+      return {
+        ok: false as const,
+        code: "invalid-payload",
+        message: `compatibility evidence references exceed the supported bound of ${MAX_COMPATIBILITY_FANOUT}`,
+      };
+    }
     const requirement = await ctx.db.get(candidate.value.requirementId);
     if (
       requirement === null ||
@@ -329,12 +340,51 @@ export const verifyCompatibility = f1Mutation({
         return { ok: false as const, code: "unrelated-evidence", message: "compatibility evidence concerns another requirement" };
       }
     }
+    // Keep a bounded reverse index for every cited evidence row. The old
+    // candidate row remains the authoritative finding payload; these child
+    // rows only make sparse invalidation addressable when the requirement
+    // itself has more candidates than one transaction may scan or patch.
+    const bindingEvidenceIds = new Set<string>();
+    for (const ref of candidate.value.compatibilityEvidenceRefs ?? []) {
+      bindingEvidenceIds.add(ref.sourceId);
+    }
+    for (const ref of args.evidenceRefs) bindingEvidenceIds.add(ref.sourceId);
+    for (const sourceId of bindingEvidenceIds) {
+      const bindings = await ctx.db
+        .query("compatibilityEvidenceBindings")
+        .withIndex("by_candidate_and_evidence", (q) =>
+          q
+            .eq("candidateId", args.candidateId)
+            .eq("evidenceId", sourceId as Id<"productEvidence">),
+        )
+        .take(MAX_COMPATIBILITY_FANOUT + 1);
+      if (bindings.length > MAX_COMPATIBILITY_FANOUT) {
+        return {
+          ok: false as const,
+          code: "invalid-payload",
+          message: `compatibility evidence binding fanout exceeds the supported bound of ${MAX_COMPATIBILITY_FANOUT}`,
+        };
+      }
+      for (const binding of bindings) await ctx.db.delete(binding._id);
+    }
     await ctx.db.patch(args.candidateId, {
       compatibility: args.result,
       compatibilityEvidenceRefs: [...args.evidenceRefs],
       compatibilityRequirementVersion: requirement.version,
       compatibilityRuleVersion: COMPATIBILITY_RULE_VERSION,
     });
+    const indexedEvidenceIds = new Set<string>();
+    for (const ref of args.evidenceRefs) {
+      if (indexedEvidenceIds.has(ref.sourceId)) continue;
+      indexedEvidenceIds.add(ref.sourceId);
+      await ctx.db.insert("compatibilityEvidenceBindings", {
+        organizationId: args.organizationId,
+        projectId: args.projectId,
+        candidateId: args.candidateId,
+        evidenceId: ref.sourceId as Id<"productEvidence">,
+        evidenceVersion: ref.version,
+      });
+    }
     return { ok: true as const };
   },
 });
@@ -383,17 +433,23 @@ export const listCandidates = f1Query({
       .query("candidates")
       .withIndex("by_requirement", (q) => q.eq("requirementId", args.requirementId))
       .take(Math.max(1, Math.min(50, Math.floor(args.limit))));
-    return {
-      ok: true as const,
-      candidates: rows
+    const candidates = await Promise.all(
+      rows
         .filter((row) => row.organizationId === args.organizationId)
-        .map((row) => ({
+        .map(async (row) => ({
           id: row._id,
           productModel: row.productModel,
           variant: row.variant,
-          compatibility: row.compatibility,
+          // A historical row may predate the reverse index. Derive the
+          // public status from the authoritative evidence revision so a
+          // bounded legacy invalidation can never expose a stale pass.
+          compatibility: row.compatibility === "pass" &&
+              !(await hasCurrentCompatibilityBasis(ctx, row))
+            ? "unknown"
+            : row.compatibility,
         })),
-    };
+    );
+    return { ok: true as const, candidates };
   },
 });
 
@@ -424,6 +480,68 @@ type ProductEvidenceFields = {
  * silently leaves a tail of pass findings stale.
  */
 export const MAX_COMPATIBILITY_FANOUT = 256;
+
+type CompatibilityEvidenceRef = {
+  readonly sourceId: string;
+  readonly version: string;
+  readonly locator?: string;
+};
+
+async function hasCurrentCompatibilityBasis(
+  ctx: F1QueryCtx,
+  row: {
+    readonly _id: Id<"candidates">;
+    readonly organizationId: Id<"organizations">;
+    readonly projectId: Id<"projects">;
+    readonly requirementId: Id<"requirements">;
+    readonly compatibility: "pass" | "fail" | "unknown";
+    readonly compatibilityEvidenceRefs?: readonly CompatibilityEvidenceRef[];
+    readonly compatibilityRequirementVersion?: number;
+    readonly compatibilityRuleVersion?: string;
+  },
+): Promise<boolean> {
+  if (row.compatibility !== "pass") return true;
+  if (
+    row.compatibilityRuleVersion !== COMPATIBILITY_RULE_VERSION ||
+    row.compatibilityRequirementVersion === undefined
+  ) {
+    return false;
+  }
+  const requirement = await ctx.db.get(row.requirementId);
+  if (
+    requirement === null ||
+    requirement.organizationId !== row.organizationId ||
+    requirement.projectId !== row.projectId ||
+    requirement.version !== row.compatibilityRequirementVersion
+  ) {
+    return false;
+  }
+  const refs = row.compatibilityEvidenceRefs ?? [];
+  if (refs.length === 0 || refs.length > MAX_COMPATIBILITY_FANOUT) return false;
+  for (const ref of refs) {
+    const evidenceId = ctx.db.normalizeId("productEvidence", ref.sourceId);
+    if (evidenceId === null) return false;
+    const evidence = await ctx.db.get(evidenceId);
+    if (
+      evidence === null ||
+      evidence.organizationId !== row.organizationId ||
+      evidence.projectId !== row.projectId ||
+      evidence.version !== ref.version ||
+      evidence.freshness !== "fresh" ||
+      evidence.verification !== "verified"
+    ) {
+      return false;
+    }
+    if (
+      evidence.candidateId !== undefined
+        ? evidence.candidateId !== row._id
+        : evidence.requirementId !== row.requirementId
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
 
 async function checkProductEvidenceRefs(
   ctx: F1MutationCtx,
@@ -493,9 +611,9 @@ function sameProductEvidenceFields(
   }
   // Legacy rows predate the immutable identity field. Their verification
   // transition may already have changed lastCheckedAt, so derive the
-  // migration-safe identity from the fields that were immutable in that
-  // schema. New rows use the strict normalized snapshot above, which also
-  // binds freshness and supplied check-time fields.
+  // migration-safe identity from the original source fields plus freshness.
+  // Freshness remains an ingestion input and must conflict when changed;
+  // lastCheckedAt is omitted because verification may have overwritten it.
   return (
     (existing.requirementId ?? undefined) === fields.requirementId &&
     (existing.candidateId ?? undefined) === fields.candidateId &&
@@ -505,6 +623,7 @@ function sameProductEvidenceFields(
     existing.capturedAt === fields.capturedAt &&
     existing.originalValue === fields.originalValue &&
     existing.normalizedValue === fields.normalizedValue &&
+    existing.freshness === fields.freshness &&
     existing.counterpartyRole === fields.counterpartyRole &&
     existing.executionMode === fields.executionMode &&
     existing.origin === fields.origin
@@ -592,45 +711,94 @@ async function invalidateDependentCompatibility(
     readonly candidateId?: Id<"candidates">;
   },
 ): Promise<{ ok: true } | { ok: false; code: "invalid-payload"; message: string }> {
-  const seen = new Set<string>();
-  const rows: {
+  type CandidateRow = {
     readonly _id: Id<"candidates">;
-    readonly compatibilityEvidenceRefs?: readonly {
-      readonly sourceId: string;
-      readonly version: string;
-      readonly locator?: string;
-    }[];
-  }[] = [];
-  const invalidate = async (row: {
-    readonly _id: Id<"candidates">;
-    readonly compatibilityEvidenceRefs?: readonly {
-      readonly sourceId: string;
-      readonly version: string;
-      readonly locator?: string;
-    }[];
-  }): Promise<void> => {
-    const refs = row.compatibilityEvidenceRefs ?? [];
-    if (refs.some((ref) => ref.sourceId === evidence._id)) {
-      await ctx.db.patch(row._id, {
-        compatibility: "unknown",
-        compatibilityEvidenceRefs: [],
-        compatibilityRequirementVersion: undefined,
-        compatibilityRuleVersion: undefined,
-      });
-    }
+    readonly organizationId: Id<"organizations">;
+    readonly projectId: Id<"projects">;
+    readonly compatibilityEvidenceRefs?: readonly CompatibilityEvidenceRef[];
   };
-  if (evidence.candidateId !== undefined) {
+  type CandidateInvalidation = {
+    readonly row: CandidateRow;
+    readonly bindingIds: Id<"compatibilityEvidenceBindings">[];
+  };
+  const rows = new Map<string, CandidateInvalidation>();
+  const staleBindingIds: Id<"compatibilityEvidenceBindings">[] = [];
+  const addCandidate = (
+    row: CandidateRow,
+    bindingId?: Id<"compatibilityEvidenceBindings">,
+  ): void => {
+    const existing = rows.get(row._id);
+    if (existing !== undefined) {
+      if (bindingId !== undefined) existing.bindingIds.push(bindingId);
+      return;
+    }
+    rows.set(row._id, {
+      row,
+      bindingIds: bindingId === undefined ? [] : [bindingId],
+    });
+  };
+
+  // New findings are addressed through the sparse reverse index. The
+  // MAX+1 read is the integrity gate for a dense dependent set, preserving
+  // the existing no-write denial instead of partially invalidating a tail.
+  const bindings = await ctx.db
+    .query("compatibilityEvidenceBindings")
+    .withIndex("by_evidence", (q) => q.eq("evidenceId", evidence._id))
+    .take(MAX_COMPATIBILITY_FANOUT + 1);
+  if (bindings.length > MAX_COMPATIBILITY_FANOUT) {
+    return {
+      ok: false,
+      code: "invalid-payload",
+      message: `compatibility fanout exceeds the supported bound of ${MAX_COMPATIBILITY_FANOUT}`,
+    };
+  }
+  for (const binding of bindings) {
+    if (
+      binding.organizationId !== evidence.organizationId ||
+      binding.projectId !== evidence.projectId
+    ) {
+      return {
+        ok: false,
+        code: "invalid-payload",
+        message: "compatibility evidence binding scope is inconsistent",
+      };
+    }
+    const candidate = await ctx.db.get(binding.candidateId);
+    if (
+      candidate === null ||
+      candidate.organizationId !== evidence.organizationId ||
+      candidate.projectId !== evidence.projectId
+    ) {
+      staleBindingIds.push(binding._id);
+      continue;
+    }
+    const citesEvidence = (candidate.compatibilityEvidenceRefs ?? [])
+      .some((ref) => ref.sourceId === evidence._id);
+    if (!citesEvidence) {
+      staleBindingIds.push(binding._id);
+      continue;
+    }
+    addCandidate(candidate, binding._id);
+  }
+
+  // Historical rows predate the child index. Keep their migration path
+  // bounded; once any current binding exists, the indexed set is complete
+  // for current writes and public reads derive stale status for old rows.
+  if (bindings.length === 0 && evidence.candidateId !== undefined) {
     const direct = await ctx.db.get(evidence.candidateId);
     if (
       direct !== null &&
       direct.organizationId === evidence.organizationId &&
-      direct.projectId === evidence.projectId
+      direct.projectId === evidence.projectId &&
+      (direct.compatibilityEvidenceRefs ?? []).some((ref) => ref.sourceId === evidence._id)
     ) {
-      seen.add(direct._id);
-      rows.push(direct);
+      addCandidate(direct);
     }
-  }
-  if (evidence.requirementId !== undefined) {
+  } else if (
+    bindings.length === 0 &&
+    evidence.candidateId === undefined &&
+    evidence.requirementId !== undefined
+  ) {
     const scoped = await ctx.db
       .query("candidates")
       .withIndex("by_requirement", (q) => q.eq("requirementId", evidence.requirementId as Id<"requirements">))
@@ -646,14 +814,23 @@ async function invalidateDependentCompatibility(
       if (
         row.organizationId === evidence.organizationId &&
         row.projectId === evidence.projectId &&
-        !seen.has(row._id)
+        (row.compatibilityEvidenceRefs ?? []).some((ref) => ref.sourceId === evidence._id)
       ) {
-        seen.add(row._id);
-        rows.push(row);
+        addCandidate(row);
       }
     }
   }
-  for (const row of rows) await invalidate(row);
+
+  for (const bindingId of staleBindingIds) await ctx.db.delete(bindingId);
+  for (const { row, bindingIds } of rows.values()) {
+    await ctx.db.patch(row._id, {
+      compatibility: "unknown",
+      compatibilityEvidenceRefs: [],
+      compatibilityRequirementVersion: undefined,
+      compatibilityRuleVersion: undefined,
+    });
+    for (const bindingId of bindingIds) await ctx.db.delete(bindingId);
+  }
   return { ok: true };
 }
 

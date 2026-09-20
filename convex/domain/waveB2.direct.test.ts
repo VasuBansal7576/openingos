@@ -475,6 +475,98 @@ describe("F1R-06 compatibility binds resolving versioned evidence", () => {
     expect(unrelated?.compatibility).toBe("pass");
   });
 
+  test("sparse indexed references remain resolvable beyond the candidate fanout bound", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, "compat-sparse-over-bound");
+    const asOwner = t.withIdentity(OWNER);
+    const graph = await setupGraph(t, project, "sparse-over-bound");
+    const shared = await recordFieldEvidence(
+      t,
+      project,
+      { requirementId: graph.requirementId },
+      "compat-sparse-shared",
+    );
+    if (!shared.ok) throw new Error("shared evidence setup failed");
+    const sharedVersion = await resolveVerified(t, project, shared.evidenceId);
+    const candidateIds: Id<"candidates">[] = [graph.candidateId];
+    for (let index = 1; index <= sourcing.MAX_COMPATIBILITY_FANOUT; index += 1) {
+      const created = await asOwner.mutation(recordCandidateRef, {
+        organizationId: project.orgId,
+        projectId: project.projectId,
+        requirementId: graph.requirementId,
+        vendorId: graph.vendorId,
+        productModel: `Model sparse-over-bound-${index}`,
+        variant: "220V",
+        conversationState: "draft",
+      });
+      if (!created.ok) throw new Error("candidate setup failed");
+      candidateIds.push(created.candidateId);
+    }
+    const tailCandidateId = candidateIds[candidateIds.length - 1];
+    if (tailCandidateId === undefined) throw new Error("tail candidate missing");
+    const specific = await recordFieldEvidence(
+      t,
+      project,
+      { candidateId: tailCandidateId },
+      "compat-sparse-specific",
+    );
+    if (!specific.ok) throw new Error("candidate evidence setup failed");
+    const specificVersion = await resolveVerified(t, project, specific.evidenceId);
+
+    expect((await verify(t, project, graph.candidateId, [
+      { sourceId: shared.evidenceId, version: sharedVersion },
+    ])).ok).toBe(true);
+    expect((await verify(t, project, tailCandidateId, [
+      { sourceId: shared.evidenceId, version: sharedVersion },
+      { sourceId: specific.evidenceId, version: specificVersion },
+    ])).ok).toBe(true);
+
+    const indexed = await t.run((ctx) =>
+      ctx.db
+        .query("compatibilityEvidenceBindings")
+        .withIndex("by_evidence", (q) => q.eq("evidenceId", shared.evidenceId))
+        .take(sourcing.MAX_COMPATIBILITY_FANOUT + 1),
+    );
+    expect(indexed).toHaveLength(2);
+    const conflicting = await recordFieldEvidence(
+      t,
+      project,
+      { requirementId: graph.requirementId },
+      "compat-sparse-conflict",
+    );
+    if (!conflicting.ok) throw new Error("conflicting evidence setup failed");
+    const disputed = await asOwner.mutation(linkEvidenceConflictRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      evidenceId: shared.evidenceId,
+      conflictingIds: [conflicting.evidenceId],
+    });
+    expect(disputed.ok).toBe(true);
+    expect((await t.run((ctx) => ctx.db.get(graph.candidateId)))?.compatibility).toBe("unknown");
+    expect((await t.run((ctx) => ctx.db.get(tailCandidateId)))?.compatibility).toBe("unknown");
+
+    // The candidate-specific index remains independently addressable after
+    // the shared requirement evidence has been disputed.
+    expect((await verify(t, project, tailCandidateId, [
+      { sourceId: specific.evidenceId, version: specificVersion },
+    ])).ok).toBe(true);
+    const specificConflict = await recordFieldEvidence(
+      t,
+      project,
+      { candidateId: tailCandidateId },
+      "compat-sparse-specific-conflict",
+    );
+    if (!specificConflict.ok) throw new Error("specific conflict setup failed");
+    const specificDisputed = await asOwner.mutation(linkEvidenceConflictRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      evidenceId: specific.evidenceId,
+      conflictingIds: [specificConflict.evidenceId],
+    });
+    expect(specificDisputed.ok).toBe(true);
+    expect((await t.run((ctx) => ctx.db.get(tailCandidateId)))?.compatibility).toBe("unknown");
+  });
+
   test("fanout above the integrity bound is denied before evidence or pass rows change", async () => {
     const t = convexTest(schema, modules);
     const project = await setupProject(t, "compat-fanout-boundary");
@@ -596,6 +688,7 @@ describe("F1R-07 replays compare the full material snapshot", () => {
       originalValue: "220V",
       normalizedValue: "220V",
       freshness: "fresh" as const,
+      lastCheckedAt: 7,
       counterpartyRole: "vendor" as const,
       idempotencyKey: "replay-legacy-identity",
     };
@@ -613,6 +706,13 @@ describe("F1R-07 replays compare the full material snapshot", () => {
     expect(afterReplay?.verification).toBe(beforeReplay?.verification);
     expect(afterReplay?.version).toBe(resolved);
     expect(afterReplay?.lastCheckedAt).toBe(beforeReplay?.lastCheckedAt);
+    expect(afterReplay?.freshness).toBe("fresh");
+    const changedFreshness = await t.withIdentity(OWNER).mutation(recordProductEvidenceRef, {
+      ...args,
+      freshness: "stale",
+    });
+    expect(changedFreshness.ok).toBe(false);
+    if (!changedFreshness.ok) expect(changedFreshness.code).toBe("duplicate-conflict");
   });
 
   test("each omitted evidence field conflicts on the public path", async () => {
