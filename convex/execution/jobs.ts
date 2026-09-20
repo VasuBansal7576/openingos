@@ -802,11 +802,17 @@ export const listUnresolvedOperations = f1Query({
       Date.now(),
     );
     if (!access.ok) return { ok: false as const, code: access.code, message: access.message };
-    const requested = args.limit ?? CANCELLATION_PAGE_SIZE;
-    const pageSize = Math.min(
-      CANCELLATION_PAGE_SIZE,
-      Math.max(1, Math.floor(requested)),
-    );
+    const requested = args.limit;
+    // Invalid supplied limits never reach pagination: NaN, Infinity,
+    // zero, negatives, and non-integers are denied, and the hard maximum
+    // of one bounded page still applies to large valid values.
+    let pageSize = CANCELLATION_PAGE_SIZE;
+    if (requested !== undefined) {
+      if (!Number.isSafeInteger(requested) || requested < 1) {
+        return { ok: false as const, code: "invalid-payload", message: "limit must be a positive safe integer" };
+      }
+      pageSize = Math.min(CANCELLATION_PAGE_SIZE, requested);
+    }
     const page = await ctx.db
       .query("operations")
       .withIndex("by_job", (q) => q.eq("jobId", args.jobId))

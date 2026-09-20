@@ -52,6 +52,7 @@ const modules = {
 type MutationArgs<T> = T extends RegisteredMutation<infer _V, infer A, infer _R> ? A : never;
 type MutationReturn<T> = T extends RegisteredMutation<infer _V, infer _A, infer R> ? R : never;
 type QueryArgs<T> = T extends RegisteredQuery<infer _V, infer A, infer _R> ? A : never;
+type QueryReturn<T> = T extends RegisteredQuery<infer _V, infer _A, infer R> ? R : never;
 
 const createOrganizationRef = makeFunctionReference<
   "mutation",
@@ -81,14 +82,12 @@ const cancelRef = makeFunctionReference<
 const getJobRef = makeFunctionReference<
   "query",
   QueryArgs<typeof jobs.get>,
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  any
+  Awaited<QueryReturn<typeof jobs.get>>
 >("execution/jobs:get");
 const listUnresolvedRef = makeFunctionReference<
   "query",
   QueryArgs<typeof jobs.listUnresolvedOperations>,
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  any
+  Awaited<QueryReturn<typeof jobs.listUnresolvedOperations>>
 >("execution/jobs:listUnresolvedOperations");
 const reserveRef = makeFunctionReference<
   "mutation",
@@ -383,6 +382,21 @@ describe("F1R-23 unresolved operation inventory", () => {
     expect(new Set(second.operationIds)).toEqual(new Set(tail));
     expect(second.isDone).toBe(true);
     expect(second.continueCursor).toBeNull();
+  });
+
+  test("invalid limits are denied before pagination and large limits clamp to one page", async () => {
+    const setup = await setupResearch();
+    const jobId = await startJob(setup);
+    await makeUnknown(setup, jobId, "unknown-0", 1);
+    for (const limit of [Number.NaN, Number.POSITIVE_INFINITY, 0, -3, 2.5]) {
+      const denied = await setup.asOwner.query(listUnresolvedRef, { jobId, limit });
+      expect(denied).toMatchObject({ ok: false, code: "invalid-payload" });
+    }
+    const clamped = await setup.asOwner.query(listUnresolvedRef, { jobId, limit: 1000 });
+    expect(clamped.ok).toBe(true);
+    if (!clamped.ok) throw new Error("clamped query failed");
+    expect(clamped.operationIds).toHaveLength(1);
+    expect(clamped.isDone).toBe(true);
   });
 
   test("the inventory requires authentication and project authorization", async () => {
