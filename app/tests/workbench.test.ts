@@ -3,35 +3,41 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import App from "../App";
 import WorkbenchView from "../Workbench";
-import {
-  formatMoney,
-  parseWorkbenchSnapshot,
-  type WorkbenchSnapshot,
-} from "../workbench-state";
+import { formatMoney, parseWorkbenchSnapshot } from "../workbench-state";
 
-const snapshot: WorkbenchSnapshot = {
+const projection = {
+  ok: true,
   project: {
-    id: "project-controlled-1",
+    id: "project-w1-1",
+    organizationId: "organization-w1-1",
     name: "Northside café",
-    region: "Netherlands",
+    visibility: "open",
+    location: {
+      id: "location-w1-1",
+      name: "Northside",
+      region: "Netherlands",
+      reportingCurrency: "EUR",
+      operatingStatus: "open",
+    },
     currency: "EUR",
     budgetMinorUnits: 900000,
     needByAt: Date.UTC(2026, 9, 12),
+    createdAt: Date.UTC(2026, 8, 1),
   },
-  access: {
-    role: "approver",
-    capabilities: {
-      canResearch: true,
-      canApprove: true,
-      canCommunicate: true,
-      canRecordOrder: false,
-      canResolveRisk: true,
-    },
+  effectiveRole: "approver",
+  capabilities: {
+    canResearch: true,
+    canRecordEvidence: true,
+    canRecordQuote: true,
+    canCompare: true,
+    canCommunicate: true,
+    canClarify: true,
   },
   requirements: [{
-    id: "requirement-machine",
+    id: "requirement-w1-1",
     key: "ESP-01",
     title: "Two-group espresso machine",
+    category: "equipment",
     quantity: "1",
     unit: "unit",
     priority: "P0",
@@ -39,66 +45,75 @@ const snapshot: WorkbenchSnapshot = {
     fulfillment: "notOrdered",
     version: 3,
     budgetMinorUnits: 900000,
+    currency: "EUR",
     needByAt: Date.UTC(2026, 9, 12),
   }],
-  offers: [{
-    id: "offer-controlled-1",
-    requirementId: "requirement-machine",
-    vendor: { id: "vendor-controlled-1", name: "Harbor Equipment", regions: ["NL"], serviceCoverage: "Service coverage reported for this inquiry" },
+  candidates: [{
+    id: "candidate-w1-1",
+    requirementId: "requirement-w1-1",
     productModel: "Atlas 2G",
     variant: "new · two-group",
     compatibility: "pass",
     conversationState: "quoteReceived",
-    quote: {
-      id: "quote-controlled-1",
+    vendor: { id: "vendor-w1-1", name: "Harbor Equipment", regions: ["NL"], serviceCoverage: "Service coverage reported for this inquiry" },
+    latestValidQuote: {
+      id: "quote-w1-1",
       version: "2",
       currency: "EUR",
-      lines: [{ lineId: "machine", description: "Atlas 2G", quantity: "1", unit: "unit", unitMinorUnits: 795000, evidenceIds: ["evidence-controlled-1"] }],
+      lines: [{ lineId: "machine", description: "Atlas 2G", quantity: "1", unitPrice: { currency: "EUR", minorUnits: 795000 } }],
       charges: [
-        { kind: "equipment", state: "known", minorUnits: 795000, currency: "EUR", scope: "line", evidenceIds: ["evidence-controlled-1"] },
-        { kind: "delivery", state: "included", minorUnits: null, currency: "EUR", scope: "quote", evidenceIds: ["evidence-controlled-1"] },
-        { kind: "installation", state: "unknown", minorUnits: null, currency: "EUR", scope: "quote", evidenceIds: [] },
+        { chargeId: "charge-equipment", label: "equipment", scope: { kind: "line", lineId: "machine" }, state: { kind: "known", amount: { currency: "EUR", minorUnits: 795000 } } },
+        { chargeId: "charge-delivery", label: "delivery", scope: { kind: "quote" }, state: { kind: "included", coveringId: "charge-equipment" } },
+        { chargeId: "charge-installation", label: "installation", scope: { kind: "quote" }, state: { kind: "unknown", reason: "Supplier did not confirm installation." } },
       ],
-      totalMinorUnits: null,
-      comparableTotalMinorUnits: null,
-      validUntil: null,
-      taxBasis: "inclusive",
-      superseded: false,
+      taxBasis: { kind: "inclusive", basisId: "tax-w1-1" },
+      createdAt: Date.UTC(2026, 8, 20),
+      provenance: { mode: "recorded", label: "Recorded owner exchange", ownerAuthoredTerms: true },
     },
     evidence: [{
-      id: "evidence-controlled-1",
-      label: "Supplier terms, version 2",
+      id: "product-evidence-w1-1",
+      field: "installation",
       sourceKind: "owner mailbox exchange",
-      freshness: "fresh",
+      capturedAt: Date.UTC(2026, 8, 20),
+      completeness: "complete",
       verification: "verified",
-      executionMode: "recorded",
+      freshness: "fresh",
+      lastCheckedAt: Date.UTC(2026, 8, 20),
       counterpartyRole: "ownerStandIn",
-      origin: "ownerImport",
-      sourceUrl: null,
+      executionMode: "recorded",
     }],
-    provenance: "recorded",
-    ownerAuthoredTerms: true,
-    recommendationNote: "Installation still needs confirmation.",
+    provenance: { mode: "recorded", label: "Recorded owner exchange", ownerAuthoredTerms: true },
   }],
   jobs: [
-    { id: "job-queued", kind: "research", state: "queued", delivery: "queued", progress: 0.2, attempts: 1, updatedAt: Date.UTC(2026, 8, 20), failureCode: null, lastCheckedAt: null, summary: "Research branch is queued", evidenceIds: [] },
-    { id: "job-sent", kind: "communication", state: "waiting", delivery: "sent", progress: null, attempts: 1, updatedAt: Date.UTC(2026, 8, 20), failureCode: null, lastCheckedAt: Date.UTC(2026, 8, 20), summary: "Owner-only RFQ was sent", evidenceIds: [] },
-    { id: "job-delivered", kind: "communication", state: "completed", delivery: "delivered", progress: 1, attempts: 1, updatedAt: Date.UTC(2026, 8, 20), failureCode: null, lastCheckedAt: Date.UTC(2026, 8, 20), summary: "Reply receipt was recorded", evidenceIds: ["evidence-controlled-1"] },
-    { id: "job-unknown", kind: "communication", state: "failed", delivery: "unknown", progress: null, attempts: 2, updatedAt: Date.UTC(2026, 8, 20), failureCode: "provider-outcome-unknown", lastCheckedAt: Date.UTC(2026, 8, 20), summary: "Send outcome needs reconciliation", evidenceIds: [] },
-    { id: "job-partial", kind: "recovery", state: "paused", delivery: "partial", progress: 0.5, attempts: 2, updatedAt: Date.UTC(2026, 8, 20), failureCode: "partial-result", lastCheckedAt: Date.UTC(2026, 8, 20), summary: "Completed evidence retained", evidenceIds: [] },
-    { id: "job-paused", kind: "recovery", state: "paused", delivery: "paused", progress: null, attempts: 1, updatedAt: Date.UTC(2026, 8, 20), failureCode: "approval-required", lastCheckedAt: null, summary: "Recovery waits for approval", evidenceIds: [] },
+    { id: "job-queued", kind: "research", status: "queued", createdAt: Date.UTC(2026, 8, 20), updatedAt: Date.UTC(2026, 8, 20), grantVersion: 1, attempts: [] },
+    { id: "job-sent", kind: "communication", status: "sent", createdAt: Date.UTC(2026, 8, 20), updatedAt: Date.UTC(2026, 8, 20), grantVersion: 1, attempts: [{ state: "observedSuccess", createdAt: Date.UTC(2026, 8, 20) }] },
+    { id: "job-delivered", kind: "communication", status: "delivered", createdAt: Date.UTC(2026, 8, 20), updatedAt: Date.UTC(2026, 8, 20), grantVersion: 1, attempts: [{ state: "observedSuccess", createdAt: Date.UTC(2026, 8, 20), observedAt: Date.UTC(2026, 8, 20) }] },
+    { id: "job-unknown", kind: "communication", status: "unknown", createdAt: Date.UTC(2026, 8, 20), updatedAt: Date.UTC(2026, 8, 20), grantVersion: 1, attempts: [{ state: "outcomeUnknown", createdAt: Date.UTC(2026, 8, 20) }] },
+    { id: "job-partial", kind: "recovery", status: "partial", createdAt: Date.UTC(2026, 8, 20), updatedAt: Date.UTC(2026, 8, 20), grantVersion: 1, attempts: [{ state: "observedSuccess", createdAt: Date.UTC(2026, 8, 20) }] },
+    { id: "job-paused", kind: "recovery", status: "paused", createdAt: Date.UTC(2026, 8, 20), updatedAt: Date.UTC(2026, 8, 20), grantVersion: 1, attempts: [] },
   ],
-  decisions: [{ id: "decision-1", type: "approval", state: "requested", requirementId: "requirement-machine", offerId: "offer-controlled-1", quoteId: "quote-controlled-1", quoteVersion: "2", requestedAt: Date.UTC(2026, 8, 20), evidenceIds: ["evidence-controlled-1"], summary: "Review Atlas 2G quote v2", authorizationRequired: true }],
-  activity: { items: [{ id: "event-1", type: "quote", occurredAt: Date.UTC(2026, 8, 20), actorLabel: "Project owner", state: "recorded", summary: "Quote v2 was recorded", evidenceIds: ["evidence-controlled-1"] }], continueCursor: null, isDone: true },
+  decisions: [{ id: "approval-w1-1", kind: "approval", state: "requested", quoteId: "quote-w1-1", createdAt: Date.UTC(2026, 8, 20) }],
+  activity: { page: [{ id: "event-w1-1", kind: "quoteRecorded", createdAt: Date.UTC(2026, 8, 20) }], continueCursor: null, isDone: true },
+  requirementsTruncated: false,
+  candidatesTruncated: false,
+  jobsTruncated: false,
+  decisionsTruncated: false,
   provenance: { mode: "recorded", label: "Recorded owner exchange", ownerAuthoredTerms: true },
-  selectedOfferId: null,
-  selectedForecastMinorUnits: null,
-  committedMinorUnits: 0,
-  paidMinorUnits: 0,
-  deliveredQuantityByRequirement: { "requirement-machine": "0" },
 };
 
-test("renders a project-scoped workbench from server state with honest provenance", () => {
+test("accepts the exact W1 projection without inventing aggregates or authority", () => {
+  const snapshot = parseWorkbenchSnapshot(projection, projection.project.id);
+  expect(snapshot?.project.id).toBe(projection.project.id);
+  expect(snapshot?.offers[0]?.quote?.comparableTotalMinorUnits).toBeNull();
+  expect(snapshot?.committedMinorUnits).toBeNull();
+  expect(snapshot?.access.capabilities.canApprove).toBeNull();
+  expect(snapshot?.jobs.map((job) => job.delivery)).toEqual(["queued", "sent", "delivered", "unknown", "partial", "paused"]);
+  expect(snapshot?.activity.items[0]?.summary).toBeNull();
+});
+
+test("renders a project-scoped workbench from W1 state with honest provenance", () => {
+  const snapshot = parseWorkbenchSnapshot(projection, projection.project.id);
+  if (snapshot === null) throw new Error("W1 projection should parse");
   const html = renderToStaticMarkup(createElement(WorkbenchView, { loadState: { state: "ready", snapshot } }));
   expect(html).toContain("Everything on the table.");
   expect(html).toContain("Recorded owner exchange");
@@ -119,10 +134,11 @@ test("keeps a connected app honest when no projection is available", () => {
   expect(html).not.toContain("Harbor Equipment");
 });
 
-test("rejects cross-project and private projection payloads at the adapter boundary", () => {
-  expect(parseWorkbenchSnapshot(snapshot, "different-project")).toBeNull();
-  expect(parseWorkbenchSnapshot({ ...snapshot, project: { ...snapshot.project }, ownerEmail: "private@example.test" }, snapshot.project.id)).toBeNull();
-  expect(parseWorkbenchSnapshot(snapshot, snapshot.project.id)?.project.id).toBe(snapshot.project.id);
+test("rejects malformed, cross-project, and private W1 projection payloads", () => {
+  expect(parseWorkbenchSnapshot(projection, "different-project")).toBeNull();
+  expect(parseWorkbenchSnapshot({ ...projection, project: { ...projection.project, ownerEmail: "private@example.test" } }, projection.project.id)).toBeNull();
+  expect(parseWorkbenchSnapshot({ ...projection, candidates: [{ ...projection.candidates[0], latestValidQuote: { ...projection.candidates[0]!.latestValidQuote!, charges: [{ ...projection.candidates[0]!.latestValidQuote!.charges[0], state: { kind: "known", amount: null } }] } }] }, projection.project.id)).toBeNull();
+  expect(parseWorkbenchSnapshot({ ...projection, activity: { ...projection.activity, page: [{ id: "event-w1-1", kind: "quoteRecorded", createdAt: "not-a-time" }] } }, projection.project.id)).toBeNull();
 });
 
 test("formats unknown money without turning missing charges into zero", () => {
