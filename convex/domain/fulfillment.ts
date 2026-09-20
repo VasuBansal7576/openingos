@@ -32,6 +32,7 @@ import {
   orderInputValidator,
   serviceCaseInputValidator,
 } from "../shared/domainContracts.js";
+import { checkMoney } from "../shared/money.js";
 import { requireDomainAccess, requireOwnedRef } from "./guards.js";
 
 const orderResultValidator = v.union(
@@ -313,14 +314,18 @@ export const recordCostEntry = f1Mutation({
     if (args.idempotencyKey.trim().length === 0) {
       return { ok: false as const, code: "invalid-payload", message: "idempotency key required" };
     }
-    if (!Number.isInteger(args.amount.minorUnits)) {
-      return { ok: false as const, code: "invalid-payload", message: "minor units must be an integer" };
+    // F1R-09: cost-entry money validates through the accepted
+    // proofs/money contract before any write. Nonfinite, fractional,
+    // or unsafe minor units and invalid currency are denied; zero and
+    // negative amounts are forbidden for every entry kind.
+    let checkedAmount: { currency: string; minorUnits: number };
+    try {
+      checkedAmount = checkMoney(args.amount, "entry amount");
+    } catch {
+      return { ok: false as const, code: "invalid-payload", message: "entry amount is invalid" };
     }
-    if (args.amount.minorUnits <= 0) {
+    if (checkedAmount.minorUnits <= 0) {
       return { ok: false as const, code: "invalid-payload", message: "entry amount must be positive" };
-    }
-    if (args.amount.currency.trim().length === 0) {
-      return { ok: false as const, code: "invalid-payload", message: "currency required" };
     }
     const existing = await ctx.db
       .query("costEntries")
@@ -337,8 +342,8 @@ export const recordCostEntry = f1Mutation({
       if (
         existing.orderId !== args.orderId ||
         existing.kind !== args.kind ||
-        existing.amount.currency !== args.amount.currency ||
-        existing.amount.minorUnits !== args.amount.minorUnits ||
+        existing.amount.currency !== checkedAmount.currency ||
+        existing.amount.minorUnits !== checkedAmount.minorUnits ||
         !sameLink
       ) {
         return { ok: false as const, code: "duplicate-conflict", message: "idempotency key already used with different fields" };
@@ -372,7 +377,7 @@ export const recordCostEntry = f1Mutation({
     ) {
       return { ok: false as const, code: "denied-project", message: "quote is not in this project" };
     }
-    if (args.amount.currency !== quote.currency) {
+    if (checkedAmount.currency !== quote.currency) {
       return { ok: false as const, code: "invalid-payload", message: "mixed-currency-requires-accepted-conversion-basis" };
     }
     if (args.linkedEntryId !== undefined) {
@@ -391,7 +396,7 @@ export const recordCostEntry = f1Mutation({
       projectId: args.projectId,
       orderId: args.orderId,
       kind: args.kind,
-      amount: { currency: args.amount.currency, minorUnits: args.amount.minorUnits },
+      amount: { currency: checkedAmount.currency, minorUnits: checkedAmount.minorUnits },
       idempotencyKey: args.idempotencyKey,
       ...(args.linkedEntryId === undefined ? {} : { linkedEntryId: args.linkedEntryId }),
       recordedBy: access.value.identity,
