@@ -1876,7 +1876,7 @@ describe("F1R-15 adjustment quantity and unit bind to the order line", () => {
     if (!matching.ok) throw new Error(`matching credit failed: ${JSON.stringify(matching)}`);
   });
 
-  test("legacy unit-less order lines accept any nonempty affected unit", async () => {
+  test("legacy unit-less order lines deny new unresolved-unit credit authority", async () => {
     const t = convexTest(schema, modules);
     const project = await setupProject(t, "adjust-legacy-unit");
     const graph = await setupTwoLineGraph(t, project, "adjust-legacy-unit");
@@ -1914,6 +1914,11 @@ describe("F1R-15 adjustment quantity and unit bind to the order line", () => {
       completeness: "complete",
     });
     if (!note.ok) throw new Error("evidence setup failed");
+    // A fresh scope-less scalar order stores an empty unit, which
+    // authorizes nothing new: a quantity-bound credit claiming any
+    // affected unit is denied with no write instead of inventing a
+    // unit mapping.
+    const before = await tableCounts(t, project);
     const credit = await asOwner.mutation(recordCostEntryRef, {
       organizationId: project.orgId,
       projectId: project.projectId,
@@ -1926,7 +1931,8 @@ describe("F1R-15 adjustment quantity and unit bind to the order line", () => {
       affectedUnit: "widget",
       evidenceRefs: [{ evidenceId: note.evidenceId, contentHash: noteHash }],
     });
-    if (!credit.ok) throw new Error(`legacy-unit credit failed: ${JSON.stringify(credit)}`);
+    expect(credit).toMatchObject({ ok: false, code: "invalid-payload" });
+    expect(await tableCounts(t, project)).toEqual(before);
   });
 });
 
@@ -2276,6 +2282,75 @@ describe("F1R-17 historical pre-F1R13 commands replay before new-write validatio
     const freshCredit = await asOwner.mutation(recordCostEntryRef, { ...historicCredit, idempotencyKey: "fresh-credit" });
     expect(freshCredit).toMatchObject({ ok: false, code: "invalid-payload" });
     expect(await tableCounts(t, project)).toEqual(before);
+  });
+
+  test("lineage preserves scalar mirrors for old multi-line scalar order and acceptance", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, "scalar-mirrors");
+    const graph = await setupTwoLineGraph(t, project, "scalar-mirrors");
+    const asOwner = t.withIdentity(OWNER);
+    // Genuine historical shapes: scalar selection, order, and acceptance
+    // behind a two-line quote, with no line mappings invented.
+    const historicSelection = {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      requirementId: graph.requirementId,
+      candidateId: graph.candidateId,
+      quoteId: graph.quoteId,
+      quoteVersion: "v-scalar-mirrors",
+      quantity: "1",
+      requirementVersion: 1,
+      idempotencyKey: "old-selection",
+    };
+    const selectionId = await t.run((ctx) =>
+      ctx.db.insert("selections", { ...historicSelection, actor: OWNER.tokenIdentifier, createdAt: Date.now() }),
+    );
+    const historicOrder = {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      selectionId,
+      orderedQuantity: "1",
+      idempotencyKey: "old-order",
+    };
+    const orderId = await t.run((ctx) =>
+      ctx.db.insert("orders", {
+        ...historicOrder,
+        requirementId: graph.requirementId,
+        quoteId: graph.quoteId,
+        quoteVersion: "v-scalar-mirrors",
+        requirementVersion: 1,
+        state: "recorded" as const,
+        amendmentCount: 0,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      }),
+    );
+    await t.run((ctx) =>
+      ctx.db.insert("orderEvents", {
+        organizationId: project.orgId,
+        projectId: project.projectId,
+        orderId,
+        kind: "acceptance" as const,
+        acceptedQuantity: "0.5",
+        idempotencyKey: "old-acceptance",
+        recordedBy: OWNER.tokenIdentifier,
+        createdAt: Date.now(),
+      }),
+    );
+    // The summary preserves the original scalars explicitly instead of
+    // reporting successful empty lines and totals.
+    const lineage = await asOwner.query(getOrderLineageRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      orderId,
+    });
+    if (!lineage.ok) throw new Error(`scalar lineage failed: ${JSON.stringify(lineage)}`);
+    expect(lineage.order.orderedQuantity).toBe("1");
+    expect(lineage.orderLines).toEqual([]);
+    expect(lineage.events).toHaveLength(1);
+    expect(lineage.events[0]?.acceptedQuantity).toBe("0.5");
+    expect(lineage.events[0]?.acceptanceLines).toEqual([]);
+    expect(lineage.acceptedByLine).toEqual([]);
   });
 });
 
