@@ -139,6 +139,55 @@ test("wires the bounded project discovery query and validates a W1 projection lo
   expect(watchArgs).toHaveLength(0);
 });
 
+test("follows native project-list cursors until a later accessible project is found", async () => {
+  const queryArgs: unknown[] = [];
+  const pages: unknown[] = [
+    { ok: true, projects: [], continueCursor: "project-cursor-1", isDone: false },
+    { ok: true, projects: [], continueCursor: "project-cursor-2", isDone: false },
+    accessibleProjects("project-later"),
+  ];
+  const adapter = createConvexWorkbenchAdapter({
+    query: async (_reference: unknown, args: unknown) => {
+      queryArgs.push(args);
+      return pages.shift() ?? null;
+    },
+    watchQuery: () => controlledWatch(() => projection()).watch,
+  } as unknown as ConvexWorkbenchClient);
+
+  await expect(adapter.discoverProject()).resolves.toBe("project-later");
+  expect(queryArgs).toEqual([
+    { limit: 1 },
+    { cursor: "project-cursor-1", limit: 1 },
+    { cursor: "project-cursor-2", limit: 1 },
+  ]);
+});
+
+test("stops project discovery on a repeated cursor or bounded page limit", async () => {
+  const repeatedArgs: unknown[] = [];
+  const repeated = createConvexWorkbenchAdapter({
+    query: async (_reference: unknown, args: unknown) => {
+      repeatedArgs.push(args);
+      return { ok: true, projects: [], continueCursor: "same-cursor", isDone: false };
+    },
+    watchQuery: () => controlledWatch(() => projection()).watch,
+  } as unknown as ConvexWorkbenchClient);
+  await expect(repeated.discoverProject()).rejects.toThrow("repeated accessible-project cursor");
+  expect(repeatedArgs).toHaveLength(2);
+
+  let pageNumber = 0;
+  const boundedArgs: unknown[] = [];
+  const bounded = createConvexWorkbenchAdapter({
+    query: async (_reference: unknown, args: unknown) => {
+      boundedArgs.push(args);
+      pageNumber += 1;
+      return { ok: true, projects: [], continueCursor: `cursor-${pageNumber}`, isDone: false };
+    },
+    watchQuery: () => controlledWatch(() => projection()).watch,
+  } as unknown as ConvexWorkbenchClient);
+  await expect(bounded.discoverProject()).rejects.toThrow("page safety limit");
+  expect(boundedArgs).toHaveLength(32);
+});
+
 test("rejects malformed and cross-project projections at the adapter boundary", async () => {
   const queryArgs: unknown[] = [];
   const watchArgs: unknown[] = [];

@@ -178,17 +178,23 @@ function Header({ activeTab, project, onTabChange, onOpenAssistant }: { readonly
 function OverviewStrip({ snapshot }: { readonly snapshot: WorkbenchSnapshot }) {
   const budget = snapshot.project.budgetMinorUnits;
   const forecast = snapshot.selectedForecastMinorUnits;
-  const readiness = snapshot.requirements.length === 0
+  const requirementsTruncated = snapshot.truncation.requirements;
+  const readiness = requirementsTruncated
     ? null
-    : Math.round((snapshot.requirements.filter((requirement) => requirement.fulfillment === "commissioned").length / snapshot.requirements.length) * 100);
+    : snapshot.requirements.length === 0
+      ? null
+      : Math.round((snapshot.requirements.filter((requirement) => requirement.fulfillment === "commissioned").length / snapshot.requirements.length) * 100);
   return (
-    <section className="wb-overview-strip" aria-label="Project financial overview">
-      <div className="wb-overview-intro"><span className="wb-eyebrow">PROCUREMENT READINESS</span><strong>{readiness === null ? "Not assessed" : `${readiness}%`}</strong><span>{snapshot.requirements.length === 0 ? "No requirements in scope" : `${snapshot.requirements.length} requirement${snapshot.requirements.length === 1 ? "" : "s"} · P0 blockers stay visible`}</span></div>
+    <>
+      <section className="wb-overview-strip" aria-label="Project financial overview">
+        <div className="wb-overview-intro"><span className="wb-eyebrow">PROCUREMENT READINESS</span><strong>{requirementsTruncated ? "Unavailable" : readiness === null ? "Not assessed" : `${readiness}%`}</strong><span>{requirementsTruncated ? `Showing ${snapshot.requirements.length} visible requirement${snapshot.requirements.length === 1 ? "" : "s"} · complete project scope unavailable` : snapshot.requirements.length === 0 ? "No requirements in scope" : `${snapshot.requirements.length} requirement${snapshot.requirements.length === 1 ? "" : "s"} · P0 blockers stay visible`}</span></div>
       <div className="wb-metric"><span>Approved budget</span><strong>{formatMoney(budget, snapshot.project.currency)}</strong><small>Planning allocation</small></div>
       <div className="wb-metric"><span>Selected forecast</span><strong>{formatMoney(forecast, snapshot.project.currency)}</strong><small>Expected, not yet ordered</small></div>
       <div className="wb-metric"><span>Committed</span><strong>{formatMoney(snapshot.committedMinorUnits, snapshot.project.currency)}</strong><small>Recorded orders only</small></div>
       <div className="wb-metric"><span>Paid</span><strong>{formatMoney(snapshot.paidMinorUnits, snapshot.project.currency)}</strong><small>Confirmed payments</small></div>
-    </section>
+      </section>
+      {requirementsTruncated ? <div className="wb-inline-warning" role="status"><Icon name="warning" size={16} /> Readiness unavailable: the requirements page is truncated and no complete authoritative aggregate was supplied.</div> : null}
+    </>
   );
 }
 

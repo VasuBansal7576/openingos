@@ -131,6 +131,24 @@ test("renders a project-scoped workbench from W1 state with honest provenance", 
   expect(html).not.toContain("providerId");
 });
 
+test("does not claim project-wide readiness from a truncated requirement page", () => {
+  const snapshot = parseWorkbenchSnapshot({
+    ...projection,
+    requirements: [{ ...projection.requirements[0]!, fulfillment: "commissioned", state: "fulfilled" }],
+    requirementsTruncated: true,
+  }, projection.project.id);
+  if (snapshot === null) throw new Error("Truncated W1 projection should parse");
+
+  const html = renderToStaticMarkup(createElement(WorkbenchView, {
+    loadState: { state: "ready", snapshot },
+  }));
+  expect(html).toContain("Readiness unavailable");
+  expect(html).toContain("requirements page is truncated");
+  expect(html).toContain("complete project scope unavailable");
+  expect(html).not.toContain("100%");
+  expect(html).not.toContain("P0 blockers stay visible");
+});
+
 test("keeps a connected app honest when no projection is available", () => {
   const html = renderToStaticMarkup(createElement(App, {
     backendStatus: "connected",
@@ -501,6 +519,201 @@ test("discards stale head responses and failures after a live update", async () 
     else actEnvironment.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment;
   }
 });
+
+test("fences load-older fulfillment and rejection after a same-project adapter replacement", async () => {
+  const page = (projectName: string, eventId: string, continueCursor: string | null, isDone: boolean) => ({
+    ...projection,
+    project: { ...projection.project, name: projectName },
+    activity: {
+      page: [{ id: eventId, kind: "quoteRecorded", createdAt: Date.UTC(2026, 8, 20) }],
+      continueCursor,
+      isDone,
+    },
+  });
+  interface PendingLoad {
+    readonly resolve: (value: unknown) => void;
+    readonly reject: (error: unknown) => void;
+  }
+  const makeAdapter = () => {
+    const loads: PendingLoad[] = [];
+    const adapter = {
+      load: (_projectId: string, _cursor?: string | null) => new Promise<unknown>((resolve, reject) => {
+        loads.push({ resolve, reject });
+      }),
+      subscribe: (_projectId: string, _onSnapshot: (snapshot: unknown) => void, _onError: (error: unknown) => void) => () => {},
+      act: async () => ({ ok: true }),
+    };
+    return { adapter, loads };
+  };
+  const first = makeAdapter();
+  const replacement = makeAdapter();
+
+  const dom = new HappyWindow({ url: "https://openingos.test/" });
+  const previousWindow = globalThis.window;
+  const previousDocument = globalThis.document;
+  const previousNavigator = globalThis.navigator;
+  const actEnvironment = globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean };
+  const previousActEnvironment = actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+  const browserGlobals = globalThis as unknown as { window: unknown; document: unknown; navigator: unknown };
+  browserGlobals.window = dom as unknown as globalThis.Window;
+  browserGlobals.document = dom.document as unknown as globalThis.Document;
+  browserGlobals.navigator = dom.navigator as unknown as globalThis.Navigator;
+  actEnvironment.IS_REACT_ACT_ENVIRONMENT = true;
+  const container = dom.document.createElement("div");
+  dom.document.body.append(container);
+  const root = createRoot(container as unknown as globalThis.Element);
+  const loadMore = () => Array.from(container.querySelectorAll("button")).find((button) => button.textContent?.includes("Load older activity"));
+
+  try {
+    await act(async () => {
+      root.render(createElement(AdapterAwareApp, {
+        backendStatus: "connected",
+        onRetry: () => undefined,
+        projectId: projection.project.id,
+        workbenchAdapter: first.adapter,
+      }));
+    });
+    await act(async () => {
+      first.loads[0]?.resolve(page("Original project", "event-head", "old-cursor", false));
+    });
+    await act(async () => {
+      loadMore()?.dispatchEvent(new dom.window.Event("click", { bubbles: true }));
+      loadMore()?.dispatchEvent(new dom.window.Event("click", { bubbles: true }));
+    });
+    expect(first.loads).toHaveLength(3);
+
+    await act(async () => {
+      root.render(createElement(AdapterAwareApp, {
+        backendStatus: "connected",
+        onRetry: () => undefined,
+        projectId: projection.project.id,
+        workbenchAdapter: replacement.adapter,
+      }));
+    });
+    expect(replacement.loads).toHaveLength(1);
+    await act(async () => {
+      replacement.loads[0]?.resolve(page("Replacement project", "event-replacement", null, true));
+    });
+
+    await act(async () => {
+      first.loads[1]?.resolve(page("Stale old page", "event-stale", null, true));
+    });
+    await act(async () => {
+      first.loads[2]?.reject(new Error("stale old page failure"));
+    });
+    expect(container.textContent).toContain("Replacement project");
+    expect(container.textContent).not.toContain("stale old page failure");
+    expect(container.querySelectorAll(".wb-activity-item")).toHaveLength(1);
+  } finally {
+    await act(async () => {
+      root.unmount();
+    });
+    browserGlobals.window = previousWindow;
+    browserGlobals.document = previousDocument;
+    browserGlobals.navigator = previousNavigator;
+    if (previousActEnvironment === undefined) delete actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+    else actEnvironment.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment;
+  }
+});
+
+test("fences load-older fulfillment and rejection across a same-project reconnect", async () => {
+  const page = (projectName: string, eventId: string, continueCursor: string | null, isDone: boolean) => ({
+    ...projection,
+    project: { ...projection.project, name: projectName },
+    activity: {
+      page: [{ id: eventId, kind: "quoteRecorded", createdAt: Date.UTC(2026, 8, 20) }],
+      continueCursor,
+      isDone,
+    },
+  });
+  interface PendingLoad {
+    readonly resolve: (value: unknown) => void;
+    readonly reject: (error: unknown) => void;
+  }
+  const loads: PendingLoad[] = [];
+  const adapter = {
+    load: (_projectId: string, _cursor?: string | null) => new Promise<unknown>((resolve, reject) => {
+      loads.push({ resolve, reject });
+    }),
+    subscribe: (_projectId: string, _onSnapshot: (snapshot: unknown) => void, _onError: (error: unknown) => void) => () => {},
+    act: async () => ({ ok: true }),
+  };
+
+  const dom = new HappyWindow({ url: "https://openingos.test/" });
+  const previousWindow = globalThis.window;
+  const previousDocument = globalThis.document;
+  const previousNavigator = globalThis.navigator;
+  const actEnvironment = globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean };
+  const previousActEnvironment = actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+  const browserGlobals = globalThis as unknown as { window: unknown; document: unknown; navigator: unknown };
+  browserGlobals.window = dom as unknown as globalThis.Window;
+  browserGlobals.document = dom.document as unknown as globalThis.Document;
+  browserGlobals.navigator = dom.navigator as unknown as globalThis.Navigator;
+  actEnvironment.IS_REACT_ACT_ENVIRONMENT = true;
+  const container = dom.document.createElement("div");
+  dom.document.body.append(container);
+  const root = createRoot(container as unknown as globalThis.Element);
+  const loadMore = () => Array.from(container.querySelectorAll("button")).find((button) => button.textContent?.includes("Load older activity"));
+
+  try {
+    await act(async () => {
+      root.render(createElement(AdapterAwareApp, {
+        backendStatus: "connected",
+        onRetry: () => undefined,
+        projectId: projection.project.id,
+        workbenchAdapter: adapter,
+      }));
+    });
+    await act(async () => {
+      loads[0]?.resolve(page("Original project", "event-head", "old-cursor", false));
+    });
+    await act(async () => {
+      loadMore()?.dispatchEvent(new dom.window.Event("click", { bubbles: true }));
+      loadMore()?.dispatchEvent(new dom.window.Event("click", { bubbles: true }));
+    });
+    expect(loads).toHaveLength(3);
+
+    await act(async () => {
+      root.render(createElement(AdapterAwareApp, {
+        backendStatus: "reconnecting",
+        onRetry: () => undefined,
+        projectId: projection.project.id,
+        workbenchAdapter: adapter,
+      }));
+    });
+    await act(async () => {
+      root.render(createElement(AdapterAwareApp, {
+        backendStatus: "connected",
+        onRetry: () => undefined,
+        projectId: projection.project.id,
+        workbenchAdapter: adapter,
+      }));
+    });
+    expect(loads).toHaveLength(4);
+    await act(async () => {
+      loads[3]?.resolve(page("Reconnected project", "event-reconnected", null, true));
+    });
+    await act(async () => {
+      loads[1]?.resolve(page("Stale reconnect page", "event-stale-reconnect", null, true));
+    });
+    await act(async () => {
+      loads[2]?.reject(new Error("stale reconnect failure"));
+    });
+    expect(container.textContent).toContain("Reconnected project");
+    expect(container.textContent).not.toContain("stale reconnect failure");
+    expect(container.querySelectorAll(".wb-activity-item")).toHaveLength(1);
+  } finally {
+    await act(async () => {
+      root.unmount();
+    });
+    browserGlobals.window = previousWindow;
+    browserGlobals.document = previousDocument;
+    browserGlobals.navigator = previousNavigator;
+    if (previousActEnvironment === undefined) delete actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+    else actEnvironment.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment;
+  }
+});
+
 test("places activity pagination in the activity area instead of supplier results", () => {
   const snapshot = parseWorkbenchSnapshot({
     ...projection,
