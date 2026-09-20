@@ -74,22 +74,37 @@ async function hasCurrentOrganizationOwner(
     )
     .order("desc")
     .first();
-  if (projected !== null) {
-    return projected.expiresAt === undefined || !isExpired(now, projected.expiresAt);
-  }
-  const legacy = await ctx.db
+  const legacyPermanent = await ctx.db
     .query("memberships")
-    .withIndex("by_organization_and_identity_and_project_and_status_and_role", (q) =>
+    .withIndex("by_organization_and_identity_and_project_and_status_and_role_and_expires_at", (q) =>
       q
         .eq("organizationId", organizationId)
         .eq("identity", identity)
         .eq("projectId", undefined)
         .eq("status", "active")
-        .eq("role", "owner"),
+        .eq("role", "owner")
+        .eq("expiresAt", undefined),
     )
     .order("desc")
     .first();
-  return legacy !== null && (legacy.expiresAt === undefined || !isExpired(now, legacy.expiresAt));
+  const legacyCurrentTemporary = await ctx.db
+    .query("memberships")
+    .withIndex("by_organization_and_identity_and_project_and_status_and_role_and_expires_at", (q) =>
+      q
+        .eq("organizationId", organizationId)
+        .eq("identity", identity)
+        .eq("projectId", undefined)
+        .eq("status", "active")
+        .eq("role", "owner")
+        .gt("expiresAt", now),
+    )
+    .order("desc")
+    .first();
+  return [
+    ...(projected === null ? [] : [projected.expiresAt]),
+    ...(legacyPermanent === null ? [] : [legacyPermanent.expiresAt]),
+    ...(legacyCurrentTemporary === null ? [] : [legacyCurrentTemporary.expiresAt]),
+  ].some((expiresAt) => expiresAt === undefined || !isExpired(now, expiresAt));
 }
 
 /** Caller's own role for a project (proves isolation on direct calls). */

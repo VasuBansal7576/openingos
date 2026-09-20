@@ -99,15 +99,24 @@ function authorityFromProjection(row: {
     : { role: row.role, authorityUntil: row.authorityUntil, expiresAt: row.expiresAt };
 }
 
+function authorityFromMembership(row: {
+  readonly role: DbRole;
+  readonly expiresAt?: number;
+}): CurrentProjectAuthority {
+  return row.expiresAt === undefined
+    ? { role: row.role, authorityUntil: PERMANENT_AUTHORITY_UNTIL }
+    : { role: row.role, authorityUntil: row.expiresAt, expiresAt: row.expiresAt };
+}
+
 /**
  * Read one role/scope authority without traversing membership history.
  *
  * New writes are represented in `membershipAuthorities`, which has a
- * sortable row per active membership grant and scope/role.  The descending
- * indexed probe selects the strongest current row for that role.  The
- * bounded legacy probe keeps pre-projection rows readable during the
- * migration window; it is still an exact indexed range and never collects
- * the history.
+ * sortable row per active membership grant and scope/role.  The bounded
+ * legacy probes keep pre-projection rows readable during the migration
+ * window.  Both sources are returned so an expired or shorter projected row
+ * cannot mask a stronger legacy row; every probe is an exact indexed range
+ * and none traverses membership history.
  */
 async function readAuthorityForRole(
   ctx: F1QueryCtx | F1MutationCtx,
@@ -115,7 +124,8 @@ async function readAuthorityForRole(
   identity: string,
   scope: AuthorityScope,
   role: DbRole,
-): Promise<AuthorityObservation | null> {
+  now: number,
+): Promise<readonly AuthorityObservation[]> {
   const projected = await ctx.db
     .query("membershipAuthorities")
     .withIndex("by_organization_and_identity_and_scope_and_role_and_authority_until", (q) =>
@@ -127,29 +137,50 @@ async function readAuthorityForRole(
     )
     .order("desc")
     .first();
-  if (projected !== null) {
-    return { status: "active", authority: authorityFromProjection(projected) };
-  }
 
-  const legacy = await ctx.db
+  // The optional deadline is split into exact ranges: missing means
+  // permanent, a value after `now` is current, and a finite value through
+  // `now` is retained only to preserve expired-denial semantics.
+  const legacyPermanent = await ctx.db
     .query("memberships")
-    .withIndex("by_organization_and_identity_and_project_and_status_and_role", (q) =>
+    .withIndex("by_organization_and_identity_and_project_and_status_and_role_and_expires_at", (q) =>
       q
         .eq("organizationId", organizationId)
         .eq("identity", identity)
         .eq("projectId", scope.projectId)
         .eq("status", "active")
-        .eq("role", role),
+        .eq("role", role)
+        .eq("expiresAt", undefined),
     )
     .order("desc")
     .first();
-  if (legacy !== null) {
-    const authority =
-      legacy.expiresAt === undefined
-        ? { role: legacy.role, authorityUntil: PERMANENT_AUTHORITY_UNTIL }
-        : { role: legacy.role, authorityUntil: legacy.expiresAt, expiresAt: legacy.expiresAt };
-    return { status: "active", authority };
-  }
+  const legacyCurrentTemporary = await ctx.db
+    .query("memberships")
+    .withIndex("by_organization_and_identity_and_project_and_status_and_role_and_expires_at", (q) =>
+      q
+        .eq("organizationId", organizationId)
+        .eq("identity", identity)
+        .eq("projectId", scope.projectId)
+        .eq("status", "active")
+        .eq("role", role)
+        .gt("expiresAt", now),
+    )
+    .order("desc")
+    .first();
+  const legacyExpired = await ctx.db
+    .query("memberships")
+    .withIndex("by_organization_and_identity_and_project_and_status_and_role_and_expires_at", (q) =>
+      q
+        .eq("organizationId", organizationId)
+        .eq("identity", identity)
+        .eq("projectId", scope.projectId)
+        .eq("status", "active")
+        .eq("role", role)
+        .gt("expiresAt", undefined)
+        .lte("expiresAt", now),
+    )
+    .order("desc")
+    .first();
   const revoked = await ctx.db
     .query("memberships")
     .withIndex("by_organization_and_identity_and_project_and_status_and_role", (q) =>
@@ -162,12 +193,23 @@ async function readAuthorityForRole(
     )
     .order("desc")
     .first();
-  if (revoked === null) return null;
-  const authority =
-    revoked.expiresAt === undefined
-      ? { role: revoked.role, authorityUntil: PERMANENT_AUTHORITY_UNTIL }
-      : { role: revoked.role, authorityUntil: revoked.expiresAt, expiresAt: revoked.expiresAt };
-  return { status: "revoked", authority };
+  return [
+    ...(projected === null
+      ? []
+      : [{ status: "active" as const, authority: authorityFromProjection(projected) }]),
+    ...(legacyPermanent === null
+      ? []
+      : [{ status: "active" as const, authority: authorityFromMembership(legacyPermanent) }]),
+    ...(legacyCurrentTemporary === null
+      ? []
+      : [{ status: "active" as const, authority: authorityFromMembership(legacyCurrentTemporary) }]),
+    ...(legacyExpired === null
+      ? []
+      : [{ status: "active" as const, authority: authorityFromMembership(legacyExpired) }]),
+    ...(revoked === null
+      ? []
+      : [{ status: "revoked" as const, authority: authorityFromMembership(revoked) }]),
+  ];
 }
 
 /**
@@ -200,8 +242,7 @@ export async function resolveProjectAccess(
   const observations: AuthorityObservation[] = [];
   for (const scope of scopes) {
     for (const role of ROLE_ORDER) {
-      const observation = await readAuthorityForRole(ctx, organizationId, identity, scope, role);
-      if (observation !== null) observations.push(observation);
+      observations.push(...(await readAuthorityForRole(ctx, organizationId, identity, scope, role, now)));
     }
   }
   const authorities = observations
