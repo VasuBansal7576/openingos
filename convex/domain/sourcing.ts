@@ -375,6 +375,12 @@ async function checkProductEvidenceRefs(
     if (!candidate.ok) {
       return { ok: false as const, code: candidate.code, message: candidate.message };
     }
+    // F1R-03: when both sides are named, the candidate must belong to
+    // the stated requirement. Independent in-project checks preserve a
+    // contradiction instead of validating it.
+    if (requirementId !== undefined && candidate.value.requirementId !== requirementId) {
+      return { ok: false as const, code: "denied-project", message: "candidate is for another requirement" };
+    }
   }
   return { ok: true as const };
 }

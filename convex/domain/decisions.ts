@@ -10,6 +10,7 @@
  */
 
 import { v } from "convex/values";
+import type { Id } from "../_generated/dataModel.js";
 import { f1Mutation, f1Query } from "../server.js";
 import { denialValidator } from "../access/checks.js";
 import { sha256HexOfCanonical } from "../shared/sha256.js";
@@ -76,8 +77,46 @@ export const recordSelection = f1Mutation({
     if (quote.version !== args.quoteVersion) {
       return { ok: false as const, code: "invalid-payload", message: "quote version mismatch" };
     }
+    // F1R-03: the quote's own lineage must agree with the selection
+    // graph. A quote bound to another requirement, another vendor's
+    // offer, or another RFQ scope can never authorize this selection,
+    // even inside the same project. Quotes without lineage fields keep
+    // their existing behavior; hashing preserves but never validates.
+    if (quote.requirementId !== undefined && quote.requirementId !== args.requirementId) {
+      return { ok: false as const, code: "denied-project", message: "quote is bound to another requirement" };
+    }
+    if (quote.vendorId !== undefined && candidate.value.vendorId !== quote.vendorId) {
+      return { ok: false as const, code: "denied-project", message: "quote is bound to another vendor offer" };
+    }
+    if (quote.rfqId !== undefined) {
+      const rfq = await ctx.db.get(quote.rfqId);
+      if (
+        rfq === null ||
+        rfq.organizationId !== args.organizationId ||
+        rfq.projectId !== args.projectId
+      ) {
+        return { ok: false as const, code: "denied-project", message: "quote RFQ is not in this project" };
+      }
+      if (rfq.requirementId !== args.requirementId) {
+        return { ok: false as const, code: "denied-project", message: "quote RFQ is bound to another requirement" };
+      }
+      if (!rfq.scenarioVendorIds.includes(candidate.value.vendorId)) {
+        return { ok: false as const, code: "denied-project", message: "quote RFQ scope excludes the candidate vendor" };
+      }
+    }
     if (requirement.value.version !== args.requirementVersion) {
       return { ok: false as const, code: "invalid-payload", message: "requirement version is stale" };
+    }
+    // F1R-04: the selected quote version must still be current. A
+    // recorded successor (supersedes === this content hash) makes a new
+    // selection of the old terms a stale-basis denial. Historical
+    // selections and orders stay intact; only new authority is refused.
+    const revisionSuccessors = await ctx.db
+      .query("quotes")
+      .withIndex("by_project", (q) => q.eq("projectId", args.projectId))
+      .collect();
+    if (revisionSuccessors.some((entry) => entry.supersedes === quote.contentHash)) {
+      return { ok: false as const, code: "stale-quote-version", message: "quote version has been superseded; select the current revision" };
     }
     if (
       requirement.value.currency !== undefined &&
@@ -153,6 +192,18 @@ export const recordApproval = f1Mutation({
       if (existing.organizationId !== args.organizationId) {
         return { ok: false as const, code: "denied-project", message: "reference is not in this project" };
       }
+      // F1R-05: replay identity covers every material field, not just
+      // the hash. A reused snapshot with a changed scope, selection,
+      // quote, or canonical text conflicts instead of returning the old
+      // row, so one approval id can never authorize another decision.
+      if (
+        existing.scope !== args.scope ||
+        existing.snapshotCanonical !== args.snapshotCanonical ||
+        (existing.selectionId ?? undefined) !== args.selectionId ||
+        (existing.quoteId ?? undefined) !== args.quoteId
+      ) {
+        return { ok: false as const, code: "duplicate-conflict", message: "snapshot hash already used with different decision fields" };
+      }
       return { ok: true as const, approvalId: existing._id, deduplicated: true };
     }
     if (args.selectionId !== undefined) {
@@ -224,6 +275,37 @@ export const decideApproval = f1Mutation({
     }
     if (approval.value.state !== "pending") {
       return { ok: false as const, code: "invalid-payload", message: "approval is no longer pending" };
+    }
+    // F1R-04: a pending approval whose quoted basis has since been
+    // superseded cannot authorize the old terms. The check resolves the
+    // directly linked quote and the selection's quote atomically in this
+    // mutation, so a revision racing the decision still fences it.
+    // Historical approvals and orders stay intact.
+    const basisQuoteIds: Id<"quotes">[] = [];
+    if (approval.value.quoteId !== undefined) {
+      basisQuoteIds.push(approval.value.quoteId);
+    }
+    if (approval.value.selectionId !== undefined) {
+      const selection = await ctx.db.get(approval.value.selectionId);
+      if (
+        selection !== null &&
+        selection.organizationId === args.organizationId &&
+        selection.projectId === args.projectId &&
+        !basisQuoteIds.includes(selection.quoteId)
+      ) {
+        basisQuoteIds.push(selection.quoteId);
+      }
+    }
+    for (const basisQuoteId of basisQuoteIds) {
+      const basisQuote = await ctx.db.get(basisQuoteId);
+      if (basisQuote === null) continue;
+      const basisSuccessors = await ctx.db
+        .query("quotes")
+        .withIndex("by_project", (q) => q.eq("projectId", args.projectId))
+        .collect();
+      if (basisSuccessors.some((entry) => entry.supersedes === basisQuote.contentHash)) {
+        return { ok: false as const, code: "stale-approval-basis", message: "quoted terms changed since approval; renewed authority required" };
+      }
     }
     await ctx.db.patch(args.approvalId, {
       state: args.decision,
