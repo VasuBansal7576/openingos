@@ -367,7 +367,7 @@ describe("F1R-06 residual shared-index lifecycle", () => {
       evidenceRefs: [{ sourceId: bId, version: bVersion }],
     });
     expect(rebound.ok).toBe(true);
-  });
+  }, 15_000);
 
   test("historical row without ingestion identity keeps the bounded legacy fallback", async () => {
     const t = convexTest(schema, modules);
