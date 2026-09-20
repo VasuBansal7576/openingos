@@ -18,8 +18,8 @@ function smallResearchGrant(fixture: ReturnType<typeof buildControlledFixture>, 
       operations: ["research.collect"],
       communicationProfile: COMMUNICATION_PROFILE_OWNER_ROLEPLAY,
       recipientConfigVersion: 1,
-      inputVersions: { brief: "wave-a" },
-      payload: { query: "wave-a" },
+      inputVersions: { brief: "espresso-opening-v1" },
+      payload: { query: "Research commercial espresso machine suppliers for equivalent quotes." },
       costCeilingMicroUsd: ceiling,
       roundLimit: 10,
       expiresAt: fixture.now + 3_600_000,
@@ -36,7 +36,7 @@ function researchJob(fixture: ReturnType<typeof buildControlledFixture>, grantId
       identity: fixture.ownerA,
       organizationId: fixture.orgPrivateA,
       projectId: fixture.projAOpen,
-      text: `Research suppliers wave-a ${label}.`,
+      text: `Research commercial espresso machine suppliers for the opening ${label}.`,
       kind: "research",
       grantId,
     },
@@ -59,7 +59,7 @@ function researchOp(
       jobId,
       kind: "research.collect",
       requestId,
-      payload: { query: "wave-a" },
+      payload: { query: "Research commercial espresso machine suppliers for equivalent quotes." },
       grantId,
       reservationId,
     },
@@ -140,7 +140,7 @@ describe("F1R-01 grant-wide cost ceiling", () => {
     const claim = fixture.store.claimOperation({ identity: fixture.ownerA, operationId: op }, fixture.now);
     if (!claim.ok) throw new Error("claim failed");
     const outcome = fixture.store.recordOutcome(
-      { operationId: op, token: claim.value.attemptToken, outcome: "success", providerEventId: "evt-wave-a-spent" },
+      { operationId: op, token: claim.value.attemptToken, outcome: "success", providerEventId: "evt-espresso-opening-spent" },
       fixture.now,
     );
     expect(outcome.ok).toBe(true);
@@ -164,7 +164,7 @@ describe("F1R-01 grant-wide cost ceiling", () => {
         operationId: op,
         token: claim.value.attemptToken,
         outcome: "unknown",
-        providerEventId: "evt-wave-a-unresolved",
+        providerEventId: "evt-espresso-opening-unresolved",
       },
       fixture.now,
     );
@@ -223,7 +223,7 @@ describe("F1R-02 cancellation releases orphan reservations", () => {
         jobId,
         kind: "research.collect",
         requestId: "req-bad-grant",
-        payload: { query: "wave-a" },
+        payload: { query: "Research commercial espresso machine suppliers for equivalent quotes." },
         grantId: fixture.grantResearchA,
         reservationId: reserved.value.id,
       },

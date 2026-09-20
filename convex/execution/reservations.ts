@@ -93,8 +93,8 @@ export const reserve = f1Mutation({
     ) {
       return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
     }
-    if (job.state === "cancelled") {
-      return { ok: false as const, code: "cancelled-before-claim", message: "job is cancelled" };
+    if (job.state === "cancelled" || job.state === "cancelling") {
+      return { ok: false as const, code: "cancelled-before-claim", message: "job is fenced for cancellation" };
     }
     const grant = await ctx.db.get(job.grantId);
     if (grant === null) {

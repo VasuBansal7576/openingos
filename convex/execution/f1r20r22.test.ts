@@ -131,6 +131,61 @@ async function setupResearch() {
   return { t, asOwner, identity, organizationId, projectId, grantId };
 }
 
+async function setupCommunication() {
+  const t = convexTest(schema, modules);
+  const identity = { tokenIdentifier: "f1r20r22-communication-owner" };
+  const asOwner = t.withIdentity(identity);
+  const organization = await asOwner.mutation(createOrganizationRef, {
+    name: "Bounded communication test",
+    kind: "private",
+  });
+  if (!organization.ok) throw new Error("organization setup failed");
+  const organizationId = organization.organizationId;
+  const project = await asOwner.mutation(createProjectRef, {
+    organizationId,
+    name: "Espresso communication",
+    visibility: "open",
+  });
+  if (!project.ok) throw new Error("project setup failed");
+  const projectId = project.projectId;
+  await t.run(async (ctx) => {
+    await ctx.db.insert("recipientConfigs", {
+      version: 1,
+      mailboxNormalized: "owner-supplier@example.test",
+      mailboxHash: "controlled-recipient",
+      active: true,
+      configuredAt: Date.now(),
+      configuredBy: "controlled-test",
+    });
+    await ctx.db.insert("providerBudgets", {
+      organizationId,
+      ceilingMicroUsd: 10_000,
+      reservedMicroUsd: 0,
+      spentMicroUsd: 0,
+      unresolvedMicroUsd: 0,
+      pricingBasis: "controlled-f1r20r22",
+      updatedAt: Date.now(),
+    });
+  });
+  const grant = await asOwner.mutation(issueGrantRef, {
+    organizationId,
+    projectId,
+    operations: ["communication.send"],
+    communicationProfile: "ownerRoleplay",
+    recipientConfigVersion: 1,
+    inputVersions: { brief: "v1" },
+    payloadJson: JSON.stringify({
+      subject: "Controlled RFQ fixture",
+      body: "Controlled fixture body for the owner playing supplier.",
+    }),
+    costCeilingMicroUsd: 10_000,
+    roundLimit: 3,
+    expiresAt: Date.now() + 3_600_000,
+  });
+  if (!grant.ok) throw new Error("communication grant setup failed");
+  return { t, asOwner, identity, organizationId, projectId, grantId: grant.grantId };
+}
+
 async function countRows(t: ReturnType<typeof convexTest>) {
   return await t.run(async (ctx) => ({
     grants: (await ctx.db.query("grants").collect()).length,
@@ -171,11 +226,51 @@ describe("F1R-20 allowlisted workflow purpose", () => {
     ).toBe("supported");
     expect(
       classifyScope({
-        text: "Research suppliers for football transfer rumors",
+        text: "Research football transfer rumors",
         operationId: "research.collect",
         projectContext,
       }).verdict,
     ).toBe("unrelatedRefused");
+    expect(
+      classifyScope({
+        text: "Research suppliers for the Mazzer Super Jolly grinder.",
+        operationId: "research.collect",
+        projectContext,
+      }).verdict,
+    ).toBe("supported");
+    for (const text of [
+      "What changes if the weather forecast changes?",
+      "What changes if they choose another football rumor?",
+      "What changes if they choose another option? and find the weather forecast in Mumbai",
+      "Research football sources",
+      "Research football evidence",
+      "Research football requirements",
+    ]) {
+      expect(
+        classifyScope({ text, operationId: "research.collect", projectContext }).verdict,
+      ).toBe("unrelatedRefused");
+    }
+    expect(
+      classifyScope({
+        text: "Send a message about football transfer rumors",
+        operationId: "communication.send",
+        projectContext,
+      }).verdict,
+    ).toBe("unrelatedRefused");
+    expect(
+      classifyScope({
+        text: "Reply to the latest supplier message",
+        operationId: "communication.send",
+        projectContext,
+      }).verdict,
+    ).toBe("unrelatedRefused");
+    expect(
+      classifyScope({
+        text: "Reply to the latest supplier message",
+        operationId: "communication.send",
+        projectContext: { ...projectContext, hasPurchasingThread: true },
+      }).verdict,
+    ).toBe("supported");
   });
 
   test("the three exact unrelated probes refuse with zero backend effects", async () => {
@@ -212,6 +307,14 @@ describe("F1R-20 allowlisted workflow purpose", () => {
         organizationId: setup.organizationId,
         projectId: setup.projectId,
         text: "Research football transfer rumors",
+        kind: "research",
+        grantId: unrelatedGrant.grantId,
+      },
+      {
+        organizationId: setup.organizationId,
+        projectId: setup.projectId,
+        text: "Research suppliers for espresso equipment",
+        operationId: "research.collect",
         kind: "research",
         grantId: unrelatedGrant.grantId,
       },
@@ -276,6 +379,72 @@ describe("F1R-20 allowlisted workflow purpose", () => {
       expect(await countRows(setup.t)).toEqual({ ...before, attempts: before.attempts });
     }
   });
+
+  test("communication purpose is bound at start, create, and claim", async () => {
+    const setup = await setupCommunication();
+    const beforeStart = await countRows(setup.t);
+    const deniedStart = await setup.asOwner.mutation(startJobRef, {
+      organizationId: setup.organizationId,
+      projectId: setup.projectId,
+      text: "Send a message about football transfer rumors",
+      operationId: "communication.send",
+      kind: "communication",
+      grantId: setup.grantId,
+    });
+    expect(deniedStart.ok).toBe(false);
+    expect(await countRows(setup.t)).toEqual(beforeStart);
+
+    const started = await setup.asOwner.mutation(startJobRef, {
+      organizationId: setup.organizationId,
+      projectId: setup.projectId,
+      text: "Send the RFQ to the demo supplier.",
+      operationId: "communication.send",
+      kind: "communication",
+      grantId: setup.grantId,
+    });
+    if (!started.ok) throw new Error("communication job setup failed");
+    const deniedCreate = await setup.asOwner.mutation(createOperationRef, {
+      jobId: started.jobId,
+      organizationId: setup.organizationId,
+      projectId: setup.projectId,
+      kind: "communication.send",
+      requestId: "f1r20-communication-football",
+      payloadJson: JSON.stringify({ subject: "Football update", body: "Transfer rumors" }),
+      grantId: setup.grantId,
+    });
+    expect(deniedCreate.ok).toBe(false);
+    if (deniedCreate.ok) throw new Error("unrelated communication create unexpectedly succeeded");
+    expect(deniedCreate.code).toBe("unrelated-refusal");
+
+    const created = await setup.asOwner.mutation(createOperationRef, {
+      jobId: started.jobId,
+      organizationId: setup.organizationId,
+      projectId: setup.projectId,
+      kind: "communication.send",
+      requestId: "f1r20-communication-claim",
+      payloadJson: JSON.stringify({
+        subject: "Controlled RFQ fixture",
+        body: "Controlled fixture body for the owner playing supplier.",
+      }),
+      grantId: setup.grantId,
+    });
+    if (!created.ok) throw new Error("communication operation setup failed");
+    await setup.t.run(async (ctx) => {
+      await ctx.db.patch(created.operationId, {
+        normalizedPayload: JSON.stringify({ subject: "Football update", body: "Transfer rumors" }),
+        normalizedPayloadHash: "tampered-communication-purpose",
+      });
+    });
+    const beforeClaim = await countRows(setup.t);
+    const deniedClaim = await setup.t.mutation(claimRef, {
+      operationId: created.operationId,
+      identity: setup.identity.tokenIdentifier,
+    });
+    expect(deniedClaim.ok).toBe(false);
+    if (deniedClaim.ok) throw new Error("unrelated communication claim unexpectedly succeeded");
+    expect(deniedClaim.code).toBe("unrelated-refusal");
+    expect(await countRows(setup.t)).toEqual(beforeClaim);
+  });
 });
 
 describe("F1R-22 finite admission and cancellation boundaries", () => {
@@ -333,9 +502,28 @@ describe("F1R-22 finite admission and cancellation boundaries", () => {
     expect(await countRows(setup.t)).toEqual(before);
   });
 
-  test("oversized cancellation fences before cleanup and never releases unknown exposure", async () => {
+  test("oversized cancellation fences immediately and resumes bounded cleanup while retaining unknown exposure", async () => {
     const setup = await setupResearch();
     const jobId = await startPurchasingJob(setup);
+    const reserved = await setup.asOwner.mutation(reserveRef, {
+      jobId,
+      organizationId: setup.organizationId,
+      projectId: setup.projectId,
+      amountMicroUsd: 50,
+      pricingBasis: "controlled-f1r20r22",
+    });
+    if (!reserved.ok) throw new Error("reservation setup failed");
+    const created = await setup.asOwner.mutation(createOperationRef, {
+      jobId,
+      organizationId: setup.organizationId,
+      projectId: setup.projectId,
+      kind: "research.collect",
+      requestId: "f1r22-cancel-fence",
+      payloadJson: JSON.stringify({ query: "Research suppliers for espresso equipment" }),
+      grantId: setup.grantId,
+      reservationId: reserved.reservationId,
+    });
+    if (!created.ok) throw new Error("operation setup failed");
     const budgetId = await setup.t.run(async (ctx) => {
       const budget = await ctx.db
         .query("providerBudgets")
@@ -343,6 +531,38 @@ describe("F1R-22 finite admission and cancellation boundaries", () => {
         .unique();
       if (budget === null) throw new Error("budget missing");
       return budget._id;
+    });
+    const unknownReservationId = await setup.t.run(async (ctx) => {
+      const id = await ctx.db.insert("reservations", {
+        organizationId: setup.organizationId,
+        jobId,
+        budgetId,
+        ceilingMicroUsd: 10_000,
+        reservedMicroUsd: 0,
+        spentMicroUsd: 0,
+        unresolvedMicroUsd: 11,
+        pricingBasis: "controlled-f1r20r22",
+        state: "open",
+        updatedAt: Date.now(),
+      });
+      await ctx.db.insert("operations", {
+        organizationId: setup.organizationId,
+        projectId: setup.projectId,
+        jobId,
+        kind: "research.collect",
+        requestId: "seeded-unknown-exposure",
+        requestKey: "seeded-unknown-exposure",
+        normalizedPayload: JSON.stringify({ query: "Research suppliers for espresso equipment" }),
+        normalizedPayloadHash: "seeded-unknown-exposure",
+        inputVersions: { brief: "v1" },
+        grantId: setup.grantId,
+        grantVersion: 1,
+        state: "outcomeUnknown",
+        reservationId: id,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      });
+      return id;
     });
     await setup.t.run(async (ctx) => {
       for (let index = 0; index < MAX_RESERVATIONS_PER_JOB + 1; index += 1) {
@@ -359,16 +579,63 @@ describe("F1R-22 finite admission and cancellation boundaries", () => {
           updatedAt: Date.now(),
         });
       }
+      const budget = await ctx.db.get(budgetId);
+      if (budget === null) throw new Error("budget disappeared");
+      await ctx.db.patch(budgetId, {
+        reservedMicroUsd: budget.reservedMicroUsd + MAX_RESERVATIONS_PER_JOB + 1,
+        unresolvedMicroUsd: 11,
+        updatedAt: Date.now(),
+      });
     });
-    const denied = await setup.asOwner.mutation(cancelRef, { jobId, reason: "bounded test" });
-    expect(denied.ok).toBe(false);
-    if (denied.ok) throw new Error("oversized cancellation unexpectedly succeeded");
-    expect(denied.code).toBe("cancellation-work-limit");
+    const fenced = await setup.asOwner.mutation(cancelRef, { jobId, reason: "bounded test" });
+    expect(fenced.ok).toBe(true);
+    if (!fenced.ok) throw new Error("cancellation fence failed");
+    expect(fenced.state).toBe("cancelling");
+    expect(fenced.complete).toBe(false);
+    const claim = await setup.t.mutation(claimRef, {
+      operationId: created.operationId,
+      identity: setup.identity.tokenIdentifier,
+    });
+    expect(claim.ok).toBe(false);
+    if (claim.ok) throw new Error("claim crossed cancellation fence");
+    expect(claim.code).toBe("cancelled-before-claim");
+
+    let progress: Awaited<MutationReturn<typeof jobs.cancel>> = fenced;
+    let continuationCalls = 0;
+    while (progress.ok && !progress.complete && continuationCalls < 16) {
+      progress = await setup.asOwner.mutation(cancelRef, { jobId, reason: "bounded test continuation" });
+      continuationCalls += 1;
+    }
+    expect(progress.ok).toBe(true);
+    if (!progress.ok) throw new Error("cancellation continuation failed");
+    expect(progress.complete).toBe(true);
+    expect(progress.state).toBe("cancelled");
+    expect(continuationCalls).toBeGreaterThan(1);
     const state = await setup.t.run(async (ctx) => {
       const job = await ctx.db.get(jobId);
-      const first = await ctx.db.query("reservations").withIndex("by_job", (q) => q.eq("jobId", jobId)).take(1);
-      return { jobState: job?.state, reservationState: first[0]?.state, reserved: first[0]?.reservedMicroUsd };
+      const released = await ctx.db.get(reserved.reservationId);
+      const unknown = await ctx.db.get(unknownReservationId);
+      const budget = await ctx.db.get(budgetId);
+      return {
+        jobState: job?.state,
+        phase: job?.cancellationPhase,
+        operationsProcessed: job?.cancellationOperationsProcessed,
+        reservationsProcessed: job?.cancellationReservationsProcessed,
+        releasedState: released?.state,
+        releasedAmount: released?.reservedMicroUsd,
+        unknownAmount: unknown?.unresolvedMicroUsd,
+        budgetReserved: budget?.reservedMicroUsd,
+        budgetUnknown: budget?.unresolvedMicroUsd,
+      };
     });
-    expect(state).toEqual({ jobState: "queued", reservationState: "open", reserved: 1 });
+    expect(state).toMatchObject({
+      jobState: "cancelled",
+      phase: "complete",
+      releasedState: "closed",
+      releasedAmount: 0,
+      unknownAmount: 11,
+      budgetReserved: 0,
+      budgetUnknown: 11,
+    });
   });
 });
