@@ -316,3 +316,13 @@ PR #1 merged to `main` as `96f0f1f`, and the merged tree is identical to the tes
 F1 shared contracts are complete for controlled implementation, which unblocks parallel R1 research, C1 communication and U1 workbench packages.
 Hosted Convex, provider credentials and allowances, the private owner mailbox, live provider calls and publication remain unverified and block only their live evidence paths.
 No controlled result is presented as live integration success.
+
+### 2026-09-21 - d53c2ef R1/C1/W1 integration checkpoint
+
+Integrated C1 owner-only communication, signed callback forwarding, reconciliation, quote ingestion and redacted evidence without performing a live send or callback.
+Integrated R1 bounded Firecrawl search, map and scrape operations with shared allowance reservations, cancellation and stale-result fencing, partial-result preservation and explicit controlled provenance.
+Integrated W1 authorized workbench projections using the identity-first authority index and project/requirement/vendor quote tuple index, including 300-row bounded-read regressions.
+Repaired Greptile's PR #2 finding by replacing both unrestricted negative-control scans with explicit 65-row reads while preserving their intended budget failures.
+The combined checkout passes TypeScript, production build, 23 repository tests, 77 proof tests, 244 F1 tests, 155 browser tests, 21 application/communication tests and 199 direct Convex tests.
+R1 and C1 are checked complete only for their controlled implementation packages; U1 integration, live provider evidence, hosted Convex, credentials, allowances, owner-mailbox exchange and publication remain open.
+No controlled result is presented as live integration success.
