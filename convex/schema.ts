@@ -615,6 +615,12 @@ export default defineSchema({
     .index(
       "by_organization_and_identity_and_project_and_status_and_role",
       ["organizationId", "identity", "projectId", "status", "role"],
+    )
+    // The deadline suffix lets migration reads select permanent rows and the
+    // strongest currently valid temporary row without collecting history.
+    .index(
+      "by_organization_and_identity_and_project_and_status_and_role_and_expires_at",
+      ["organizationId", "identity", "projectId", "status", "role", "expiresAt"],
     ),
 
   /**
