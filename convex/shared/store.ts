@@ -1817,6 +1817,8 @@ export class ControlledBackend {
       conversationId: input.conversationId ?? null,
       version: parsed.version,
       contentHash: payloadHash(quoteDecisionFields({
+        organizationId,
+        projectId,
         version: parsed.version,
         currency: parts.currency,
         lines: parts.lines,
@@ -1827,6 +1829,7 @@ export class ControlledBackend {
         counterpartyRole: input.counterpartyRole,
         executionMode: input.executionMode,
         ...(input.conversationId === undefined ? {} : { conversationId: input.conversationId }),
+        ...(input.supersedes === undefined ? {} : { supersedes: input.supersedes }),
       })),
       currency: parts.currency,
       lines: Object.freeze(parts.lines.map((line) => ({ ...line, evidenceRefs: [...line.evidenceRefs] }))),
@@ -1849,9 +1852,10 @@ export class ControlledBackend {
    * unrelated scope refusing. Shared with the Convex compare handler.
    */
   compareControlledQuotes(leftId: string, rightId: string): AuthorityResult<{
-    verdict: "complete" | "incomplete";
+    status: "complete" | "estimated" | "incomplete" | "incompatible";
     differenceMinorUnits: number | null;
     cheaper: "left" | "right" | "equal" | null;
+    estimatedDeltaRange?: { readonly minimum: number; readonly maximum: number };
     reason: string;
   }> {
     const left = this.quotes.get(leftId);

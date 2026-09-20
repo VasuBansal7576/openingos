@@ -895,8 +895,10 @@ describe("direct checkpoint-2 money, budgets, and reconciliation", () => {
     });
     expect(compared.ok).toBe(true);
     if (!compared.ok) throw new Error("compare failed");
-    expect(compared.verdict).toBe("incomplete");
+    expect(compared.status).toBe("incompatible");
     expect(compared.reason).toContain("not compatible");
+    expect(compared.differenceMinorUnits).toBeNull();
+    expect(compared.cheaper).toBeNull();
   });
 
   test("record validates versions, supersedes, and conversation references", async () => {
@@ -1958,8 +1960,9 @@ describe("direct checkpoint-A authority hardening", () => {
     });
     expect(compared.ok).toBe(true);
     if (!compared.ok) throw new Error("compare failed");
-    expect(compared.verdict).toBe("complete");
+    expect(compared.status).toBe("complete");
     expect(compared.cheaper).toBe("equal");
+    expect(compared.differenceMinorUnits).toBe(0);
   });
 
   test("unrelated aggregate-equal lines never compare", async () => {
@@ -1983,7 +1986,76 @@ describe("direct checkpoint-A authority hardening", () => {
     });
     expect(compared.ok).toBe(true);
     if (!compared.ok) throw new Error("compare failed");
-    expect(compared.verdict).toBe("incomplete");
+    expect(compared.status).toBe("incompatible");
+    expect(compared.cheaper).toBeNull();
+  });
+
+  test("estimated comparisons expose the signed range with no singular cheaper side", async () => {
+    const t = convexTest(schema, modules);
+    const setup = await setupCommsProject(t, OWNER_A);
+    const asOwner = t.withIdentity(OWNER_A);
+    const left = await asOwner.mutation(recordQuoteRef, quoteBArgs(setup.orgId, setup.projectId, "qb-est-a"));
+    if (!left.ok) throw new Error("left setup failed");
+    const right = await asOwner.mutation(recordQuoteRef, {
+      ...quoteBArgs(setup.orgId, setup.projectId, "qb-est-b"),
+      charges: [{
+        chargeId: "freight",
+        label: "freight",
+        state: {
+          kind: "estimated",
+          estimate: {
+            kind: "range",
+            minimum: { currency: "EUR", minorUnits: 100_00 },
+            maximum: { currency: "EUR", minorUnits: 200_00 },
+          },
+        },
+        evidenceRefs: [],
+      }],
+    });
+    if (!right.ok) throw new Error("right setup failed");
+    const compared = await asOwner.query(compareQuotesRef, {
+      leftQuoteId: left.quoteId,
+      rightQuoteId: right.quoteId,
+    });
+    expect(compared.ok).toBe(true);
+    if (!compared.ok) throw new Error("compare failed");
+    expect(compared.status).toBe("estimated");
+    expect(compared.differenceMinorUnits).toBeNull();
+    expect(compared.cheaper).toBeNull();
+    expect(compared.estimatedDeltaRange).toEqual({ minimum: -200_00, maximum: -100_00 });
+  });
+
+  test("identical content in another project cannot break lineage", async () => {
+    const t = convexTest(schema, modules);
+    const setup = await setupCommsProject(t, OWNER_A);
+    const asOwner = t.withIdentity(OWNER_A);
+    const other = await asOwner.mutation(createProjectRef, {
+      organizationId: setup.orgId,
+      name: "Lineage other",
+      visibility: "open",
+    });
+    if (!other.ok) throw new Error("other project setup failed");
+    const home = await asOwner.mutation(recordQuoteRef, quoteBArgs(setup.orgId, setup.projectId, "qb-xproj-a"));
+    if (!home.ok) throw new Error("home setup failed");
+    // Same version and content, other project: records with its own hash.
+    const awayArgs = quoteBArgs(setup.orgId, other.projectId, "qb-xproj-a");
+    const away = await asOwner.mutation(recordQuoteRef, {
+      ...awayArgs,
+      comparisonScope: {
+        requirementId: "req-direct-b",
+        scopeId: "scope-direct-b",
+        items: [{ itemId: "machine", lineId: "machine", unit: "piece", requiredQuantity: "1" }],
+      },
+    });
+    expect(away.ok).toBe(true);
+    if (!away.ok) throw new Error("away setup failed");
+    expect(away.contentHash).not.toBe(home.contentHash);
+    // A supersedes pointer at the other project's hash resolves nothing here.
+    const foreign = await asOwner.mutation(recordQuoteRef, {
+      ...quoteBArgs(setup.orgId, other.projectId, "qb-xproj-b"),
+      supersedes: home.contentHash,
+    });
+    expect(foreign.ok).toBe(false);
   });
 
   test("supersedes binds counterparty lineage and hashes decision fields", async () => {

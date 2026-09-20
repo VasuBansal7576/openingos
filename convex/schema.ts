@@ -327,7 +327,9 @@ export default defineSchema({
     createdAt: v.number(),
   })
     .index("by_project", ["projectId"])
-    .index("by_contentHash", ["contentHash"]),
+    .index("by_contentHash", ["contentHash"])
+    .index("by_project_and_version", ["projectId", "version"])
+    .index("by_project_and_contentHash", ["projectId", "contentHash"]),
 
   scopeDecisions: defineTable({
     organizationId: v.id("organizations"),
