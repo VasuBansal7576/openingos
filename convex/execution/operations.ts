@@ -18,7 +18,7 @@
 import { v } from "convex/values";
 import type { Id } from "../_generated/dataModel.js";
 import { f1InternalMutation, f1Mutation, f1Query, type F1MutationCtx } from "../server.js";
-import { canonicalJson, parseBoundedPayloadJson, requestKey } from "../shared/hashing.js";
+import { canonicalJson, parseBoundedPayloadJson, payloadHash, requestKey } from "../shared/hashing.js";
 import { normalizeMailbox } from "../shared/mailbox.js";
 import { sameCanonicalPayload, sha256BindingOk, sha256HexOfCanonical } from "../shared/sha256.js";
 import { isExpired } from "../shared/time.js";
@@ -27,9 +27,12 @@ import {
   MAX_OPERATIONS_PER_GRANT,
   MAX_OPERATIONS_PER_JOB,
   MAX_RESERVATIONS_PER_JOB,
+  classifyScope,
   lookupCapability,
   validateWorkflowBinding,
   validateWorkflowPayload,
+  supportedWorkflowPayload,
+  workflowTextForPayload,
   workflowAuthorityForOperation,
   workflowAuthorityMatchesProject,
   workflowContextKey,
@@ -427,9 +430,9 @@ export const create = f1Mutation({
 
     const parsed = parseBoundedPayloadJson(args.payloadJson);
     if (!parsed.ok) return { ok: false as const, code: parsed.code, message: parsed.message };
-    const canonical = parsed.payload.canonical;
-    const hash = parsed.payload.hash;
-    const operationPayload = parseCanonicalPayload(canonical);
+    let canonical = parsed.payload.canonical;
+    let hash = parsed.payload.hash;
+    let operationPayload = parseCanonicalPayload(canonical);
     if (operationPayload === null) {
       return { ok: false as const, code: "invalid-payload", message: "operation payload is not valid JSON" };
     }
@@ -466,6 +469,42 @@ export const create = f1Mutation({
       return { ok: false as const, code: "unrelated-refusal", message: "job is not bound to this OpeningOS workflow purpose" };
     }
 
+    // Admission accepts the caller's shaped request only long enough to
+    // derive its server-owned supported segment. Persist the canonical
+    // segment, never the full mixed text, so a downstream handler cannot
+    // accidentally execute a refused clause.
+    const operationText = workflowTextForPayload(args.kind, operationPayload);
+    if (operationText === null) {
+      return { ok: false as const, code: "unrelated-refusal", message: "operation payload is outside the purchasing workflow" };
+    }
+    const operationClassification = classifyScope({
+      text: operationText,
+      operationId: args.kind,
+      projectContext: context,
+    });
+    if (operationClassification.verdict === "unrelatedRefused") {
+      return { ok: false as const, code: "unrelated-refusal", message: operationClassification.reason };
+    }
+    if (operationClassification.verdict === "unavailableRefused") {
+      return { ok: false as const, code: "unavailable-capability", message: operationClassification.reason };
+    }
+    const supportedPayload = supportedWorkflowPayload(
+      args.kind,
+      operationPayload,
+      operationClassification.supportedSegment,
+    );
+    if (supportedPayload === null) {
+      return { ok: false as const, code: "invalid-payload", message: "operation payload cannot carry the supported segment" };
+    }
+    if (
+      operationClassification.refusedSegments.length > 0 ||
+      canonicalJson(supportedPayload) === grant.canonicalPayload
+    ) {
+      canonical = canonicalJson(supportedPayload);
+      hash = payloadHash(supportedPayload);
+      operationPayload = supportedPayload;
+    }
+
     const operationPurpose = validateWorkflowBinding({
       operationId: args.kind,
       jobPurpose: job.workflowPurpose,
@@ -488,6 +527,34 @@ export const create = f1Mutation({
     });
     if (!grantPurpose.ok) {
       return { ok: false as const, code: "unrelated-refusal", message: grantPurpose.reason ?? "grant purpose is not supported" };
+    }
+    const grantText = workflowTextForPayload(args.kind, grantPayload);
+    if (grantText === null) {
+      return { ok: false as const, code: "invalid-payload", message: "grant payload has no workflow text" };
+    }
+    const grantClassification = classifyScope({
+      text: grantText,
+      operationId: args.kind,
+      projectContext: context,
+    });
+    if (grantClassification.verdict !== "supported") {
+      return { ok: false as const, code: "unrelated-refusal", message: "grant purpose is not supported" };
+    }
+    const supportedGrantPayload = supportedWorkflowPayload(
+      args.kind,
+      grantPayload,
+      operationClassification.supportedSegment,
+    );
+    const canonicalizeSegments =
+      operationClassification.refusedSegments.length > 0 ||
+      grantClassification.refusedSegments.length > 0;
+    if (
+      supportedGrantPayload === null ||
+      (canonicalizeSegments &&
+        grantClassification.supportedSegment !== operationClassification.supportedSegment) ||
+      (canonicalizeSegments && canonicalJson(supportedGrantPayload) !== canonical)
+    ) {
+      return { ok: false as const, code: "changed-draft", message: "operation segment does not match the approved grant" };
     }
     let operationAuthority: WorkflowAuthority = grantAuthority;
     if (
@@ -737,6 +804,33 @@ export const claim = f1InternalMutation({
     ) {
       return { ok: false as const, code: "unrelated-refusal", message: "reply requires one exact active purchasing conversation" };
     }
+    const operationText = workflowTextForPayload(operation.kind, operationPayload);
+    if (operationText === null) {
+      return { ok: false as const, code: "unrelated-refusal", message: "operation payload is outside the purchasing workflow" };
+    }
+    const operationClassification = classifyScope({
+      text: operationText,
+      operationId: operation.kind,
+      projectContext: context,
+    });
+    if (operationClassification.verdict === "unrelatedRefused") {
+      return { ok: false as const, code: "unrelated-refusal", message: operationClassification.reason };
+    }
+    if (operationClassification.verdict === "unavailableRefused") {
+      return { ok: false as const, code: "unavailable-capability", message: operationClassification.reason };
+    }
+    const expectedOperationPayload = supportedWorkflowPayload(
+      operation.kind,
+      operationPayload,
+      operationClassification.supportedSegment,
+    );
+    if (
+      expectedOperationPayload === null ||
+      (operationClassification.refusedSegments.length > 0 &&
+        canonicalJson(expectedOperationPayload) !== operation.normalizedPayload)
+    ) {
+      return { ok: false as const, code: "unrelated-refusal", message: "operation payload is not the canonical supported segment" };
+    }
     const grantAuthority = workflowAuthorityForOperation(grant.workflowAuthorities, operation.kind);
     if (grantAuthority === null || operation.workflowAuthority === undefined) {
       return { ok: false as const, code: "unrelated-refusal", message: "operation authority is unavailable" };
@@ -778,6 +872,33 @@ export const claim = f1InternalMutation({
     });
     if (!grantPurpose.ok) {
       return { ok: false as const, code: "unrelated-refusal", message: grantPurpose.reason ?? "grant purpose is not supported" };
+    }
+    const grantText = workflowTextForPayload(operation.kind, grantPayload);
+    if (grantText === null) {
+      return { ok: false as const, code: "unrelated-refusal", message: "grant payload is outside the purchasing workflow" };
+    }
+    const grantClassification = classifyScope({
+      text: grantText,
+      operationId: operation.kind,
+      projectContext: context,
+    });
+    if (grantClassification.verdict !== "supported") {
+      return { ok: false as const, code: "unrelated-refusal", message: "grant purpose is not supported" };
+    }
+    const expectedGrantPayload = supportedWorkflowPayload(
+      operation.kind,
+      grantPayload,
+      operationClassification.supportedSegment,
+    );
+    if (
+      expectedGrantPayload === null ||
+      grantClassification.supportedSegment !== operationClassification.supportedSegment ||
+      ((operationClassification.refusedSegments.length > 0 ||
+        grantClassification.refusedSegments.length > 0) &&
+        canonicalJson(expectedGrantPayload) !== grant.canonicalPayload) ||
+      grant.canonicalPayload !== operation.normalizedPayload
+    ) {
+      return { ok: false as const, code: "changed-draft", message: "operation segment no longer matches the approved grant" };
     }
     // F1-22: compare the operation's captured versions against current
     // authority. Coordinated job/grant advancement still stales prepared

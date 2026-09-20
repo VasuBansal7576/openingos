@@ -59,6 +59,63 @@ describe("S-10 unrelated and unavailable refusal", () => {
     expect(store.snapshotCounts()).toEqual({ ...before, scopeDecisions: before.scopeDecisions + 1 });
   });
 
+  test("mixed research runs only its supported segment in the controlled backend", () => {
+    const fixture = buildControlledFixture();
+    const { store, now } = fixture;
+    const amended = store.amendGrantDraft(
+      fixture.grantResearchA,
+      fixture.ownerA,
+      { query: "Research suppliers for the espresso machine" },
+      now,
+    );
+    expect(amended.ok).toBe(true);
+    const started = store.requestWork(
+      {
+        identity: fixture.ownerA,
+        organizationId: fixture.orgPrivateA,
+        projectId: fixture.projAOpen,
+        text: "Research suppliers for the espresso machine and tell me a joke",
+        operationId: "research.collect",
+        kind: "research",
+        grantId: fixture.grantResearchA,
+      },
+      now,
+    );
+    expect(started.ok).toBe(true);
+    if (!started.ok) throw new Error("mixed research job failed");
+    expect(store.scopeSegmentDecisions).toHaveLength(1);
+    expect(store.scopeSegmentDecisions[0]?.supportedSegment).toBe(
+      "Research suppliers for the espresso machine",
+    );
+    expect(store.scopeSegmentDecisions[0]?.refusedSegments[0]?.text).toBe("tell me a joke");
+    const reservation = store.reserve(started.value.id, 100, "controlled-mixed", now);
+    expect(reservation.ok).toBe(true);
+    const created = store.createOperation(
+      {
+        identity: fixture.ownerA,
+        jobId: started.value.id,
+        kind: "research.collect",
+        requestId: "req-mixed-research",
+        payload: {
+          query: "Research suppliers for the espresso machine and tell me a joke",
+        },
+        grantId: fixture.grantResearchA,
+        ...(reservation.ok ? { reservationId: reservation.value.id } : {}),
+      },
+      now,
+    );
+    expect(created.ok).toBe(true);
+    if (!created.ok) throw new Error("mixed research operation failed");
+    expect(created.value.operation.canonicalPayload).toBe(
+      JSON.stringify({ query: "Research suppliers for the espresso machine" }),
+    );
+    const claimed = store.claimOperation(
+      { identity: fixture.ownerA, operationId: created.value.operation.id },
+      now,
+    );
+    expect(claimed.ok).toBe(true);
+  });
+
   test("direct unsupported backend operation is rejected (D-17)", () => {
     const fixture = buildControlledFixture();
     const { store, now } = fixture;

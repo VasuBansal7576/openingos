@@ -325,9 +325,25 @@ export type ScopeVerdict =
       readonly verdict: "supported";
       readonly operationId: string;
       readonly purpose: WorkflowPurpose;
+      /**
+       * The server-derived portion that this job is allowed to execute.
+       * Never use the caller's full mixed text as an execution payload.
+       */
+      readonly supportedSegment: string;
+      /**
+       * Unrelated or unavailable clauses are retained as explicit metadata
+       * so a caller can explain what was refused without granting it work.
+       */
+      readonly refusedSegments: readonly RefusedScopeSegment[];
     }
   | { readonly verdict: "unrelatedRefused"; readonly reason: string }
   | { readonly verdict: "unavailableRefused"; readonly reason: string };
+
+export interface RefusedScopeSegment {
+  readonly text: string;
+  readonly verdict: "unrelatedRefused" | "unavailableRefused";
+  readonly reason: string;
+}
 
 /**
  * Stable purchasing-intent anchors.  This is deliberately not a vocabulary
@@ -540,6 +556,51 @@ function tokenize(text: string): string[] {
   return text.toLocaleLowerCase().match(/[a-z0-9]+/g) ?? [];
 }
 
+/**
+ * Split only at explicit natural-language clause boundaries.  A clause is
+ * admitted independently below, so a separator never creates authority by
+ * itself and opaque product names remain payload data.
+ */
+function requestClauses(text: string): string[] {
+  return text
+    .split(/\band\b|\bbut\b|[.!?;]|\n/i)
+    .map((clause) => clause.trim())
+    .filter((clause) => meaningfulTokens(tokenize(clause)).length > 0);
+}
+
+/**
+ * Detect only structurally explicit requests for capabilities that are not
+ * shipped.  Bare nouns such as "order", "purchase", or "send" stay data;
+ * they cannot turn an otherwise ambiguous clause into a refused authority
+ * decision.
+ */
+function unavailableCapabilityForClause(
+  text: string,
+): { readonly operationId: string; readonly reason: string } | null {
+  if (
+    /\b(place|create|submit|confirm|accept)\b(?:\W+\w+){0,4}\W+\b(order|purchase|payment|financing|contract)\b/i.test(
+      text,
+    ) ||
+    /\b(buy|purchase|pay|finance|sign)\b(?:\W+\w+){0,3}\b/i.test(text)
+  ) {
+    return {
+      operationId: "purchase.placeOrder",
+      reason: "operation-unavailable:purchase.placeOrder",
+    };
+  }
+  if (
+    /\b(submit|send|fill|use)\b(?:\W+\w+){0,4}\W+\b(contact\s+form|vendor\s+form|website\s+chat|chat\s+box)\b/i.test(
+      text,
+    )
+  ) {
+    return {
+      operationId: "vendorForm",
+      reason: "operation-unavailable:vendorForm",
+    };
+  }
+  return null;
+}
+
 function contextTokens(context: ProjectWorkflowContext | undefined): ReadonlySet<string> {
   // Project names are labels, not workflow authority. Only requirement
   // terms that were loaded from server-owned records may participate in a
@@ -603,51 +664,14 @@ function hasContextualFollowUp(
   );
 }
 
-function hasMixedUnsupportedClause(input: {
-  readonly text: string;
-  readonly context: ReadonlySet<string>;
-  readonly purpose: WorkflowPurpose;
-  readonly hasStructuredContext: boolean;
-}): boolean {
-  const clauses = input.text
-    .toLocaleLowerCase()
-    .split(/\band\b|\bbut\b|[.!?;]|\n/)
-    .map((clause) => meaningfulTokens(tokenize(clause)))
-    .filter((clause) => clause.length > 0);
-  if (clauses.length < 2) return false;
-  return clauses.some((clause) => {
-    const hasPurposeAnchor =
-      input.purpose === "purchasingCommunication"
-        ? hasCommunicationAnchor(clause)
-        : hasResearchAnchor(clause);
-    const hasContextualReference =
-      input.hasStructuredContext &&
-      input.context.size > 0 &&
-      hasContextualFollowUp(clause, input.context, input.hasStructuredContext);
-    return !hasPurposeAnchor && !hasContextualReference;
-  });
-}
-
-function allowedWorkflowText(input: {
+function allowedWorkflowClause(input: {
   readonly text: string;
   readonly purpose: WorkflowPurpose;
   readonly context?: ProjectWorkflowContext;
 }): boolean {
   const context = contextTokens(input.context);
-  const tokens = tokenize(input.text);
-  const meaningful = meaningfulTokens(tokens);
-  if (meaningful.length === 0) return false;
-  if (
-    hasMixedUnsupportedClause({
-      text: input.text,
-      context,
-      purpose: input.purpose,
-      hasStructuredContext: input.context?.hasStructuredContext === true,
-    })
-  ) {
-    return false;
-  }
-
+  const meaningful = meaningfulTokens(tokenize(input.text));
+  if (meaningful.length === 0 || unavailableCapabilityForClause(input.text) !== null) return false;
   const anchor =
     input.purpose === "purchasingCommunication"
       ? hasCommunicationAnchor(meaningful, input.context)
@@ -657,13 +681,19 @@ function allowedWorkflowText(input: {
     context,
     input.context?.hasStructuredContext === true,
   );
-  if (!anchor && !contextual) return false;
+  return anchor || contextual;
+}
 
-  // There is intentionally no unknown-token allowlist or vocabulary budget.
-  // The positive anchor or the server-owned contextual follow-up is the
-  // authority boundary; opaque product names are data carried by that
-  // already-authorized structure, never a source of authority themselves.
-  return true;
+function allowedWorkflowText(input: {
+  readonly text: string;
+  readonly purpose: WorkflowPurpose;
+  readonly context?: ProjectWorkflowContext;
+}): boolean {
+  const clauses = requestClauses(input.text);
+  return (
+    clauses.length > 0 &&
+    clauses.every((text) => allowedWorkflowClause({ ...input, text }))
+  );
 }
 
 function isCommunicationSendText(text: string): boolean {
@@ -826,6 +856,60 @@ function validatedResearchPayload(
 }
 
 /**
+ * Extract the text that carries workflow purpose from an already shaped
+ * payload.  The surrounding payload remains data and is never interpreted as
+ * authority.  Callers use this before classifying a grant or operation so the
+ * same segment contract applies at admission, creation, and claim.
+ */
+export function workflowTextForPayload(
+  operationId: string,
+  payload: unknown,
+): string | null {
+  if (operationId === "communication.send" || operationId === "communication.clarify") {
+    return exactObjectKeys(payload, ["profile", "to", "cc", "bcc", "subject", "body"]) &&
+      typeof payload.body === "string"
+      ? payload.body
+      : null;
+  }
+  if (
+    operationId !== "research.collect" &&
+    operationId !== "research.read" &&
+    operationId !== "comparison.read"
+  ) {
+    return null;
+  }
+  return exactObjectKeys(payload, ["query"]) && typeof payload.query === "string"
+    ? payload.query
+    : null;
+}
+
+/**
+ * Return the canonical payload that carries only a classifier-approved
+ * segment.  Refused clauses are intentionally not serialised into a provider
+ * payload, preventing a downstream handler from accidentally executing them.
+ */
+export function supportedWorkflowPayload(
+  operationId: string,
+  payload: unknown,
+  supportedSegment: string,
+): Record<string, unknown> | null {
+  if (supportedSegment.trim().length === 0) return null;
+  if (operationId === "communication.send" || operationId === "communication.clarify") {
+    if (!exactObjectKeys(payload, ["profile", "to", "cc", "bcc", "subject", "body"])) return null;
+    return { ...payload, body: supportedSegment };
+  }
+  if (
+    operationId !== "research.collect" &&
+    operationId !== "research.read" &&
+    operationId !== "comparison.read"
+  ) {
+    return null;
+  }
+  if (!exactObjectKeys(payload, ["query"])) return null;
+  return { query: supportedSegment };
+}
+
+/**
  * Validate semantic payload fields that can carry a workflow purpose. Other
  * fields stay bound to the approved grant and are not interpreted as policy.
  */
@@ -854,13 +938,12 @@ export function validateWorkflowPayload(input: {
     // The subject is metadata, not authority. Validate the body on its own
     // so an "RFQ" or "Clarification" subject cannot launder an unrelated
     // request into an approved outbound operation.
-    if (
-      !allowedWorkflowText({
-        text: input.payload.body,
-        purpose: input.purpose,
-        ...(input.context === undefined ? {} : { context: input.context }),
-      })
-    ) {
+    const classified = classifyScope({
+      text: input.payload.body,
+      operationId: input.operationId,
+      ...(input.context === undefined ? {} : { projectContext: input.context }),
+    });
+    if (classified.verdict !== "supported") {
       return { ok: false, reason: "communication-payload-is-outside-purchasing-workflow" };
     }
     return { ok: true };
@@ -869,14 +952,12 @@ export function validateWorkflowPayload(input: {
   if (research === null) {
     return { ok: false, reason: "research-payload-is-outside-purchasing-workflow" };
   }
-  const allowedText = isResearchReadOperation(input.operationId)
-    ? allowedResearchReadText(research.text, input.context)
-    : allowedWorkflowText({
-        text: research.text,
-        purpose: input.purpose,
-        ...(input.context === undefined ? {} : { context: input.context }),
-      });
-  if (!allowedText) {
+  const classified = classifyScope({
+    text: research.text,
+    operationId: input.operationId,
+    ...(input.context === undefined ? {} : { projectContext: input.context }),
+  });
+  if (classified.verdict !== "supported") {
     return { ok: false, reason: "research-payload-is-outside-purchasing-workflow" };
   }
   return { ok: true };
@@ -931,25 +1012,86 @@ export function classifyScope(input: {
   if (purpose === undefined) {
     return { verdict: "unavailableRefused", reason: `operation-purpose-unavailable:${entry.operationId}` };
   }
-  const allowedText = isResearchReadOperation(entry.operationId)
-    ? allowedResearchReadText(text, input.projectContext)
-    : allowedWorkflowText({
-        text,
-        purpose,
-        ...(input.projectContext === undefined ? {} : { context: input.projectContext }),
+  const clauses = requestClauses(text);
+  const supported: string[] = [];
+  const refusedSegments: RefusedScopeSegment[] = [];
+  for (const clause of clauses) {
+    const unavailable = unavailableCapabilityForClause(clause);
+    if (unavailable !== null) {
+      refusedSegments.push({
+        text: clause,
+        verdict: "unavailableRefused",
+        reason: unavailable.reason,
       });
-  if (!allowedText) {
-    return { verdict: "unrelatedRefused", reason: "request-is-not-an-allowlisted-openingos-workflow" };
+      continue;
+    }
+    const allowed = isResearchReadOperation(entry.operationId)
+      ? isResearchReadTokens(
+          meaningfulTokens(tokenize(clause)),
+          contextTokens(input.projectContext),
+          input.projectContext?.hasStructuredContext === true,
+        )
+      : allowedWorkflowClause({
+          text: clause,
+          purpose,
+          ...(input.projectContext === undefined ? {} : { context: input.projectContext }),
+        });
+    if (allowed) {
+      supported.push(clause);
+    } else {
+      refusedSegments.push({
+        text: clause,
+        verdict: "unrelatedRefused",
+        reason: "request-is-not-an-allowlisted-openingos-workflow",
+      });
+    }
   }
-  if (input.operationId !== undefined) {
-    // Explicit IDs are checked against the same positive workflow contract;
-    // they never bypass text or project-context validation.
-    return { verdict: "supported", operationId: entry.operationId, purpose };
+  // A contextual-only clause is safe as a standalone follow-up, but splitting
+  // it away from unrelated text would let an ambiguous request manufacture
+  // authority.  Mixed admission therefore needs one explicit purchasing
+  // anchor; contextual-only requests remain supported when they are whole.
+  if (
+    supported.length > 0 &&
+    refusedSegments.length > 0 &&
+    !supported.some((clause) => {
+      const tokens = meaningfulTokens(tokenize(clause));
+      if (isResearchReadOperation(entry.operationId)) {
+        return tokens.some((token) => PURCHASING_READ_STATE_CUES.has(token)) &&
+          tokens.some((token) => PURCHASING_READ_RECORD_ANCHORS.has(token));
+      }
+      return purpose === "purchasingCommunication"
+        ? hasCommunicationAnchor(tokens, input.projectContext)
+        : hasResearchAnchor(tokens);
+    })
+  ) {
+    const firstRefusal = refusedSegments[0];
+    return {
+      verdict: firstRefusal?.verdict === "unavailableRefused" ? "unavailableRefused" : "unrelatedRefused",
+      reason: firstRefusal?.reason ?? "request-is-not-an-allowlisted-openingos-workflow",
+    };
   }
-  if (entry.operationId === "communication.send" && !isCommunicationSendText(text)) {
+  if (supported.length === 0) {
+    const firstRefusal = refusedSegments[0];
+    if (firstRefusal?.verdict === "unavailableRefused") {
+      return { verdict: "unavailableRefused", reason: firstRefusal.reason };
+    }
+    return {
+      verdict: "unrelatedRefused",
+      reason: firstRefusal?.reason ?? "request-is-not-an-allowlisted-openingos-workflow",
+    };
+  }
+  if (input.operationId === undefined && entry.operationId === "communication.send" && supported.length === 0) {
     return { verdict: "unrelatedRefused", reason: "communication-purpose-not-established" };
   }
-  return { verdict: "supported", operationId: entry.operationId, purpose };
+  // Explicit IDs are checked against the same positive workflow contract;
+  // they never bypass text, project context, or the segment boundary.
+  return {
+    verdict: "supported",
+    operationId: entry.operationId,
+    purpose,
+    supportedSegment: supported.join(" and "),
+    refusedSegments,
+  };
 }
 
 /** Detect prompt-injection directives smuggled inside supplier content. */
