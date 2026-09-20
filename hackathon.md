@@ -359,3 +359,15 @@ The controlled server-only OpenAI Responses boundary is integrated locally throu
 It uses dated snapshot `gpt-5.4-mini-2026-03-17`, strict source-backed extraction and supplier-draft schemas, bounded token and byte policies, a shared reservation fence, exactly one transport attempt and durable ambiguous-exposure accounting.
 The integrated 17 focused tests and full local matrix pass; no OpenAI credential or live request was used, and downstream approval and communication consumption remain open.
 Greptile subsequently identified one new P1 in production communication scope admission; a focused Luna repair is active and PR #2 will not merge until that exact-head finding and independent Astra review are complete.
+
+### 2026-09-21 - E1 equipment UI controlled checkpoint
+
+Integrated the real bounded E1 equipment projection into the selected purchasing workbench at local commit `8ac84de`.
+The Equipment view now renders only server-projected installed assets, safe purchase and warranty document metadata, and linked service cases, including explicit empty and truncation states.
+It does not infer assets from selected, ordered or fulfilled requirements.
+Service-case creation remains visibly disabled and produces zero adapter calls because no backend command route exists.
+An independent rerun passes all 47 app tests, strict TypeScript and the production build.
+This is controlled local evidence only.
+No hosted Convex read, service mutation, live provider call, owner-mailbox exchange or external effect was observed.
+The direct PR-thread audit also found four additional actionable Greptile discussions that were not represented by the green aggregate check: an activity-cursor race, duplicate J-06 IDs, ambiguous OpenAI response accounting and unbound OpenAI workload input.
+Focused Luna and Muse repairs are active, so PR #2 remains unmergeable until those fixes are integrated, tested, pushed and reviewed.

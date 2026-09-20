@@ -26,7 +26,9 @@ This file supplies order, not duplicate contracts or a running automation.
    - [x] C1 owner-only transport, callbacks, reconciliation and quote ingestion use indexed provider binding lookup at exact PR head `099d016`.
    - [ ] U1 production-state adapter, live Convex wiring and desktop/narrow browser proof remain open.
 5. [ ] **E1, integrated behavior.** Build recovery, change impact and equipment/service flows against the integrated research and communication modules.
-   - [x] Project-authorized, bounded equipment projection reads real asset, safe document and service-case records at local integration commit `436dc61`; UI consumption, mutations, recovery and change-impact flows remain open.
+   - [x] Project-authorized, bounded equipment projection reads real asset, safe document and service-case records at local integration commit `436dc61`.
+   - [x] The workbench consumes that exact equipment shape at local integration commit `8ac84de`, renders honest empty and truncation states, and keeps service creation disabled because no backend command route exists.
+   - [ ] Equipment/service mutations, commissioning, recovery and change-impact flows remain open.
 6. [ ] **V1, proof and review.** A separate Astra session reviews a fixed combined commit; implementation owners repair its findings.
    Prove all 52 P/H/D requirements, 24 S-cases and 7 J-cases, recording live versus controlled evidence and any unmet case.
    Exercise the real owner-email negotiation, Jev decisions, browser recovery, guest isolation and responsive UI; an early working path is not completion.
@@ -95,7 +97,11 @@ This file supplies order, not duplicate contracts or a running automation.
 - [x] Close U1 Greptile P1 discussions `4058112415` and `4058112420` at exact PR head `df30e5f` with append-only activity pagination and connected-only mutation controls; factual test evidence is posted to both discussions.
 - [x] Integrate the controlled J-06 versioned Jev evaluation corpus and runner through local commit `1f98a60`; 12 focused tests and strict TypeScript pass, and the suite is now part of `bun run test`.
 - [x] Integrate the controlled server-only OpenAI Responses boundary through local commit `a0ec63f`; the dated model, strict extraction/draft schemas, source and token bounds, shared reservation fence, one-attempt transport and ambiguous accounting pass 17 focused tests and the combined full matrix.
+- [x] Integrate the real E1 equipment projection into the workbench UI through local commit `8ac84de`; the independent rerun passes 47 app tests, strict TypeScript and the production build, with no live backend or service mutation claimed.
 - [ ] Repair Greptile P1 discussion `4058171616`, which found that short exact-grant communication drafts can be refused before communication-envelope validation.
+- [ ] Repair Greptile P1 discussion `4058206836`, which found that out-of-order activity page responses can regress the current cursor.
+- [ ] Repair Greptile P2 discussion `4058227807`, which found that duplicate J-06 corpus IDs can skew metrics.
+- [ ] Repair Greptile P1 discussions `4058238262` and `4058238267`, which require ambiguous accounting after a billable invalid OpenAI response and exact binding of the complete model workload.
 - [ ] Finish the U1 backend-shape adapter, connect the UI to Convex, inspect the selected flow at desktop and narrow widths, then obtain exact-head CI, Greptile and separate Astra review.
 
 The completed money and Jev proof wave contains controlled proofs only, reviewed at `595d30c` with no actionable findings remaining.
