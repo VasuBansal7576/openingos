@@ -92,7 +92,9 @@ This file supplies order, not duplicate contracts or a running automation.
 - [x] Integrate D-17 mixed-scope admission, the real Convex U1 adapter and the J-03 actual-action allowance fence through local commit `c6c60fb`; focused controlled tests, TypeScript and production build pass.
 - [x] Integrate the repaired E1 equipment backend projection through local commit `436dc61`; 10 focused projection tests, strict TypeScript and the production build pass, with asset documents restricted to exactly `kind` and `createdAt`.
 - [x] Integrate the U1 activity-pagination and reconnect-action repairs through local commit `6c63609`; the full local test matrix, strict TypeScript and production build pass.
-- [ ] Close U1 Greptile P1 discussions `4058112415` and `4058112420` with append-only activity pagination and connected-only mutation controls on the next exact PR head.
+- [x] Close U1 Greptile P1 discussions `4058112415` and `4058112420` at exact PR head `df30e5f` with append-only activity pagination and connected-only mutation controls; factual test evidence is posted to both discussions.
+- [x] Integrate the controlled J-06 versioned Jev evaluation corpus and runner through local commit `1f98a60`; 12 focused tests and strict TypeScript pass, and the suite is now part of `bun run test`.
+- [ ] Repair Greptile P1 discussion `4058171616`, which found that short exact-grant communication drafts can be refused before communication-envelope validation.
 - [ ] Finish the U1 backend-shape adapter, connect the UI to Convex, inspect the selected flow at desktop and narrow widths, then obtain exact-head CI, Greptile and separate Astra review.
 
 The completed money and Jev proof wave contains controlled proofs only, reviewed at `595d30c` with no actionable findings remaining.

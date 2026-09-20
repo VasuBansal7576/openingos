@@ -347,3 +347,12 @@ Its 10 focused controlled tests, strict TypeScript and production build pass; eq
 Official OpenAI documentation resolved the pending controlled model contract to dated snapshot `gpt-5.4-mini-2026-03-17`; no live OpenAI account access or request was claimed.
 All evidence in this checkpoint is controlled local execution only.
 No live provider call, hosted deployment, owner-mailbox exchange or external effect was observed.
+
+### 2026-09-21 - U1 and J-06 controlled checkpoint
+
+PR head `df30e5f` contains the U1 pagination and reconnect-action repairs, and all four related D-17, J-03 and U1 review discussions now carry exact-head controlled evidence and are resolved.
+The full local test matrix, strict TypeScript and production build pass for that head.
+The controlled J-06 evaluation package is integrated locally through `1f98a60` and is now included in the default test command.
+Its versioned corpus covers incomplete offers, legitimate short follow-ups, unrelated requests, adversarial text and changed owner replies, with per-decision candidate error rates, intervention counts and separate model-versus-total latency.
+The 12 focused tests and strict TypeScript pass, but no live `jev-1.13.0` evaluation ran and no production threshold has been chosen.
+Greptile subsequently identified one new P1 in production communication scope admission; a focused Luna repair is active and PR #2 will not merge until that exact-head finding and independent Astra review are complete.

@@ -118,7 +118,7 @@ Passing controlled evidence never counts as a live provider, deployed applicatio
 | J-03 | controlled-verified | The actual Jev action now rejects missing, invalid, overflowing or stale configured pricing before provider dispatch, requires one full three-attempt shared reservation, preserves ambiguous exposure and passes 15 focused controlled tests including concurrent action admission; live pricing and provider access remain unverified. |
 | J-04 | controlled-verified | F1 validation, stale-result, grant, recipient and late-authority tests prevent changed, revoked or cross-recipient decisions from authorizing effects. |
 | J-05 | live-unverified | No authorized hosted Jev call has run. |
-| J-06 | not-started | Domain evaluation set, thresholds, latency and intervention report remain. |
+| J-06 | partial-controlled | A versioned offline corpus covers incomplete offers, short follow-ups, unrelated and adversarial text, and changed owner replies; 12 tests report per-decision candidate error rates, intervention counts, and model latency separately from total work. Live `jev-1.13.0` runs and production threshold selection remain. |
 | J-07 | live-unverified | No published useful Jev effect or owner-reply negotiation has run. |
 
 ## Current reviewed artifacts
