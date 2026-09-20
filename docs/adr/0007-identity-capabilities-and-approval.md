@@ -1,7 +1,14 @@
 # ADR-0007: Identity, capabilities and approval
 
-Status: Proposed; identity choice and published-origin behavior need acceptance.
+Status: Accepted for backend capability and grant contracts; identity provider and published-origin behavior still need proof.
 Requirements: P-13, P-15, P-16, P-20, H-06, D-07, D-09, D-14, D-17.
+
+## September 20, 2026 evidence amendment
+
+The three independent checks, deny-by-default capability catalog, version-bound grant and owner-only communication profile are accepted as F1 implementation contracts.
+Controlled executor review demonstrates that UI/model intent alone does not authorize an operation and that expiry, revocation, origin and operation boundaries can be enforced.
+NR03 remains the explicit F1 gate for durable shared-schema authority, tenant/project isolation, direct-call bypass tests and owner-recipient configuration versions.
+Convex Auth selection, OAuth behavior, guest/private isolation on a hosted deployment and the published origin remain unproven.
 
 ## Recommendation
 

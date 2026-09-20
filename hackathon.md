@@ -2,17 +2,17 @@
 
 - **Project:** OpeningOS
 - **Event:** Convex All Gas Hackathon
-- **What it does:** Café procurement and equipment coordination concept with an accepted purchasing-workbench prototype; production application and backend not implemented yet.
+- **What it does:** Café procurement workbench with a controlled React/Convex foundation, typed Jev boundary and isolated browser-executor contracts; full product workflows remain in implementation.
 - **Live app:** not deployed
 - **Repo:** https://github.com/VasuBansal7576/openingos
-- **Frontend:** Codex Sites
+- **Frontend:** React/Vite foundation; ChatGPT Sites publication target
 - **Convex deployment:** not deployed
-- **Components:** none
-- **Convex features:** none yet
-- **Auth:** none
-- **AI models:** none
+- **Components:** Firecrawl, AgentMail and Workflow registered in local configuration; no hosted proof
+- **Convex features:** local component configuration, HTTP/auth foundation and generated references; no hosted persistence proof
+- **Auth:** Convex Auth foundation only; no hosted guest/private isolation proof
+- **AI models:** controlled Jev `jev-1.13.0` adapter tests only; no live application inference
 - **Started:** 2026-09-19T09:46:19Z
-- **Last updated:** 2026-09-19T20:07:33Z
+- **Last updated:** 2026-09-20T01:03:00Z
 
 ## Log
 
@@ -175,3 +175,14 @@ Shut down the settled implementation and reviewer sessions, verified clean workt
 Native OpenCode approvals were supervised directly, with scoped routine permissions verified after restart using the requested model and high variant.
 All evidence remains controlled; no live application, hosted identity, shared provider budget, owner-email run or publication was verified.
 The next foundation stage requires the privately configured application credentials, approved provider allowances and owner recipient that remain unresolved.
+
+### 2026-09-20 - 6432e98
+
+Integrated the React/Vite and Convex application foundation, official Firecrawl, AgentMail and Workflow registration, Convex Auth scaffolding, controlled Jev boundary and the isolated browser-executor contract.
+The exact checkpoint passes typechecking, a production build, 23 repository tests, 77 proof tests, 155 browser-executor tests, 2 application tests, 19 provider-contract tests and 5 mounted user-path tests.
+Both exact-head GitHub workflows passed: application CI run `35479908327` and repository checks run `35479908303`.
+A separate GPT-6 Astra reviewer accepted the fixed commit after 66 fresh deadline/isolation tests, the prior 64-probe suite and 20 additional complete browser-suite repetitions, closing FR01 through FR08 with no actionable finding.
+The retained application browser evidence covers controlled loading, unavailable, interrupted and retry states at 1280px and 390px widths, keyboard activation, cleanup and horizontal-overflow checks; the application code was unchanged in the final browser-only repair.
+Accepted ADR-0003 through ADR-0008 only for their documented controlled implementation surfaces and added one evidence matrix for all 52 P/H/D requirements, 24 sponsor cases and 7 Jev cases.
+No hosted Convex deployment, live Jev/OpenAI/Firecrawl/AgentMail call, owner mailbox exchange, remote browser, genuine vendor result, public site or realized savings was observed.
+The next unblocked package is F1 durable shared-schema authority; NR03, hosted identity, live providers and publication remain open.

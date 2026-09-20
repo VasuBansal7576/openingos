@@ -16,6 +16,7 @@ This file supplies order, not duplicate contracts or a running automation.
    Once the app contains Convex, run `npx convex ai-files status`, install missing/stale managed AI files, and read the generated guidelines.
    Establish app CI, hosted Convex access, identity isolation, the Jev adapter and isolated remote browser execution.
    Resolve ordinary technical choices with test evidence and amend the relevant ADR before dependent implementation.
+   The controlled application, Jev and browser foundations are accepted at `6432e98`; hosted Convex, live credentials, identity isolation on the published origin and D-04 remain open.
 3. [ ] **F1, shared contracts.** Prove schemas, money, authority, owner-only recipients, deduplication and shared provider budgets.
    Independent controlled contract tests may run alongside F0; freeze affected interfaces only after their prerequisites pass.
    Assign one owner to schema, dependency and lockfile changes.
@@ -48,16 +49,19 @@ This file supplies order, not duplicate contracts or a running automation.
 - [ ] Verify hosted environment, application credentials, provider allowances and owner recipient.
 - [x] Integrate and review the independent financial and Jev contract proofs.
 - [x] Integrate browser-executor controlled contract proof `714155f`; its 51 nominal controlled tests passed before independent review.
-- [ ] Close the ten actionable browser-executor findings reported by the separate Astra review of `78e2694`, integrate the Spark-owned repairs and have Astra re-review the fixed combined commit before crediting the affected D-cases.
-- [ ] Integrate and review the Luna-owned application foundation, including strict app and browser-executor CI coverage, official component registration, identity foundation, controlled Jev and AgentMail boundaries and an honest unconfigured-backend state.
+- [x] Close all FR01 through FR08 browser-executor findings reported by the separate Astra reviews, integrate the Spark-owned repairs through `6432e98`, and obtain an ACCEPT verdict on that exact fixed commit.
+- [x] Integrate and review the Luna-owned application foundation, including strict app and browser-executor CI coverage, official component registration, identity foundation, controlled Jev and AgentMail boundaries and an honest unconfigured-backend state.
+- [x] Pass the full local matrix at `6432e98`: typechecks, production build, 23 repository tests, 77 proof tests, 155 browser tests, 2 application tests, 19 provider-contract tests and 5 mounted user-path tests.
+- [x] Pass both exact-head GitHub workflows at `6432e98`: application CI run `35479908327` and repository checks run `35479908303`.
+- [x] Have the separate Astra reviewer pass 66 fresh FR03 boundary/isolation tests, the prior 64-probe suite and 20 additional complete browser-suite runs; all evidence remains controlled.
+- [x] Resolve ADR-0003 through ADR-0008 for controlled implementation and record every P/H/D, S and J case in the [evidence matrix](docs/verification/evidence-matrix.md).
 - [x] Shut down settled worker/reviewer sessions and remove both completed worker worktrees through Orca after verifying clean status and remote preservation.
 
 The completed money and Jev proof wave contains controlled proofs only, reviewed at `595d30c` with no actionable findings remaining.
 Luna owned `proofs/money/**`; Muse Spark owned `proofs/jev/**`; Astra owned shared tooling, integration and progress files.
 The separate Astra reviewer also passed 1,144 exact allocation/changed-price cases and 1,760 settlement split/reordering checks.
-The worker branches remain on GitHub; their completed worktrees have been removed, and the coordinator checkout remains available.
-Neither this proof wave nor its green CI accepts the proposed architecture, passes full F0/F1 gates or authorizes dependent product features.
-Browser-executor review repairs and the application foundation remain active and do not require live credentials.
+The application/browser foundation is accepted at `6432e98` for controlled implementation, with FR01 through FR08 closed and NR03 assigned to F1.
+This accepts the documented contracts as implementation inputs; it does not pass the full F0/F1 gates or authorize live provider effects.
 Hosted provider cases still need a hosted environment, application credentials, provider allowances and the private owner recipient; those facts remain unverified and block only the affected live evidence.
 
 ## Duties throughout

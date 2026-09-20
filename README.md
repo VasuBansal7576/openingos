@@ -5,9 +5,9 @@ The planned product connects requirements, source evidence, quote versions, appr
 
 ## Current state
 
-This repository contains the agreed PRD, architecture proposals, controlled foundation proofs, delivery tooling and selected clickable design.
-It does not contain an implemented application or deployed Convex backend yet.
-There is no live site or production start command.
+This repository contains the agreed PRD, accepted controlled architecture contracts, a React/Convex application foundation, controlled Jev and browser-executor modules, delivery tooling and the selected clickable design.
+The foundation compiles, builds and passes controlled contract tests, but the full purchasing product and durable shared schema are still being implemented.
+There is no hosted Convex deployment, live provider run, public site or production start command yet.
 
 Open [the standalone purchasing workbench](design/purchasing-workbench.html) in a browser to inspect the selected flow.
 Its images, fonts and fixture runtime are embedded.
@@ -36,34 +36,31 @@ No real vendor is contacted through email, forms or another channel.
 | [Jev integration](docs/adr/0005-jev-and-openai.md#api-contract) | Backend endpoint, request/response validation and retry policy |
 | [Implementation packages](docs/implementation/sponsor-integration-plan.md) | Dependencies, owned files and acceptance evidence |
 | [Coordinator roadmap](ROADMAP.md) | Coordinator setup, build order and completion gates |
+| [Evidence matrix](docs/verification/evidence-matrix.md) | Current status for all 52 P/H/D requirements, 24 S-cases and 7 J-cases |
 | [Agent instructions](AGENTS.md) | Repository rules and GitHub delivery responsibilities |
 | [Build log](hackathon.md) | Factual progress, not planned capabilities presented as completed work |
 
 ## Run the existing checks
 
-Use a recent Node.js release with the built-in test runner.
-These checks do not require installing application packages:
-
-```sh
-node --test scripts/check-pr.test.mjs scripts/check-workbench.test.mjs
-```
-
-These 23 tests validate the CI-inspection helper and saved prototype structure only.
-The independent contracts under `proofs/money` and `proofs/jev` use controlled data and injected HTTP responses.
-They exercise financial calculations and Jev transport validation without provider credentials or live calls.
-The controlled proof checkpoint `595d30c` passes 77 tests and independent Astra review with no remaining actionable findings.
-The roadmap records the separate hosted and application gates that remain open.
-Run them with the pinned Bun 1.3.11 toolchain:
+Use the pinned Bun 1.3.11 toolchain for the application and controlled contracts:
 
 ```sh
 bun install --frozen-lockfile
-bun run typecheck:proofs
+bun run typecheck
+bun run typecheck:browser
+bun run build
 bun run test
+bun run test:provider-contracts
+bun run test:user-path
 ```
 
-CI requires `delivery-guard-tests`, `workbench-artifact-tests`, `foundation-typecheck` and `foundation-contract-tests`.
-Application typechecking, build, backend tests and live integration checks remain foundation deliverables, not passing checks today.
-Use Bun for the application unless the selected Sites starter specifies another package manager.
+The independent contracts under `proofs/money` and `proofs/jev` use controlled data and injected HTTP responses.
+They exercise financial calculations and Jev transport validation without provider credentials or live calls.
+The controlled proof checkpoint `595d30c` passes 77 tests and independent Astra review with no remaining actionable findings.
+The application/browser checkpoint `6432e98` passes 23 repository tests, 77 proof tests, 155 browser-executor tests, 2 application tests, 19 provider-contract tests and 5 mounted user-path tests, with separate Astra acceptance.
+Its exact-head GitHub application and repository workflows passed.
+CI now requires `delivery-guard-tests`, `workbench-artifact-tests`, `foundation-typecheck`, `foundation-contract-tests`, `app-typecheck`, `app-build`, `app-tests`, `app-provider-contracts` and `app-user-path`.
+These results are controlled evidence only; the [roadmap](ROADMAP.md) and [evidence matrix](docs/verification/evidence-matrix.md) retain the hosted and live gates.
 
 ## Configuration and publication
 
