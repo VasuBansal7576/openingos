@@ -172,6 +172,39 @@ export interface WorkbenchActivityPage {
   readonly isDone: boolean;
 }
 
+export interface WorkbenchAssetDocument {
+  readonly kind: string;
+  readonly createdAt: number;
+}
+
+export interface WorkbenchServiceCase {
+  readonly id: string;
+  readonly urgency: string;
+  readonly summary: string;
+  readonly state: string;
+  readonly outcome: string | null;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+}
+
+export interface WorkbenchAsset {
+  readonly id: string;
+  readonly label: string;
+  readonly serial: string | null;
+  readonly constraints: string | null;
+  readonly purchaseProvenance: string | null;
+  readonly createdAt: number;
+  readonly documents: readonly WorkbenchAssetDocument[];
+  readonly documentsTruncated: boolean;
+  readonly serviceCases: readonly WorkbenchServiceCase[];
+  readonly serviceCasesTruncated: boolean;
+}
+
+export interface WorkbenchEquipment {
+  readonly assets: readonly WorkbenchAsset[];
+  readonly assetsTruncated: boolean;
+}
+
 export interface WorkbenchProvenance {
   readonly mode: ProvenanceMode;
   readonly label: string;
@@ -187,6 +220,7 @@ export interface WorkbenchSnapshot {
   readonly decisions: readonly WorkbenchDecision[];
   readonly activity: WorkbenchActivityPage;
   readonly provenance: WorkbenchProvenance;
+  readonly equipment: WorkbenchEquipment;
   readonly selectedOfferId: string | null;
   readonly selectedForecastMinorUnits: number | null;
   readonly committedMinorUnits: number | null;
@@ -197,6 +231,7 @@ export interface WorkbenchSnapshot {
     readonly offers: boolean;
     readonly jobs: boolean;
     readonly decisions: boolean;
+    readonly equipment: boolean;
   };
 }
 
@@ -551,6 +586,96 @@ function containsPrivateProjectionKey(value: unknown): boolean {
   }
 }
 
+function containsPrivateEquipmentKey(value: unknown): boolean {
+  try {
+    const serialized = JSON.stringify(value);
+    return serialized === undefined || /"(?:[^"\\]*storageRef[^"\\]*|[^"\\]*storageId[^"\\]*|[^"\\]*idempotency[^"\\]*|[^"\\]*documentId[^"\\]*|[^"\\]*assetId[^"\\]*|[^"\\]*projectId[^"\\]*|[^"\\]*organizationId[^"\\]*)"\s*:/i.test(serialized);
+  } catch {
+    return true;
+  }
+}
+
+function optionalNonEmptyString(value: unknown): string | null | undefined {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string" || value.trim().length === 0) return undefined;
+  return value;
+}
+
+function hasOnlyKeys(value: Record<string, unknown>, allowed: readonly string[]): boolean {
+  return Object.keys(value).every((key) => allowed.includes(key));
+}
+
+/**
+ * Asset documents project exactly kind and createdAt. Any additional key —
+ * an id, storage locator, idempotency key, URL, or cross-shape reference —
+ * means the row is not the safe E1 projection and the payload is rejected.
+ */
+function parseAssetDocument(value: unknown): WorkbenchAssetDocument | null {
+  if (!isRecord(value) || !hasOnlyKeys(value, ["kind", "createdAt"])) return null;
+  const kind = requiredString(value.kind);
+  if (kind === null || !isFiniteNumber(value.createdAt)) return null;
+  return { kind, createdAt: value.createdAt };
+}
+
+const SERVICE_CASE_KEYS = ["id", "urgency", "summary", "state", "outcome", "createdAt", "updatedAt"] as const;
+
+function parseServiceCase(value: unknown): WorkbenchServiceCase | null {
+  if (!isRecord(value) || !hasOnlyKeys(value, SERVICE_CASE_KEYS)) return null;
+  const id = requiredString(value.id);
+  const urgency = requiredString(value.urgency);
+  const summary = requiredString(value.summary);
+  const state = requiredString(value.state);
+  const outcome = optionalNonEmptyString(value.outcome);
+  if (id === null || urgency === null || summary === null || state === null || outcome === undefined || !isFiniteNumber(value.createdAt) || !isFiniteNumber(value.updatedAt)) return null;
+  return { id, urgency, summary, state, outcome, createdAt: value.createdAt, updatedAt: value.updatedAt };
+}
+
+const ASSET_KEYS = ["id", "label", "serial", "constraints", "purchaseProvenance", "createdAt", "documents", "documentsTruncated", "serviceCases", "serviceCasesTruncated"] as const;
+
+function parseAsset(value: unknown): WorkbenchAsset | null {
+  if (!isRecord(value) || !hasOnlyKeys(value, ASSET_KEYS)) return null;
+  const id = requiredString(value.id);
+  const label = requiredString(value.label);
+  const serial = optionalNonEmptyString(value.serial);
+  const constraints = optionalNonEmptyString(value.constraints);
+  const purchaseProvenance = optionalNonEmptyString(value.purchaseProvenance);
+  if (id === null || label === null || serial === undefined || constraints === undefined || purchaseProvenance === undefined || !isFiniteNumber(value.createdAt)) return null;
+  if (!Array.isArray(value.documents) || typeof value.documentsTruncated !== "boolean" || !Array.isArray(value.serviceCases) || typeof value.serviceCasesTruncated !== "boolean") return null;
+  const documents: WorkbenchAssetDocument[] = [];
+  for (const entry of value.documents) {
+    const parsed = parseAssetDocument(entry);
+    if (parsed === null) return null;
+    documents.push(parsed);
+  }
+  const serviceCases: WorkbenchServiceCase[] = [];
+  for (const entry of value.serviceCases) {
+    const parsed = parseServiceCase(entry);
+    if (parsed === null) return null;
+    serviceCases.push(parsed);
+  }
+  return { id, label, serial, constraints, purchaseProvenance, createdAt: value.createdAt, documents, documentsTruncated: value.documentsTruncated, serviceCases, serviceCasesTruncated: value.serviceCasesTruncated };
+}
+
+/**
+ * Consume only the real bounded E1 equipment projection: installed assets
+ * with their safe documents and service cases plus explicit truncation
+ * flags. A missing block, a malformed row, a private locator, or a
+ * cross-shape reference rejects the payload instead of inventing an asset.
+ * Requirement, selection, or order state is never consulted here, so a
+ * selected or fulfilled requirement can never become an installed asset.
+ */
+function parseEquipment(value: unknown): WorkbenchEquipment | null {
+  if (!isRecord(value) || containsPrivateEquipmentKey(value)) return null;
+  if (!Array.isArray(value.assets) || typeof value.assetsTruncated !== "boolean") return null;
+  const assets: WorkbenchAsset[] = [];
+  for (const entry of value.assets) {
+    const parsed = parseAsset(entry);
+    if (parsed === null) return null;
+    assets.push(parsed);
+  }
+  return { assets, assetsTruncated: value.assetsTruncated };
+}
+
 /**
  * Transform and validate the exact W1 `workbench/getProjection` result.
  * Unsupported aggregate facts remain null instead of being inferred from
@@ -567,6 +692,8 @@ export function parseWorkbenchSnapshot(value: unknown, expectedProjectId?: strin
   if (!isRecord(value.activity) || !Array.isArray(value.activity.page) || typeof value.activity.isDone !== "boolean") return null;
   const continueCursor = nullableString(value.activity.continueCursor);
   if (continueCursor === undefined) return null;
+  const equipment = parseEquipment(value.equipment);
+  if (equipment === null) return null;
   const requirements: WorkbenchRequirement[] = [];
   const offers: WorkbenchOffer[] = [];
   const jobs: WorkbenchJob[] = [];
@@ -586,11 +713,12 @@ export function parseWorkbenchSnapshot(value: unknown, expectedProjectId?: strin
     decisions,
     activity: { items: activity, continueCursor, isDone: value.activity.isDone },
     provenance,
+    equipment,
     selectedOfferId: null,
     selectedForecastMinorUnits: null,
     committedMinorUnits: null,
     paidMinorUnits: null,
     deliveredQuantityByRequirement: {},
-    truncation: { requirements: value.requirementsTruncated, offers: value.candidatesTruncated, jobs: value.jobsTruncated, decisions: value.decisionsTruncated },
+    truncation: { requirements: value.requirementsTruncated, offers: value.candidatesTruncated, jobs: value.jobsTruncated, decisions: value.decisionsTruncated, equipment: equipment.assetsTruncated },
   };
 }

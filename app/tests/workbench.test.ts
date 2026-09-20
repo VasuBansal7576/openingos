@@ -100,6 +100,7 @@ const projection = {
   ],
   decisions: [{ id: "approval-w1-1", kind: "approval", state: "requested", quoteId: "quote-w1-1", createdAt: Date.UTC(2026, 8, 20) }],
   activity: { page: [{ id: "event-w1-1", kind: "quoteRecorded", createdAt: Date.UTC(2026, 8, 20) }], continueCursor: null, isDone: true },
+  equipment: { assets: [], assetsTruncated: false },
   requirementsTruncated: false,
   candidatesTruncated: false,
   jobsTruncated: false,
@@ -157,6 +158,87 @@ test("formats unknown money without turning missing charges into zero", () => {
   expect(formatMoney(795000, "EUR")).toContain("7,950");
 });
 
+function assetFixture(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: "asset-e1-1",
+    label: "Atlas 2G espresso machine",
+    serial: "ATLAS-0042",
+    constraints: "Requires water filtration",
+    purchaseProvenance: "Order ord-7, delivered Sep 2026",
+    createdAt: Date.UTC(2026, 8, 28),
+    documents: [{ kind: "warranty", createdAt: Date.UTC(2026, 8, 28) }],
+    documentsTruncated: false,
+    serviceCases: [{
+      id: "case-e1-1",
+      urgency: "high",
+      summary: "Pressure fault on group head",
+      state: "open",
+      outcome: "Technician visit scheduled",
+      createdAt: Date.UTC(2026, 9, 2),
+      updatedAt: Date.UTC(2026, 9, 3),
+    }],
+    serviceCasesTruncated: false,
+    ...overrides,
+  };
+}
+
+function projectionWithEquipment(equipment: unknown): Record<string, unknown> {
+  return { ...(projection as unknown as Record<string, unknown>), equipment };
+}
+
+async function mountEquipmentTab(
+  loadState: Parameters<typeof WorkbenchView>[0]["loadState"],
+  onAction: (action: WorkbenchAction) => WorkbenchActionResult,
+): Promise<{
+  readonly container: HTMLElement;
+  readonly findButton: (label: string) => HTMLButtonElement;
+  readonly clickTab: (label: string) => Promise<void>;
+  readonly cleanup: () => Promise<void>;
+}> {
+  const dom = new HappyWindow({ url: "https://openingos.test/" });
+  const previousWindow = globalThis.window;
+  const previousDocument = globalThis.document;
+  const previousNavigator = globalThis.navigator;
+  const actEnvironment = globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean };
+  const previousActEnvironment = actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+  const browserGlobals = globalThis as unknown as { window: unknown; document: unknown; navigator: unknown };
+  browserGlobals.window = dom as unknown as globalThis.Window;
+  browserGlobals.document = dom.document as unknown as globalThis.Document;
+  browserGlobals.navigator = dom.navigator as unknown as globalThis.Navigator;
+  actEnvironment.IS_REACT_ACT_ENVIRONMENT = true;
+  const happyElement = dom.document.createElement("div");
+  dom.document.body.append(happyElement);
+  const container = happyElement as unknown as HTMLElement;
+  const root = createRoot(container as unknown as globalThis.Element);
+  await act(async () => {
+    root.render(createElement(WorkbenchView, { loadState, onAction }));
+  });
+  const findButton = (label: string): HTMLButtonElement => {
+    const button = Array.from(container.querySelectorAll("button")).find((candidate) => candidate.textContent?.includes(label));
+    if (!(button instanceof dom.window.HTMLButtonElement)) throw new Error(`Button not found: ${label}`);
+    return button as unknown as HTMLButtonElement;
+  };
+  return {
+    container,
+    findButton,
+    clickTab: async (label: string) => {
+      await act(async () => {
+        findButton(label).click();
+      });
+    },
+    cleanup: async () => {
+      await act(async () => {
+        root.unmount();
+      });
+      browserGlobals.window = previousWindow;
+      browserGlobals.document = previousDocument;
+      browserGlobals.navigator = previousNavigator;
+      if (previousActEnvironment === undefined) delete actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+      else actEnvironment.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment;
+    },
+  };
+}
+
 test("appends later activity pages without replacing the latest snapshot", () => {
   const current = parseWorkbenchSnapshot({
     ...projection,
@@ -210,6 +292,128 @@ test("places activity pagination in the activity area instead of supplier result
   expect(html).toContain("Load older activity");
   expect(html).not.toContain("Load more results");
   expect(html.indexOf("Load older activity")).toBeGreaterThan(html.indexOf("Activity with evidence."));
+});
+
+test("parses real E1 asset records with documents, cases, and truncation flags", () => {
+  const snapshot = parseWorkbenchSnapshot(projectionWithEquipment({
+    assets: [assetFixture()],
+    assetsTruncated: true,
+  }), projection.project.id);
+  if (snapshot === null) throw new Error("E1 equipment projection should parse");
+  expect(snapshot.equipment.assets).toHaveLength(1);
+  const asset = snapshot.equipment.assets[0]!;
+  expect(asset.label).toBe("Atlas 2G espresso machine");
+  expect(asset.serial).toBe("ATLAS-0042");
+  expect(asset.constraints).toBe("Requires water filtration");
+  expect(asset.purchaseProvenance).toBe("Order ord-7, delivered Sep 2026");
+  expect(asset.documents).toEqual([{ kind: "warranty", createdAt: Date.UTC(2026, 8, 28) }]);
+  expect(asset.documentsTruncated).toBe(false);
+  expect(asset.serviceCases[0]?.summary).toBe("Pressure fault on group head");
+  expect(asset.serviceCases[0]?.outcome).toBe("Technician visit scheduled");
+  expect(snapshot.equipment.assetsTruncated).toBe(true);
+  expect(snapshot.truncation.equipment).toBe(true);
+});
+
+test("parses assets without optional fields as null without inventing values", () => {
+  const snapshot = parseWorkbenchSnapshot(projectionWithEquipment({
+    assets: [assetFixture({ serial: undefined, constraints: undefined, purchaseProvenance: undefined, documents: [], serviceCases: [{ id: "case-e1-2", urgency: "low", summary: "Annual descale reminder", state: "open", createdAt: Date.UTC(2026, 9, 1), updatedAt: Date.UTC(2026, 9, 1) }] })],
+    assetsTruncated: false,
+  }), projection.project.id);
+  if (snapshot === null) throw new Error("E1 equipment projection should parse");
+  const asset = snapshot.equipment.assets[0]!;
+  expect(asset.serial).toBeNull();
+  expect(asset.constraints).toBeNull();
+  expect(asset.purchaseProvenance).toBeNull();
+  expect(asset.documents).toEqual([]);
+  expect(asset.serviceCases[0]?.outcome).toBeNull();
+});
+
+test("rejects malformed, private, and cross-shape equipment payloads", () => {
+  const projectId = projection.project.id;
+  expect(parseWorkbenchSnapshot({ ...projection, equipment: undefined }, projectId)).toBeNull();
+  expect(parseWorkbenchSnapshot(projectionWithEquipment({ assets: [] }), projectId)).toBeNull();
+  expect(parseWorkbenchSnapshot(projectionWithEquipment({ assets: [assetFixture({ label: "" })], assetsTruncated: false }), projectId)).toBeNull();
+  expect(parseWorkbenchSnapshot(projectionWithEquipment({ assets: [assetFixture({ serial: 42 })], assetsTruncated: false }), projectId)).toBeNull();
+  expect(parseWorkbenchSnapshot(projectionWithEquipment({ assets: [assetFixture({ documents: [{ kind: "warranty", createdAt: Date.UTC(2026, 8, 28), storageRef: "private-bucket/ref" }] })], assetsTruncated: false }), projectId)).toBeNull();
+  expect(parseWorkbenchSnapshot(projectionWithEquipment({ assets: [assetFixture({ documents: [{ kind: "warranty", createdAt: Date.UTC(2026, 8, 28), id: "document-e1-1" }] })], assetsTruncated: false }), projectId)).toBeNull();
+  const seededCase = (assetFixture().serviceCases as ReadonlyArray<Record<string, unknown>>)[0]!;
+  expect(parseWorkbenchSnapshot(projectionWithEquipment({ assets: [assetFixture({ serviceCases: [{ ...seededCase, assetId: "asset-e1-1" }] })], assetsTruncated: false }), projectId)).toBeNull();
+  expect(parseWorkbenchSnapshot(projectionWithEquipment({ assets: [assetFixture({ projectId: "project-w1-1" })], assetsTruncated: false }), projectId)).toBeNull();
+  expect(parseWorkbenchSnapshot(projectionWithEquipment({ assets: [assetFixture({ label: "Contact private@example.test owner" })], assetsTruncated: false, ownerEmail: "private@example.test" }), projectId)).toBeNull();
+  expect(parseWorkbenchSnapshot(projectionWithEquipment({ assets: [assetFixture()], assetsTruncated: "yes" }), projectId)).toBeNull();
+});
+
+test("never infers an installed asset from a fulfilled requirement", async () => {
+  const snapshot = parseWorkbenchSnapshot({
+    ...projection,
+    requirements: [{ ...projection.requirements[0], state: "fulfilled", fulfillment: "commissioned" }],
+  }, projection.project.id);
+  if (snapshot === null) throw new Error("W1 projection should parse");
+  expect(snapshot.equipment.assets).toEqual([]);
+  const mounted = await mountEquipmentTab({ state: "ready", snapshot }, () => ({ ok: false, message: "controlled test refusal" }));
+  try {
+    await mounted.clickTab("Equipment");
+    expect(mounted.container.textContent).toContain("No installed equipment in this project");
+    expect(mounted.container.textContent).toContain("is not an asset until commissioning is recorded");
+    expect(mounted.container.textContent).not.toContain("Two-group espresso machine");
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("renders real assets with documents, cases, truncation, and a disabled service action", async () => {
+  const snapshot = parseWorkbenchSnapshot(projectionWithEquipment({
+    assets: [assetFixture({ documentsTruncated: true, serviceCasesTruncated: true })],
+    assetsTruncated: true,
+  }), projection.project.id);
+  if (snapshot === null) throw new Error("E1 equipment projection should parse");
+  const actionCalls: string[] = [];
+  const mounted = await mountEquipmentTab({ state: "ready", snapshot }, (action: WorkbenchAction): WorkbenchActionResult => {
+    actionCalls.push(action.type);
+    return { ok: false, message: "controlled test refusal" };
+  });
+  try {
+    await mounted.clickTab("Equipment");
+    const text = mounted.container.textContent ?? "";
+    expect(text).toContain("Atlas 2G espresso machine");
+    expect(text).toContain("ATLAS-0042");
+    expect(text).toContain("Warranty");
+    expect(text).toContain("Pressure fault on group head");
+    expect(text).toContain("Technician visit scheduled");
+    expect(text).toContain("More installed assets exist than this projection shows");
+    expect(text).toContain("More documents exist than this projection shows");
+    expect(text).toContain("More service cases exist than this projection shows");
+    const serviceButton = mounted.findButton("Open service case");
+    expect(serviceButton.disabled).toBe(true);
+    expect(serviceButton.title).toContain("no backend command route exists");
+    await act(async () => {
+      serviceButton.click();
+    });
+    expect(actionCalls).toEqual([]);
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("keeps the equipment service action disabled with zero adapter calls while reconnecting", async () => {
+  const snapshot = parseWorkbenchSnapshot(projectionWithEquipment({
+    assets: [assetFixture()],
+    assetsTruncated: false,
+  }), projection.project.id);
+  if (snapshot === null) throw new Error("E1 equipment projection should parse");
+  const actionCalls: string[] = [];
+  const mounted = await mountEquipmentTab({ state: "reconnecting", lastKnown: snapshot }, (action: WorkbenchAction): WorkbenchActionResult => {
+    actionCalls.push(action.type);
+    return { ok: false, message: "controlled test refusal" };
+  });
+  try {
+    await mounted.clickTab("Equipment");
+    expect(mounted.container.textContent).toContain("Atlas 2G espresso machine");
+    expect(mounted.findButton("Open service case").disabled).toBe(true);
+    expect(actionCalls).toEqual([]);
+  } finally {
+    await mounted.cleanup();
+  }
 });
 
 test("disables every mutation control while reconnecting and resumes after a fresh snapshot", async () => {

@@ -284,6 +284,7 @@ test("automatically wires the default adapter and discovers the first authorized
     jobsTruncated: false,
     decisions: [],
     decisionsTruncated: false,
+    equipment: { assets: [], assetsTruncated: false },
     activity: { page: [], continueCursor: null, isDone: true },
     provenance: { mode: "unknown", label: "No supplier terms", ownerAuthoredTerms: false },
   };

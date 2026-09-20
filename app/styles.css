@@ -224,6 +224,33 @@ h1, h2, h3, p { margin-top: 0; }
 .wb-recovery-story strong { display: block; font-size: .67rem; }
 .wb-recovery-story p { margin: .2rem 0 0; color: #728075; font-size: .59rem; }
 .wb-equipment-card { max-width: 38rem; padding: 1.8rem; }
+.wb-equipment-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; align-items: start; }
+.wb-equipment-list .wb-equipment-card { max-width: none; }
+.wb-equipment-top { display: flex; align-items: center; justify-content: space-between; gap: .7rem; margin-bottom: 1rem; }
+.wb-equipment-top .wb-equipment-icon { margin-bottom: 0; }
+.wb-equipment-card h2 { margin: .9rem 0 .25rem; font-family: Georgia, serif; font-size: 2rem; font-weight: 400; }
+.wb-equipment-card > p { margin-bottom: 1.4rem; color: #728075; font-size: .68rem; }
+.wb-asset-meta { margin: 0 0 1rem; color: #728075; font-size: .64rem; }
+.wb-asset-facts { display: grid; gap: .6rem; margin: 0 0 1.4rem; padding: 1rem; border-radius: .3rem; background: #f5f9f2; }
+.wb-asset-facts > div { display: grid; gap: .15rem; }
+.wb-asset-facts dt { color: #728075; font-size: .6rem; }
+.wb-asset-facts dd { margin: 0; font-size: .7rem; font-weight: 700; }
+.wb-asset-section { margin-top: 1.3rem; padding-top: 1.1rem; border-top: 1px solid #e6eee6; }
+.wb-asset-section > .wb-eyebrow { display: block; margin-bottom: .6rem; }
+.wb-asset-note { margin: 0; color: #728075; font-size: .64rem; line-height: 1.6; }
+.wb-document-list { display: grid; gap: .4rem; margin: 0; padding: 0; list-style: none; }
+.wb-document-list li { display: flex; align-items: center; gap: .55rem; padding: .6rem .7rem; border: 1px solid #e6eee6; border-radius: .28rem; background: #fffdf8; font-size: .64rem; }
+.wb-document-list li > span:first-of-type { flex: 1; font-weight: 700; }
+.wb-document-list li > span:last-child { color: #728075; }
+.wb-case-list { display: grid; gap: .6rem; margin: 0; padding: 0; list-style: none; }
+.wb-case-row { padding: .8rem; border: 1px solid #e6eee6; border-radius: .3rem; background: #f8fbfd; }
+.wb-case-head { display: flex; align-items: flex-start; justify-content: space-between; gap: .7rem; }
+.wb-case-head strong { font-size: .68rem; line-height: 1.4; }
+.wb-case-facts { display: flex; flex-wrap: wrap; gap: .4rem 1.1rem; margin-top: .5rem; color: #728075; font-size: .6rem; }
+.wb-case-facts strong { color: #193b2f; }
+.wb-case-outcome { margin: .5rem 0 0; color: #5d7266; font-size: .63rem; line-height: 1.55; }
+.wb-asset-foot { display: grid; gap: .5rem; margin-top: 1.4rem; padding-top: 1.1rem; border-top: 1px solid #e6eee6; }
+.wb-asset-foot > .wb-micro { margin-top: 0; }
 .wb-equipment-icon { display: inline-flex; width: 3.8rem; height: 3.8rem; align-items: center; justify-content: center; margin-bottom: 1rem; border: 1px solid #d8e7dc; border-radius: .65rem; color: #236254; background: #f5f9f2; }
 .wb-equipment-card h2 { margin: .9rem 0 .25rem; font-family: Georgia, serif; font-size: 2rem; font-weight: 400; }
 .wb-equipment-card > p { margin-bottom: 1.4rem; color: #728075; font-size: .68rem; }
@@ -319,7 +346,7 @@ h1, h2, h3, p { margin-top: 0; }
   .wb-page-heading > .wb-button { margin-top: 1.2rem; }
   .wb-requirement-facts { grid-template-columns: repeat(2, 1fr); }
   .wb-requirement-offers { align-items: flex-start; flex-wrap: wrap; }
-  .wb-offer-grid, .wb-project-lower { grid-template-columns: 1fr; }
+  .wb-offer-grid, .wb-project-lower, .wb-equipment-list { grid-template-columns: 1fr; }
   .wb-offer-card { min-height: 0; }
   .wb-section-heading { align-items: flex-start; flex-direction: column; gap: .4rem; }
   .wb-tools { align-items: stretch; flex-direction: column; }
@@ -332,6 +359,7 @@ h1, h2, h3, p { margin-top: 0; }
   .wb-supplier-price { justify-items: start; text-align: left; }
   .wb-supplier-actions { justify-content: flex-start; }
   .wb-inbox-layout { grid-template-columns: 1fr; }
+  .wb-case-head { align-items: flex-start; flex-direction: column; }
   .wb-job-row { grid-template-columns: 1fr; gap: .7rem; }
   .wb-job-actions { justify-content: flex-start; }
   .wb-recovery-story { margin-top: 2rem; }
