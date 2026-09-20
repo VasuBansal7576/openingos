@@ -34,7 +34,7 @@ import { components } from "../models/components.js";
 import type { ComponentApi } from "@firecrawl/firecrawl-convex/_generated/component.js";
 import { canonicalJson, requestKey } from "../shared/hashing.js";
 import { provenanceLabel } from "../shared/provenance.js";
-import { MAX_OPERATIONS_PER_JOB } from "../shared/scope.js";
+import { MAX_OPERATIONS_PER_GRANT, MAX_OPERATIONS_PER_JOB } from "../shared/scope.js";
 import {
   compareResultValidator,
   classifyFirecrawlError,
@@ -124,6 +124,7 @@ type ProviderReadReturn =
       readonly grantId: Id<"grants">;
       readonly payload: string;
       readonly state: string;
+      readonly requestId: string;
     }
   | { readonly ok: false; readonly code: string; readonly message: string };
 type ApplyArgs = {
@@ -212,6 +213,7 @@ const internalReadResultValidator = v.union(
     grantId: v.id("grants"),
     payload: v.string(),
     state: v.string(),
+    requestId: v.string(),
   }),
   denialValidator,
 );
@@ -312,6 +314,100 @@ function canonicalResearchPayload(query: string): string {
   return canonicalJson({ query });
 }
 
+/**
+ * F03 collection-target binding.
+ *
+ * The shared operation payload shape is frozen to exactly `{query}` by the
+ * F1 scope contract, so the actual collection inputs (effective mode and
+ * source URL) cannot travel inside `normalizedPayload`. They are bound into
+ * the stored operation `requestId` instead, which is server-written at
+ * request time and is part of the request-key retry identity. A same-key
+ * retry or recovery that supplies a different mode/sourceUrl therefore
+ * conflicts instead of returning the existing operation as success, and the
+ * internal transport action re-derives its dispatch values from this stored
+ * binding rather than trusting independently supplied scheduler arguments.
+ *
+ * Rows written before this binding carry a bare client requestId. Those
+ * legacy rows keep query-only comparison; every row written by the request
+ * and recovery paths below carries the bound form.
+ */
+const COLLECTION_BINDING_PREFIX = "r1cb1:";
+
+interface CollectionTarget {
+  readonly mode: ResearchMode;
+  readonly sourceUrl?: string;
+}
+
+function effectiveCollectionMode(
+  mode: ResearchMode | undefined,
+  sourceUrl: string | undefined,
+): ResearchMode {
+  return mode ?? (sourceUrl === undefined ? "search" : "scrape");
+}
+
+function collectionTargetOf(
+  mode: ResearchMode | undefined,
+  sourceUrl: string | undefined,
+  effectiveMode: ResearchMode,
+): CollectionTarget {
+  return sourceUrl === undefined ? { mode: effectiveMode } : { mode: effectiveMode, sourceUrl };
+}
+
+/** Server-owned encoding of one client requestId plus its collection target. */
+function encodeCollectionRequestId(clientRequestId: string, target: CollectionTarget): string {
+  return `${COLLECTION_BINDING_PREFIX}${JSON.stringify({ r: clientRequestId, m: target.mode, s: target.sourceUrl ?? null })}`;
+}
+
+function decodeCollectionRequestId(stored: string): {
+  readonly clientRequestId: string;
+  readonly binding: CollectionTarget | undefined;
+} {
+  if (!stored.startsWith(COLLECTION_BINDING_PREFIX)) return { clientRequestId: stored, binding: undefined };
+  try {
+    const value = JSON.parse(stored.slice(COLLECTION_BINDING_PREFIX.length)) as unknown;
+    if (!isRecord(value) || typeof value.r !== "string") return { clientRequestId: stored, binding: undefined };
+    if (value.m !== "search" && value.m !== "scrape" && value.m !== "map") {
+      return { clientRequestId: stored, binding: undefined };
+    }
+    if (value.s !== null && value.s !== undefined && typeof value.s !== "string") {
+      return { clientRequestId: stored, binding: undefined };
+    }
+    const binding: CollectionTarget =
+      value.s === null || value.s === undefined ? { mode: value.m } : { mode: value.m, sourceUrl: value.s };
+    return { clientRequestId: value.r, binding };
+  } catch {
+    return { clientRequestId: stored, binding: undefined };
+  }
+}
+
+function collectionTargetsEqual(first: CollectionTarget, second: CollectionTarget): boolean {
+  return first.mode === second.mode && (first.sourceUrl ?? undefined) === (second.sourceUrl ?? undefined);
+}
+
+/**
+ * Validate the collection target before any dispatch or accounting side
+ * effect. Private/local source URLs are rejected here, including the search
+ * path when a source URL is supplied alongside it.
+ */
+function validateCollectionTarget(
+  mode: ResearchMode | undefined,
+  sourceUrl: string | undefined,
+):
+  | { readonly ok: true; readonly effectiveMode: ResearchMode }
+  | { readonly ok: false; readonly code: "invalid-payload"; readonly message: string } {
+  if (mode === undefined && sourceUrl !== undefined) {
+    return { ok: false as const, code: "invalid-payload", message: "mode is required when sourceUrl is supplied" };
+  }
+  const effectiveMode = effectiveCollectionMode(mode, sourceUrl);
+  if (sourceUrl !== undefined && !isSafePublicSourceUrl(sourceUrl)) {
+    return { ok: false as const, code: "invalid-payload", message: "source URL was not allowed" };
+  }
+  if ((effectiveMode === "map" || effectiveMode === "scrape") && sourceUrl === undefined) {
+    return { ok: false as const, code: "invalid-payload", message: "source URL was not allowed" };
+  }
+  return { ok: true as const, effectiveMode };
+}
+
 function sourceKey(projectId: Id<"projects">, record: NormalizedSourceRecord): string {
   return `${projectId}|${record.contentHash}`;
 }
@@ -396,6 +492,7 @@ export const readOperation = f1InternalQuery({
       grantId: operation.grantId,
       payload: operation.normalizedPayload,
       state: operation.state,
+      requestId: operation.requestId,
     };
   },
 });
@@ -752,6 +849,24 @@ export const execute = internalAction({
       identity: args.identity,
     });
     if (!operation.ok) return operation;
+    // F03: the dispatch target is server-derived from the stored request
+    // binding. Scheduler arguments that disagree with the bound mode or
+    // source URL are rejected before the claim, so a changed-input retry can
+    // never dispatch or consume accounting under another request's identity.
+    // Private/local source URLs are likewise rejected before the claim, for
+    // both the live and the controlled paths. Rows written before the binding
+    // keep the previous scheduler-argument behavior.
+    const storedBinding = decodeCollectionRequestId(operation.requestId).binding;
+    const requestedTarget = collectionTargetOf(args.mode, args.sourceUrl, args.mode);
+    if (storedBinding !== undefined && !collectionTargetsEqual(requestedTarget, storedBinding)) {
+      return { ok: false as const, code: "duplicate-conflict", message: "requestId reused with a different research payload" };
+    }
+    const effectiveMode = storedBinding?.mode ?? args.mode;
+    const effectiveSourceUrl = storedBinding?.sourceUrl ?? args.sourceUrl ?? undefined;
+    const targetCheck = validateCollectionTarget(effectiveMode, effectiveSourceUrl);
+    if (!targetCheck.ok) {
+      return { ok: false as const, code: targetCheck.code, message: targetCheck.message };
+    }
     const claim = await ctx.runMutation(
       makeInternalMutationRef<ClaimArgs, ClaimReturn>("execution/operations:claim"),
       { operationId: args.operationId, identity: args.identity },
@@ -762,18 +877,18 @@ export const execute = internalAction({
     try {
       if (args.controlledResponseJson !== undefined) {
         if (new TextEncoder().encode(args.controlledResponseJson).byteLength > 256_000) {
-          response = args.mode === "scrape"
+          response = effectiveMode === "scrape"
             ? {
-                url: args.sourceUrl,
+                url: effectiveSourceUrl,
                 title: "Controlled oversized source",
                 markdown: "Source payload exceeded the application capture bound.",
                 truncated: true,
               }
-            : args.mode === "map"
+            : effectiveMode === "map"
               ? {
                   links: [
                     {
-                      url: args.sourceUrl,
+                      url: effectiveSourceUrl,
                       title: "Controlled oversized source",
                       truncated: true,
                     },
@@ -782,7 +897,7 @@ export const execute = internalAction({
               : {
                   web: [
                     {
-                      url: args.sourceUrl,
+                      url: effectiveSourceUrl,
                       title: "Controlled oversized source",
                       truncated: true,
                       description: "Source payload exceeded the application capture bound.",
@@ -798,10 +913,10 @@ export const execute = internalAction({
             token: claim.attemptToken,
             identity: args.identity,
             outcome: normalizeProviderResponse({
-              mode: args.mode,
+              mode: effectiveMode,
               response: {},
               capturedAt: Date.now(),
-              ...(args.sourceUrl === undefined ? {} : { sourceUrl: args.sourceUrl }),
+              ...(effectiveSourceUrl === undefined ? {} : { sourceUrl: effectiveSourceUrl }),
               executionMode,
             }),
           });
@@ -818,31 +933,16 @@ export const execute = internalAction({
           };
         }
       } else {
-        if ((args.mode === "map" || args.mode === "scrape") &&
-          (args.sourceUrl === undefined || !isSafePublicSourceUrl(args.sourceUrl))) {
-          const recorded = await ctx.runMutation(recordOutcomeRef, {
-            operationId: args.operationId,
-            token: claim.attemptToken,
-            outcome: "failure",
-            provider: "firecrawl",
-            environment: "production",
-            providerEventId: `firecrawl:invalid-url:${args.operationId}`,
-            detail: "source URL was not an allowed public HTTP(S) URL",
-          });
-          return recorded.ok
-            ? { ok: false as const, code: "invalid-payload", message: "source URL was not allowed" }
-            : { ok: false as const, code: recorded.code, message: recorded.message };
-        }
-        if (args.mode === "search") {
+        if (effectiveMode === "search") {
           response = await firecrawl.search(ctx, queryFromPayload(operation.payload) ?? "", {
             sources: ["web"],
             limit: 10,
             highlights: true,
           });
-        } else if (args.mode === "map") {
-          response = await firecrawl.map(ctx, args.sourceUrl ?? "", { limit: 20, sitemap: "include" });
+        } else if (effectiveMode === "map") {
+          response = await firecrawl.map(ctx, effectiveSourceUrl ?? "", { limit: 20, sitemap: "include" });
         } else {
-          response = await firecrawl.scrape(ctx, args.sourceUrl ?? "", {
+          response = await firecrawl.scrape(ctx, effectiveSourceUrl ?? "", {
             formats: [
               "markdown",
               "links",
@@ -870,10 +970,10 @@ export const execute = internalAction({
         }
       }
       const normalized = normalizeProviderResponse({
-        mode: args.mode,
+        mode: effectiveMode,
         response,
         capturedAt: Date.now(),
-        ...(args.sourceUrl === undefined ? {} : { sourceUrl: args.sourceUrl }),
+        ...(effectiveSourceUrl === undefined ? {} : { sourceUrl: effectiveSourceUrl }),
         executionMode,
       });
       const applied = await ctx.runMutation(researchInternal.research.collection.applyOutcome, {
@@ -975,9 +1075,9 @@ export const requestResearchWithoutGrant = f1Mutation({
     if (args.requestId.trim().length === 0 || args.researchIntent.trim().length === 0) {
       return { ok: false as const, code: "invalid-payload", message: "research intent and requestId are required" };
     }
-    if ((args.mode === "map" || args.mode === "scrape") &&
-      (args.sourceUrl === undefined || !isSafePublicSourceUrl(args.sourceUrl))) {
-      return { ok: false as const, code: "invalid-payload", message: "source URL was not allowed" };
+    const targetCheck = validateCollectionTarget(args.mode, args.sourceUrl);
+    if (!targetCheck.ok) {
+      return { ok: false as const, code: targetCheck.code, message: targetCheck.message };
     }
     const project = await ctx.db.get(args.projectId);
     if (project === null) {
@@ -998,11 +1098,19 @@ export const requestResearchWithoutGrant = f1Mutation({
       }
     }
     const operationPayload = canonicalResearchPayload(args.researchIntent);
-    const key = requestKey(project.organizationId, "research.collect", args.requestId);
-    const existing = await ctx.db
-      .query("operations")
-      .withIndex("by_requestKey", (q) => q.eq("requestKey", key))
-      .unique();
+    // F03: the retry lookup covers both the bound request identity (same
+    // client requestId, mode, and sourceUrl) and legacy bare rows. A changed
+    // target misses both lookups and falls through to the allowance refusal
+    // below, never to a false success.
+    const boundKey = requestKey(
+      project.organizationId,
+      "research.collect",
+      encodeCollectionRequestId(args.requestId, collectionTargetOf(args.mode, args.sourceUrl, targetCheck.effectiveMode)),
+    );
+    const bareKey = requestKey(project.organizationId, "research.collect", args.requestId);
+    const existing =
+      (await ctx.db.query("operations").withIndex("by_requestKey", (q) => q.eq("requestKey", boundKey)).unique()) ??
+      (await ctx.db.query("operations").withIndex("by_requestKey", (q) => q.eq("requestKey", bareKey)).unique());
     if (existing !== null) {
       if (
         existing.projectId !== project._id ||
@@ -1024,9 +1132,6 @@ export const requestResearchWithoutGrant = f1Mutation({
         incompleteCount: existing.state === "observedSuccess" ? 0 : 0,
         controlled: false,
       };
-    }
-    if (args.mode === undefined && args.sourceUrl !== undefined) {
-      return { ok: false as const, code: "invalid-payload", message: "mode is required when sourceUrl is supplied" };
     }
     // A no-grant automatic F1 job deliberately carries a zero cost ceiling;
     // it cannot dispatch a paid Firecrawl call.  Require an explicit grant
@@ -1062,9 +1167,9 @@ export const requestGrantedResearch = f1Mutation({
     if (args.requestId.trim().length === 0 || args.researchIntent.trim().length === 0) {
       return { ok: false as const, code: "invalid-payload", message: "research intent and requestId are required" };
     }
-    if ((args.mode === "map" || args.mode === "scrape") &&
-      (args.sourceUrl === undefined || !isSafePublicSourceUrl(args.sourceUrl))) {
-      return { ok: false as const, code: "invalid-payload", message: "source URL was not allowed" };
+    const targetCheck = validateCollectionTarget(args.mode, args.sourceUrl);
+    if (!targetCheck.ok) {
+      return { ok: false as const, code: targetCheck.code, message: targetCheck.message };
     }
     const project = await ctx.db.get(args.projectId);
     if (project === null) return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
@@ -1085,8 +1190,14 @@ export const requestGrantedResearch = f1Mutation({
     if (grant.canonicalPayload !== operationPayload) {
       return { ok: false as const, code: "changed-draft", message: "research intent does not match the approved grant" };
     }
-    const key = requestKey(project.organizationId, "research.collect", args.requestId);
-    const existing = await ctx.db.query("operations").withIndex("by_requestKey", (q) => q.eq("requestKey", key)).unique();
+    // F03: the stored request identity binds the client requestId together
+    // with the effective collection target. An identical retry returns the
+    // existing operation; a same-key retry with another mode or source URL
+    // conflicts before any job, reservation, or dispatch side effect.
+    const requestedTarget = collectionTargetOf(args.mode, args.sourceUrl, targetCheck.effectiveMode);
+    const boundRequestId = encodeCollectionRequestId(args.requestId, requestedTarget);
+    const boundKey = requestKey(project.organizationId, "research.collect", boundRequestId);
+    const existing = await ctx.db.query("operations").withIndex("by_requestKey", (q) => q.eq("requestKey", boundKey)).unique();
     if (existing !== null) {
       if (existing.projectId !== project._id || existing.kind !== "research.collect" || existing.normalizedPayload !== operationPayload) {
         return { ok: false as const, code: "duplicate-conflict", message: "requestId reused with a different research payload" };
@@ -1096,6 +1207,27 @@ export const requestGrantedResearch = f1Mutation({
         return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
       }
       return { ok: true as const, jobId: existing.jobId, operationId: existing._id, state: existingJob.state, requestCount: 0, incompleteCount: 0, controlled: false };
+    }
+    const grantOperations = await ctx.db
+      .query("operations")
+      .withIndex("by_grant", (q) => q.eq("grantId", args.grantId))
+      .take(MAX_OPERATIONS_PER_GRANT + 1);
+    for (const sibling of grantOperations) {
+      if (sibling.kind !== "research.collect") continue;
+      const decoded = decodeCollectionRequestId(sibling.requestId);
+      if (decoded.clientRequestId !== args.requestId) continue;
+      if (
+        decoded.binding === undefined &&
+        sibling.projectId === project._id &&
+        sibling.normalizedPayload === operationPayload
+      ) {
+        const legacyJob = await ctx.db.get(sibling.jobId);
+        if (legacyJob === null || legacyJob.projectId !== project._id) {
+          return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
+        }
+        return { ok: true as const, jobId: sibling.jobId, operationId: sibling._id, state: legacyJob.state, requestCount: 0, incompleteCount: 0, controlled: false };
+      }
+      return { ok: false as const, code: "duplicate-conflict", message: "requestId reused with a different research payload" };
     }
     const pausedJobs = await ctx.db.query("jobs").withIndex("by_project", (q) => q.eq("projectId", project._id)).take(MAX_PROJECT_RECORDS + 1);
     if (pausedJobs.length > MAX_PROJECT_RECORDS || pausedJobs.some((job) => job.state === "pausedBudget")) {
@@ -1138,7 +1270,7 @@ export const requestGrantedResearch = f1Mutation({
       organizationId: project.organizationId,
       projectId: project._id,
       kind: "research.collect",
-      requestId: args.requestId,
+      requestId: boundRequestId,
       payloadJson: operationPayload,
       grantId: args.grantId,
       reservationId: reserved.reservationId,
@@ -1150,8 +1282,8 @@ export const requestGrantedResearch = f1Mutation({
     await ctx.scheduler.runAfter(0, makeInternalActionRef<ExecuteArgs, ExecuteReturn>("research/collection:execute"), {
       operationId: created.operationId,
       identity,
-      mode: args.mode ?? (args.sourceUrl === undefined ? "search" : "scrape"),
-      ...(args.sourceUrl === undefined ? {} : { sourceUrl: args.sourceUrl }),
+      mode: requestedTarget.mode,
+      ...(requestedTarget.sourceUrl === undefined ? {} : { sourceUrl: requestedTarget.sourceUrl }),
     });
     return {
       ok: true as const,
@@ -1207,8 +1339,9 @@ export const recoverResearch = f1Mutation({
     const identity = await identityOf(ctx);
     if (identity === null) return { ok: false as const, code: "forged-identity", message: "unauthenticated" };
     if (args.requestId.trim().length === 0) return { ok: false as const, code: "invalid-payload", message: "requestId required" };
-    if ((args.mode === "map" || args.mode === "scrape") && (args.sourceUrl === undefined || !isSafePublicSourceUrl(args.sourceUrl))) {
-      return { ok: false as const, code: "invalid-payload", message: "source URL was not allowed" };
+    const recoveryTargetCheck = validateCollectionTarget(args.mode, args.sourceUrl);
+    if (!recoveryTargetCheck.ok) {
+      return { ok: false as const, code: recoveryTargetCheck.code, message: recoveryTargetCheck.message };
     }
     const operation = await ctx.db.get(args.operationId);
     const job = await ctx.db.get(args.jobId);
@@ -1226,8 +1359,20 @@ export const recoverResearch = f1Mutation({
     const access = await checkProjectAccess(ctx, identity, job.organizationId, job.projectId, "contributor", Date.now());
     if (!access.ok) return { ok: false as const, code: access.code, message: access.message };
     if (job.state === "cancelled" || job.state === "cancelling") return { ok: false as const, code: "cancelled-before-claim", message: "job is fenced for cancellation" };
+    // F03: recovery re-runs the original collection target. A recovery that
+    // supplies another mode or source URL conflicts before any job patch,
+    // reservation, or dispatch side effect. Legacy rows without a stored
+    // binding adopt the requested target going forward.
+    const originalBinding = decodeCollectionRequestId(operation.requestId).binding;
+    const requestedRecoveryTarget = collectionTargetOf(args.mode, args.sourceUrl, args.mode);
+    if (originalBinding !== undefined && !collectionTargetsEqual(requestedRecoveryTarget, originalBinding)) {
+      return { ok: false as const, code: "duplicate-conflict", message: "recovery target does not match the original collection target" };
+    }
+    const recoveryTarget = originalBinding ?? requestedRecoveryTarget;
     const siblingOperations = await ctx.db.query("operations").withIndex("by_job", (q) => q.eq("jobId", job._id)).take(MAX_OPERATIONS_PER_JOB + 1);
-    const recoveryCount = siblingOperations.filter((entry) => entry.requestId.startsWith(`${args.operationId}:recovery:`)).length;
+    const recoveryCount = siblingOperations.filter((entry) =>
+      decodeCollectionRequestId(entry.requestId).clientRequestId.startsWith(`${args.operationId}:recovery:`),
+    ).length;
     if (recoveryCount >= MAX_RECOVERY_OPERATIONS) return { ok: false as const, code: "round-limit-exceeded", message: "bounded research recovery exhausted" };
     const grant = await ctx.db.get(operation.grantId);
     if (
@@ -1258,7 +1403,10 @@ export const recoverResearch = f1Mutation({
     });
     if (!reserved.ok) return reserved;
     const payload = operation.normalizedPayload;
-    const recoveryRequestId = `${args.operationId}:recovery:${args.requestId}`;
+    const recoveryRequestId = encodeCollectionRequestId(
+      `${args.operationId}:recovery:${args.requestId}`,
+      recoveryTarget,
+    );
     const created = await ctx.runMutation(createOperationRef, {
       jobId: job._id,
       organizationId: job.organizationId,
@@ -1273,8 +1421,8 @@ export const recoverResearch = f1Mutation({
     await ctx.scheduler.runAfter(0, makeInternalActionRef<ExecuteArgs, ExecuteReturn>("research/collection:execute"), {
       operationId: created.operationId,
       identity,
-      mode: args.mode,
-      ...(args.sourceUrl === undefined ? {} : { sourceUrl: args.sourceUrl }),
+      mode: recoveryTarget.mode,
+      ...(recoveryTarget.sourceUrl === undefined ? {} : { sourceUrl: recoveryTarget.sourceUrl }),
     });
     return { ok: true as const, jobId: job._id, operationId: created.operationId, state: "queued" };
   },
