@@ -516,6 +516,7 @@ export const recordApproval = f1Mutation({
       }
       return { ok: true as const, approvalId: existing._id, deduplicated: true };
     }
+    let selectionQuoteId: Id<"quotes"> | undefined;
     if (args.selectionId !== undefined) {
       const selection = await requireOwnedRef(
         await ctx.db.get(args.selectionId),
@@ -525,6 +526,7 @@ export const recordApproval = f1Mutation({
       if (!selection.ok) {
         return { ok: false as const, code: selection.code, message: selection.message };
       }
+      selectionQuoteId = selection.value.quoteId;
     }
     if (args.quoteId !== undefined) {
       const quote = await ctx.db.get(args.quoteId);
@@ -534,6 +536,13 @@ export const recordApproval = f1Mutation({
         quote.projectId !== args.projectId
       ) {
         return { ok: false as const, code: "denied-project", message: "quote is not in this project" };
+      }
+      if (selectionQuoteId !== undefined && selectionQuoteId !== args.quoteId) {
+        return {
+          ok: false as const,
+          code: "denied-project",
+          message: "selection and quote must refer to the same quote",
+        };
       }
     }
     const approvalId = await ctx.db.insert("approvals", {

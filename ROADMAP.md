@@ -77,6 +77,9 @@ Hosted provider cases still need a hosted environment, application credentials, 
   Validate scoped OpenCode permissions before launch; configuration changes require a verified session restart before claiming they affect a running worker.
 - Preserve an uncertain worker's ownership; use Orca's documented recovery only after proving its state.
 - Push meaningful checkpoints, inspect every expected check on the latest remote commit, and fix failures.
+- Keep each integrated delivery wave visible in a ready-for-review GitHub PR; do not leave reviewable progress only in local commits or worker branches.
+- The owner has authorized merging a ready PR only after its exact latest head passes the agreed application and repository CI, all actionable Greptile findings on that head are resolved, a separate Astra session accepts the same code revision, and GitHub reports the PR conflict-free.
+  After each merge, verify the remote main tree matches the locally tested integration tree before starting the next wave; local and GitHub output must come from equivalent source.
 - Verify Greptile on the first authorized real PR and address its findings; its current green check does not enforce a confidence threshold.
 - Be the sole `hackathon.md` writer after verified integrated checkpoints and before pausing; workers supply evidence.
 - Keep these checkboxes current after each verified wave, and never convert controlled evidence into a live-provider or deployment claim.

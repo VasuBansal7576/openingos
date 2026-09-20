@@ -898,16 +898,21 @@ export const recordCostEntry = f1Mutation({
       if (linked.linkedEntryId !== undefined) {
         return { ok: false as const, code: "invalid-payload", message: "linked entry is already paired" };
       }
+      // Bounded existence lookup over the link index: at most one row is
+      // read, never the whole order history. Cross-order siblings cannot
+      // exist because links are denied unless the linked entry is on this
+      // order, so scoping the probe to this order preserves the exact
+      // prior semantics.
       const siblings = await ctx.db
         .query("costEntries")
-        .withIndex("by_order", (q) => q.eq("orderId", args.orderId))
-        .collect();
+        .withIndex("by_linked_entry", (q) => q.eq("linkedEntryId", args.linkedEntryId))
+        .take(1);
       if (
         siblings.some(
           (entry) =>
             entry.organizationId === args.organizationId &&
             entry.projectId === args.projectId &&
-            entry.linkedEntryId === args.linkedEntryId,
+            entry.orderId === args.orderId,
         )
       ) {
         return { ok: false as const, code: "invalid-payload", message: "linked entry is already paired" };
