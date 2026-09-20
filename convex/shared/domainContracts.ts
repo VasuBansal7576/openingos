@@ -183,6 +183,14 @@ export const compatibilityResultValidator = v.union(
 );
 export type CompatibilityResult = Infer<typeof compatibilityResultValidator>;
 
+/**
+ * Compatibility rule version (F1R-06): every compatibility finding pins
+ * the rule version it was decided against alongside the requirement
+ * version, so a rule change can be detected as a stale basis exactly
+ * like a changed input.
+ */
+export const COMPATIBILITY_RULE_VERSION = "1";
+
 /** Negotiation mandate execution state (PRD 24, ADR-0004). */
 export const negotiationStateValidator = v.union(
   v.literal("draft"),

@@ -25,6 +25,27 @@ import {
 import { requireDomainAccess, requireOwnedRef } from "./guards.js";
 
 /**
+ * F1R-07: normalized watch-evidence equality. Refs compare as a set of
+ * source/version/locator triples so order never distinguishes a replay,
+ * while any changed, added, or removed reference conflicts.
+ */
+function sameWatchEvidenceRefs(
+  existing:
+    | readonly { readonly sourceId: string; readonly version: string; readonly locator?: string }[]
+    | undefined,
+  wanted:
+    | readonly { readonly sourceId: string; readonly version: string; readonly locator?: string }[]
+    | undefined,
+): boolean {
+  const normalize = (
+    refs: readonly { readonly sourceId: string; readonly version: string; readonly locator?: string }[],
+  ) => refs.map((ref) => `${ref.sourceId}|${ref.version}|${ref.locator ?? ""}`).sort();
+  const left = normalize(existing ?? []);
+  const right = normalize(wanted ?? []);
+  return left.length === right.length && left.every((entry, index) => entry === right[index]);
+}
+
+/**
  * Create an evidence watch on a named target (explicit owner-import
  * path). The caller declares the watched counterparty from the closed
  * union and an optional job allowance linkage; the source is fixed to
@@ -69,12 +90,16 @@ export const createWatch = f1Mutation({
         return { ok: false as const, code: "denied-project", message: "reference is not in this project" };
       }
       const sameJob = (existing.jobId ?? undefined) === args.jobId;
+      // F1R-07: replay identity includes the evidence references in
+      // normalized form, so a watch retargeted at different evidence
+      // conflicts instead of replaying the old observation.
       if (
         !sameJob ||
         existing.targetKind !== args.targetKind ||
         existing.targetId !== args.targetId ||
         existing.cadenceMs !== args.cadenceMs ||
-        existing.counterpartyRole !== args.counterpartyRole
+        existing.counterpartyRole !== args.counterpartyRole ||
+        !sameWatchEvidenceRefs(existing.evidenceRefs, args.evidenceRefs)
       ) {
         return { ok: false as const, code: "duplicate-conflict", message: "idempotency key already used with different fields" };
       }

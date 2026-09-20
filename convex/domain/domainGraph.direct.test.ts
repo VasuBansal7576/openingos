@@ -522,15 +522,9 @@ describe("direct full graph journey through required indexes", () => {
     if (!candidates.ok) throw new Error("candidate list failed");
     expect(candidates.candidates).toHaveLength(1);
     expect(candidates.candidates[0]?.compatibility).toBe("unknown");
-    const verified = await asOwner.mutation(verifyCompatibilityRef, {
-      organizationId: project.orgId,
-      projectId: project.projectId,
-      candidateId: graph.candidateId,
-      result: "pass",
-      evidenceRefs: [{ sourceId: "compat-source", version: "v1" }],
-    });
-    expect(verified.ok).toBe(true);
-
+    // F1R-06: compatibility passes are verified-evidence-backed. The
+    // supporting field evidence is recorded, resolved to verified, and
+    // then bound at its bumped exact revision.
     const evidence = await asOwner.mutation(recordProductEvidenceRef, {
       organizationId: project.orgId,
       projectId: project.projectId,
@@ -551,6 +545,21 @@ describe("direct full graph journey through required indexes", () => {
     expect(storedEvidence?.counterpartyRole).toBe("vendor");
     expect(storedEvidence?.origin).toBe("ownerImport");
     expect(storedEvidence?.executionMode).toBe("recorded");
+    const resolved = await asOwner.mutation(verifyProductEvidenceRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      evidenceId: evidence.evidenceId,
+      verdict: "verified",
+    });
+    if (!resolved.ok) throw new Error("evidence verification failed");
+    const verified = await asOwner.mutation(verifyCompatibilityRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      candidateId: graph.candidateId,
+      result: "pass",
+      evidenceRefs: [{ sourceId: evidence.evidenceId, version: "2" }],
+    });
+    expect(verified.ok).toBe(true);
 
     const rfq = await asOwner.mutation(createRfqRef, {
       organizationId: project.orgId,

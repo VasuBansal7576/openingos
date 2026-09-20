@@ -241,6 +241,21 @@ async function checkQuoteReferences(
     if (prior.counterpartyRole !== fields.counterpartyRole) {
       return denial("invalid-payload", "supersedes must share the counterparty lineage");
     }
+    // F1R-08: a successor must retain its offer's stable lineage — the
+    // same requirement, vendor, and RFQ. A revision of one supplier's
+    // offer can never silently adopt another offer's content hash, with
+    // or without conversations. An RFQ or scope change that is genuinely
+    // a new offer is recorded without a supersedes link, never by
+    // crossing the lineage.
+    if ((prior.requirementId ?? undefined) !== fields.requirementId) {
+      return denial("invalid-payload", "supersedes must retain the offer requirement");
+    }
+    if ((prior.vendorId ?? undefined) !== fields.vendorId) {
+      return denial("invalid-payload", "supersedes must retain the offer vendor");
+    }
+    if ((prior.rfqId ?? undefined) !== fields.rfqId) {
+      return denial("invalid-payload", "supersedes must retain the offer RFQ");
+    }
   }
   return approved(true);
 }
