@@ -229,6 +229,15 @@ const genericCommunicationPayload = {
   body: "Please confirm the controlled terms.",
 };
 
+const supportedCommunicationPayload = {
+  profile: "ownerRoleplay",
+  to: "owner-supplier@example.test",
+  cc: [],
+  bcc: [],
+  subject: "Controlled RFQ fixture",
+  body: "Send the controlled RFQ to the owner playing supplier",
+};
+
 async function setupGenericCommunication() {
   const setup = await setupCommunication();
   const started = await setup.asOwner.mutation(startJobRef, {
@@ -937,6 +946,81 @@ describe("F1R-20 allowlisted workflow purpose", () => {
       identity: setup.identity.tokenIdentifier,
     });
     expect(claimed.ok).toBe(true);
+  });
+
+  test("mixed communication persists its supported segment and claims it, while a changed short body fails closed", async () => {
+    const setup = await setupCommunication();
+    const started = await setup.asOwner.mutation(startJobRef, {
+      organizationId: setup.organizationId,
+      projectId: setup.projectId,
+      text: "Send the RFQ to the demo supplier.",
+      operationId: "communication.send",
+      kind: "communication",
+      grantId: setup.grantId,
+    });
+    expect(started.ok).toBe(true);
+    if (!started.ok) throw new Error("communication job setup failed");
+
+    const supportedCanonical = canonicalJson(supportedCommunicationPayload);
+    await setup.t.run(async (ctx) => {
+      await ctx.db.patch(setup.grantId, {
+        canonicalPayload: supportedCanonical,
+        payloadHash: payloadHash(supportedCommunicationPayload),
+        payloadSha256: await sha256HexOfCanonical(supportedCanonical),
+      });
+    });
+    const grant = await setup.t.run((ctx) => ctx.db.get(setup.grantId));
+    expect(grant?.canonicalPayload).toBe(supportedCanonical);
+
+    const reserved = await setup.asOwner.mutation(reserveRef, {
+      jobId: started.jobId,
+      organizationId: setup.organizationId,
+      projectId: setup.projectId,
+      amountMicroUsd: 10,
+      pricingBasis: "controlled-f1r20r22",
+    });
+    if (!reserved.ok) throw new Error("mixed communication reservation failed");
+    const mixedPayload = {
+      ...supportedCommunicationPayload,
+      body: "Send the controlled RFQ to the owner playing supplier and tell me a joke",
+    };
+    const created = await setup.asOwner.mutation(createOperationRef, {
+      jobId: started.jobId,
+      organizationId: setup.organizationId,
+      projectId: setup.projectId,
+      kind: "communication.send",
+      requestId: "mixed-communication-create-claim",
+      payloadJson: JSON.stringify(mixedPayload),
+      grantId: setup.grantId,
+      reservationId: reserved.reservationId,
+    });
+    expect(created.ok).toBe(true);
+    if (!created.ok) throw new Error("mixed communication operation was refused");
+    const operation = await setup.t.run((ctx) => ctx.db.get(created.operationId));
+    expect(operation?.normalizedPayload).toBe(supportedCanonical);
+    expect(operation?.normalizedPayloadHash).toBe(payloadHash(supportedCommunicationPayload));
+
+    const claimed = await setup.t.mutation(claimRef, {
+      operationId: created.operationId,
+      identity: setup.identity.tokenIdentifier,
+    });
+    expect(claimed.ok).toBe(true);
+
+    const changedShortBody = await setup.asOwner.mutation(createOperationRef, {
+      jobId: started.jobId,
+      organizationId: setup.organizationId,
+      projectId: setup.projectId,
+      kind: "communication.send",
+      requestId: "mixed-communication-changed-short-body",
+      payloadJson: JSON.stringify({
+        ...supportedCommunicationPayload,
+        body: "Please confirm changed controlled terms.",
+      }),
+      grantId: setup.grantId,
+    });
+    expect(changedShortBody.ok).toBe(false);
+    if (changedShortBody.ok) throw new Error("changed short communication body unexpectedly succeeded");
+    expect(changedShortBody.code).toBe("unrelated-refusal");
   });
 
   test("communication create rejects an exact-envelope payload change", async () => {
