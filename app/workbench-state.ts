@@ -523,11 +523,11 @@ function parseProject(value: unknown): WorkbenchProject | null {
 }
 
 function parseAccess(value: unknown): WorkbenchAccess | null {
-  if (!isRecord(value) || !isOneOf(value.effectiveRole, ["viewer", "contributor", "approver", "owner"] as const) || !isRecord(value.capabilities)) return null;
+  if (!isRecord(value) || !isOneOf(value.role, ["viewer", "contributor", "approver", "owner"] as const) || !isRecord(value.capabilities)) return null;
   const capabilities = value.capabilities;
   if (typeof capabilities.canResearch !== "boolean" || typeof capabilities.canRecordEvidence !== "boolean" || typeof capabilities.canRecordQuote !== "boolean" || typeof capabilities.canCompare !== "boolean" || typeof capabilities.canCommunicate !== "boolean" || typeof capabilities.canClarify !== "boolean") return null;
   return {
-    role: value.effectiveRole,
+    role: value.role,
     capabilities: {
       canResearch: capabilities.canResearch,
       canRecordEvidence: capabilities.canRecordEvidence,
@@ -559,7 +559,7 @@ function containsPrivateProjectionKey(value: unknown): boolean {
 export function parseWorkbenchSnapshot(value: unknown, expectedProjectId?: string): WorkbenchSnapshot | null {
   if (!isRecord(value) || value.ok !== true || containsPrivateProjectionKey(value)) return null;
   const project = parseProject(value.project);
-  const access = parseAccess({ effectiveRole: value.effectiveRole, capabilities: value.capabilities });
+  const access = parseAccess(value.access);
   const provenance = parseProjectionProvenance(value.provenance);
   if (project === null || access === null || provenance === null || expectedProjectId !== undefined && project.id !== expectedProjectId) return null;
   if (!Array.isArray(value.requirements) || !Array.isArray(value.candidates) || !Array.isArray(value.jobs) || !Array.isArray(value.decisions)) return null;
