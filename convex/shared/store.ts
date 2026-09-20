@@ -149,6 +149,22 @@ export interface OutcomeInput {
   readonly detail?: string;
 }
 
+type ControlledAppliedOutcome = "success" | "failure" | "unknown";
+
+function controlledAppliedOutcome(
+  outcome: OutcomeInput["outcome"],
+  unknownCharges: boolean | undefined,
+): ControlledAppliedOutcome {
+  if (outcome === "unknown" || (outcome === "failure" && unknownCharges === true)) return "unknown";
+  return outcome;
+}
+
+function controlledAppliedState(outcome: ControlledAppliedOutcome): OperationState {
+  if (outcome === "success") return "observedSuccess";
+  if (outcome === "failure") return "observedFailure";
+  return "outcomeUnknown";
+}
+
 export interface RequestWorkInput {
   readonly identity: string;
   readonly organizationId: string;
@@ -173,7 +189,16 @@ export class ControlledBackend {
   readonly operationsByKey = new Map<string, string>();
   readonly attempts = new Map<string, Attempt>();
   readonly reservations = new Map<string, Reservation>();
-  readonly processedEvents = new Map<string, { outcome: string; processingVersion: number; operationId?: string }>();
+  readonly processedEvents = new Map<string, {
+    outcome: string;
+    processingVersion: number;
+    organizationId?: string;
+    projectId?: string;
+    operationId?: string;
+    applicationOutcome?: ControlledAppliedOutcome;
+    applicationState?: OperationState;
+    appliedAt?: number;
+  }>();
   readonly evidenceRecords = new Map<string, Evidence>();
   readonly files = new Map<string, EvidenceFile>();
   readonly outboundSnapshots = new Map<string, OutboundSnapshot>();
@@ -1128,17 +1153,38 @@ export class ControlledBackend {
       const key = `${provider}|${environment}|${input.providerEventId}`;
       const seen = this.processedEvents.get(key);
       if (seen) {
-        // F1R-12: unbound early receipts bind here and apply below
-        // exactly once; events bound elsewhere stay fenced.
+        const effective = controlledAppliedOutcome(input.outcome, input.unknownCharges);
+        if (seen.organizationId !== operation.organizationId || seen.projectId !== operation.projectId) {
+          return denial("duplicate-conflict", "event receipt belongs to another project");
+        }
+        if (seen.outcome !== input.outcome || (seen.applicationOutcome !== undefined && seen.applicationOutcome !== effective)) {
+          return denial("duplicate-conflict", "event receipt facts conflict");
+        }
         if (seen.operationId === input.operationId) {
           return approved(operation);
         }
         if (seen.operationId !== undefined) {
-          return approved(operation);
+          return denial("duplicate-conflict", "event receipt is bound to another operation");
         }
-        this.processedEvents.set(key, { ...seen, operationId: input.operationId });
+        this.processedEvents.set(key, {
+          ...seen,
+          operationId: input.operationId,
+          applicationOutcome: effective,
+          applicationState: controlledAppliedState(effective),
+          appliedAt: now,
+        });
       } else {
-        this.processedEvents.set(key, { outcome: input.outcome, processingVersion: 1, operationId: input.operationId });
+        const effective = controlledAppliedOutcome(input.outcome, input.unknownCharges);
+        this.processedEvents.set(key, {
+          outcome: input.outcome,
+          processingVersion: 1,
+          organizationId: operation.organizationId,
+          projectId: operation.projectId,
+          operationId: input.operationId,
+          applicationOutcome: effective,
+          applicationState: controlledAppliedState(effective),
+          appliedAt: now,
+        });
       }
     }
     let state: OperationState = "observedSuccess";
@@ -1391,20 +1437,34 @@ export class ControlledBackend {
     }
     const eventKey = `${provider}|${environment}|${providerEventId}`;
     const seen = this.processedEvents.get(eventKey);
-    // F1R-12: receipt and application are separate. An unbound early
-    // receipt binds here and applies below exactly once; an event
-    // already applied here dedupes; an event bound elsewhere stays
-    // fenced with zero new effect.
     if (seen) {
-      if (seen.operationId === operationId) {
-        return approved({ jobState: job.state, delivery: "observedSuccess", deduplicated: true });
+      if (seen.organizationId !== operation.organizationId || seen.projectId !== operation.projectId) {
+        return denial("duplicate-conflict", "event receipt belongs to another project");
       }
-      if (seen.operationId !== undefined) {
-        return approved({ jobState: job.state, delivery: operation.state, deduplicated: true });
+      if (seen.operationId !== undefined && seen.operationId !== operationId) {
+        return denial("duplicate-conflict", "event receipt is bound to another operation");
       }
-      this.processedEvents.set(eventKey, { ...seen, operationId });
+      if (seen.outcome === "failure") {
+        return denial("duplicate-conflict", "event receipt records failure");
+      }
+      this.processedEvents.set(eventKey, {
+        ...seen,
+        operationId,
+        applicationOutcome: "success",
+        applicationState: "observedSuccess",
+        appliedAt: now,
+      });
     } else {
-      this.processedEvents.set(eventKey, { outcome: "success", processingVersion: 1, operationId });
+      this.processedEvents.set(eventKey, {
+        outcome: "success",
+        processingVersion: 1,
+        organizationId: operation.organizationId,
+        projectId: operation.projectId,
+        operationId,
+        applicationOutcome: "success",
+        applicationState: "observedSuccess",
+        appliedAt: now,
+      });
     }
     const updated: Operation = { ...operation, state: "observedSuccess", updatedAt: now };
     this.operations.set(operationId, updated);
@@ -1613,12 +1673,34 @@ export class ControlledBackend {
     processingVersion: number,
     outcome: string,
     now: number,
+    organizationId?: string,
+    projectId?: string,
   ): { deduplicated: boolean; outcome: string } {
     void now;
     const key = `${provider}|${environment}|${eventId}`;
     const seen = this.processedEvents.get(key);
-    if (seen) return { deduplicated: true, outcome: seen.outcome };
-    this.processedEvents.set(key, { outcome, processingVersion });
+    const suppliedScope = organizationId !== undefined || projectId !== undefined;
+    if (suppliedScope && (organizationId === undefined || projectId === undefined)) {
+      return { deduplicated: false, outcome: "conflict" };
+    }
+    if (seen) {
+      if (
+        suppliedScope &&
+        (seen.organizationId !== organizationId ||
+          seen.projectId !== projectId ||
+          seen.processingVersion !== processingVersion ||
+          seen.outcome !== outcome)
+      ) {
+        return { deduplicated: false, outcome: "conflict" };
+      }
+      return { deduplicated: true, outcome: seen.outcome };
+    }
+    this.processedEvents.set(key, {
+      outcome,
+      processingVersion,
+      ...(organizationId === undefined ? {} : { organizationId }),
+      ...(projectId === undefined ? {} : { projectId }),
+    });
     return { deduplicated: false, outcome };
   }
 

@@ -284,7 +284,16 @@ describe("F1R-12 early receipt binds late delivery exactly once", () => {
     const fixture = buildControlledFixture();
     const { store, now } = fixture;
     const flow = commsFlow(fixture, "req-early-bind");
-    const receipt = store.processEvent("synthetic-provider", "controlled", "early-event-1", 1, "success", now);
+    const receipt = store.processEvent(
+      "synthetic-provider",
+      "controlled",
+      "early-event-1",
+      1,
+      "success",
+      now,
+      flow.job.organizationId,
+      flow.job.projectId,
+    );
     expect(receipt.deduplicated).toBe(false);
     store.reconcileAfterCrash(flow.op, now + 1);
     const delivery = store.recordLateDelivery(flow.op, flow.token, "early-event-1", now + 2, "synthetic-provider", "controlled");
@@ -304,6 +313,26 @@ describe("F1R-12 early receipt binds late delivery exactly once", () => {
     expect(delivery.ok).toBe(true);
     if (!delivery.ok) throw new Error("late delivery failed");
     expect(delivery.value.delivery).toBe("observedSuccess");
+  });
+
+  test("unknown receipt on the same event gains an applied late-success state", () => {
+    const fixture = buildControlledFixture();
+    const { store, now } = fixture;
+    const flow = commsFlow(fixture, "req-unknown-then-confirmed");
+    const unknown = store.recordOutcome(
+      { operationId: flow.op, token: flow.token, outcome: "unknown", providerEventId: "evt-unknown-confirmed" },
+      now,
+    );
+    expect(unknown.ok).toBe(true);
+    expect(store.operations.get(flow.op)?.state).toBe("outcomeUnknown");
+    const delivery = store.recordLateDelivery(flow.op, flow.token, "evt-unknown-confirmed", now + 1);
+    expect(delivery.ok).toBe(true);
+    if (!delivery.ok) throw new Error("late delivery failed");
+    expect(delivery.value.delivery).toBe("observedSuccess");
+    expect(delivery.value.deduplicated).toBe(false);
+    expect(store.operations.get(flow.op)?.state).toBe("observedSuccess");
+    expect(store.processedEvents.get("controlled|controlled|evt-unknown-confirmed")?.outcome).toBe("unknown");
+    expect(store.processedEvents.get("controlled|controlled|evt-unknown-confirmed")?.applicationOutcome).toBe("success");
   });
 
   test("duplicate delivery after application dedupes with no second effect", () => {
@@ -340,12 +369,11 @@ describe("F1R-12 early receipt binds late delivery exactly once", () => {
       { operationId: second.op, token: second.token, outcome: "success", providerEventId: "evt-shared-fence" },
       now + 1,
     );
-    expect(duplicate.ok).toBe(true);
+    expect(duplicate.ok).toBe(false);
     expect(store.operations.get(second.op)?.state).toBe("dispatching");
     expect(store.getBudgetForOrganization(fixture.orgPrivateA)?.spentMicroUsd).toBe(spentBefore);
     const lateFence = store.recordLateDelivery(second.op, second.token, "evt-shared-fence", now + 2);
-    expect(lateFence.ok).toBe(true);
-    if (!lateFence.ok) throw new Error("fence check failed");
+    expect(lateFence.ok).toBe(false);
     expect(store.operations.get(second.op)?.state).toBe("dispatching");
   });
 

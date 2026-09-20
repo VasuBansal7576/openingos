@@ -27,6 +27,7 @@ import {
 } from "../shared/domainContracts.js";
 import { f1InternalMutation, type F1MutationCtx } from "../server.js";
 import { decimalCompare, decimalToString, decimalZero, quantity } from "../../proofs/money/decimal.js";
+import { canonicalJson } from "../shared/hashing.js";
 import type { Id } from "../_generated/dataModel.js";
 import {
   requireDomainAccess,
@@ -415,6 +416,15 @@ type ProductEvidenceFields = {
   idempotencyKey: string;
 };
 
+/**
+ * F1R-06 integrity bound. Compatibility invalidation is one transaction, so
+ * a requirement-scoped evidence change is accepted only when its indexed
+ * candidate fanout fits this bounded write set. The MAX+1 probe below denies
+ * before any state changes when the supported fanout is exceeded; it never
+ * silently leaves a tail of pass findings stale.
+ */
+export const MAX_COMPATIBILITY_FANOUT = 256;
+
 async function checkProductEvidenceRefs(
   ctx: F1MutationCtx,
   organizationId: Id<"organizations">,
@@ -474,9 +484,18 @@ function sameProductEvidenceFields(
     readonly counterpartyRole: string;
     readonly executionMode: string;
     readonly origin: string;
+    readonly ingestionIdentity?: string;
   },
   fields: ProductEvidenceFields,
 ): boolean {
+  if (existing.ingestionIdentity !== undefined) {
+    return existing.ingestionIdentity === productEvidenceIngestionIdentity(fields);
+  }
+  // Legacy rows predate the immutable identity field. Their verification
+  // transition may already have changed lastCheckedAt, so derive the
+  // migration-safe identity from the fields that were immutable in that
+  // schema. New rows use the strict normalized snapshot above, which also
+  // binds freshness and supplied check-time fields.
   return (
     (existing.requirementId ?? undefined) === fields.requirementId &&
     (existing.candidateId ?? undefined) === fields.candidateId &&
@@ -486,12 +505,36 @@ function sameProductEvidenceFields(
     existing.capturedAt === fields.capturedAt &&
     existing.originalValue === fields.originalValue &&
     existing.normalizedValue === fields.normalizedValue &&
-    existing.freshness === fields.freshness &&
-    (existing.lastCheckedAt ?? undefined) === fields.lastCheckedAt &&
     existing.counterpartyRole === fields.counterpartyRole &&
     existing.executionMode === fields.executionMode &&
     existing.origin === fields.origin
   );
+}
+
+/**
+ * F1R-07: normalize every material ingestion relationship and provenance
+ * field once. Mutable verification/status projections are deliberately not
+ * part of this identity, so verification and conflict replay cannot reset a
+ * row or create a second evidence record.
+ */
+function productEvidenceIngestionIdentity(fields: ProductEvidenceFields): string {
+  return canonicalJson({
+    organizationId: fields.organizationId,
+    projectId: fields.projectId,
+    requirementId: fields.requirementId,
+    candidateId: fields.candidateId,
+    field: fields.field,
+    sourceKind: fields.sourceKind,
+    sourceUrl: fields.sourceUrl,
+    capturedAt: fields.capturedAt,
+    originalValue: fields.originalValue,
+    normalizedValue: fields.normalizedValue,
+    freshness: fields.freshness,
+    lastCheckedAt: fields.lastCheckedAt,
+    counterpartyRole: fields.counterpartyRole,
+    executionMode: fields.executionMode,
+    origin: fields.origin,
+  });
 }
 
 async function insertProductEvidence(
@@ -518,6 +561,7 @@ async function insertProductEvidence(
     origin: fields.origin,
     conflictEvidenceIds: [],
     idempotencyKey: fields.idempotencyKey,
+    ingestionIdentity: productEvidenceIngestionIdentity(fields),
     // F1R-06: every evidence row starts at revision "1". Verification
     // or freshness changes bump it so outstanding finding references
     // go stale instead of silently covering new terms.
@@ -547,7 +591,7 @@ async function invalidateDependentCompatibility(
     readonly requirementId?: Id<"requirements">;
     readonly candidateId?: Id<"candidates">;
   },
-): Promise<void> {
+): Promise<{ ok: true } | { ok: false; code: "invalid-payload"; message: string }> {
   const seen = new Set<string>();
   const rows: {
     readonly _id: Id<"candidates">;
@@ -557,34 +601,14 @@ async function invalidateDependentCompatibility(
       readonly locator?: string;
     }[];
   }[] = [];
-  if (evidence.candidateId !== undefined) {
-    const direct = await ctx.db.get(evidence.candidateId);
-    if (
-      direct !== null &&
-      direct.organizationId === evidence.organizationId &&
-      direct.projectId === evidence.projectId
-    ) {
-      rows.push(direct);
-      seen.add(direct._id);
-    }
-  }
-  if (evidence.requirementId !== undefined) {
-    const scoped = await ctx.db
-      .query("candidates")
-      .withIndex("by_requirement", (q) => q.eq("requirementId", evidence.requirementId as Id<"requirements">))
-      .take(50);
-    for (const row of scoped) {
-      if (
-        row.organizationId === evidence.organizationId &&
-        row.projectId === evidence.projectId &&
-        !seen.has(row._id)
-      ) {
-        rows.push(row);
-        seen.add(row._id);
-      }
-    }
-  }
-  for (const row of rows) {
+  const invalidate = async (row: {
+    readonly _id: Id<"candidates">;
+    readonly compatibilityEvidenceRefs?: readonly {
+      readonly sourceId: string;
+      readonly version: string;
+      readonly locator?: string;
+    }[];
+  }): Promise<void> => {
     const refs = row.compatibilityEvidenceRefs ?? [];
     if (refs.some((ref) => ref.sourceId === evidence._id)) {
       await ctx.db.patch(row._id, {
@@ -594,7 +618,43 @@ async function invalidateDependentCompatibility(
         compatibilityRuleVersion: undefined,
       });
     }
+  };
+  if (evidence.candidateId !== undefined) {
+    const direct = await ctx.db.get(evidence.candidateId);
+    if (
+      direct !== null &&
+      direct.organizationId === evidence.organizationId &&
+      direct.projectId === evidence.projectId
+    ) {
+      seen.add(direct._id);
+      rows.push(direct);
+    }
   }
+  if (evidence.requirementId !== undefined) {
+    const scoped = await ctx.db
+      .query("candidates")
+      .withIndex("by_requirement", (q) => q.eq("requirementId", evidence.requirementId as Id<"requirements">))
+      .take(MAX_COMPATIBILITY_FANOUT + 1);
+    if (scoped.length > MAX_COMPATIBILITY_FANOUT) {
+      return {
+        ok: false,
+        code: "invalid-payload",
+        message: `compatibility fanout exceeds the supported bound of ${MAX_COMPATIBILITY_FANOUT}`,
+      };
+    }
+    for (const row of scoped) {
+      if (
+        row.organizationId === evidence.organizationId &&
+        row.projectId === evidence.projectId &&
+        !seen.has(row._id)
+      ) {
+        seen.add(row._id);
+        rows.push(row);
+      }
+    }
+  }
+  for (const row of rows) await invalidate(row);
+  return { ok: true };
 }
 
 const productEvidenceResultValidator = v.union(
@@ -793,14 +853,16 @@ export const linkEvidenceConflict = f1Mutation({
         return { ok: false as const, code: conflicting.code, message: conflicting.message };
       }
     }
-    // F1R-06: disputing the evidence bumps its revision and invalidates
-    // compatibility findings decided against the undisputed revision.
+    // F1R-06: check the bounded invalidation set before changing the receipt.
+    // An over-bound fanout returns with zero writes rather than leaving stale
+    // compatibility passes behind.
+    const invalidation = await invalidateDependentCompatibility(ctx, evidence.value);
+    if (!invalidation.ok) return invalidation;
     await ctx.db.patch(args.evidenceId, {
       verification: "conflicted",
       conflictEvidenceIds: [...args.conflictingIds],
       version: bumpEvidenceVersion(evidence.value.version),
     });
-    await invalidateDependentCompatibility(ctx, evidence.value);
     return { ok: true as const };
   },
 });
@@ -838,17 +900,18 @@ export const verifyProductEvidence = f1Mutation({
     if (evidence.value.verification !== "unverified" && evidence.value.verification !== "conflicted") {
       return { ok: false as const, code: "invalid-payload", message: "evidence already resolved" };
     }
-    // F1R-06: resolving the evidence bumps its revision so outstanding
-    // references go stale. A supersession additionally invalidates
-    // compatibility findings decided against the superseded revision.
+    // F1R-06: resolve the bounded invalidation set before changing the
+    // evidence. A supersession that exceeds the bound is denied with zero
+    // writes, so no stale compatibility pass can be observed.
+    if (args.verdict === "superseded") {
+      const invalidation = await invalidateDependentCompatibility(ctx, evidence.value);
+      if (!invalidation.ok) return invalidation;
+    }
     await ctx.db.patch(args.evidenceId, {
       verification: args.verdict,
       lastCheckedAt: Date.now(),
       version: bumpEvidenceVersion(evidence.value.version),
     });
-    if (args.verdict === "superseded") {
-      await invalidateDependentCompatibility(ctx, evidence.value);
-    }
     return { ok: true as const };
   },
 });

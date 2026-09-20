@@ -78,6 +78,69 @@ async function settleReservation(
   }
 }
 
+type AppliedOutcome = "success" | "failure" | "unknown";
+type AppliedState = "observedSuccess" | "observedFailure" | "outcomeUnknown";
+
+function appliedOutcome(outcome: "success" | "failure" | "unknown", unknownCharges: boolean | undefined): AppliedOutcome {
+  if (outcome === "unknown" || (outcome === "failure" && unknownCharges === true)) return "unknown";
+  return outcome;
+}
+
+function appliedState(outcome: AppliedOutcome): AppliedState {
+  if (outcome === "success") return "observedSuccess";
+  if (outcome === "failure") return "observedFailure";
+  return "outcomeUnknown";
+}
+
+function receiptScopeMatches(
+  receipt: { readonly organizationId?: Id<"organizations">; readonly projectId?: Id<"projects"> },
+  operation: { readonly organizationId: Id<"organizations">; readonly projectId: Id<"projects"> },
+): boolean {
+  return receipt.organizationId === operation.organizationId && receipt.projectId === operation.projectId;
+}
+
+async function applyOutcome(
+  ctx: F1MutationCtx,
+  operation: {
+    readonly _id: Id<"operations">;
+    readonly reservationId?: Id<"reservations">;
+  },
+  args: {
+    readonly outcome: "success" | "failure" | "unknown";
+    readonly unknownCharges?: boolean;
+    readonly providerEventId?: string;
+    readonly detail?: string;
+    readonly token: string;
+  },
+  now: number,
+): Promise<AppliedState> {
+  const outcome = appliedOutcome(args.outcome, args.unknownCharges);
+  const state = appliedState(outcome);
+  if (state === "outcomeUnknown") {
+    if (operation.reservationId !== undefined) await settleReservation(ctx, operation.reservationId, "retainUnknown", now);
+  } else if (state === "observedFailure") {
+    if (operation.reservationId !== undefined) await settleReservation(ctx, operation.reservationId, "release", now);
+  } else if (operation.reservationId !== undefined) {
+    await settleReservation(ctx, operation.reservationId, "spend", now);
+  }
+  await ctx.db.patch(operation._id, { state, updatedAt: now });
+  const attempts = await ctx.db
+    .query("attempts")
+    .withIndex("by_token", (q) => q.eq("token", args.token))
+    .collect();
+  for (const attempt of attempts) {
+    if (attempt.operationId === operation._id) {
+      await ctx.db.patch(attempt._id, {
+        state,
+        observedAt: now,
+        ...(args.providerEventId === undefined ? {} : { providerEventId: args.providerEventId }),
+        ...(args.detail === undefined ? {} : { detail: args.detail }),
+      });
+    }
+  }
+  return state;
+}
+
 /**
  * Internal: record a validated provider outcome for a claimed token.
  *
@@ -114,6 +177,9 @@ export const recordOutcome = f1InternalMutation({
     const provider = args.provider ?? "controlled";
     const environment = args.environment ?? "controlled";
     if (args.providerEventId !== undefined) {
+      if (args.providerEventId.trim().length === 0) {
+        return { ok: false as const, code: "invalid-payload", message: "providerEventId required" };
+      }
       const seen = await ctx.db
         .query("processedEvents")
         .withIndex("by_provider_environment_and_event", (q) =>
@@ -123,59 +189,45 @@ export const recordOutcome = f1InternalMutation({
             .eq("eventId", args.providerEventId ?? ""),
         )
         .unique();
-      // F1R-12: receipt and application are separate. An unbound early
-      // receipt binds to this operation and the outcome below applies
-      // exactly once; an event already applied here dedupes; an event
-      // bound elsewhere stays fenced with zero new effect.
       if (seen !== null) {
+        const effective = appliedOutcome(args.outcome, args.unknownCharges);
+        if (!receiptScopeMatches(seen, operation)) {
+          return { ok: false as const, code: "duplicate-conflict", message: "event receipt belongs to another project" };
+        }
+        if (seen.outcome !== args.outcome || (seen.applicationOutcome !== undefined && seen.applicationOutcome !== effective)) {
+          return { ok: false as const, code: "duplicate-conflict", message: "event receipt facts conflict" };
+        }
         if (seen.operationId === args.operationId) {
           return { ok: true as const, state: operation.state, deduplicated: true, outcome: seen.outcome };
         }
         if (seen.operationId !== undefined) {
-          return { ok: true as const, state: operation.state, deduplicated: true, outcome: seen.outcome };
+          return { ok: false as const, code: "duplicate-conflict", message: "event receipt is bound to another operation" };
         }
-        await ctx.db.patch(seen._id, { operationId: args.operationId });
+        await ctx.db.patch(seen._id, {
+          operationId: args.operationId,
+          applicationOutcome: effective,
+          applicationState: appliedState(effective),
+          appliedAt: now,
+        });
       } else {
+        const effective = appliedOutcome(args.outcome, args.unknownCharges);
         await ctx.db.insert("processedEvents", {
           provider,
           environment,
           eventId: args.providerEventId,
           processingVersion: 1,
           outcome: args.outcome,
+          organizationId: operation.organizationId,
+          projectId: operation.projectId,
           operationId: args.operationId,
+          applicationOutcome: effective,
+          applicationState: appliedState(effective),
+          appliedAt: now,
           createdAt: now,
         });
       }
     }
-    let state: "observedSuccess" | "observedFailure" | "outcomeUnknown" = "observedSuccess";
-    if (args.outcome === "unknown" || (args.outcome === "failure" && args.unknownCharges === true)) {
-      state = "outcomeUnknown";
-      if (operation.reservationId !== undefined) {
-        await settleReservation(ctx, operation.reservationId, "retainUnknown", now);
-      }
-    } else if (args.outcome === "failure") {
-      state = "observedFailure";
-      if (operation.reservationId !== undefined) {
-        await settleReservation(ctx, operation.reservationId, "release", now);
-      }
-    } else if (operation.reservationId !== undefined) {
-      await settleReservation(ctx, operation.reservationId, "spend", now);
-    }
-    await ctx.db.patch(args.operationId, { state, updatedAt: now });
-    const attempts = await ctx.db
-      .query("attempts")
-      .withIndex("by_token", (q) => q.eq("token", args.token))
-      .collect();
-    for (const attempt of attempts) {
-      if (attempt.operationId === args.operationId) {
-        await ctx.db.patch(attempt._id, {
-          state,
-          observedAt: now,
-          ...(args.providerEventId === undefined ? {} : { providerEventId: args.providerEventId }),
-          ...(args.detail === undefined ? {} : { detail: args.detail }),
-        });
-      }
-    }
+    const state = await applyOutcome(ctx, operation, args, now);
     return { ok: true as const, state, deduplicated: false, outcome: args.outcome };
   },
 });

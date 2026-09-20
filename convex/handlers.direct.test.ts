@@ -116,6 +116,11 @@ const lateDeliveryRef = makeFunctionReference<
   MutationArgs<typeof reconciliation.recordLateDelivery>,
   MutationReturn<typeof reconciliation.recordLateDelivery>
 >("execution/reconciliation:recordLateDelivery");
+const ingestEventRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof reconciliation.ingestEvent>,
+  MutationReturn<typeof reconciliation.ingestEvent>
+>("execution/reconciliation:ingestEvent");
 const reviewedResendRef = makeFunctionReference<
   "mutation",
   MutationArgs<typeof attempts.reviewedResend>,
@@ -1361,6 +1366,83 @@ describe("direct checkpoint-2 money, budgets, and reconciliation", () => {
     expect(resent.warning).toContain("may duplicate");
   });
 
+  test("F1R-12 keeps receipt facts separate from unknown-to-success application", async () => {
+    const t = convexTest(schema, modules);
+    const setup = await setupBudgetedProject(t, OWNER_A);
+    const asOwner = t.withIdentity(OWNER_A);
+    const job = await asOwner.mutation(startJobRef, {
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      text: "Send the RFQ to the demo supplier.",
+      kind: "communication",
+      grantId: setup.grantId,
+    });
+    if (!job.ok) throw new Error("job setup failed");
+    const reservation = await asOwner.mutation(reserveBudgetRef, {
+      jobId: job.jobId,
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      amountMicroUsd: 10_000,
+      pricingBasis: "controlled-direct",
+    });
+    if (!reservation.ok) throw new Error("reserve failed");
+    const created = await asOwner.mutation(createOperationRef, {
+      jobId: job.jobId,
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      kind: "communication.send",
+      requestId: "req-direct-receipt-application",
+      payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
+      grantId: setup.grantId,
+      reservationId: reservation.reservationId,
+    });
+    if (!created.ok) throw new Error("operation setup failed");
+    const claim = await t.mutation(claimOperationRef, {
+      operationId: created.operationId,
+      identity: OWNER_A.tokenIdentifier,
+    });
+    if (!claim.ok || !("attemptToken" in claim)) throw new Error("claim failed");
+    const event = {
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      provider: "direct-provider",
+      environment: "controlled",
+      eventId: "evt-direct-receipt-application",
+      processingVersion: 1,
+      outcome: "unknown",
+    } as const;
+    const receipt = await t.mutation(ingestEventRef, event);
+    expect(receipt).toEqual({ ok: true, deduplicated: false, outcome: "unknown" });
+    const recorded = await t.mutation(recordOutcomeRef, {
+      operationId: created.operationId,
+      token: claim.attemptToken,
+      provider: event.provider,
+      environment: event.environment,
+      providerEventId: event.eventId,
+      outcome: "unknown",
+    });
+    expect(recorded).toMatchObject({ ok: true, state: "outcomeUnknown", deduplicated: false, outcome: "unknown" });
+    const late = await t.mutation(lateDeliveryRef, {
+      operationId: created.operationId,
+      token: claim.attemptToken,
+      provider: event.provider,
+      environment: event.environment,
+      providerEventId: event.eventId,
+    });
+    expect(late).toMatchObject({ ok: true, delivery: "observedSuccess", deduplicated: false });
+    const saved = await t.run((ctx) =>
+      ctx.db
+        .query("processedEvents")
+        .withIndex("by_provider_environment_and_event", (q) =>
+          q.eq("provider", event.provider).eq("environment", event.environment).eq("eventId", event.eventId),
+        )
+        .unique(),
+    );
+    expect(saved?.outcome).toBe("unknown");
+    expect(saved?.applicationOutcome).toBe("success");
+    expect(saved?.operationId).toBe(created.operationId);
+  });
+
   test("F1-20 duplicate events across operations settle nothing twice", async () => {
     const t = convexTest(schema, modules);
     const setup = await setupBudgetedProject(t, OWNER_A);
@@ -1415,9 +1497,9 @@ describe("direct checkpoint-2 money, budgets, and reconciliation", () => {
       outcome: "success",
       providerEventId: "evt-direct-shared-1",
     });
-    expect(duplicate.ok).toBe(true);
-    if (!duplicate.ok) throw new Error("dedupe failed");
-    expect(duplicate.deduplicated).toBe(true);
+    expect(duplicate.ok).toBe(false);
+    if (duplicate.ok) throw new Error("foreign operation unexpectedly applied the receipt");
+    expect(duplicate.code).toBe("duplicate-conflict");
     const secondState = await asOwner.query(getOperationRef, { operationId: second.op });
     if (!secondState.ok) throw new Error("get failed");
     expect(secondState.state).toBe("dispatching");

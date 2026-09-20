@@ -243,6 +243,10 @@ export default defineSchema({
     origin: v.union(v.literal("internal"), v.literal("ownerImport")),
     conflictEvidenceIds: v.array(v.id("productEvidence")),
     idempotencyKey: v.string(),
+    // F1R-07: the normalized ingestion identity is immutable. Verification,
+    // freshness, and status projections may change without changing replay
+    // identity, while any material ingestion input still conflicts.
+    ingestionIdentity: v.optional(v.string()),
     // F1R-06: explicit evidence revision. Compatibility findings bind
     // the exact version they were decided against; any verification or
     // freshness change bumps it so outstanding refs go stale.
@@ -722,7 +726,15 @@ export default defineSchema({
     eventId: v.string(),
     processingVersion: v.number(),
     outcome: v.string(),
+    // F1R-12: receipt ownership/facts are immutable and separate from the
+    // operation binding and application projection below. Optional fields
+    // preserve reads of historical receipts created before this contract.
+    organizationId: v.optional(v.id("organizations")),
+    projectId: v.optional(v.id("projects")),
     operationId: v.optional(v.id("operations")),
+    applicationOutcome: v.optional(v.union(v.literal("success"), v.literal("failure"), v.literal("unknown"))),
+    applicationState: v.optional(v.string()),
+    appliedAt: v.optional(v.number()),
     createdAt: v.number(),
   }).index("by_provider_environment_and_event", ["provider", "environment", "eventId"]),
 

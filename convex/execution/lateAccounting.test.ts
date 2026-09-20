@@ -149,7 +149,7 @@ describe("F1-20 duplicate event IDs never settle a second effect", () => {
       { operationId: second.op, token: second.token, outcome: "success", providerEventId: "evt-shared-1" },
       now + 1,
     );
-    expect(duplicate.ok).toBe(true);
+    expect(duplicate.ok).toBe(false);
     expect(store.operations.get(second.op)?.state).toBe("dispatching");
     expect(store.getBudgetForOrganization(fixture.orgPrivateA)?.spentMicroUsd).toBe(spentBefore);
     expect(store.snapshotCounts().sends).toBe(before.sends);
