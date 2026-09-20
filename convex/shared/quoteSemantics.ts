@@ -544,8 +544,10 @@ export function compareStoredQuotes(left: StoredComparableQuote, right: StoredCo
 /**
  * Every decision and lineage field hashed for a quote version: tenant,
  * identity, money, quantities, charge scopes and states, tax basis,
- * comparison scope, evidence, counterparty lineage, conversation
- * binding, and the superseded version link.
+ * comparison scope, evidence, counterparty lineage, conversation and
+ * shared-domain graph bindings (requirement, vendor, RFQ), and the
+ * superseded version link. A swapped graph reference changes the
+ * content hash: lineage is hash-bound, not merely stored alongside.
  */
 export function quoteDecisionFields(input: {
   readonly organizationId: string;
@@ -560,6 +562,9 @@ export function quoteDecisionFields(input: {
   readonly counterpartyRole: string;
   readonly executionMode: string;
   readonly conversationId?: string;
+  readonly requirementId?: string;
+  readonly vendorId?: string;
+  readonly rfqId?: string;
   readonly supersedes?: string;
 }): Record<string, unknown> {
   return {
@@ -575,6 +580,9 @@ export function quoteDecisionFields(input: {
     counterpartyRole: input.counterpartyRole,
     executionMode: input.executionMode,
     ...(input.conversationId === undefined ? {} : { conversationId: input.conversationId }),
+    ...(input.requirementId === undefined ? {} : { requirementId: input.requirementId }),
+    ...(input.vendorId === undefined ? {} : { vendorId: input.vendorId }),
+    ...(input.rfqId === undefined ? {} : { rfqId: input.rfqId }),
     ...(input.supersedes === undefined ? {} : { supersedes: input.supersedes }),
   };
 }
