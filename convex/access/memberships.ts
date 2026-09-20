@@ -9,9 +9,18 @@
  */
 
 import { v } from "convex/values";
-import { f1Mutation, f1Query } from "../server.js";
-import { checkProjectAccess, denialValidator, identityOf } from "./checks.js";
+import { f1Mutation, f1Query, type F1MutationCtx } from "../server.js";
+import type { Id } from "../_generated/dataModel.js";
+import {
+  checkProjectAccess,
+  denialValidator,
+  identityOf,
+  membershipScopeKey,
+  PERMANENT_AUTHORITY_UNTIL,
+  resolveProjectAccess,
+} from "./checks.js";
 import { roleSatisfies } from "../shared/scope.js";
+import { isExpired } from "../shared/time.js";
 
 const roleValidator = v.union(
   v.literal("owner"),
@@ -24,6 +33,64 @@ const roleResultValidator = v.union(
   v.object({ ok: v.literal(true), role: v.string() }),
   denialValidator,
 );
+
+async function recordCurrentAuthority(
+  ctx: F1MutationCtx,
+  organizationId: Id<"organizations">,
+  projectId: Id<"projects"> | undefined,
+  identity: string,
+  role: "owner" | "approver" | "contributor" | "viewer",
+  membershipId: Id<"memberships">,
+  expiresAt: number | undefined,
+  updatedAt: number,
+): Promise<void> {
+  await ctx.db.insert("membershipAuthorities", {
+    organizationId,
+    ...(projectId === undefined ? {} : { projectId }),
+    identity,
+    scopeKey: membershipScopeKey(projectId),
+    role,
+    membershipId,
+    authorityUntil: expiresAt ?? PERMANENT_AUTHORITY_UNTIL,
+    ...(expiresAt === undefined ? {} : { expiresAt }),
+    updatedAt,
+  });
+}
+
+async function hasCurrentOrganizationOwner(
+  ctx: F1MutationCtx,
+  organizationId: Id<"organizations">,
+  identity: string,
+  now: number,
+): Promise<boolean> {
+  const projected = await ctx.db
+    .query("membershipAuthorities")
+    .withIndex("by_organization_and_identity_and_scope_and_role_and_authority_until", (q) =>
+      q
+        .eq("organizationId", organizationId)
+        .eq("identity", identity)
+        .eq("scopeKey", membershipScopeKey(undefined))
+        .eq("role", "owner"),
+    )
+    .order("desc")
+    .first();
+  if (projected !== null) {
+    return projected.expiresAt === undefined || !isExpired(now, projected.expiresAt);
+  }
+  const legacy = await ctx.db
+    .query("memberships")
+    .withIndex("by_organization_and_identity_and_project_and_status_and_role", (q) =>
+      q
+        .eq("organizationId", organizationId)
+        .eq("identity", identity)
+        .eq("projectId", undefined)
+        .eq("status", "active")
+        .eq("role", "owner"),
+    )
+    .order("desc")
+    .first();
+  return legacy !== null && (legacy.expiresAt === undefined || !isExpired(now, legacy.expiresAt));
+}
 
 /** Caller's own role for a project (proves isolation on direct calls). */
 export const myProjectRole = f1Query({
@@ -68,7 +135,7 @@ export const createOrganization = f1Mutation({
       kind: args.kind,
       createdAt: now,
     });
-    await ctx.db.insert("memberships", {
+    const membershipId = await ctx.db.insert("memberships", {
       organizationId,
       identity,
       role: "owner",
@@ -76,6 +143,16 @@ export const createOrganization = f1Mutation({
       version: 1,
       updatedAt: now,
     });
+    await recordCurrentAuthority(
+      ctx,
+      organizationId,
+      undefined,
+      identity,
+      "owner",
+      membershipId,
+      undefined,
+      now,
+    );
     return { ok: true as const, organizationId };
   },
 });
@@ -101,22 +178,10 @@ export const createProject = f1Mutation({
       return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
     }
     const now = Date.now();
-    const rows = await ctx.db
-      .query("memberships")
-      .withIndex("by_organization_and_identity", (q) =>
-        q.eq("organizationId", args.organizationId).eq("identity", identity),
-      )
-      .collect();
     // Organization administration requires current ORG-SCOPED owner
     // authority: a project-scoped owner row administers nothing outside
     // its own project.
-    const owner = rows.some(
-      (row) =>
-        row.status === "active" &&
-        row.role === "owner" &&
-        row.projectId === undefined &&
-        (row.expiresAt === undefined || row.expiresAt > now),
-    );
+    const owner = await hasCurrentOrganizationOwner(ctx, args.organizationId, identity, now);
     if (!owner) {
       return { ok: false as const, code: "denied-capability", message: "only an owner creates projects" };
     }
@@ -135,7 +200,7 @@ export const createProject = f1Mutation({
     // locked out of their own project. The grant lives in the same
     // mutation as the project row, so creation never leaves an
     // inaccessible project behind.
-    await ctx.db.insert("memberships", {
+    const membershipId = await ctx.db.insert("memberships", {
       organizationId: args.organizationId,
       projectId,
       identity,
@@ -144,6 +209,16 @@ export const createProject = f1Mutation({
       version: 1,
       updatedAt: now2,
     });
+    await recordCurrentAuthority(
+      ctx,
+      args.organizationId,
+      projectId,
+      identity,
+      "owner",
+      membershipId,
+      undefined,
+      now2,
+    );
     return { ok: true as const, projectId };
   },
 });
@@ -167,7 +242,7 @@ export const grantProjectAccess = f1Mutation({
       return { ok: false as const, code: "forged-identity", message: "unauthenticated" };
     }
     const now = Date.now();
-    const access = await checkProjectAccess(
+    const resolution = await resolveProjectAccess(
       ctx,
       identity,
       args.organizationId,
@@ -175,7 +250,7 @@ export const grantProjectAccess = f1Mutation({
       "approver",
       now,
     );
-    if (!access.ok) return { ok: false as const, code: access.code, message: access.message };
+    if (!resolution.ok) return { ok: false as const, code: resolution.code, message: resolution.message };
     if (args.targetIdentity.trim().length === 0) {
       return { ok: false as const, code: "forged-identity", message: "target identity required" };
     }
@@ -193,48 +268,24 @@ export const grantProjectAccess = f1Mutation({
     }
     // No escalation or lateral grants: the granted role cannot exceed the
     // granter's own role in the stated project.
-    if (!roleSatisfies(access.value, args.role)) {
+    if (!roleSatisfies(resolution.value.role, args.role)) {
       return { ok: false as const, code: "denied-capability", message: "cannot grant a role above your own" };
     }
 
-    // A temporary authority cannot mint a longer-lived membership, including
-    // a grant back to the same identity. `checkProjectAccess` returns the
-    // highest current role, so only memberships at that effective role can
-    // authorize this grant; a non-expiring membership at that role keeps the
-    // authority non-expiring, while several temporary rows use the latest
-    // expiry that still supplies the effective role.
-    const project = await ctx.db.get(args.projectId);
-    if (project === null || project.organizationId !== args.organizationId) {
-      return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
-    }
-    const granterRows = await ctx.db
-      .query("memberships")
-      .withIndex("by_organization_and_identity", (q) =>
-        q.eq("organizationId", args.organizationId).eq("identity", identity),
-      )
-      .collect();
-    const effectiveRows = granterRows.filter(
-      (row) =>
-        row.status === "active" &&
-        (row.expiresAt === undefined || row.expiresAt > now) &&
-        (project.visibility === "restricted"
-          ? row.projectId === args.projectId
-          : row.projectId === undefined || row.projectId === args.projectId),
+    // The target role may be supplied by any current stronger authority. A
+    // permanent approver therefore remains able to delegate an approver role
+    // even while a shorter temporary owner row is also present, while an
+    // owner grant is still bounded by the temporary owner row itself.
+    const authorityRows = resolution.value.authorities.filter((authority) =>
+      roleSatisfies(authority.role, args.role),
     );
-    const authorityRows = effectiveRows.filter((row) => row.role === access.value);
     if (authorityRows.length === 0) {
       return { ok: false as const, code: "denied-capability", message: "granting authority is no longer current" };
     }
-    const hasNonExpiringAuthority = authorityRows.some((row) => row.expiresAt === undefined);
-    const finiteAuthorityExpiries = authorityRows.flatMap((row) =>
-      row.expiresAt === undefined ? [] : [row.expiresAt],
-    );
-    const authorityExpiry = hasNonExpiringAuthority
-      ? undefined
-      : Math.max(...finiteAuthorityExpiries);
+    const authorityUntil = Math.max(...authorityRows.map((row) => row.authorityUntil));
     if (
-      authorityExpiry !== undefined &&
-      (args.expiresAt === undefined || args.expiresAt > authorityExpiry)
+      authorityUntil !== PERMANENT_AUTHORITY_UNTIL &&
+      (args.expiresAt === undefined || args.expiresAt > authorityUntil)
     ) {
       return {
         ok: false as const,
@@ -252,6 +303,16 @@ export const grantProjectAccess = f1Mutation({
       ...(args.expiresAt === undefined ? {} : { expiresAt: args.expiresAt }),
       updatedAt: now,
     });
+    await recordCurrentAuthority(
+      ctx,
+      args.organizationId,
+      args.projectId,
+      args.targetIdentity,
+      args.role,
+      membershipId,
+      args.expiresAt,
+      now,
+    );
     return { ok: true as const, membershipId };
   },
 });
@@ -283,7 +344,22 @@ export const revokeProjectAccess = f1Mutation({
     );
     if (!access.ok) return { ok: false as const, code: access.code, message: access.message };
     const row = await ctx.db.get(args.membershipId);
-    if (row === null || row.organizationId !== args.organizationId) {
+    if (
+      row === null ||
+      row.organizationId !== args.organizationId ||
+      (row.projectId !== undefined && row.projectId !== args.projectId)
+    ) {
+      return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
+    }
+    // A project-scoped target must match the stated project before any role
+    // comparison.  Organization-scoped targets are visible only to a current
+    // organization owner, also checked before role comparison.  This keeps
+    // inaccessible existing membership IDs indistinguishable from absent or
+    // cross-organization IDs.
+    if (
+      row.projectId === undefined &&
+      !(await hasCurrentOrganizationOwner(ctx, args.organizationId, identity, now))
+    ) {
       return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
     }
     // Role-capped revocation: the revoker's best role in the stated
@@ -292,29 +368,11 @@ export const revokeProjectAccess = f1Mutation({
     if (!roleSatisfies(access.value, row.role)) {
       return { ok: false as const, code: "denied-capability", message: "cannot revoke a membership above your own role" };
     }
-    // The target membership must belong to the stated project. An org-level
-    // row additionally requires org-scoped owner authority to revoke.
-    if (row.projectId !== args.projectId) {
-      if (row.projectId !== undefined) {
-        return { ok: false as const, code: "denied-project", message: "membership is not in this project" };
-      }
-      const revokerRows = await ctx.db
-        .query("memberships")
-        .withIndex("by_organization_and_identity", (q) =>
-          q.eq("organizationId", args.organizationId).eq("identity", identity),
-        )
-        .collect();
-      const orgOwner = revokerRows.some(
-        (revoker) =>
-          revoker.status === "active" &&
-          revoker.role === "owner" &&
-          revoker.projectId === undefined &&
-          (revoker.expiresAt === undefined || revoker.expiresAt > now),
-      );
-      if (!orgOwner) {
-        return { ok: false as const, code: "denied-capability", message: "only an organization owner revokes organization membership" };
-      }
-    }
+    const authority = await ctx.db
+      .query("membershipAuthorities")
+      .withIndex("by_membership", (q) => q.eq("membershipId", args.membershipId))
+      .unique();
+    if (authority !== null) await ctx.db.delete(authority._id);
     await ctx.db.patch(args.membershipId, { status: "revoked", revokedAt: now, updatedAt: now });
     return { ok: true as const, revoked: true };
   },
