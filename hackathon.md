@@ -335,7 +335,12 @@ Integrated R1's independently bounded native pagination for evidence, normalized
 Integrated C1's normalized AgentMail message, thread and inbox binding fields with exact compound indexes for callback-to-operation and inbound conversation routing.
 Current callback paths no longer depend on an arbitrary `processedEvents` prefix; legacy JSON recovery remains bounded and refuses an incomplete prefix rather than misbinding it.
 The combined local head through `ddc4d3a` passes TypeScript, production build, the full repository, money/Jev, F1, browser, application and communication suite, plus 203 direct Convex tests.
-The R1 and C1 roadmap boxes remain open until this replacement PR head passes exact-head GitHub Actions and Greptile review.
-J-03 allowance enforcement, D-17 mixed-scope partitioning and the real Convex UI adapter remain active worker packages.
+Exact PR head `099d016` passed every expected GitHub Actions job and Greptile, and the two repaired P1 threads are resolved with controlled evidence replies.
+R1 and C1 are complete for controlled implementation; the latest Greptile pass opened two U1 P1 findings for activity pagination and reconnect action fencing.
+The real Convex UI adapter, D-17 mixed-scope partitioning and the repaired J-03 actual-action allowance fence are integrated locally through `c6c60fb`.
+The J-03 action now fails closed on missing, invalid, overflowing or stale server-configured pricing, reserves the full bounded three-attempt exposure and does not encode an invented live price.
+Its 15 focused controlled tests, TypeScript and production build pass on the combined checkout.
+The two U1 Greptile P1 repairs remain active, and E1 equipment projection is under coordinator redaction repair before integration.
+Official OpenAI documentation resolved the pending controlled model contract to dated snapshot `gpt-5.4-mini-2026-03-17`; no live OpenAI account access or request was claimed.
 All evidence in this checkpoint is controlled local execution only.
 No live provider call, hosted deployment, owner-mailbox exchange or external effect was observed.

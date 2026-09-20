@@ -22,8 +22,8 @@ This file supplies order, not duplicate contracts or a running automation.
    Assign one owner to schema, dependency and lockfile changes.
 4. [ ] **R1 / C1 / U1, parallel features.** After accepted F1 contracts land, dispatch research, communication and workbench packages with exclusive file ownership.
    Use the Netherlands/EUR source set in PRD section 52; preserve all required categories and the full evaluator journey.
-   - [ ] R1 bounded Firecrawl collection and controlled S-11 through S-14 coverage are integrated through `d53c2ef`; complete claims/candidates pagination is under Greptile P1 repair.
-   - [ ] C1 owner-only transport, callbacks, reconciliation and quote ingestion are integrated through `d53c2ef`; indexed callback-binding lookup is under Greptile P1 repair.
+   - [x] R1 bounded Firecrawl collection and controlled S-11 through S-14 coverage include independently paginated evidence, claims and candidate streams at exact PR head `099d016`.
+   - [x] C1 owner-only transport, callbacks, reconciliation and quote ingestion use indexed provider binding lookup at exact PR head `099d016`.
    - [ ] U1 production-state adapter, live Convex wiring and desktop/narrow browser proof remain open.
 5. [ ] **E1, integrated behavior.** Build recovery, change impact and equipment/service flows against the integrated research and communication modules.
 6. [ ] **V1, proof and review.** A separate Astra session reviews a fixed combined commit; implementation owners repair its findings.
@@ -87,7 +87,9 @@ This file supplies order, not duplicate contracts or a running automation.
 - [x] Shut down settled worker/reviewer sessions and remove both completed worker worktrees through Orca after verifying clean status and remote preservation.
 - [x] Integrate the initial R1 research and C1 communication packages plus the bounded W1 backend projection through `d53c2ef`; pass TypeScript, production build, 23 repository tests, 77 proof tests, 244 F1 tests, 155 browser tests, 21 application/communication tests and 199 direct Convex tests.
 - [x] Repair Greptile's PR #2 unbounded S1 negative controls with explicit 65-row reads in `1db56b5`, while retaining the production identity-first and quote-tuple index assertions.
-- [ ] Close Greptile P1 discussions `4058028201` and `4058028206` with indexed C1 binding lookup and independently paginated R1 evidence, claims and candidate streams.
+- [x] Close Greptile P1 discussions `4058028201` and `4058028206` with indexed C1 binding lookup and independently paginated R1 evidence, claims and candidate streams; exact PR head `099d016` passes every expected GitHub check and Greptile.
+- [x] Integrate D-17 mixed-scope admission, the real Convex U1 adapter and the J-03 actual-action allowance fence through local commit `c6c60fb`; focused controlled tests, TypeScript and production build pass.
+- [ ] Close U1 Greptile P1 discussions `4058112415` and `4058112420` with append-only activity pagination and connected-only mutation controls on the next exact PR head.
 - [ ] Finish the U1 backend-shape adapter, connect the UI to Convex, inspect the selected flow at desktop and narrow widths, then obtain exact-head CI, Greptile and separate Astra review.
 
 The completed money and Jev proof wave contains controlled proofs only, reviewed at `595d30c` with no actionable findings remaining.

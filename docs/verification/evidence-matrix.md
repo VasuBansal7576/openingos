@@ -78,7 +78,7 @@ Passing controlled evidence never counts as a live provider, deployed applicatio
 | D-14 | controlled-verified | Reviewed F1 and browser tests enforce backend capability, grant, expiry, revocation, recipient and unknown-operation denial, including covered-action continuity. |
 | D-15 | not-started | Changed-term re-evaluation without history overwrite needs E1/U1. |
 | D-16 | controlled-verified | F1 concurrency tests prove organization-wide reservations prevent branches and retries from each consuming the full shared allowance. |
-| D-17 | controlled-verified | Reviewed backend and browser tests refuse unrelated, unavailable and direct-bypass work while preserving supported context and blocking evidence-based capability expansion. |
+| D-17 | controlled-verified | Integrated handler and controlled-store tests derive one supported purchasing segment, persist only its canonical payload, expose refused clauses, and revalidate at operation claim while pure unrelated, unavailable purchase, prompt-injection and evidence-expansion probes create no unauthorized work; separate Astra review remains. |
 
 ## Sponsor integration cases
 
@@ -107,7 +107,7 @@ Passing controlled evidence never counts as a live provider, deployed applicatio
 | S-21 | live-unverified | Full published Firecrawl/Jev/OpenAI/AgentMail/Convex path has not run. |
 | S-22 | partial-controlled | F1 and browser tests enforce owner-only recipient versions and block alternate channels across API, model, retry and browser boundaries; C1 still owns the real transport integration. |
 | S-23 | live-unverified | Requires the owner mailbox, hosted route, provider credentials and an unscripted real reply. |
-| S-24 | not-started | C1/U1 project-thread isolation, provenance and public redaction. |
+| S-24 | partial-controlled | C1 callback and quote tests plus W1 projection tests enforce project-thread isolation, controlled/recorded counterparty provenance and public redaction; complete browser and export coverage remains. |
 
 ## Jev cases
 
@@ -115,7 +115,7 @@ Passing controlled evidence never counts as a live provider, deployed applicatio
 | --- | --- | --- |
 | J-01 | controlled-verified | Reviewed injected HTTP tests prove endpoint, pinned `jev-1.13.0`, body, authorization boundary and one request per reserved attempt. |
 | J-02 | controlled-verified | Reviewed parser tests reject missing/wrong/unknown/malformed/nonfinite/model-drift responses. |
-| J-03 | controlled-verified | Controlled adapter and F1 shared-ledger tests cover retry classes, backoff, timeout, cancellation, three-attempt bounds and concurrent allowance accounting. |
+| J-03 | controlled-verified | The actual Jev action now rejects missing, invalid, overflowing or stale configured pricing before provider dispatch, requires one full three-attempt shared reservation, preserves ambiguous exposure and passes 15 focused controlled tests including concurrent action admission; live pricing and provider access remain unverified. |
 | J-04 | controlled-verified | F1 validation, stale-result, grant, recipient and late-authority tests prevent changed, revoked or cross-recipient decisions from authorizing effects. |
 | J-05 | live-unverified | No authorized hosted Jev call has run. |
 | J-06 | not-started | Domain evaluation set, thresholds, latency and intervention report remain. |
