@@ -113,7 +113,6 @@ test("drives mounted RootApplication recovery and disposes every replaced client
   const previousDocument = globalThis.document;
   const previousNavigator = globalThis.navigator;
   const previousWebSocket = globalThis.WebSocket;
-  const previousKeyboardEvent = globalThis.KeyboardEvent;
   const previousFetch = globalThis.fetch;
   const actEnvironment = globalThis as typeof globalThis & {
     IS_REACT_ACT_ENVIRONMENT?: boolean;
@@ -151,7 +150,6 @@ test("drives mounted RootApplication recovery and disposes every replaced client
   browserGlobals.document = dom.document as unknown as globalThis.Document;
   browserGlobals.navigator = dom.navigator as unknown as globalThis.Navigator;
   actEnvironment.IS_REACT_ACT_ENVIRONMENT = true;
-  globalThis.KeyboardEvent = dom.window.KeyboardEvent as unknown as typeof KeyboardEvent;
   globalThis.WebSocket = SocketForTest as unknown as typeof WebSocket;
   globalThis.fetch = (async (input: RequestInfo | URL) => {
     blockedRequests.push(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url);
@@ -179,32 +177,35 @@ test("drives mounted RootApplication recovery and disposes every replaced client
     expect(records.length).toBeGreaterThanOrEqual(2);
     expect(records.filter(({ closeCalls }) => closeCalls === 0)).toHaveLength(1);
 
+    const keydownOnlyButton = container.querySelector<HTMLButtonElement>(".retry-button");
+    expect(keydownOnlyButton).not.toBeNull();
+    const recordsBeforeKeydown = records.length;
+    await act(async () => {
+      keydownOnlyButton?.dispatchEvent(
+        new dom.window.KeyboardEvent("keydown", { bubbles: true, key: "Enter" }) as unknown as globalThis.KeyboardEvent,
+      );
+    });
+    expect(records).toHaveLength(recordsBeforeKeydown);
+    expect(records.filter(({ closeCalls }) => closeCalls === 0)).toHaveLength(1);
+
     behavior = "reconnecting";
-    const retryWithKeyboard = async () => {
-      const retryButton = container.querySelector<HTMLButtonElement>(".retry-button");
-      expect(retryButton).not.toBeNull();
-      const previousRecordCount = records.length;
-      retryButton?.focus();
-      await act(async () => {
-        retryButton?.dispatchEvent(new dom.window.KeyboardEvent("keydown", { bubbles: true, key: "Enter" }) as unknown as KeyboardEvent);
-      });
-      await waitForStatus(container, "CONNECTION INTERRUPTED");
-      expect(records.length).toBeGreaterThan(previousRecordCount);
-      expect(records.filter(({ closeCalls }) => closeCalls === 0)).toHaveLength(1);
-    };
     const retryWithClick = async () => {
       const retryButton = container.querySelector<HTMLButtonElement>(".retry-button");
       expect(retryButton).not.toBeNull();
-      const previousRecordCount = records.length;
+      const previousRecords = [...records];
+      const replacedClient = previousRecords.find(({ closeCalls }) => closeCalls === 0);
+      expect(replacedClient).not.toBeUndefined();
       await act(async () => {
         retryButton?.click();
       });
       await waitForStatus(container, "CONNECTION INTERRUPTED");
-      expect(records.length).toBeGreaterThan(previousRecordCount);
+      expect(records).toHaveLength(previousRecords.length + 2);
+      expect(replacedClient?.closeCalls).toBe(1);
+      expect(previousRecords.every(({ closeCalls }) => closeCalls === 1)).toBe(true);
       expect(records.filter(({ closeCalls }) => closeCalls === 0)).toHaveLength(1);
     };
-    await retryWithKeyboard();
-    await retryWithKeyboard();
+    await retryWithClick();
+    await retryWithClick();
     await retryWithClick();
     await retryWithClick();
 
@@ -229,7 +230,6 @@ test("drives mounted RootApplication recovery and disposes every replaced client
     } else {
       actEnvironment.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment;
     }
-    globalThis.KeyboardEvent = previousKeyboardEvent;
     globalThis.WebSocket = previousWebSocket;
     globalThis.fetch = previousFetch;
   }
