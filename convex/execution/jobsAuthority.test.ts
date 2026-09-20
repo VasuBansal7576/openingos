@@ -68,6 +68,11 @@ const createOperationRef = makeFunctionReference<
   MutationArgs<typeof operations.create>,
   MutationReturn<typeof operations.create>
 >("execution/operations:create");
+const claimOperationRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof operations.claim>,
+  MutationReturn<typeof operations.claim>
+>("execution/operations:claim");
 
 const identity = { tokenIdentifier: "jobs-authority-chain-owner" };
 
@@ -310,6 +315,93 @@ test("automatic research creates exact query payload and operation authority", a
   ]);
   expect(rows.job?.workflowAuthority).toEqual(rows.grant?.workflowAuthorities?.[0]);
   expect(await rowCounts(fixture)).toMatchObject({ grants: 1, jobs: 1, operations: 0 });
+});
+
+test("automatic research reads refuse an unrelated explanation before any durable row", async () => {
+  const fixture = await setup();
+  const text = "Explain how a Turing machine solves the halting problem";
+  const before = await rowCounts(fixture);
+
+  for (const operationId of ["research.read", "comparison.read"] as const) {
+    const denied = await fixture.asOwner.mutation(startJobRef, {
+      organizationId: fixture.organizationId,
+      projectId: fixture.projectId,
+      text,
+      operationId,
+      kind: "research",
+    });
+    expect(denied.ok, operationId).toBe(false);
+    if (denied.ok) throw new Error(`${operationId} unexpectedly accepted an unrelated request`);
+    expect(denied.code, operationId).toBe("unrelated-refusal");
+    expect(await rowCounts(fixture), operationId).toEqual(before);
+  }
+});
+
+test("read routes preserve contextual purchasing questions and automatic supplier research", async () => {
+  const fixture = await setup();
+  await insertRequirement(fixture, "Quasar");
+
+  const readRoutes = [
+    ["research.read", "What changes if they choose another option for Quasar?"],
+    ["comparison.read", "Compare the current quotes for Quasar."],
+  ] as const;
+  for (const [operationId, text] of readRoutes) {
+    const started = await fixture.asOwner.mutation(startJobRef, {
+      organizationId: fixture.organizationId,
+      projectId: fixture.projectId,
+      text,
+      operationId,
+      kind: "research",
+    });
+    expect(started.ok, operationId).toBe(true);
+    if (!started.ok) throw new Error(`${operationId} setup failed`);
+    const grantId = await fixture.t.run(async (ctx) => {
+      const job = await ctx.db.get(started.jobId);
+      if (job === null) throw new Error("job row missing");
+      return job.grantId;
+    });
+    const beforeUnrelatedCreate = await rowCounts(fixture);
+    const unrelatedCreate = await fixture.asOwner.mutation(createOperationRef, {
+      organizationId: fixture.organizationId,
+      projectId: fixture.projectId,
+      jobId: started.jobId,
+      grantId,
+      kind: operationId,
+      requestId: `unrelated-${operationId}`,
+      payloadJson: JSON.stringify({
+        query: "Explain how a Turing machine solves the halting problem",
+      }),
+    });
+    expect(unrelatedCreate.ok, operationId).toBe(false);
+    if (unrelatedCreate.ok) throw new Error(`${operationId} created an unrelated operation`);
+    expect(unrelatedCreate.code, operationId).toBe("unrelated-refusal");
+    expect(await rowCounts(fixture), operationId).toEqual(beforeUnrelatedCreate);
+
+    const created = await fixture.asOwner.mutation(createOperationRef, {
+      organizationId: fixture.organizationId,
+      projectId: fixture.projectId,
+      jobId: started.jobId,
+      grantId,
+      kind: operationId,
+      requestId: `contextual-${operationId}`,
+      payloadJson: JSON.stringify({ query: text }),
+    });
+    expect(created.ok, operationId).toBe(true);
+    if (!created.ok) throw new Error(`${operationId} operation setup failed`);
+    const claimed = await fixture.t.mutation(claimOperationRef, {
+      operationId: created.operationId,
+      identity: identity.tokenIdentifier,
+    });
+    expect(claimed.ok, operationId).toBe(true);
+  }
+
+  const collected = await fixture.asOwner.mutation(startJobRef, {
+    organizationId: fixture.organizationId,
+    projectId: fixture.projectId,
+    text: "Research suppliers for the Mazzer Super Jolly grinder",
+    kind: "research",
+  });
+  expect(collected.ok).toBe(true);
 });
 
 test("automatic record-changing operation IDs create no grant, job, or operation", async () => {

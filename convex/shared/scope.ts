@@ -442,6 +442,88 @@ const CONTEXTUAL_ANAPHORIC_GRAMMAR: ReadonlySet<string> = new Set([
 
 const RESEARCH_ANCHORS = PURCHASING_INTENT_ANCHORS;
 
+/**
+ * Commercial data nouns a purchasing read or comparison question names.
+ * `research.read` and `comparison.read` serve durable project records,
+ * including quotes, prices, suppliers, delivery terms, and evidence, so a request must
+ * reference that data, not merely an object the project happens to
+ * mention. An object noun such as "machine" or "equipment" is payload,
+ * never read authority: "Explain how a Turing machine solves the halting
+ * problem" carries none of these and is refused on both read routes.
+ */
+const PURCHASING_READ_DATA_ANCHORS: ReadonlySet<string> = new Set([
+  "availability",
+  "budget",
+  "candidate",
+  "candidates",
+  "cost",
+  "costs",
+  "delivery",
+  "evidence",
+  "freight",
+  "lead",
+  "leadtime",
+  "offer",
+  "offers",
+  "order",
+  "orders",
+  "payment",
+  "payments",
+  "price",
+  "prices",
+  "pricing",
+  "quote",
+  "quotes",
+  "rfq",
+  "savings",
+  "spend",
+  "spent",
+  "stock",
+  "supplier",
+  "suppliers",
+  "terms",
+  "vendor",
+  "vendors",
+  "warranty",
+]);
+
+/**
+ * Progress, comparison, and listing cues. They stay weaker than the data
+ * anchors: a cue authorizes a read only beside a purchasing anchor or a
+ * server-owned project term, so a generic "what is the latest" or an
+ * unrelated "lakers vs celtics" cannot reach project records.
+ */
+const PURCHASING_READ_STATE_CUES: ReadonlySet<string> = new Set([
+  "cheap",
+  "cheaper",
+  "cheapest",
+  "compare",
+  "comparison",
+  "current",
+  "difference",
+  "differences",
+  "equivalent",
+  "expensive",
+  "findings",
+  "latest",
+  "list",
+  "listed",
+  "option",
+  "options",
+  "outstanding",
+  "pending",
+  "progress",
+  "read",
+  "results",
+  "review",
+  "show",
+  "status",
+  "summarize",
+  "summary",
+  "versus",
+  "vs",
+]);
+
 const STOP_WORDS: ReadonlySet<string> = new Set([
   "a",
   "an",
@@ -682,6 +764,74 @@ function isResearchCollectionText(
   return collectionAction && supplierTarget;
 }
 
+function isResearchReadOperation(operationId: string): boolean {
+  return operationId === "research.read" || operationId === "comparison.read";
+}
+
+/**
+ * `research.read`/`comparison.read` read the project's durable purchasing
+ * records, so the request must reference that data: a commercial-data
+ * anchor, a progress/comparison cue beside a purchasing anchor or a
+ * server-owned term, or a full contextual follow-up. A bare object noun,
+ * such as "machine" inside an unrelated question, cannot establish read
+ * authority, and unknown product names remain carried data only.
+ */
+function isResearchReadTokens(
+  tokens: readonly string[],
+  context: ReadonlySet<string>,
+  hasStructuredContext: boolean,
+): boolean {
+  if (hasContextualFollowUp(tokens, context, hasStructuredContext)) return true;
+  if (tokens.some((token) => PURCHASING_READ_DATA_ANCHORS.has(token))) return true;
+  if (!tokens.some((token) => PURCHASING_READ_STATE_CUES.has(token))) return false;
+  return tokens.some((token) => RESEARCH_ANCHORS.has(token) || context.has(token));
+}
+
+function hasMixedUnsupportedReadClause(input: {
+  readonly text: string;
+  readonly context: ReadonlySet<string>;
+  readonly hasStructuredContext: boolean;
+}): boolean {
+  const clauses = input.text
+    .toLocaleLowerCase()
+    .split(/\band\b|\bbut\b|[.!?;]|\n/)
+    .map((clause) => meaningfulTokens(tokenize(clause)))
+    .filter((clause) => clause.length > 0);
+  if (clauses.length < 2) return false;
+  return clauses.some(
+    (clause) =>
+      !isResearchReadTokens(clause, input.context, input.hasStructuredContext),
+  );
+}
+
+/**
+ * The read-route analogue of `allowedWorkflowText`: the same mixed-clause
+ * boundary, but each clause must satisfy the read structure rather than a
+ * single weak purchasing anchor.
+ */
+function allowedResearchReadText(
+  text: string,
+  context: ProjectWorkflowContext | undefined,
+): boolean {
+  const contextTokensSet = contextTokens(context);
+  const tokens = meaningfulTokens(tokenize(text));
+  if (tokens.length === 0) return false;
+  if (
+    hasMixedUnsupportedReadClause({
+      text,
+      context: contextTokensSet,
+      hasStructuredContext: context?.hasStructuredContext === true,
+    })
+  ) {
+    return false;
+  }
+  return isResearchReadTokens(
+    tokens,
+    contextTokensSet,
+    context?.hasStructuredContext === true,
+  );
+}
+
 function validatedResearchPayload(
   payload: unknown,
   operationId: string,
@@ -738,13 +888,14 @@ export function validateWorkflowPayload(input: {
   if (research === null) {
     return { ok: false, reason: "research-payload-is-outside-purchasing-workflow" };
   }
-  if (
-    !allowedWorkflowText({
-      text: research.text,
-      purpose: input.purpose,
-      ...(input.context === undefined ? {} : { context: input.context }),
-    })
-  ) {
+  const allowedText = isResearchReadOperation(input.operationId)
+    ? allowedResearchReadText(research.text, input.context)
+    : allowedWorkflowText({
+        text: research.text,
+        purpose: input.purpose,
+        ...(input.context === undefined ? {} : { context: input.context }),
+      });
+  if (!allowedText) {
     return { ok: false, reason: "research-payload-is-outside-purchasing-workflow" };
   }
   return { ok: true };
@@ -799,13 +950,14 @@ export function classifyScope(input: {
   if (purpose === undefined) {
     return { verdict: "unavailableRefused", reason: `operation-purpose-unavailable:${entry.operationId}` };
   }
-  if (
-    !allowedWorkflowText({
-      text,
-      purpose,
-      ...(input.projectContext === undefined ? {} : { context: input.projectContext }),
-    })
-  ) {
+  const allowedText = isResearchReadOperation(entry.operationId)
+    ? allowedResearchReadText(text, input.projectContext)
+    : allowedWorkflowText({
+        text,
+        purpose,
+        ...(input.projectContext === undefined ? {} : { context: input.projectContext }),
+      });
+  if (!allowedText) {
     return { verdict: "unrelatedRefused", reason: "request-is-not-an-allowlisted-openingos-workflow" };
   }
   if (input.operationId !== undefined) {

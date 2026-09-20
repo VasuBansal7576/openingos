@@ -10,6 +10,7 @@ import { convexTest } from "convex-test";
 import {
   makeFunctionReference,
   type RegisteredMutation,
+  type RegisteredQuery,
 } from "convex/server";
 import { describe, expect, test } from "bun:test";
 import schema from "../schema.js";
@@ -19,6 +20,7 @@ import * as grants from "../access/grants.js";
 import * as attempts from "./attempts.js";
 import * as jobs from "./jobs.js";
 import * as operations from "./operations.js";
+import * as reconciliation from "./reconciliation.js";
 import * as reservations from "./reservations.js";
 import {
   classifyScope,
@@ -33,6 +35,7 @@ const modules = {
   "./execution/jobs.ts": async () => await import("./jobs.js"),
   "./execution/attempts.ts": async () => await import("./attempts.js"),
   "./execution/operations.ts": async () => await import("./operations.js"),
+  "./execution/reconciliation.ts": async () => await import("./reconciliation.js"),
   "./execution/reservations.ts": async () => await import("./reservations.js"),
   "./shared/scope.ts": async () => await import("../shared/scope.js"),
   "./shared/hashing.ts": async () => await import("../shared/hashing.js"),
@@ -47,6 +50,8 @@ const modules = {
 
 type MutationArgs<T> = T extends RegisteredMutation<infer _V, infer A, infer _R> ? A : never;
 type MutationReturn<T> = T extends RegisteredMutation<infer _V, infer _A, infer R> ? R : never;
+type QueryArgs<T> = T extends RegisteredQuery<infer _V, infer A, infer _R> ? A : never;
+type QueryReturn<T> = T extends RegisteredQuery<infer _V, infer _A, infer R> ? R : never;
 
 const createOrganizationRef = makeFunctionReference<
   "mutation",
@@ -88,11 +93,21 @@ const cancelRef = makeFunctionReference<
   MutationArgs<typeof jobs.cancel>,
   MutationReturn<typeof jobs.cancel>
 >("execution/jobs:cancel");
+const listUnresolvedRef = makeFunctionReference<
+  "query",
+  QueryArgs<typeof jobs.listUnresolvedOperations>,
+  Awaited<QueryReturn<typeof jobs.listUnresolvedOperations>>
+>("execution/jobs:listUnresolvedOperations");
 const reconcileAfterCrashRef = makeFunctionReference<
   "mutation",
   MutationArgs<typeof attempts.reconcileAfterCrash>,
   MutationReturn<typeof attempts.reconcileAfterCrash>
 >("execution/attempts:reconcileAfterCrash");
+const lateDeliveryRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof reconciliation.recordLateDelivery>,
+  MutationReturn<typeof reconciliation.recordLateDelivery>
+>("execution/reconciliation:recordLateDelivery");
 const reviewedResendRef = makeFunctionReference<
   "mutation",
   MutationArgs<typeof attempts.reviewedResend>,
@@ -449,6 +464,41 @@ async function seedManyPagedCancellationOperations(
     const unsampled = unresolved[16];
     if (unsampled === undefined) throw new Error("unsampled operation setup failed");
     return unsampled;
+  });
+}
+
+async function seedFortyNineOrderedCancellationOperations(
+  setup: Awaited<ReturnType<typeof setupResearch>>,
+  jobId: Awaited<ReturnType<typeof startPurchasingJob>>,
+): Promise<{ readonly lateOperationId: Id<"operations">; readonly token: string }> {
+  return await setup.t.run(async (ctx) => {
+    const now = Date.now();
+    const token = "late-delivery-index-20-token";
+    const operationIds: Id<"operations">[] = [];
+    for (let index = 0; index < 49; index += 1) {
+      const state = index < 33 ? ("outcomeUnknown" as const) : ("prepared" as const);
+      const operationId = await ctx.db.insert("operations", {
+        organizationId: setup.organizationId,
+        projectId: setup.projectId,
+        jobId,
+        kind: "research.collect",
+        requestId: `adversarial-ordered-${index}`,
+        requestKey: `adversarial-ordered-${index}`,
+        normalizedPayload: JSON.stringify({ query: "Research suppliers for espresso equipment" }),
+        normalizedPayloadHash: `adversarial-ordered-${index}`,
+        inputVersions: { brief: "v1" },
+        grantId: setup.grantId,
+        grantVersion: 1,
+        state,
+        ...(index === 20 ? { attemptToken: token } : {}),
+        createdAt: now,
+        updatedAt: now,
+      });
+      operationIds.push(operationId);
+    }
+    const lateOperationId = operationIds[20];
+    if (lateOperationId === undefined) throw new Error("late operation setup failed");
+    return { lateOperationId, token };
   });
 }
 
@@ -1211,6 +1261,83 @@ describe("F1R-22 finite admission and cancellation boundaries", () => {
     expect(reconciled.reconciliationComplete).toBe(true);
     expect(reconciled.unresolvedOperationCount).toBe(0);
     expect(reconciled.unresolvedOperationIds).toEqual([]);
+  });
+
+  test("late delivery at unsampled index 20 keeps a 49-operation inventory exactly at 32", async () => {
+    const setup = await setupResearch();
+    const jobId = await startPurchasingJob(setup);
+    const seeded = await seedFortyNineOrderedCancellationOperations(setup, jobId);
+
+    const cancelled = (await drainCancellation(setup, jobId)).at(-1);
+    if (cancelled === undefined || !cancelled.ok) throw new Error("cancellation did not return a result");
+    expect(cancelled.complete).toBe(true);
+    expect(cancelled.unresolvedOperationCount).toBe(33);
+    expect(cancelled.reconciliationComplete).toBe(false);
+
+    const firstReconciliationPage = await setup.asOwner.mutation(cancelRef, {
+      jobId,
+      reason: "adversarial reconciliation page one",
+    });
+    expect(firstReconciliationPage.ok).toBe(true);
+    if (!firstReconciliationPage.ok) throw new Error("first reconciliation page failed");
+    expect(firstReconciliationPage.unresolvedOperationCount).toBe(16);
+
+    const secondReconciliationPage = await setup.asOwner.mutation(cancelRef, {
+      jobId,
+      reason: "adversarial reconciliation page two",
+    });
+    expect(secondReconciliationPage.ok).toBe(true);
+    if (!secondReconciliationPage.ok) throw new Error("second reconciliation page failed");
+    expect(secondReconciliationPage.unresolvedOperationCount).toBe(32);
+
+    const late = await setup.t.mutation(lateDeliveryRef, {
+      operationId: seeded.lateOperationId,
+      token: seeded.token,
+      providerEventId: "adversarial-late-index-20",
+    });
+    expect(late.ok).toBe(true);
+
+    const thirdReconciliationPage = await setup.asOwner.mutation(cancelRef, {
+      jobId,
+      reason: "adversarial reconciliation after late delivery",
+    });
+    expect(thirdReconciliationPage.ok).toBe(true);
+    if (!thirdReconciliationPage.ok) throw new Error("third reconciliation page failed");
+    expect(thirdReconciliationPage.unresolvedOperationCount).toBe(32);
+    expect(thirdReconciliationPage.reconciliationComplete).toBe(false);
+
+    const fourthReconciliationPage = await setup.asOwner.mutation(cancelRef, {
+      jobId,
+      reason: "adversarial reconciliation final page",
+    });
+    expect(fourthReconciliationPage.ok).toBe(true);
+    if (!fourthReconciliationPage.ok) throw new Error("fourth reconciliation page failed");
+    expect(fourthReconciliationPage.unresolvedOperationCount).toBe(32);
+    expect(fourthReconciliationPage.reconciliationComplete).toBe(false);
+
+    const durable = await setup.t.run((ctx) => ctx.db.get(jobId));
+    expect(durable?.cancellationUnresolvedOperationCount).toBe(32);
+    expect(durable?.cancellationReconciliationComplete).toBe(false);
+
+    const inventory: Id<"operations">[] = [];
+    let cursor: string | undefined;
+    let done = false;
+    for (let pageNumber = 0; !done; pageNumber += 1) {
+      const page = await setup.asOwner.query(listUnresolvedRef, {
+        jobId,
+        limit: 16,
+        ...(cursor === undefined ? {} : { cursor }),
+      });
+      expect(page.ok).toBe(true);
+      if (!page.ok) throw new Error("unresolved inventory query failed");
+      inventory.push(...page.operationIds);
+      expect(page.unresolvedOperationCount).toBe(32);
+      done = page.isDone;
+      cursor = page.continueCursor ?? undefined;
+      if (pageNumber > 10) throw new Error("unresolved inventory did not terminate");
+    }
+    expect(inventory).toHaveLength(32);
+    expect(inventory).not.toContain(seeded.lateOperationId);
   });
 
   test("completed cancellation still exposes unresolved work on repeat", async () => {

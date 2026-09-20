@@ -29,6 +29,7 @@ import {
   containsInstructionOverride,
   defaultWorkflowAuthority,
   MAX_JOBS_PER_GRANT,
+  MAX_OPERATIONS_PER_JOB,
   validateWorkflowPayload,
   workflowAuthorityForOperation,
   workflowAuthorityMatchesProject,
@@ -152,29 +153,35 @@ type UnresolvedSummary = {
 };
 
 /**
- * Return an exact current unresolved set when it fits in the durable sample.
- * The bounded probes avoid a full scan and let a completed reconciliation
- * page replace a stale aggregate when an unsampled operation resolved between
- * pages. More than the sample limit stays explicitly incomplete and is
- * rebuilt by the next resumable pass.
+ * Return an exact current unresolved count and a bounded ID sample whenever
+ * the job stays within its finite operation admission limit. The two state
+ * indexes avoid a full scan while still detecting a terminal outcome for an
+ * operation that is not in the durable 16-ID sample. Legacy rows beyond the
+ * admission limit remain explicitly incomplete and are handled by the
+ * resumable raw-page pass.
  */
 async function boundedCurrentUnresolvedSnapshot(
   ctx: F1MutationCtx,
   jobId: Id<"jobs">,
-): Promise<Id<"operations">[] | null> {
+): Promise<UnresolvedSummary | null> {
   const [dispatching, outcomeUnknown] = await Promise.all([
     ctx.db
       .query("operations")
       .withIndex("by_job_and_state", (q) => q.eq("jobId", jobId).eq("state", "dispatching"))
-      .take(CANCELLATION_UNRESOLVED_SAMPLE_LIMIT + 1),
+      .take(MAX_OPERATIONS_PER_JOB + 1),
     ctx.db
       .query("operations")
       .withIndex("by_job_and_state", (q) => q.eq("jobId", jobId).eq("state", "outcomeUnknown"))
-      .take(CANCELLATION_UNRESOLVED_SAMPLE_LIMIT + 1),
+      .take(MAX_OPERATIONS_PER_JOB + 1),
   ]);
   const unresolved = [...dispatching, ...outcomeUnknown];
-  if (unresolved.length > CANCELLATION_UNRESOLVED_SAMPLE_LIMIT) return null;
-  return unresolved.map((operation) => operation._id);
+  if (unresolved.length > MAX_OPERATIONS_PER_JOB) return null;
+  return {
+    count: unresolved.length,
+    ids: unresolved
+      .slice(0, CANCELLATION_UNRESOLVED_SAMPLE_LIMIT)
+      .map((operation) => operation._id),
+  };
 }
 
 function unresolvedSummary(job: CancellationJobProgress): UnresolvedSummary {
@@ -459,18 +466,21 @@ async function processReconciliationPage(
       summary = recordUnresolved(summary, operation._id);
     }
   }
-  let currentSnapshot: Id<"operations">[] | null = null;
-  if (page.isDone) {
-    currentSnapshot = await boundedCurrentUnresolvedSnapshot(ctx, job._id);
-    if (currentSnapshot !== null) {
-      summary = { count: currentSnapshot.length, ids: [...currentSnapshot] };
-    }
+  const currentSnapshot = await boundedCurrentUnresolvedSnapshot(ctx, job._id);
+  // A page summary is a lower-bound count while the raw cursor is in flight.
+  // Replace it only when the current indexed snapshot proves that a late
+  // terminal outcome made the carried count stale. This preserves the
+  // existing page-by-page progress while correcting an unsampled resolution
+  // before the next page can add it back to the count.
+  if (currentSnapshot !== null && currentSnapshot.count < summary.count) {
+    summary = currentSnapshot;
   }
   // An exact empty snapshot is required before declaring reconciliation
-  // complete. If more than the durable sample remains, the public result is
-  // explicitly incomplete and the null cursor starts another bounded pass.
+  // complete. If more than the finite admission limit remains, the public
+  // result is explicitly incomplete and the cursor continues the bounded raw
+  // pass.
   const reconciliationComplete =
-    page.isDone && currentSnapshot !== null && currentSnapshot.length === 0;
+    page.isDone && currentSnapshot !== null && currentSnapshot.count === 0;
   const nextCursor = page.isDone ? null : page.continueCursor;
   await ctx.db.patch(job._id, {
     state: "cancelled",
