@@ -6,16 +6,17 @@
  * organization-level `providerBudgets` ledger inside the same mutation, so
  * two concurrent branches or jobs cannot each reserve the full shared
  * allowance. While an outcome or charge is unknown the reservation is
- * retained as `unresolved`, never released as free.
+ * retained as `unresolved`, never released as free. Identity and time are
+ * server-derived.
  */
 
-import { mutation, query } from "../_generated/server";
 import { v } from "convex/values";
+import { f1Mutation, f1Query } from "../server.js";
 import { checkProjectAccess, denialValidator, identityOf } from "../access/checks.js";
 
 const reservationViewValidator = v.object({
-  id: v.string(),
-  jobId: v.string(),
+  id: v.id("reservations"),
+  jobId: v.id("jobs"),
   ceilingMicroUsd: v.number(),
   reservedMicroUsd: v.number(),
   spentMicroUsd: v.number(),
@@ -25,17 +26,16 @@ const reservationViewValidator = v.object({
 });
 
 /** Reserve shared allowance for a job (atomic against the org ledger). */
-export const reserve = mutation({
+export const reserve = f1Mutation({
   args: {
-    jobId: v.string(),
-    organizationId: v.string(),
-    projectId: v.string(),
+    jobId: v.id("jobs"),
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
     amountMicroUsd: v.number(),
     pricingBasis: v.string(),
-    now: v.number(),
   },
   returns: v.union(
-    v.object({ ok: v.literal(true), reservationId: v.string() }),
+    v.object({ ok: v.literal(true), reservationId: v.id("reservations") }),
     denialValidator,
   ),
   handler: async (ctx, args) => {
@@ -43,46 +43,41 @@ export const reserve = mutation({
     if (identity === null) {
       return { ok: false as const, code: "forged-identity", message: "unauthenticated" };
     }
+    const now = Date.now();
     const access = await checkProjectAccess(
       ctx,
       identity,
       args.organizationId,
       args.projectId,
       "contributor",
-      args.now,
+      now,
     );
     if (!access.ok) return { ok: false as const, code: access.code, message: access.message };
     if (!Number.isSafeInteger(args.amountMicroUsd) || args.amountMicroUsd <= 0) {
       return { ok: false as const, code: "invalid-payload", message: "reservation amount must be a positive safe integer" };
     }
-    const job = (await ctx.db.get(args.jobId as never)) as unknown as {
-      organizationId?: string;
-      state?: string;
-    } | null;
-    if (!job || job.organizationId !== args.organizationId) {
-      return { ok: false as const, code: "denied-project", message: "job is not in this organization" };
+    const job = await ctx.db.get(args.jobId);
+    if (
+      job === null ||
+      job.organizationId !== args.organizationId ||
+      job.projectId !== args.projectId
+    ) {
+      return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
     }
     if (job.state === "cancelled") {
       return { ok: false as const, code: "cancelled-before-claim", message: "job is cancelled" };
     }
-    const budgets = (await ctx.db
+    const budget = await ctx.db
       .query("providerBudgets")
-      .filter((q) => q.eq(q.field("organizationId"), args.organizationId))
-      .collect()) as unknown as {
-      _id: string;
-      ceilingMicroUsd: number;
-      reservedMicroUsd: number;
-      spentMicroUsd: number;
-      unresolvedMicroUsd: number;
-    }[];
-    const budget = budgets[0];
-    if (!budget) {
+      .withIndex("by_organization", (q) => q.eq("organizationId", args.organizationId))
+      .unique();
+    if (budget === null) {
       return { ok: false as const, code: "allowance-exhausted", message: "no provider budget configured" };
     }
     const committed =
       budget.reservedMicroUsd + budget.spentMicroUsd + budget.unresolvedMicroUsd;
     if (committed + args.amountMicroUsd > budget.ceilingMicroUsd) {
-      await ctx.db.patch(args.jobId as never, { state: "pausedBudget", updatedAt: args.now });
+      await ctx.db.patch(args.jobId, { state: "pausedBudget", updatedAt: now });
       return {
         ok: false as const,
         code: "allowance-exhausted",
@@ -99,19 +94,23 @@ export const reserve = mutation({
       unresolvedMicroUsd: 0,
       pricingBasis: args.pricingBasis,
       state: "open",
-      updatedAt: args.now,
+      updatedAt: now,
     });
-    await ctx.db.patch(budget._id as never, {
+    await ctx.db.patch(budget._id, {
       reservedMicroUsd: budget.reservedMicroUsd + args.amountMicroUsd,
-      updatedAt: args.now,
+      updatedAt: now,
     });
-    return { ok: true as const, reservationId: reservationId as unknown as string };
+    return { ok: true as const, reservationId };
   },
 });
 
 /** Read the org ledger plus one job's reservations (authorized readers). */
-export const ledger = query({
-  args: { organizationId: v.string(), projectId: v.string(), jobId: v.string(), now: v.number() },
+export const ledger = f1Query({
+  args: {
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    jobId: v.id("jobs"),
+  },
   returns: v.union(
     v.object({
       ok: v.literal(true),
@@ -139,32 +138,25 @@ export const ledger = query({
       args.organizationId,
       args.projectId,
       "viewer",
-      args.now,
+      Date.now(),
     );
     if (!access.ok) return { ok: false as const, code: access.code, message: access.message };
-    const budgets = (await ctx.db
+    const job = await ctx.db.get(args.jobId);
+    if (
+      job === null ||
+      job.organizationId !== args.organizationId ||
+      job.projectId !== args.projectId
+    ) {
+      return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
+    }
+    const budget = await ctx.db
       .query("providerBudgets")
-      .filter((q) => q.eq(q.field("organizationId"), args.organizationId))
-      .collect()) as unknown as {
-      ceilingMicroUsd: number;
-      reservedMicroUsd: number;
-      spentMicroUsd: number;
-      unresolvedMicroUsd: number;
-    }[];
-    const reservations = (await ctx.db
+      .withIndex("by_organization", (q) => q.eq("organizationId", args.organizationId))
+      .unique();
+    const reservations = await ctx.db
       .query("reservations")
-      .filter((q) => q.eq(q.field("jobId"), args.jobId))
-      .collect()) as unknown as {
-      _id: string;
-      jobId: string;
-      ceilingMicroUsd: number;
-      reservedMicroUsd: number;
-      spentMicroUsd: number;
-      unresolvedMicroUsd: number;
-      pricingBasis: string;
-      state: string;
-    }[];
-    const budget = budgets[0];
+      .withIndex("by_job", (q) => q.eq("jobId", args.jobId))
+      .collect();
     return {
       ok: true as const,
       budget: budget

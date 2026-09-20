@@ -3,13 +3,13 @@
  *
  * Exactly one active `HACKATHON_OWNER_RECIPIENT`-backed configuration exists
  * at a time. Every communication grant binds its version; a change
- * invalidates queued grants and requires re-approval. Callers never see the
- * raw address unless they hold an owner role; public guests receive the
- * controlled-counterparty label and version only.
+ * invalidates queued grants and requires re-approval. The descriptor
+ * exposes version + label only, never the private address; configuration
+ * requires an owner role proven through organization membership.
  */
 
-import { mutation, query } from "../_generated/server";
 import { v } from "convex/values";
+import { f1Mutation, f1Query } from "../server.js";
 import { normalizeMailbox, payloadHash } from "../shared/hashing.js";
 import { denialValidator, identityOf } from "./checks.js";
 
@@ -24,21 +24,21 @@ const describeValidator = v.union(
 );
 
 /** Public descriptor: version + label, never the private address. */
-export const describe = query({
+export const describe = f1Query({
   args: {},
   returns: describeValidator,
   handler: async (ctx) => {
-    const configs = (await ctx.db.query("recipientConfigs").collect()) as unknown as {
-      version: number;
-      active: boolean;
-    }[];
-    const active = configs.find((config) => config.active);
-    if (!active) {
+    const active = await ctx.db
+      .query("recipientConfigs")
+      .withIndex("by_active", (q) => q.eq("active", true))
+      .take(1);
+    const current = active[0];
+    if (current === undefined) {
       return { ok: false as const, code: "missing-recipient-config", message: "owner recipient is not configured" };
     }
     return {
       ok: true as const,
-      version: active.version,
+      version: current.version,
       active: true,
       counterpartyLabel: "Demo supplier (owner playing supplier)",
     };
@@ -46,12 +46,12 @@ export const describe = query({
 });
 
 /**
- * Configure (or rotate) the owner recipient. Requires an owner role in at
- * least one organization; the value is protected backend configuration and
+ * Configure (or rotate) the owner recipient. Requires an owner role in the
+ * named organization; the value is protected backend configuration and
  * never comes from project inputs, prompts, or reply headers.
  */
-export const configure = mutation({
-  args: { mailbox: v.string(), now: v.number() },
+export const configure = f1Mutation({
+  args: { organizationId: v.id("organizations"), mailbox: v.string() },
   returns: v.union(
     v.object({ ok: v.literal(true), version: v.number() }),
     denialValidator,
@@ -65,32 +65,43 @@ export const configure = mutation({
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized)) {
       return { ok: false as const, code: "invalid-payload", message: "mailbox is not valid" };
     }
-    const memberships = (await ctx.db.query("memberships").collect()) as unknown as {
-      identity: string;
-      role: string;
-      status: string;
-    }[];
-    const isOwner = memberships.some(
-      (row) => row.identity === identity && row.role === "owner" && row.status === "active",
+    const organization = await ctx.db.get(args.organizationId);
+    if (organization === null) {
+      return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
+    }
+    const rows = await ctx.db
+      .query("memberships")
+      .withIndex("by_organization_and_identity", (q) =>
+        q.eq("organizationId", args.organizationId).eq("identity", identity),
+      )
+      .collect();
+    const now = Date.now();
+    const current = rows.filter(
+      (row) => row.status === "active" && (row.expiresAt === undefined || row.expiresAt > now),
     );
+    const isOwner = current.some((row) => row.role === "owner");
     if (!isOwner) {
       return { ok: false as const, code: "denied-capability", message: "only an owner configures the recipient" };
     }
-    const existing = (await ctx.db.query("recipientConfigs").collect()) as unknown as {
-      _id: string;
-      active: boolean;
-      version: number;
-    }[];
-    for (const config of existing) {
-      if (config.active) await ctx.db.patch(config._id as never, { active: false });
+    const activeConfigs = await ctx.db
+      .query("recipientConfigs")
+      .withIndex("by_active", (q) => q.eq("active", true))
+      .collect();
+    for (const config of activeConfigs) {
+      await ctx.db.patch(config._id, { active: false });
     }
-    const version = existing.reduce((max, config) => Math.max(max, config.version), 0) + 1;
+    const latest = await ctx.db
+      .query("recipientConfigs")
+      .withIndex("by_version")
+      .order("desc")
+      .take(1);
+    const version = (latest[0]?.version ?? 0) + 1;
     await ctx.db.insert("recipientConfigs", {
       version,
       mailboxNormalized: normalized,
       mailboxHash: payloadHash(normalized),
       active: true,
-      configuredAt: args.now,
+      configuredAt: now,
       configuredBy: identity,
     });
     return { ok: true as const, version };

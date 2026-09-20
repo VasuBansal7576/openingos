@@ -8,61 +8,34 @@
  * no Reply-To redirection. Missing configuration, recipient mismatch, or an
  * alternate channel produces a typed denial with no send. The controlled
  * record never performs a live provider call.
+ *
+ * Visibility: internal executor transition, invoked only by the authorized
+ * dispatch action after a successful internal claim. Browsers cannot record
+ * sends, so header smuggling through a direct call is impossible.
  */
 
-import { mutation } from "../_generated/server";
 import { v } from "convex/values";
+import { f1InternalMutation } from "../server.js";
 import { normalizeMailbox, payloadHash } from "../shared/hashing.js";
 import { COMMUNICATION_PROFILE_OWNER_ROLEPLAY } from "../shared/provenance.js";
-import { checkProjectAccess, denialValidator, identityOf } from "../access/checks.js";
+import { denialValidator } from "../access/checks.js";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-/**
- * Record one controlled send for a claimed attempt token. Exactly one send
- * per token; replays are denied without a second effect.
- */
-export const recordControlledSend = mutation({
-  args: {
-    operationId: v.string(),
-    organizationId: v.string(),
-    projectId: v.string(),
-    token: v.string(),
-    now: v.number(),
-  },
+/** Internal: record one controlled send for a claimed attempt token. */
+export const recordControlledSend = f1InternalMutation({
+  args: { operationId: v.id("operations"), token: v.string() },
   returns: v.union(
     v.object({ ok: v.literal(true), to: v.string(), payloadHash: v.string() }),
     denialValidator,
   ),
   handler: async (ctx, args) => {
-    const identity = await identityOf(ctx);
-    if (identity === null) {
-      return { ok: false as const, code: "forged-identity", message: "unauthenticated" };
-    }
-    const access = await checkProjectAccess(
-      ctx,
-      identity,
-      args.organizationId,
-      args.projectId,
-      "approver",
-      args.now,
-    );
-    if (!access.ok) return { ok: false as const, code: access.code, message: access.message };
-    const operation = (await ctx.db.get(args.operationId as never)) as unknown as {
-      organizationId?: string;
-      projectId?: string;
-      kind?: string;
-      state?: string;
-      attemptToken?: string;
-      normalizedPayload?: string;
-      normalizedPayloadHash?: string;
-      grantId?: string;
-      recipientConfigVersion?: number;
-    } | null;
-    if (!operation || operation.organizationId !== args.organizationId || operation.projectId !== args.projectId) {
-      return { ok: false as const, code: "denied-project", message: "operation is not in this project" };
+    const now = Date.now();
+    const operation = await ctx.db.get(args.operationId);
+    if (operation === null) {
+      return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
     }
     if (operation.kind !== "communication.send" && operation.kind !== "communication.clarify") {
       return { ok: false as const, code: "denied-capability", message: "only communication operations dispatch mail" };
@@ -70,38 +43,36 @@ export const recordControlledSend = mutation({
     if (operation.state !== "dispatching" || operation.attemptToken !== args.token) {
       return { ok: false as const, code: "already-claimed", message: "attempt token is not valid for dispatch" };
     }
-    const prior = (await ctx.db
+    const prior = await ctx.db
       .query("outboundSnapshots")
-      .filter((q) => q.eq(q.field("operationId"), args.operationId))
-      .unique()) as unknown as { _id: string } | null;
-    if (prior) {
+      .withIndex("by_operation", (q) => q.eq("operationId", args.operationId))
+      .unique();
+    if (prior !== null) {
       return { ok: false as const, code: "already-claimed", message: "this attempt was already dispatched" };
     }
-    const grant = (await ctx.db.get((operation.grantId ?? "") as never)) as unknown as {
-      recipientConfigVersion?: number;
-      communicationProfile?: string;
-    } | null;
-    const configs = (await ctx.db.query("recipientConfigs").collect()) as unknown as {
-      version: number;
-      active: boolean;
-      mailboxNormalized: string;
-    }[];
-    const recipient = configs.find((config) => config.active);
-    if (!recipient) {
+    const grant = await ctx.db.get(operation.grantId);
+    if (grant === null) {
+      return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
+    }
+    const recipient = await ctx.db
+      .query("recipientConfigs")
+      .withIndex("by_active", (q) => q.eq("active", true))
+      .unique();
+    if (recipient === null) {
       return { ok: false as const, code: "missing-recipient-config", message: "owner recipient is not configured" };
     }
     if (
-      operation.recipientConfigVersion !== (grant?.recipientConfigVersion ?? -1) ||
-      (grant?.recipientConfigVersion ?? -1) !== recipient.version
+      operation.recipientConfigVersion !== grant.recipientConfigVersion ||
+      grant.recipientConfigVersion !== recipient.version
     ) {
       return { ok: false as const, code: "stale-recipient-version", message: "recipient configuration changed; re-approval required" };
     }
-    if (grant?.communicationProfile !== COMMUNICATION_PROFILE_OWNER_ROLEPLAY) {
+    if (grant.communicationProfile !== COMMUNICATION_PROFILE_OWNER_ROLEPLAY) {
       return { ok: false as const, code: "alternate-channel-denied", message: "only the owner-roleplay profile is permitted" };
     }
     let parsed: unknown;
     try {
-      parsed = JSON.parse(operation.normalizedPayload ?? "");
+      parsed = JSON.parse(operation.normalizedPayload);
     } catch {
       return { ok: false as const, code: "invalid-payload", message: "communication payload is not valid JSON" };
     }
@@ -127,20 +98,20 @@ export const recordControlledSend = mutation({
       return { ok: false as const, code: "alternate-channel-denied", message: "only the owner-roleplay profile is permitted" };
     }
     await ctx.db.insert("outboundSnapshots", {
-      organizationId: args.organizationId,
-      projectId: args.projectId,
-      operationId: args.operationId as never,
-      grantId: (operation.grantId ?? "") as never,
+      organizationId: operation.organizationId,
+      projectId: operation.projectId,
+      operationId: args.operationId,
+      grantId: operation.grantId,
       to,
       cc: [],
       bcc: [],
       communicationProfile: COMMUNICATION_PROFILE_OWNER_ROLEPLAY,
       recipientConfigVersion: recipient.version,
-      payloadHash: operation.normalizedPayloadHash ?? "",
+      payloadHash: operation.normalizedPayloadHash,
       bodyHash: payloadHash(parsed["body"] ?? null),
       counterpartyRole: "ownerStandIn",
-      createdAt: args.now,
+      createdAt: now,
     });
-    return { ok: true as const, to, payloadHash: operation.normalizedPayloadHash ?? "" };
+    return { ok: true as const, to, payloadHash: operation.normalizedPayloadHash };
   },
 });

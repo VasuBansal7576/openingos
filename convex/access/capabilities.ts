@@ -6,8 +6,8 @@
  * authority; this catalog plus backend checks is authoritative.
  */
 
-import { query } from "../_generated/server";
 import { v } from "convex/values";
+import { f1Query } from "../server.js";
 import {
   CAPABILITY_CATALOG_VERSION,
   catalogEntries,
@@ -28,7 +28,7 @@ export const catalogVersionValidator = v.object({
 });
 
 /** Public catalog descriptor: versions and enabled operations only. */
-export const catalog = query({
+export const catalog = f1Query({
   args: {},
   returns: catalogVersionValidator,
   handler: async () => ({
@@ -44,7 +44,7 @@ export const catalog = query({
 });
 
 /** Whether an operation ID exists and is enabled (no authority granted). */
-export const describe = query({
+export const describe = f1Query({
   args: { operationId: v.string() },
   returns: v.union(
     v.object({

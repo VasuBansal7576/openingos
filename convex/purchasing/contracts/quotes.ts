@@ -7,12 +7,19 @@
  * charges carry no amount and block any "cheaper" claim. Owner-authored
  * terms keep `counterpartyRole: ownerStandIn` and never overwrite
  * researched vendor facts.
+ *
+ * Visibility: `record` is a public user import (corrections and manual
+ * quotes under project capability); `ingestProviderQuote` is the
+ * internal provider write for the extraction pipeline. Both share one
+ * money/provenance validation core.
  */
 
-import { mutation, query } from "../../_generated/server";
 import { v } from "convex/values";
+import type { Id } from "../../_generated/dataModel.js";
+import { f1InternalMutation, f1Mutation, f1Query, type F1MutationCtx } from "../../server.js";
 import { payloadHash } from "../../shared/hashing.js";
 import { checkMoney } from "../../shared/money.js";
+import { approved, denial, type AuthorityResult } from "../../shared/denials.js";
 import { checkProjectAccess, denialValidator, identityOf, requireCapability } from "../../access/checks.js";
 
 const moneyInputValidator = v.object({ currency: v.string(), minorUnits: v.number() });
@@ -32,94 +39,155 @@ const chargeValidator = v.object({
   amount: v.optional(moneyInputValidator),
 });
 
-/** Record an immutable quote version from bound evidence. */
-export const record = mutation({
-  args: {
-    organizationId: v.string(),
-    projectId: v.string(),
-    version: v.string(),
-    currency: v.string(),
-    lines: v.array(lineValidator),
-    charges: v.array(chargeValidator),
-    taxBasis: v.string(),
-    evidenceRefs: v.array(v.object({ sourceId: v.string(), version: v.string(), locator: v.string() })),
-    counterpartyRole: v.string(),
-    executionMode: v.union(v.literal("live"), v.literal("recorded"), v.literal("fixture")),
-    conversationId: v.optional(v.string()),
-    supersedes: v.optional(v.string()),
-    now: v.number(),
-  },
-  returns: v.union(
-    v.object({ ok: v.literal(true), quoteId: v.string(), contentHash: v.string() }),
-    denialValidator,
-  ),
+const quoteFieldsValidator = v.object({
+  organizationId: v.id("organizations"),
+  projectId: v.id("projects"),
+  version: v.string(),
+  currency: v.string(),
+  lines: v.array(lineValidator),
+  charges: v.array(chargeValidator),
+  taxBasis: v.string(),
+  evidenceRefs: v.array(v.object({ sourceId: v.string(), version: v.string(), locator: v.string() })),
+  counterpartyRole: v.string(),
+  executionMode: v.union(v.literal("live"), v.literal("recorded"), v.literal("fixture")),
+  conversationId: v.optional(v.id("conversations")),
+  supersedes: v.optional(v.string()),
+});
+
+type QuoteFields = {
+  organizationId: Id<"organizations">;
+  projectId: Id<"projects">;
+  version: string;
+  currency: string;
+  lines: {
+    lineId: string;
+    description: string;
+    quantity: string;
+    unitPrice: { currency: string; minorUnits: number };
+    evidenceRefs: { sourceId: string; version: string; locator: string }[];
+  }[];
+  charges: {
+    chargeId: string;
+    label: string;
+    state: string;
+    amount?: { currency: string; minorUnits: number };
+  }[];
+  taxBasis: string;
+  evidenceRefs: { sourceId: string; version: string; locator: string }[];
+  counterpartyRole: string;
+  executionMode: "live" | "recorded" | "fixture";
+  conversationId?: Id<"conversations">;
+  supersedes?: string;
+};
+
+function validateQuoteFields(fields: QuoteFields): AuthorityResult<QuoteFields> {
+  if (!/^[A-Z]{3}$/.test(fields.currency)) {
+    return denial("invalid-payload", "currency must be ISO 4217");
+  }
+  for (const line of fields.lines) {
+    try {
+      checkMoney(line.unitPrice, `line ${line.lineId}`);
+    } catch {
+      return denial("invalid-payload", `line ${line.lineId} is not valid minor-unit money`);
+    }
+    if (line.unitPrice.currency !== fields.currency) {
+      return denial("invalid-payload", `line ${line.lineId} mixes currency`);
+    }
+  }
+  for (const charge of fields.charges) {
+    if (charge.amount !== undefined) {
+      try {
+        checkMoney(charge.amount, `charge ${charge.chargeId}`);
+      } catch {
+        return denial("invalid-payload", `charge ${charge.chargeId} is not valid minor-unit money`);
+      }
+    }
+    if (charge.state === "unknown" && charge.amount !== undefined) {
+      return denial("invalid-payload", `unknown charge ${charge.chargeId} must not carry an amount`);
+    }
+  }
+  return approved(fields);
+}
+
+async function insertQuoteVersion(
+  ctx: F1MutationCtx,
+  fields: QuoteFields,
+  now: number,
+): Promise<{ quoteId: Id<"quotes">; contentHash: string }> {
+  const contentHash = payloadHash({
+    version: fields.version,
+    currency: fields.currency,
+    lines: fields.lines,
+    charges: fields.charges,
+    taxBasis: fields.taxBasis,
+  });
+  const quoteId = await ctx.db.insert("quotes", {
+    organizationId: fields.organizationId,
+    projectId: fields.projectId,
+    ...(fields.conversationId === undefined ? {} : { conversationId: fields.conversationId }),
+    version: fields.version,
+    contentHash,
+    currency: fields.currency,
+    lines: fields.lines.map((line) => ({ ...line, evidenceRefs: [...line.evidenceRefs] })),
+    charges: fields.charges.map((charge) => ({ ...charge })),
+    taxBasis: fields.taxBasis,
+    evidenceRefs: [...fields.evidenceRefs],
+    counterpartyRole: fields.counterpartyRole,
+    executionMode: fields.executionMode,
+    ...(fields.supersedes === undefined ? {} : { supersedes: fields.supersedes }),
+    createdAt: now,
+  });
+  return { quoteId, contentHash };
+}
+
+const recordResultValidator = v.union(
+  v.object({ ok: v.literal(true), quoteId: v.id("quotes"), contentHash: v.string() }),
+  denialValidator,
+);
+
+/** Public user import: record an immutable quote version with capability. */
+export const record = f1Mutation({
+  args: quoteFieldsValidator,
+  returns: recordResultValidator,
   handler: async (ctx, args) => {
     const identity = await identityOf(ctx);
     if (identity === null) {
       return { ok: false as const, code: "forged-identity", message: "unauthenticated" };
     }
+    const now = Date.now();
     const access = await checkProjectAccess(
       ctx,
       identity,
       args.organizationId,
       args.projectId,
       "contributor",
-      args.now,
+      now,
     );
     if (!access.ok) return { ok: false as const, code: access.code, message: access.message };
     const capability = requireCapability("quote.record", access.value);
     if (!capability.ok) {
       return { ok: false as const, code: capability.code, message: capability.message };
     }
-    if (!/^[A-Z]{3}$/.test(args.currency)) {
-      return { ok: false as const, code: "invalid-payload", message: "currency must be ISO 4217" };
+    const valid = validateQuoteFields(args);
+    if (!valid.ok) return { ok: false as const, code: valid.code, message: valid.message };
+    const { quoteId, contentHash } = await insertQuoteVersion(ctx, valid.value, now);
+    return { ok: true as const, quoteId, contentHash };
+  },
+});
+
+/** Internal provider write: extraction pipeline only, same money rules. */
+export const ingestProviderQuote = f1InternalMutation({
+  args: quoteFieldsValidator,
+  returns: recordResultValidator,
+  handler: async (ctx, args) => {
+    const project = await ctx.db.get(args.projectId);
+    if (project === null || project.organizationId !== args.organizationId) {
+      return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
     }
-    for (const line of args.lines) {
-      try {
-        checkMoney(line.unitPrice, `line ${line.lineId}`);
-      } catch {
-        return { ok: false as const, code: "invalid-payload", message: `line ${line.lineId} is not valid minor-unit money` };
-      }
-      if (line.unitPrice.currency !== args.currency) {
-        return { ok: false as const, code: "invalid-payload", message: `line ${line.lineId} mixes currency` };
-      }
-    }
-    for (const charge of args.charges) {
-      if (charge.amount !== undefined) {
-        try {
-          checkMoney(charge.amount, `charge ${charge.chargeId}`);
-        } catch {
-          return { ok: false as const, code: "invalid-payload", message: `charge ${charge.chargeId} is not valid minor-unit money` };
-        }
-      }
-      if (charge.state === "unknown" && charge.amount !== undefined) {
-        return { ok: false as const, code: "invalid-payload", message: `unknown charge ${charge.chargeId} must not carry an amount` };
-      }
-    }
-    const contentHash = payloadHash({
-      version: args.version,
-      currency: args.currency,
-      lines: args.lines,
-      charges: args.charges,
-      taxBasis: args.taxBasis,
-    });
-    const quoteId = await ctx.db.insert("quotes", {
-      organizationId: args.organizationId,
-      projectId: args.projectId,
-      ...(args.conversationId === undefined ? {} : { conversationId: args.conversationId }),
-      version: args.version,
-      contentHash,
-      currency: args.currency,
-      lines: args.lines.map((line) => ({ ...line, evidenceRefs: [...line.evidenceRefs] })),
-      charges: args.charges.map((charge) => ({ ...charge })),
-      taxBasis: args.taxBasis,
-      evidenceRefs: [...args.evidenceRefs],
-      counterpartyRole: args.counterpartyRole,
-      executionMode: args.executionMode,
-      ...(args.supersedes === undefined ? {} : { supersedes: args.supersedes }),
-      createdAt: args.now,
-    });
-    return { ok: true as const, quoteId: quoteId as unknown as string, contentHash };
+    const valid = validateQuoteFields(args);
+    if (!valid.ok) return { ok: false as const, code: valid.code, message: valid.message };
+    const { quoteId, contentHash } = await insertQuoteVersion(ctx, valid.value, Date.now());
+    return { ok: true as const, quoteId, contentHash };
   },
 });
 
@@ -135,13 +203,10 @@ const compareResultValidator = v.union(
 );
 
 /** Equivalent-scope comparison; unknown charges block complete claims. */
-export const compare = query({
+export const compare = f1Query({
   args: {
-    organizationId: v.string(),
-    projectId: v.string(),
-    leftQuoteId: v.string(),
-    rightQuoteId: v.string(),
-    now: v.number(),
+    leftQuoteId: v.id("quotes"),
+    rightQuoteId: v.id("quotes"),
   },
   returns: compareResultValidator,
   handler: async (ctx, args) => {
@@ -149,35 +214,24 @@ export const compare = query({
     if (identity === null) {
       return { ok: false as const, code: "forged-identity", message: "unauthenticated" };
     }
+    const left = await ctx.db.get(args.leftQuoteId);
+    if (left === null) {
+      return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
+    }
     const access = await checkProjectAccess(
       ctx,
       identity,
-      args.organizationId,
-      args.projectId,
+      left.organizationId,
+      left.projectId,
       "viewer",
-      args.now,
+      Date.now(),
     );
     if (!access.ok) return { ok: false as const, code: access.code, message: access.message };
-    const left = (await ctx.db.get(args.leftQuoteId as never)) as unknown as {
-      organizationId?: string;
-      projectId?: string;
-      currency?: string;
-      taxBasis?: string;
-      lines?: { unitPrice?: { minorUnits?: number } }[];
-      charges?: { state?: string; amount?: { minorUnits?: number } }[];
-    } | null;
-    const right = (await ctx.db.get(args.rightQuoteId as never)) as unknown as {
-      organizationId?: string;
-      projectId?: string;
-      currency?: string;
-      taxBasis?: string;
-      lines?: { unitPrice?: { minorUnits?: number } }[];
-      charges?: { state?: string; amount?: { minorUnits?: number } }[];
-    } | null;
+    const right = await ctx.db.get(args.rightQuoteId);
     if (
-      !left || !right ||
-      left.organizationId !== args.organizationId || left.projectId !== args.projectId ||
-      right.organizationId !== args.organizationId || right.projectId !== args.projectId
+      right === null ||
+      right.organizationId !== left.organizationId ||
+      right.projectId !== left.projectId
     ) {
       return { ok: false as const, code: "denied-project", message: "quotes are not in this project" };
     }
@@ -199,13 +253,15 @@ export const compare = query({
         reason: "mixed-tax-basis",
       };
     }
-    const total = (quote: { lines?: { unitPrice?: { minorUnits?: number } }[]; charges?: { state?: string; amount?: { minorUnits?: number } }[] }): number | null => {
+    const total = (
+      quote: typeof left,
+    ): number | null => {
       let sum = 0;
-      for (const line of quote.lines ?? []) sum += line.unitPrice?.minorUnits ?? 0;
-      for (const charge of quote.charges ?? []) {
+      for (const line of quote.lines) sum += line.unitPrice.minorUnits;
+      for (const charge of quote.charges) {
         if (charge.state === "unknown") return null;
         if (charge.state === "known" || charge.state === "estimated") {
-          if (charge.amount?.minorUnits === undefined) return null;
+          if (charge.amount === undefined) return null;
           sum += charge.amount.minorUnits;
         }
       }

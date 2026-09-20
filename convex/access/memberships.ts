@@ -2,12 +2,14 @@
  * F1 membership and project-isolation surface (controlled contract, NR03).
  *
  * Organization/project/guest/private ownership with restricted projects.
- * All reads derive identity from `ctx.auth`; forged IDs, cross-organization
- * access, and guest/private leakage are denied in backend code.
+ * Identity always derives from `ctx.auth` and time always comes from the
+ * server clock — callers supply neither. Forged IDs, cross-organization
+ * access, and guest/private leakage are denied in backend code without
+ * existence oracles.
  */
 
-import { mutation, query } from "../_generated/server";
 import { v } from "convex/values";
+import { f1Mutation, f1Query } from "../server.js";
 import { checkProjectAccess, denialValidator, identityOf } from "./checks.js";
 
 const roleValidator = v.union(
@@ -23,8 +25,8 @@ const roleResultValidator = v.union(
 );
 
 /** Caller's own role for a project (proves isolation on direct calls). */
-export const myProjectRole = query({
-  args: { organizationId: v.string(), projectId: v.string(), now: v.number() },
+export const myProjectRole = f1Query({
+  args: { organizationId: v.id("organizations"), projectId: v.id("projects") },
   returns: roleResultValidator,
   handler: async (ctx, args) => {
     const identity = await identityOf(ctx);
@@ -37,7 +39,7 @@ export const myProjectRole = query({
       args.organizationId,
       args.projectId,
       "viewer",
-      args.now,
+      Date.now(),
     );
     if (!access.ok) return { ok: false as const, code: access.code, message: access.message };
     return { ok: true as const, role: access.value };
@@ -45,10 +47,10 @@ export const myProjectRole = query({
 });
 
 /** Create an organization; the caller becomes its owner. */
-export const createOrganization = mutation({
+export const createOrganization = f1Mutation({
   args: { name: v.string(), kind: v.union(v.literal("guest"), v.literal("private")) },
   returns: v.union(
-    v.object({ ok: v.literal(true), organizationId: v.string() }),
+    v.object({ ok: v.literal(true), organizationId: v.id("organizations") }),
     denialValidator,
   ),
   handler: async (ctx, args) => {
@@ -59,10 +61,11 @@ export const createOrganization = mutation({
     if (args.name.trim().length === 0) {
       return { ok: false as const, code: "invalid-payload", message: "organization name required" };
     }
+    const now = Date.now();
     const organizationId = await ctx.db.insert("organizations", {
       name: args.name.trim(),
       kind: args.kind,
-      createdAt: Date.now(),
+      createdAt: now,
     });
     await ctx.db.insert("memberships", {
       organizationId,
@@ -70,22 +73,21 @@ export const createOrganization = mutation({
       role: "owner",
       status: "active",
       version: 1,
-      updatedAt: Date.now(),
+      updatedAt: now,
     });
-    return { ok: true as const, organizationId: organizationId as unknown as string };
+    return { ok: true as const, organizationId };
   },
 });
 
 /** Create a project inside a caller-administered organization. */
-export const createProject = mutation({
+export const createProject = f1Mutation({
   args: {
-    organizationId: v.string(),
+    organizationId: v.id("organizations"),
     name: v.string(),
     visibility: v.union(v.literal("open"), v.literal("restricted")),
-    now: v.number(),
   },
   returns: v.union(
-    v.object({ ok: v.literal(true), projectId: v.string() }),
+    v.object({ ok: v.literal(true), projectId: v.id("projects") }),
     denialValidator,
   ),
   handler: async (ctx, args) => {
@@ -93,21 +95,16 @@ export const createProject = mutation({
     if (identity === null) {
       return { ok: false as const, code: "forged-identity", message: "unauthenticated" };
     }
-    const organization = (await ctx.db.get(args.organizationId as never)) as unknown as {
-      _id?: string;
-    } | null;
-    if (!organization) {
-      return { ok: false as const, code: "denied-project", message: "unknown organization" };
+    const organization = await ctx.db.get(args.organizationId);
+    if (organization === null) {
+      return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
     }
-    const rows = (await ctx.db
+    const rows = await ctx.db
       .query("memberships")
-      .filter((q) =>
-        q.and(
-          q.eq(q.field("organizationId"), args.organizationId),
-          q.eq(q.field("identity"), identity),
-        ),
+      .withIndex("by_organization_and_identity", (q) =>
+        q.eq("organizationId", args.organizationId).eq("identity", identity),
       )
-      .collect()) as unknown as { status?: string; role?: string }[];
+      .collect();
     const owner = rows.some((row) => row.status === "active" && row.role === "owner");
     if (!owner) {
       return { ok: false as const, code: "denied-capability", message: "only an owner creates projects" };
@@ -119,24 +116,23 @@ export const createProject = mutation({
       organizationId: args.organizationId,
       name: args.name.trim(),
       visibility: args.visibility,
-      createdAt: args.now,
+      createdAt: Date.now(),
     });
-    return { ok: true as const, projectId: projectId as unknown as string };
+    return { ok: true as const, projectId };
   },
 });
 
 /** Grant project access (owner/approver only); restricted projects need this. */
-export const grantProjectAccess = mutation({
+export const grantProjectAccess = f1Mutation({
   args: {
-    organizationId: v.string(),
-    projectId: v.string(),
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
     targetIdentity: v.string(),
     role: roleValidator,
-    now: v.number(),
     expiresAt: v.optional(v.number()),
   },
   returns: v.union(
-    v.object({ ok: v.literal(true), membershipId: v.string() }),
+    v.object({ ok: v.literal(true), membershipId: v.id("memberships") }),
     denialValidator,
   ),
   handler: async (ctx, args) => {
@@ -144,13 +140,14 @@ export const grantProjectAccess = mutation({
     if (identity === null) {
       return { ok: false as const, code: "forged-identity", message: "unauthenticated" };
     }
+    const now = Date.now();
     const access = await checkProjectAccess(
       ctx,
       identity,
       args.organizationId,
       args.projectId,
       "approver",
-      args.now,
+      now,
     );
     if (!access.ok) return { ok: false as const, code: access.code, message: access.message };
     if (args.targetIdentity.trim().length === 0) {
@@ -164,19 +161,18 @@ export const grantProjectAccess = mutation({
       status: "active",
       version: 1,
       ...(args.expiresAt === undefined ? {} : { expiresAt: args.expiresAt }),
-      updatedAt: args.now,
+      updatedAt: now,
     });
-    return { ok: true as const, membershipId: membershipId as unknown as string };
+    return { ok: true as const, membershipId };
   },
 });
 
 /** Revoke a membership (owner/approver only). */
-export const revokeProjectAccess = mutation({
+export const revokeProjectAccess = f1Mutation({
   args: {
-    organizationId: v.string(),
-    projectId: v.string(),
-    membershipId: v.string(),
-    now: v.number(),
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    membershipId: v.id("memberships"),
   },
   returns: v.union(
     v.object({ ok: v.literal(true), revoked: v.boolean() }),
@@ -187,22 +183,21 @@ export const revokeProjectAccess = mutation({
     if (identity === null) {
       return { ok: false as const, code: "forged-identity", message: "unauthenticated" };
     }
+    const now = Date.now();
     const access = await checkProjectAccess(
       ctx,
       identity,
       args.organizationId,
       args.projectId,
       "approver",
-      args.now,
+      now,
     );
     if (!access.ok) return { ok: false as const, code: access.code, message: access.message };
-    const row = (await ctx.db.get(args.membershipId as never)) as unknown as {
-      organizationId?: string;
-    } | null;
-    if (!row || row.organizationId !== args.organizationId) {
-      return { ok: false as const, code: "denied-project", message: "membership is not in this organization" };
+    const row = await ctx.db.get(args.membershipId);
+    if (row === null || row.organizationId !== args.organizationId) {
+      return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
     }
-    await ctx.db.patch(args.membershipId as never, { status: "revoked", revokedAt: args.now, updatedAt: args.now });
+    await ctx.db.patch(args.membershipId, { status: "revoked", revokedAt: now, updatedAt: now });
     return { ok: true as const, revoked: true };
   },
 });

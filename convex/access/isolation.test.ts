@@ -62,6 +62,8 @@ describe("S-04 cross-tenant isolation", () => {
     const fixture = buildControlledFixture();
     const { store, now } = fixture;
 
+    // No existence oracle: a restricted project without an explicit
+    // membership denies exactly like an unknown project.
     const denied = store.checkProjectAccess(
       fixture.contribA,
       fixture.orgPrivateA,
@@ -70,7 +72,7 @@ describe("S-04 cross-tenant isolation", () => {
       now,
     );
     expect(denied.ok).toBe(false);
-    if (!denied.ok) expect(denied.code).toBe("denied-project");
+    if (!denied.ok) expect(denied.code).toBe("denied-membership");
 
     const allowed = store.checkProjectAccess(
       fixture.approverA,
@@ -122,7 +124,8 @@ describe("S-04 cross-tenant isolation", () => {
     expect(empty.ok).toBe(false);
     if (!empty.ok) expect(empty.code).toBe("forged-identity");
 
-    // A project ID from another organization cannot be smuggled in.
+    // A project ID from another organization cannot be smuggled in, and
+    // the denial reveals nothing about its existence.
     const smuggled = store.checkProjectAccess(
       fixture.ownerA,
       fixture.orgPrivateA,
@@ -131,7 +134,7 @@ describe("S-04 cross-tenant isolation", () => {
       now,
     );
     expect(smuggled.ok).toBe(false);
-    if (!smuggled.ok) expect(smuggled.code).toBe("denied-project");
+    if (!smuggled.ok) expect(smuggled.code).toBe("denied-membership");
   });
 
   test("stale and revoked roles are denied, including exact expiry boundary", () => {
