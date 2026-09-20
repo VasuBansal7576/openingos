@@ -12,7 +12,7 @@
 - **Auth:** Convex Auth foundation only; no hosted guest/private isolation proof
 - **AI models:** controlled Jev `jev-1.13.0` adapter tests only; no live application inference
 - **Started:** 2026-09-19T09:46:19Z
-- **Last updated:** 2026-09-20T01:03:00Z
+- **Last updated:** 2026-09-20T07:04:00Z
 
 ## Log
 
@@ -186,3 +186,14 @@ The retained application browser evidence covers controlled loading, unavailable
 Accepted ADR-0003 through ADR-0008 only for their documented controlled implementation surfaces and added one evidence matrix for all 52 P/H/D requirements, 24 sponsor cases and 7 Jev cases.
 No hosted Convex deployment, live Jev/OpenAI/Firecrawl/AgentMail call, owner mailbox exchange, remote browser, genuine vendor result, public site or realized savings was observed.
 The next unblocked package is F1 durable shared-schema authority; NR03, hosted identity, live providers and publication remain open.
+
+### 2026-09-20 - 8abd7c1 local checkpoint
+
+Integrated F1R-01 through F1R-12 repairs for shared grant exposure, cancellation cleanup, early and late event application, graph and quote lineage, evidence and replay binding, numeric validation, typed watch targets and project-scoped selection idempotency.
+The exact local checkpoint passes both TypeScript checks, the production build, 23 repository tests, 77 money and Jev proofs, 186 F1 tests, 117 direct Convex tests, 155 browser-executor tests, 2 application tests, 19 provider-contract tests and 5 mounted user-path tests.
+The unchanged independent probe artifact passes 18 of 19 checks.
+Its remaining old F1R-07 setup expects a watch with nonexistent evidence to be accepted, which conflicts with the later F1R-10 requirement that missing evidence must block the write.
+The stronger F1R-10 contract remains in place, and a fresh Astra review will use resolvable evidence when checking replay behavior.
+F1R-13 durable multi-line order, acceptance and financial-adjustment lineage remains in implementation, so F1 and all dependent R1/C1/U1 roadmap gates remain open.
+This checkpoint contains controlled local evidence only.
+No hosted Convex state, live provider call, owner-mailbox exchange, public site or commercial outcome was observed.
