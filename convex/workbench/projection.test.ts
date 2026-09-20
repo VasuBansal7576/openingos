@@ -606,7 +606,7 @@ describe("E1 equipment and service projection", () => {
     expect(asset?.serviceCases[1]?.outcome).toBe("replaced heating element");
     expect(asset?.serviceCases[0]).not.toHaveProperty("outcome");
     for (const document of asset?.documents ?? []) {
-      expect(document).not.toHaveProperty("storageRef");
+      expect(Object.keys(document).sort()).toEqual(["createdAt", "kind"]);
     }
     const serialized = JSON.stringify(result);
     expect(serialized).not.toContain("secret-storage-ref-purchase");
@@ -656,6 +656,11 @@ describe("E1 equipment and service projection", () => {
     expect(result.equipment.assets[0]?.label).toBe("Espresso machine asset-0");
     expect(result.equipment.assets[0]?.documents.length).toBe(projection.MAX_ASSET_DOCUMENTS);
     expect(result.equipment.assets[0]?.documentsTruncated).toBe(true);
+    for (const asset of result.equipment.assets) {
+      for (const document of asset.documents) {
+        expect(Object.keys(document).sort()).toEqual(["createdAt", "kind"]);
+      }
+    }
     expect(result.equipment.assets[0]?.serviceCases.length).toBe(projection.MAX_ASSET_CASES);
     expect(result.equipment.assets[0]?.serviceCasesTruncated).toBe(true);
     const repeat = await t.withIdentity(OWNER).query(getProjectionRef, { projectId: project.projectId });

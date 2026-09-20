@@ -247,11 +247,11 @@ const activityItemValidator = v.object({
 
 // E1 installed-equipment views project only real bounded rows from the
 // assets, assetDocuments, and serviceCases tables. Asset documents expose
-// kind and createdAt only: storageRef (and any locator/idempotency
-// material) never leaves the backend. Service cases expose state and
-// outcome. Nothing is ever synthesized from selection or order state.
+// exactly kind and createdAt: no document id, storageRef, idempotency key,
+// or any other internal identifier/locator ever leaves the backend.
+// Service cases expose state and outcome. Nothing is ever synthesized
+// from selection or order state.
 const assetDocumentValidator = v.object({
-  id: v.id("assetDocuments"),
   kind: v.string(),
   createdAt: v.number(),
 });
@@ -760,7 +760,6 @@ type EquipmentView = {
     readonly purchaseProvenance?: string;
     readonly createdAt: number;
     readonly documents: Array<{
-      readonly id: Id<"assetDocuments">;
       readonly kind: string;
       readonly createdAt: number;
     }>;
@@ -785,7 +784,8 @@ type EquipmentView = {
  * project, in stable ascending creation order. Each collection reads one
  * row past its bound so over-limit state is reported through explicit
  * truncation flags instead of a silent prefix. Asset documents project
- * kind and createdAt only — storageRef never leaves the backend — and
+ * exactly kind and createdAt — no document id, storageRef, idempotency
+ * key, or other internal identifier/locator — and
  * service cases project state and outcome. Selections and orders are
  * never consulted, so no installed asset is invented from purchase
  * intent alone.
@@ -819,7 +819,7 @@ async function readEquipment(
           row.assetId === asset._id,
       )
       .slice(0, MAX_ASSET_DOCUMENTS)
-      .map((row) => ({ id: row._id, kind: row.kind, createdAt: row.createdAt }));
+      .map((row) => ({ kind: row.kind, createdAt: row.createdAt }));
     const casePage = await ctx.db
       .query("serviceCases")
       .withIndex("by_asset", (q) => q.eq("assetId", asset._id))
