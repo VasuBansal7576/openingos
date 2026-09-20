@@ -14,6 +14,7 @@ import {
   paginationOptsValidator,
   type FunctionReference,
   type DefaultFunctionArgs,
+  type PaginationOptions,
   type RegisteredAction,
   type RegisteredMutation,
   type RegisteredQuery,
@@ -40,6 +41,9 @@ import {
   isSafePublicSourceUrl,
   normalizeProviderResponse,
   normalizedSourceRecordValidator,
+  projectResearchCandidatesPageValidator,
+  projectResearchClaimsPageValidator,
+  projectResearchEvidencePageValidator,
   projectResearchResultValidator,
   researchCompletenessValidator,
   researchExecutionModeValidator,
@@ -62,6 +66,13 @@ export const FIRECRAWL_PRICING_BASIS =
 
 const MAX_PROVIDER_RECORDS = 32;
 const MAX_PROJECT_RECORDS = 128;
+/** Maximum number of rows returned by one page of any project stream. */
+const MAX_PROJECT_PAGE_SIZE = 128;
+/** One extra row lets Convex determine whether a bounded page is complete. */
+const MAX_PROJECT_PAGE_ROWS_READ = MAX_PROJECT_PAGE_SIZE + 1;
+/** Keep each stream read bounded even when callers omit read budgets. */
+const MAX_PROJECT_PAGE_BYTES_READ = 2_000_000;
+const DEFAULT_PROJECT_PAGE_SIZE = 32;
 const MAX_RECOVERY_OPERATIONS = 4;
 
 type MutationArgs<T> = T extends RegisteredMutation<infer _V, infer A, infer _R> ? A : never;
@@ -225,6 +236,62 @@ const internalPauseResultValidator = v.union(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+type ProjectPaginationInput = {
+  readonly numItems: number;
+  readonly cursor: string | null;
+  readonly endCursor?: string | null;
+  readonly maximumRowsRead?: number;
+  readonly maximumBytesRead?: number;
+};
+
+type ProjectPaginationResult = {
+  readonly isDone: boolean;
+  readonly continueCursor: string;
+  readonly splitCursor?: string | null;
+  readonly pageStatus?: "SplitRecommended" | "SplitRequired" | null;
+};
+
+function boundedProjectBudget(value: number | undefined, minimum: number, maximum: number): number {
+  if (value === undefined || !Number.isFinite(value)) return maximum;
+  return Math.min(Math.max(Math.floor(value), minimum), maximum);
+}
+
+/**
+ * Keep every project stream bounded while preserving the caller's cursor and
+ * range.  The read floors are at least one page plus one look-ahead row so a
+ * normal page never silently becomes partial merely because a caller omitted
+ * or undersized the optional Convex read budgets.
+ */
+function normalizeProjectPaginationOpts(options: ProjectPaginationInput): PaginationOptions {
+  const floored = Number.isFinite(options.numItems) ? Math.floor(options.numItems) : MAX_PROJECT_PAGE_SIZE;
+  const numItems = Math.min(Math.max(floored, 1), MAX_PROJECT_PAGE_SIZE);
+  return {
+    numItems,
+    cursor: options.cursor,
+    ...(options.endCursor === undefined ? {} : { endCursor: options.endCursor }),
+    maximumRowsRead: boundedProjectBudget(options.maximumRowsRead, numItems + 1, MAX_PROJECT_PAGE_ROWS_READ),
+    maximumBytesRead: boundedProjectBudget(options.maximumBytesRead, 1_000_000, MAX_PROJECT_PAGE_BYTES_READ),
+  };
+}
+
+function paginationInfo(page: ProjectPaginationResult) {
+  return {
+    // Convex's native cursor remains valid at the end of a stream and is
+    // required when the other streams still have pages.  `isDone` is the
+    // authoritative stop signal; the legacy top-level alias below still
+    // converts a completed evidence cursor to null.
+    continueCursor: page.continueCursor,
+    isDone: page.isDone,
+    ...(page.splitCursor === undefined ? {} : { splitCursor: page.splitCursor }),
+    ...(page.pageStatus === undefined ? {} : { pageStatus: page.pageStatus }),
+  };
+}
+
+function isInvalidPaginationCursor(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /InvalidCursor|invalid.*cursor|cursor.*invalid|cursor.*query|invalid.*json|unexpected token/i.test(message);
 }
 
 function parseJson(value: string): unknown | null {
@@ -1213,9 +1280,182 @@ export const recoverResearch = f1Mutation({
   },
 });
 
-/** Authorized paginated research evidence and normalized candidate projection. */
+const projectResearchPageArgs = {
+  projectId: v.id("projects"),
+  identity: v.string(),
+  paginationOpts: paginationOptsValidator,
+};
+
+/** One bounded native pagination stream for evidence. */
+export const projectResearchEvidencePage = f1InternalQuery({
+  args: projectResearchPageArgs,
+  returns: v.union(projectResearchEvidencePageValidator, denialValidator),
+  handler: async (ctx, args) => {
+    const project = await ctx.db.get(args.projectId);
+    if (project === null) return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
+    const access = await checkProjectAccess(ctx, args.identity, project.organizationId, project._id, "viewer", Date.now());
+    if (!access.ok) return { ok: false as const, code: access.code, message: access.message };
+    try {
+      const page = await ctx.db
+        .query("evidence")
+        .withIndex("by_project", (q) => q.eq("projectId", project._id))
+        .order("desc")
+        .paginate(normalizeProjectPaginationOpts(args.paginationOpts));
+      const evidence = page.page.filter((row) => row.organizationId === project.organizationId).map((row) => ({
+        id: row._id,
+        projectId: row.projectId,
+        sourceKind: row.sourceKind,
+        ...(row.sourceUrl === undefined ? {} : { sourceUrl: row.sourceUrl }),
+        ...(row.providerIds === undefined ? {} : { providerIds: row.providerIds }),
+        capturedAt: row.capturedAt,
+        contentHash: row.contentHash,
+        completeness: row.completeness,
+        counterpartyRole: row.counterpartyRole,
+        executionMode: row.executionMode,
+        ...(row.locator === undefined ? {} : { locator: row.locator }),
+      }));
+      return {
+        ok: true as const,
+        projectId: project._id,
+        evidence,
+        pagination: paginationInfo(page),
+        progress: {
+          returned: evidence.length,
+          complete: evidence.filter((row) => row.completeness === "complete").length,
+          partial: evidence.filter((row) => row.completeness === "partial").length,
+          unavailable: evidence.filter((row) => row.completeness === "unavailable").length,
+        },
+      };
+    } catch (error) {
+      if (isInvalidPaginationCursor(error)) {
+        return { ok: false as const, code: "invalid-pagination", message: "pagination cursor is invalid for this research stream" };
+      }
+      throw error;
+    }
+  },
+});
+
+/** One bounded native pagination stream for normalized claims. */
+export const projectResearchClaimsPage = f1InternalQuery({
+  args: projectResearchPageArgs,
+  returns: v.union(projectResearchClaimsPageValidator, denialValidator),
+  handler: async (ctx, args) => {
+    const project = await ctx.db.get(args.projectId);
+    if (project === null) return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
+    const access = await checkProjectAccess(ctx, args.identity, project.organizationId, project._id, "viewer", Date.now());
+    if (!access.ok) return { ok: false as const, code: access.code, message: access.message };
+    try {
+      const page = await ctx.db
+        .query("productEvidence")
+        .withIndex("by_project", (q) => q.eq("projectId", project._id))
+        .order("desc")
+        .paginate(normalizeProjectPaginationOpts(args.paginationOpts));
+      const claims = page.page.filter((row) => row.organizationId === project.organizationId).map((row) => ({
+        id: row._id,
+        ...(row.requirementId === undefined ? {} : { requirementId: row.requirementId }),
+        ...(row.candidateId === undefined ? {} : { candidateId: row.candidateId }),
+        field: row.field,
+        sourceKind: row.sourceKind,
+        ...(row.sourceUrl === undefined ? {} : { sourceUrl: row.sourceUrl }),
+        capturedAt: row.capturedAt,
+        originalValue: row.originalValue,
+        normalizedValue: row.normalizedValue,
+        verification: row.verification,
+        freshness: row.freshness,
+        ...(row.lastCheckedAt === undefined ? {} : { lastCheckedAt: row.lastCheckedAt }),
+        counterpartyRole: row.counterpartyRole,
+        executionMode: row.executionMode,
+        origin: row.origin,
+      }));
+      return {
+        ok: true as const,
+        projectId: project._id,
+        claims,
+        pagination: paginationInfo(page),
+        progress: { returned: claims.length },
+      };
+    } catch (error) {
+      if (isInvalidPaginationCursor(error)) {
+        return { ok: false as const, code: "invalid-pagination", message: "pagination cursor is invalid for this research stream" };
+      }
+      throw error;
+    }
+  },
+});
+
+/** One bounded native pagination stream for candidates. */
+export const projectResearchCandidatesPage = f1InternalQuery({
+  args: projectResearchPageArgs,
+  returns: v.union(projectResearchCandidatesPageValidator, denialValidator),
+  handler: async (ctx, args) => {
+    const project = await ctx.db.get(args.projectId);
+    if (project === null) return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
+    const access = await checkProjectAccess(ctx, args.identity, project.organizationId, project._id, "viewer", Date.now());
+    if (!access.ok) return { ok: false as const, code: access.code, message: access.message };
+    try {
+      const page = await ctx.db
+        .query("candidates")
+        .withIndex("by_project", (q) => q.eq("projectId", project._id))
+        .order("desc")
+        .paginate(normalizeProjectPaginationOpts(args.paginationOpts));
+      const candidates = page.page.filter((row) => row.organizationId === project.organizationId).map((row) => ({
+        id: row._id,
+        requirementId: row.requirementId,
+        vendorId: row.vendorId,
+        productModel: row.productModel,
+        variant: row.variant,
+        variantKey: row.variantKey,
+        compatibility: row.compatibility,
+        conversationState: row.conversationState,
+        createdAt: row.createdAt,
+      }));
+      return {
+        ok: true as const,
+        projectId: project._id,
+        candidates,
+        pagination: paginationInfo(page),
+        progress: { returned: candidates.length },
+      };
+    } catch (error) {
+      if (isInvalidPaginationCursor(error)) {
+        return { ok: false as const, code: "invalid-pagination", message: "pagination cursor is invalid for this research stream" };
+      }
+      throw error;
+    }
+  },
+});
+
+const projectResearchEvidencePageRef = makeFunctionReference<
+  "query",
+  QueryArgs<typeof projectResearchEvidencePage>,
+  Awaited<QueryReturn<typeof projectResearchEvidencePage>>
+>("research/collection:projectResearchEvidencePage");
+const projectResearchClaimsPageRef = makeFunctionReference<
+  "query",
+  QueryArgs<typeof projectResearchClaimsPage>,
+  Awaited<QueryReturn<typeof projectResearchClaimsPage>>
+>("research/collection:projectResearchClaimsPage");
+const projectResearchCandidatesPageRef = makeFunctionReference<
+  "query",
+  QueryArgs<typeof projectResearchCandidatesPage>,
+  Awaited<QueryReturn<typeof projectResearchCandidatesPage>>
+>("research/collection:projectResearchCandidatesPage");
+
+/**
+ * Authorized research projection with three independently native-paginated
+ * streams.  Convex permits one `.paginate()` per function execution, so each
+ * stream runs in a bounded internal query and this public query composes the
+ * three validated pages without collecting or silently capping rows.
+ */
 export const projectResearch = f1Query({
-  args: { projectId: v.id("projects"), paginationOpts: paginationOptsValidator },
+  args: {
+    projectId: v.id("projects"),
+    /** Legacy alias: when present, this paginates the evidence stream. */
+    paginationOpts: v.optional(paginationOptsValidator),
+    evidencePaginationOpts: v.optional(paginationOptsValidator),
+    claimsPaginationOpts: v.optional(paginationOptsValidator),
+    candidatesPaginationOpts: v.optional(paginationOptsValidator),
+  },
   returns: v.union(projectResearchResultValidator, denialValidator),
   handler: async (ctx, args) => {
     const identity = await identityOf(ctx);
@@ -1224,68 +1464,68 @@ export const projectResearch = f1Query({
     if (project === null) return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
     const access = await checkProjectAccess(ctx, identity, project.organizationId, project._id, "viewer", Date.now());
     if (!access.ok) return { ok: false as const, code: access.code, message: access.message };
-    const page = await ctx.db.query("evidence").withIndex("by_project", (q) => q.eq("projectId", project._id)).order("desc").paginate(args.paginationOpts);
-    const evidence = page.page.filter((row) => row.organizationId === project.organizationId).map((row) => ({
-      id: row._id,
-      projectId: row.projectId,
-      sourceKind: row.sourceKind,
-      ...(row.sourceUrl === undefined ? {} : { sourceUrl: row.sourceUrl }),
-      ...(row.providerIds === undefined ? {} : { providerIds: row.providerIds }),
-      capturedAt: row.capturedAt,
-      contentHash: row.contentHash,
-      completeness: row.completeness,
-      counterpartyRole: row.counterpartyRole,
-      executionMode: row.executionMode,
-      ...(row.locator === undefined ? {} : { locator: row.locator }),
-    }));
-    const claimsRows = await ctx.db.query("productEvidence").withIndex("by_project", (q) => q.eq("projectId", project._id)).take(MAX_PROJECT_RECORDS + 1);
-    const claims = claimsRows.slice(0, MAX_PROJECT_RECORDS).filter((row) => row.organizationId === project.organizationId).map((row) => ({
-      id: row._id,
-      ...(row.requirementId === undefined ? {} : { requirementId: row.requirementId }),
-      ...(row.candidateId === undefined ? {} : { candidateId: row.candidateId }),
-      field: row.field,
-      sourceKind: row.sourceKind,
-      ...(row.sourceUrl === undefined ? {} : { sourceUrl: row.sourceUrl }),
-      capturedAt: row.capturedAt,
-      originalValue: row.originalValue,
-      normalizedValue: row.normalizedValue,
-      verification: row.verification,
-      freshness: row.freshness,
-      ...(row.lastCheckedAt === undefined ? {} : { lastCheckedAt: row.lastCheckedAt }),
-      counterpartyRole: row.counterpartyRole,
-      executionMode: row.executionMode,
-      origin: row.origin,
-    }));
-    const candidatesRows = await ctx.db.query("candidates").withIndex("by_project", (q) => q.eq("projectId", project._id)).take(MAX_PROJECT_RECORDS + 1);
-    const candidates = candidatesRows.slice(0, MAX_PROJECT_RECORDS).filter((row) => row.organizationId === project.organizationId).map((row) => ({
-      id: row._id,
-      requirementId: row.requirementId,
-      vendorId: row.vendorId,
-      productModel: row.productModel,
-      variant: row.variant,
-      variantKey: row.variantKey,
-      compatibility: row.compatibility,
-      conversationState: row.conversationState,
-      createdAt: row.createdAt,
-    }));
-    const complete = evidence.filter((row) => row.completeness === "complete").length;
-    const partial = evidence.filter((row) => row.completeness === "partial").length;
-    const unavailable = evidence.filter((row) => row.completeness === "unavailable").length;
+
+    // The old `paginationOpts` argument remains an evidence alias.  Claims
+    // and candidates start at their own first page unless their independent
+    // options are supplied; their cursors can never be mixed with evidence.
+    const legacyPageSize =
+      args.paginationOpts?.numItems ?? args.evidencePaginationOpts?.numItems ?? DEFAULT_PROJECT_PAGE_SIZE;
+    const evidencePaginationOpts = normalizeProjectPaginationOpts(
+      args.evidencePaginationOpts ?? args.paginationOpts ?? { numItems: legacyPageSize, cursor: null },
+    );
+    const claimsPaginationOpts = normalizeProjectPaginationOpts(
+      args.claimsPaginationOpts ?? { numItems: legacyPageSize, cursor: null },
+    );
+    const candidatesPaginationOpts = normalizeProjectPaginationOpts(
+      args.candidatesPaginationOpts ?? { numItems: legacyPageSize, cursor: null },
+    );
+
+    const evidencePage = await ctx.runQuery(projectResearchEvidencePageRef, {
+      projectId: project._id,
+      identity,
+      paginationOpts: evidencePaginationOpts,
+    });
+    if (!evidencePage.ok) return evidencePage;
+    const claimsPage = await ctx.runQuery(projectResearchClaimsPageRef, {
+      projectId: project._id,
+      identity,
+      paginationOpts: claimsPaginationOpts,
+    });
+    if (!claimsPage.ok) return claimsPage;
+    const candidatesPage = await ctx.runQuery(projectResearchCandidatesPageRef, {
+      projectId: project._id,
+      identity,
+      paginationOpts: candidatesPaginationOpts,
+    });
+    if (!candidatesPage.ok) return candidatesPage;
+
     return {
       ok: true as const,
       projectId: project._id,
-      evidence,
-      claims,
-      candidates,
-      continueCursor: page.isDone ? null : page.continueCursor,
-      isDone: page.isDone,
+      evidence: evidencePage.evidence,
+      claims: claimsPage.claims,
+      candidates: candidatesPage.candidates,
+      pagination: {
+        evidence: evidencePage.pagination,
+        claims: claimsPage.pagination,
+        candidates: candidatesPage.pagination,
+      },
+      // Backward-compatible aliases for callers that only paginated
+      // evidence before the independent stream contract was added.
+      continueCursor: evidencePage.pagination.continueCursor,
+      isDone: evidencePage.pagination.isDone,
       progress: {
-        sources: evidence.length,
-        complete,
-        partial,
-        unavailable,
-        claims: claims.length,
-        candidates: candidates.length,
+        sources: evidencePage.progress.returned,
+        complete: evidencePage.progress.complete,
+        partial: evidencePage.progress.partial,
+        unavailable: evidencePage.progress.unavailable,
+        claims: claimsPage.progress.returned,
+        candidates: candidatesPage.progress.returned,
+      },
+      streamProgress: {
+        evidence: evidencePage.progress,
+        claims: claimsPage.progress,
+        candidates: candidatesPage.progress,
       },
     };
   },

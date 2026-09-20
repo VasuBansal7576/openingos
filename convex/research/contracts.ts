@@ -207,12 +207,71 @@ export const researchCandidateViewValidator = v.object({
   createdAt: v.number(),
 });
 
+/**
+ * Pagination metadata for one independently paged research stream.
+ *
+ * `continueCursor` is scoped to the exact stream query that produced it.  A
+ * caller must not reuse an evidence cursor for claims or candidates.
+ */
+export const researchPaginationInfoValidator = v.object({
+  continueCursor: v.union(v.string(), v.null()),
+  isDone: v.boolean(),
+  splitCursor: v.optional(v.union(v.string(), v.null())),
+  pageStatus: v.optional(
+    v.union(
+      v.literal("SplitRecommended"),
+      v.literal("SplitRequired"),
+      v.null(),
+    ),
+  ),
+});
+
+export const researchEvidenceProgressValidator = v.object({
+  returned: v.number(),
+  complete: v.number(),
+  partial: v.number(),
+  unavailable: v.number(),
+});
+
+export const researchStreamProgressValidator = v.object({
+  returned: v.number(),
+});
+
+export const projectResearchEvidencePageValidator = v.object({
+  ok: v.literal(true),
+  projectId: v.id("projects"),
+  evidence: v.array(researchEvidenceViewValidator),
+  pagination: researchPaginationInfoValidator,
+  progress: researchEvidenceProgressValidator,
+});
+
+export const projectResearchClaimsPageValidator = v.object({
+  ok: v.literal(true),
+  projectId: v.id("projects"),
+  claims: v.array(researchClaimViewValidator),
+  pagination: researchPaginationInfoValidator,
+  progress: researchStreamProgressValidator,
+});
+
+export const projectResearchCandidatesPageValidator = v.object({
+  ok: v.literal(true),
+  projectId: v.id("projects"),
+  candidates: v.array(researchCandidateViewValidator),
+  pagination: researchPaginationInfoValidator,
+  progress: researchStreamProgressValidator,
+});
+
 export const projectResearchResultValidator = v.object({
   ok: v.literal(true),
   projectId: v.id("projects"),
   evidence: v.array(researchEvidenceViewValidator),
   claims: v.array(researchClaimViewValidator),
   candidates: v.array(researchCandidateViewValidator),
+  pagination: v.object({
+    evidence: researchPaginationInfoValidator,
+    claims: researchPaginationInfoValidator,
+    candidates: researchPaginationInfoValidator,
+  }),
   continueCursor: v.union(v.string(), v.null()),
   isDone: v.boolean(),
   progress: v.object({
@@ -222,6 +281,11 @@ export const projectResearchResultValidator = v.object({
     unavailable: v.number(),
     claims: v.number(),
     candidates: v.number(),
+  }),
+  streamProgress: v.object({
+    evidence: researchEvidenceProgressValidator,
+    claims: researchStreamProgressValidator,
+    candidates: researchStreamProgressValidator,
   }),
 });
 
