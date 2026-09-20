@@ -17,16 +17,23 @@ import {
   f1Query,
   type F1MutationCtx,
 } from "../server.js";
-import { projectWorkflowContext } from "./operations.js";
+import {
+  projectWorkflowContext,
+  validateWorkflowAuthority,
+} from "./operations.js";
 import { canonicalJson, payloadHash } from "../shared/hashing.js";
 import { sha256HexOfCanonical } from "../shared/sha256.js";
 import { isExpired } from "../shared/time.js";
 import {
   classifyScope,
   containsInstructionOverride,
+  defaultWorkflowAuthority,
   MAX_JOBS_PER_GRANT,
   validateWorkflowPayload,
+  workflowAuthorityForOperation,
+  workflowAuthorityMatchesProject,
   workflowContextKey,
+  type WorkflowAuthority,
 } from "../shared/scope.js";
 import { checkProjectAccess, denialValidator, identityOf, requireCapability } from "../access/checks.js";
 
@@ -443,26 +450,10 @@ export const start = f1Mutation({
       return { ok: false as const, code: "prompt-injection-denied", message: "supplier evidence cannot expand capabilities" };
     }
 
-    // Resolve project context from server-owned records before classifying the
-    // request. A caller cannot supply a project name, requirement, or topic
-    // to manufacture OpeningOS authority.
-    const access = await checkProjectAccess(
-      ctx,
-      identity,
-      args.organizationId,
-      args.projectId,
-      "contributor",
-      now,
-    );
-    if (!access.ok) return { ok: false as const, code: access.code, message: access.message };
-    const context = await projectWorkflowContext(ctx, args.organizationId, args.projectId);
-    if (context === null) {
-      return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
-    }
-
-    // Validate an explicitly supplied grant before classification so a grant
-    // payload cannot smuggle an unrelated query through the text path. This
-    // is still a no-write read boundary.
+    // Resolve the supplied grant before building context. A caller cannot
+    // supply a project name, requirement, or topic to manufacture OpeningOS
+    // authority, and context must be scoped to the validated grant when one
+    // is present.
     const suppliedGrant = args.grantId === undefined ? null : await ctx.db.get(args.grantId);
     if (args.grantId !== undefined && suppliedGrant === null) {
       return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
@@ -474,10 +465,30 @@ export const start = f1Mutation({
       return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
     }
 
+    const access = await checkProjectAccess(
+      ctx,
+      identity,
+      args.organizationId,
+      args.projectId,
+      "contributor",
+      now,
+    );
+    if (!access.ok) return { ok: false as const, code: access.code, message: access.message };
+    const routingContext = await projectWorkflowContext(
+      ctx,
+      args.organizationId,
+      args.projectId,
+      args.text,
+      args.grantId,
+    );
+    if (routingContext === null) {
+      return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
+    }
+
     const classified = classifyScope({
       text: args.text,
       ...(args.operationId === undefined ? {} : { operationId: args.operationId }),
-      projectContext: context,
+      projectContext: routingContext,
     });
     if (classified.verdict === "unrelatedRefused") {
       return { ok: false as const, code: "unrelated-refusal", message: classified.reason };
@@ -499,6 +510,8 @@ export const start = f1Mutation({
     let grantId: Id<"grants"> | undefined = args.grantId;
     let grantVersion = 0;
     let inputVersions: Record<string, string> = {};
+    let context = routingContext;
+    let grantAuthority: WorkflowAuthority | null = null;
     if (grantId !== undefined) {
       // Every explicit job grant is fully validated: same
       // organization/project, active, unexpired, and authorizing the
@@ -521,6 +534,51 @@ export const start = f1Mutation({
       if (!grant.operations.includes(operationId)) {
         return { ok: false as const, code: "denied-capability", message: `grant does not authorize ${operationId}` };
       }
+      grantAuthority = workflowAuthorityForOperation(grant.workflowAuthorities, operationId);
+      if (
+        grantAuthority === null ||
+        !workflowAuthorityMatchesProject(grantAuthority, operationId, args.projectId) ||
+        !(await validateWorkflowAuthority(
+          ctx,
+          grantAuthority,
+          args.organizationId,
+          args.projectId,
+          operationId,
+          grantId,
+        ))
+      ) {
+        return { ok: false as const, code: "unrelated-refusal", message: "workflow authority is not current for this project" };
+      }
+      const boundContext = await projectWorkflowContext(
+        ctx,
+        args.organizationId,
+        args.projectId,
+        args.text,
+        grantId,
+        grantAuthority,
+      );
+      if (boundContext === null) {
+        return { ok: false as const, code: "unrelated-refusal", message: "workflow authority is not current for this project" };
+      }
+      context = boundContext;
+      // Reclassify against the authority-bound context before any job write.
+      // The initial routing context may have matched a different textual
+      // requirement; it must not pivot a supplied grant away from its exact
+      // server-owned authority.
+      const boundClassified = classifyScope({
+        text: args.text,
+        operationId,
+        projectContext: context,
+      });
+      if (boundClassified.verdict === "unrelatedRefused") {
+        return { ok: false as const, code: "unrelated-refusal", message: boundClassified.reason };
+      }
+      if (boundClassified.verdict === "unavailableRefused") {
+        return { ok: false as const, code: "unavailable-capability", message: boundClassified.reason };
+      }
+      if (boundClassified.operationId !== operationId || boundClassified.purpose !== classified.purpose) {
+        return { ok: false as const, code: "unrelated-refusal", message: "request does not match the bound workflow authority" };
+      }
       const grantPayload = parseCanonicalPayload(grant.canonicalPayload);
       if (grantPayload === null) {
         return { ok: false as const, code: "invalid-payload", message: "grant payload is not valid JSON" };
@@ -539,11 +597,50 @@ export const start = f1Mutation({
     } else if (kind === "communication") {
       return { ok: false as const, code: "denied-capability", message: "communication requires a grant" };
     } else {
+      const automaticAuthority = defaultWorkflowAuthority(operationId, args.projectId);
+      if (
+        automaticAuthority === null ||
+        !workflowAuthorityMatchesProject(automaticAuthority, operationId, args.projectId) ||
+        !(await validateWorkflowAuthority(
+          ctx,
+          automaticAuthority,
+          args.organizationId,
+          args.projectId,
+          operationId,
+        ))
+      ) {
+        return { ok: false as const, code: "unrelated-refusal", message: "workflow authority is not current for this project" };
+      }
+      grantAuthority = workflowAuthorityForOperation([automaticAuthority], operationId);
+      if (grantAuthority === null) {
+        return { ok: false as const, code: "unrelated-refusal", message: "workflow authority is not current for this project" };
+      }
+      const automaticContext = await projectWorkflowContext(
+        ctx,
+        args.organizationId,
+        args.projectId,
+        args.text,
+        undefined,
+        grantAuthority,
+      );
+      if (automaticContext === null) {
+        return { ok: false as const, code: "unrelated-refusal", message: "workflow authority is not current for this project" };
+      }
+      context = automaticContext;
+      const autoPayload = { query: args.text };
+      const automaticPayload = validateWorkflowPayload({
+        operationId,
+        purpose: classified.purpose,
+        payload: autoPayload,
+        context,
+      });
+      if (!automaticPayload.ok) {
+        return { ok: false as const, code: "unrelated-refusal", message: automaticPayload.reason ?? "research payload is not supported" };
+      }
       const recipient = await ctx.db
         .query("recipientConfigs")
         .withIndex("by_active", (q) => q.eq("active", true))
         .unique();
-      const autoPayload = { research: "bounded-server-grant" };
       const autoCanonical = canonicalJson(autoPayload);
       grantId = await ctx.db.insert("grants", {
         organizationId: args.organizationId,
@@ -555,6 +652,7 @@ export const start = f1Mutation({
         canonicalPayload: autoCanonical,
         payloadHash: payloadHash(autoPayload),
         payloadSha256: await sha256HexOfCanonical(autoCanonical),
+        workflowAuthorities: [grantAuthority],
         // No-spend research authority with valid positive semantics: the
         // round limit passes the same positive-safe-integer validation as
         // an issued grant, while the zero cost ceiling permits no
@@ -573,7 +671,7 @@ export const start = f1Mutation({
     // A grant can legally contain several operations, but every job remains
     // a bounded unit of work. Once the finite admission is reached we deny
     // without creating another job or changing the grant/budget.
-    if (grantId === undefined) {
+    if (grantId === undefined || grantAuthority === null) {
       return { ok: false as const, code: "denied-capability", message: "job authority could not be established" };
     }
     const grantJobs = await ctx.db
@@ -592,6 +690,7 @@ export const start = f1Mutation({
       kind,
       workflowPurpose: classified.purpose,
       workflowContext: workflowContextKey(context, classified.purpose),
+      workflowAuthority: grantAuthority,
       state: "queued",
       inputVersions,
       createdAt: now,
