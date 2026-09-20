@@ -344,6 +344,11 @@ function quoteArgs(
     rfqId?: Id<"rfqs">;
     conversationId?: Id<"conversations">;
   } = {},
+  // F1R-13: the quoted line quantity caps selection. Fixtures that
+  // select more than one unit name their quoted quantity here so the
+  // line and its scope stay consistent; the default keeps every other
+  // caller on the established single-unit shape.
+  lineQuantity: string = "1",
 ) {
   return {
     organizationId: orgId,
@@ -353,7 +358,7 @@ function quoteArgs(
     lines: [{
       lineId: "machine",
       description: "machine",
-      quantity: "1",
+      quantity: lineQuantity,
       unitPrice: { currency: "EUR", minorUnits: 795000 },
       evidenceRefs: [],
     }],
@@ -362,7 +367,7 @@ function quoteArgs(
     comparisonScope: {
       requirementId: "req-domain",
       scopeId: "scope-domain",
-      items: [{ itemId: "machine", lineId: "machine", unit: "piece", requiredQuantity: "1" }],
+      items: [{ itemId: "machine", lineId: "machine", unit: "piece", requiredQuantity: lineQuantity }],
     },
     evidenceRefs: [],
     ...refs,
@@ -1743,7 +1748,7 @@ describe("direct audit repairs: authority, hashes, bounds, lineage", () => {
     const project = await setupProject(t, OWNER_A, "acceptance");
     const asOwner = t.withIdentity(OWNER_A);
     const graph = await setupSourcingGraph(t, OWNER_A, project);
-    const quote = await asOwner.mutation(recordQuoteRef, quoteArgs(project.orgId, project.projectId, "q-acc-1"));
+    const quote = await asOwner.mutation(recordQuoteRef, quoteArgs(project.orgId, project.projectId, "q-acc-1", {}, "2"));
     if (!quote.ok) throw new Error("quote failed");
     const selection = await asOwner.mutation(recordSelectionRef, {
       organizationId: project.orgId,
