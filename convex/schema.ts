@@ -607,7 +607,46 @@ export default defineSchema({
     updatedAt: v.number(),
   })
     .index("by_organization_and_identity", ["organizationId", "identity"])
-    .index("by_project_and_identity", ["projectId", "identity"]),
+    .index("by_project_and_identity", ["projectId", "identity"])
+    // Legacy membership rows remain addressable by their exact authority
+    // dimensions.  The access checks use the maintained projection below for
+    // current writes, while this index keeps bounded compatibility probes
+    // available for rows written before the projection was introduced.
+    .index(
+      "by_organization_and_identity_and_project_and_status_and_role",
+      ["organizationId", "identity", "projectId", "status", "role"],
+    ),
+
+  /**
+   * Current authority projection for membership history.
+   *
+   * One row is written for every active membership grant, and removed when
+   * that membership is revoked.  `authorityUntil` is a sortable deadline:
+   * Number.MAX_VALUE represents permanent authority.  Access checks
+   * ask for the newest row for each scope/role, so they never collect the
+   * append-only membership history.
+   */
+  membershipAuthorities: defineTable({
+    organizationId: v.id("organizations"),
+    projectId: v.optional(v.id("projects")),
+    identity: v.string(),
+    scopeKey: v.string(),
+    role: v.union(
+      v.literal("owner"),
+      v.literal("approver"),
+      v.literal("contributor"),
+      v.literal("viewer"),
+    ),
+    membershipId: v.id("memberships"),
+    authorityUntil: v.number(),
+    expiresAt: v.optional(v.number()),
+    updatedAt: v.number(),
+  })
+    .index(
+      "by_organization_and_identity_and_scope_and_role_and_authority_until",
+      ["organizationId", "identity", "scopeKey", "role", "authorityUntil"],
+    )
+    .index("by_membership", ["membershipId"]),
 
   recipientConfigs: defineTable({
     version: v.number(),
