@@ -4,23 +4,24 @@ Drafted September 19, 2026; integration contracts clarified against PRD revision
 These documents specify implementation choices, not completed capabilities.
 The user accepted the purchasing workbench and the existing hackathon platform direction.
 The user also requires all hackathon outreach to go only to their designated mailbox, with real provider execution and the user playing the supplier.
-This accepted product constraint applies to ADR-0003 through ADR-0008 even while their technical proposals await proof.
-The user delegates routine technical choices and testing to the Astra coordinator.
-Other recommendations remain proposed until Astra reviews the evidence and their blocking experiments pass.
-Do not let workers silently turn a proposal into an accepted contract.
+This accepted product constraint applies to ADR-0003 through ADR-0008.
+The user delegates routine technical choices and testing to the active OpeningOS coordinator.
+The controlled contracts in ADR-0003 through ADR-0008 were accepted on September 20, 2026 only to the extent stated in each record's evidence amendment.
+Their hosted, live-provider and publication gates remain open.
+Do not let workers turn a controlled acceptance into a live claim or silently expand the accepted contract.
 
 | ADR | Decision | Status |
 | --- | --- | --- |
 | [0001](0001-purchasing-workbench.md) | Purchasing workbench and standalone design reference | Accepted |
 | [0002](0002-platform-and-ownership.md) | Sites frontend, Convex authority, no second application backend | Accepted constraints, deployment proof pending |
-| [0003](0003-evidence-quotes-and-money.md) | Evidence, quote versions, compatibility and financial records | Proposed |
-| [0004](0004-durable-jobs-and-provider-effects.md) | Durable jobs, bounded recovery, communication and shared spend | Proposed |
-| [0005](0005-jev-and-openai.md) | Jev-first typed decisions, OpenAI extraction and generation | Proposed |
-| [0006](0006-remote-browser-execution.md) | Isolated hosted browser execution under Convex authority | Proposed, execution route unproven |
-| [0007](0007-identity-capabilities-and-approval.md) | Guest identity, private access, capabilities and approvals | Proposed |
-| [0008](0008-verification-and-worker-handoffs.md) | Environments, evidence, CI and Orca implementation packages | Proposed |
+| [0003](0003-evidence-quotes-and-money.md) | Evidence, quote versions, compatibility and financial records | Accepted controlled contract; application records pending |
+| [0004](0004-durable-jobs-and-provider-effects.md) | Durable jobs, bounded recovery, communication and shared spend | Accepted controlled contract; durable/live effects pending |
+| [0005](0005-jev-and-openai.md) | Jev-first typed decisions, OpenAI extraction and generation | Accepted transport/validation contract; live calibration pending |
+| [0006](0006-remote-browser-execution.md) | Isolated hosted browser execution under Convex authority | Accepted controlled executor contract; hosted D-04 proof pending |
+| [0007](0007-identity-capabilities-and-approval.md) | Guest identity, private access, capabilities and approvals | Accepted backend authority contract; hosted identity proof pending |
+| [0008](0008-verification-and-worker-handoffs.md) | Environments, evidence, CI and Orca implementation packages | Accepted workflow; live delivery gates pending |
 
-## Proofs owned by Astra
+## Proofs owned by the coordinator
 
 1. Prove published Sites can read, write and subscribe to the intended hosted Convex deployment.
 2. Prove a hosted Jev-guided browser operation with two isolated sessions, cancellation and an independent result check.

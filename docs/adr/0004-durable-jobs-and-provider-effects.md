@@ -1,8 +1,15 @@
 # ADR-0004: Durable jobs and provider effects
 
-Status: Proposed; integration design specified, controlled and live verification pending.
+Status: Accepted for controlled lifecycle and retry implementation; durable Convex and live provider effects pending.
 Requirements: P-05, P-13, P-14, P-17, P-23, D-05, D-06, D-07, D-12, D-13, D-16.
 Amended September 19, 2026 after inspecting the sponsor components' source and adopting the user's owner-only hackathon communication constraint.
+
+## September 20, 2026 evidence amendment
+
+The job lifecycle, fencing, retry-owner and effect-separation contracts are accepted as the F1/C1 implementation basis.
+At `6432e98`, 155 repository browser-executor tests plus an independent 66-test boundary matrix and the prior 64-test review matrix passed.
+The evidence covers exact deadline admission, acquired leases, stale/foreign handles, cancellation, bounded attempts, authenticated late reconciliation and preserved observations in an in-memory controlled executor.
+It does not prove durable Convex storage, process-crash recovery, shared budgets, AgentMail dispatch/reconciliation or any live provider effect.
 
 ## Decision
 
@@ -43,7 +50,7 @@ All branches and retries use the same job allowance and an organization-wide cap
 Reconcile actual cost once; retain a reservation while an outcome or charge is unknown.
 If no defensible upper bound fits, pause instead of making the call.
 Live allowances default to disabled until the owner approves actual limits.
-For the hackathon, Astra configures technical caps against verified authorized credits; free-account signup does not prove available balance or bound a charge.
+For the hackathon, the active OpeningOS coordinator configures technical caps against verified authorized credits; free-account signup does not prove available balance or bound a charge.
 Do not enable paid overages, buy credits or add subscriptions to unblock a job.
 
 Dispatch claims recheck cancellation, current access, grant expiry, approved payload and available reservation atomically.
@@ -76,7 +83,7 @@ Signatures and event IDs, not email subject alone, identify the ingestion route.
 
 ### Owner-only hackathon transport
 
-The user has accepted the recipient restriction; implementation of its enforcement remains pending.
+The user has accepted the recipient restriction; application enforcement remains pending.
 Every hackathon conversation sends only to the owner's privately configured mailbox, with empty CC and BCC, under the existing bounded grant.
 Discovered vendor contacts are read-only research data and cannot become destinations.
 The approved snapshot binds `communicationProfile: ownerRoleplay`, the actual recipient and its configuration version, not a vendor address later rewritten in transport.

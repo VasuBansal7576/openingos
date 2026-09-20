@@ -1,7 +1,15 @@
 # ADR-0003: Evidence, quote versions and money
 
-Status: Proposed.
+Status: Accepted for controlled contract implementation; application persistence and full product evidence pending.
 Requirements: P-02, P-03, P-04, P-06, P-07, P-08, P-09, P-10, P-18, P-24, D-02, D-08, D-15.
+
+## September 20, 2026 evidence amendment
+
+The money and quote-snapshot contract is accepted as the F1 implementation basis.
+Checkpoint `595d30c` passed 77 controlled money/Jev tests with 305 assertions and separate Astra review.
+The money cases covered complete-offer comparison, unknown charges, included-charge chains, shared charges, partial quantities, deposits, credits/refunds, immutable inputs, obsolete selections and exact allocation/rounding checks.
+This accepts P-07 and P-08 only under controlled evidence and partially supports P-06.
+It does not prove persisted application records, source collection, quote ingestion, compatibility, equipment history or a live vendor outcome.
 
 ## Decision
 

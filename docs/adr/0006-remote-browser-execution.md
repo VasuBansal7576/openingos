@@ -1,7 +1,15 @@
 # ADR-0006: Remote browser execution
 
-Status: Proposed; hosted executor and isolation proof are blocking.
+Status: Accepted for the controlled executor contract; hosted executor, application identity and D-04 remain blocking.
 Requirements: D-03, D-04, D-05, D-06, D-09, D-10, D-14.
+
+## September 20, 2026 evidence amendment
+
+The signed job, session binding, operation policy, deadline fencing, callback replay and bounded recovery contracts are accepted as a controlled implementation basis.
+The separate Astra review of exact commit `6432e98` closed FR01 through FR08 with no actionable finding after 66 fresh boundary/isolation tests, the prior 64 independent probes and 20 additional 155-test browser-suite repetitions.
+All new evidence used synthetic authority, clocks, secrets and injected transport with in-memory sessions.
+This partially supports D-05, D-06, D-09, D-10 and D-14 only.
+It does not satisfy D-04, hosted isolation, provider credentials, durable shared authority or any real external browser step.
 
 ## Recommendation
 

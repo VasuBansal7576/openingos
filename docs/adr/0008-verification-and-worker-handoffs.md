@@ -1,7 +1,14 @@
 # ADR-0008: Verification and worker handoffs
 
-Status: Proposed production workflow; existing delivery instructions remain in force.
+Status: Accepted delivery workflow; hosted/live verification and publication gates remain open.
 Requirements: H-03 through H-08, P-14 through P-21, D-01 through D-17 as applicable to each package.
+
+## September 20, 2026 evidence amendment
+
+The fixed-commit worker handoff, independent review, controlled/live labeling, exclusive ownership and latest-head CI workflow is accepted.
+It was exercised across the reviewed `595d30c` and `6432e98` checkpoints with worker-owned repairs, pushed integration commits and exact-head CI.
+The application foundation now supplies the five named application CI jobs in addition to repository checks.
+This workflow acceptance is not product acceptance and does not satisfy hosted Convex, live provider, public origin, full Playwright/Computer Use, video or submission gates.
 
 ## Decision
 
@@ -36,7 +43,7 @@ Do not dispatch dependent feature workers while their shared contracts are merel
 Use the [sponsor worker plan](../implementation/sponsor-integration-plan.md) for F0/F1/R1/C1/U1/V1 ownership, exact acceptance cases, command contracts and stop conditions.
 The plan adds detail to these packages without authorizing their execution or replacing unrelated PRD requirements.
 The [coordinator roadmap](../../ROADMAP.md) supplies setup and build order; `AGENTS.md` specifies exact model IDs.
-Astra coordinates Muse Spark 1.3 and GPT-5.6 Luna workers, with a separate Astra session for independent review.
+The active OpeningOS coordinator coordinates Muse Spark 1.3 and GPT-5.6 Luna workers, with a separate Astra session for independent review.
 The coordinator owns setup, technical proof and ADR acceptance from evidence, not repeated product questionnaires or silent model substitutions.
 
 ## Environments and realistic tests

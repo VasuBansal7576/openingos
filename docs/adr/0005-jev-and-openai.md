@@ -1,7 +1,14 @@
 # ADR-0005: Jev-first decisions and OpenAI generation
 
-Status: Proposed; live API access, task thresholds and the OpenAI snapshot remain unverified.
+Status: Accepted for controlled Jev transport and validation; live access, domain calibration and OpenAI selection pending.
 Requirements: H-04, D-02, D-03, D-10, D-11, D-12, D-13, D-17.
+
+## September 20, 2026 evidence amendment
+
+The pinned Jev HTTP transport and defensive response-validation contract is accepted for F1/R1/C1 use.
+Reviewed controlled evidence at `595d30c` passes J-01 and J-02 and partially supports J-03/J-04 through injected HTTP, timeout, cancellation, deadline and stale-result cases.
+No hosted TypeSafe credential, live `jev-1.13.0` call, shared application allowance, representative domain evaluation or threshold calibration was observed.
+J-05 through J-07 remain open, and OpenAI model selection remains pending.
 
 ## Decision
 
@@ -51,7 +58,7 @@ Do not silently truncate decision-critical evidence or enable private-body debug
 
 Source-checked September 19, 2026: [HTTP schema](https://docs.typesafe.ai/api), [model limits](https://docs.typesafe.ai/models), [known model limitations](https://docs.typesafe.ai/model-jaggedness/jev-1.13).
 The optional SDK is not required for this adapter; adopting it needs a tested ADR amendment and disabled hidden retries.
-The [package plan's J-01 through J-07](../implementation/sponsor-integration-plan.md#jev-acceptance-cases) prove this contract; all remain pending.
+The [package plan's J-01 through J-07](../implementation/sponsor-integration-plan.md#jev-acceptance-cases) prove this contract; the evidence matrix records their current controlled/live status.
 The hosted browser controller still needs ADR-0006's separate compatibility and isolation proof.
 
 ## Decision contract
@@ -83,7 +90,7 @@ Relevant unknown supplier facts trigger permitted research or clarification befo
 
 Accept numerical thresholds only after measuring false rejections, unauthorized-operation proposals, wrong model matches and incorrectly deferred suitable suppliers.
 Do not insert an arbitrary universal 0.9 threshold into worker contracts.
-Astra owns the threshold evaluation and tested OpenAI model selection before dependent execution work; workers do not choose incompatible policies independently.
+The active OpeningOS coordinator owns the threshold evaluation and tested OpenAI model selection before dependent execution work; workers do not choose incompatible policies independently.
 
 ## Documents and answers
 

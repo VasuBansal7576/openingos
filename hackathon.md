@@ -2,17 +2,17 @@
 
 - **Project:** OpeningOS
 - **Event:** Convex All Gas Hackathon
-- **What it does:** Café procurement and equipment coordination concept with an accepted purchasing-workbench prototype; production application and backend not implemented yet.
+- **What it does:** Café procurement workbench with a controlled React/Convex foundation, typed Jev boundary and isolated browser-executor contracts; full product workflows remain in implementation.
 - **Live app:** not deployed
 - **Repo:** https://github.com/VasuBansal7576/openingos
-- **Frontend:** Codex Sites
+- **Frontend:** React/Vite foundation; ChatGPT Sites publication target
 - **Convex deployment:** not deployed
-- **Components:** none
-- **Convex features:** none yet
-- **Auth:** none
-- **AI models:** none
+- **Components:** Firecrawl, AgentMail and Workflow registered in local configuration; no hosted proof
+- **Convex features:** local component configuration, HTTP/auth foundation and generated references; no hosted persistence proof
+- **Auth:** Convex Auth foundation only; no hosted guest/private isolation proof
+- **AI models:** controlled Jev `jev-1.13.0` adapter tests only; no live application inference
 - **Started:** 2026-09-19T09:46:19Z
-- **Last updated:** 2026-09-19T18:06:34Z
+- **Last updated:** 2026-09-20T07:30:00Z
 
 ## Log
 
@@ -110,3 +110,199 @@ Selected Netherlands/EUR and three public supplier examples for hackathon resear
 Created a dedicated TypeSafe key with user approval and verified secure local storage; no key value entered the repository and no live inference was tested.
 All 23 existing repository tests passed, the delivery skill validated, 49 local links and anchors checked, and all 52 product requirements plus 24 sponsor cases remained unchanged.
 Application implementation, hosted integration proofs and end-to-end review remain pending; the owner retains Firecrawl account setup and final submission tasks.
+
+### 2026-09-19 - working tree
+
+Started a supervised Orca run with isolated implementation worktrees and a separate read-only Astra reviewer.
+Verified actual session metadata for OpenAI GPT-5.6 Luna at max effort, OpenCode Go Muse Spark 1.3 Contributor at high effort, and OpenAI GPT-6 Astra for coordination and independent review.
+Exercised scoped native approvals and worker question routing; recovered an update-blocked launch and diagnosed Codex sandbox IPC restrictions without enabling unrestricted worker permissions.
+Converted the coordinator roadmap to checkboxes, recording verified substeps separately from pending foundation and live-provider gates.
+All 23 existing repository tests pass; these checks and preflight evidence do not establish application behavior or live integrations.
+
+### 2026-09-19 - working tree
+
+Integrated Luna's pushed financial proof `884a70b` and Muse Spark's pushed Jev proof `03ffe2e`, covering equivalent quote costs, incomplete charges, distinct financial states and validated single-attempt HTTP results.
+The combined checkout passes 41 controlled contract tests, all 23 repository checks and strict TypeScript; coordinator findings prompted timeout/body-stream and compiler repairs by the responsible workers.
+Added pinned Bun/TypeScript tooling and two foundation CI jobs; independent review of the fixed combined commit and its latest remote checks are still pending.
+Installed OpenCode's official Convex skills and MCP, verified twelve tools after restart without invoking them, and confirmed the requested Muse Spark model/high variant from session metadata.
+Handled ongoing native approvals and verified that scoped routine tests and assigned-file edits execute without repeated prompts after restart.
+All contract evidence uses controlled inputs or injected HTTP responses; hosted identity, shared provider allowances, backend authority, live integrations and publication remain unverified.
+
+### 2026-09-19 - 897eea7
+
+Pushed the combined contract proofs and verified all four expected jobs in the [GitHub check run](https://github.com/VasuBansal7576/openingos/actions/runs/35462668966).
+A separate Astra session reviewed that fixed commit and reproduced 13 correctness defects plus one financial fixture-scale gap beyond the passing tests.
+Assigned the financial findings to Luna and the Jev findings to Muse Spark with exclusive file ownership and regression-test requirements.
+Repairs and a second fixed-commit review are pending; the green CI result does not approve these contracts for application use.
+
+### 2026-09-19 - working tree
+
+Integrated Muse Spark's pushed repair `c16b807` for request snapshots, deadlines, cancellation, JSON validation, reserved keys, retry advice and ignored response bodies.
+The combined checkout passes 56 controlled proof tests, 23 repository checks and strict TypeScript, including 15 new Jev regressions.
+Independent verification of RJ1–RJ7 and Luna's financial repairs remain pending; no live provider call or application capability is claimed.
+
+### 2026-09-19 - working tree
+
+Integrated Luna’s pushed `a7d4c61` financial repairs and Muse Spark’s pushed `29fed49` Jev repairs.
+Financial proofs now use explicit item and quantity mappings, preserve equivalent allocated partial selections, resolve included-charge coverage, freeze quote snapshots, reject duplicate adjustment identities, require settlement evidence and conserve rounding.
+Jev proofs now copy supported JSON defensively, preserve the original cancellation signal, enforce an inclusive absolute deadline and clean up cancelled test streams.
+The combined checkout passes 75 controlled proof tests, all 23 repository checks, strict TypeScript and whitespace checks.
+The coordinator reproduced a delayed test-timer failure between suites and routed its repair to Muse Spark before this passing combined run.
+Independent review of this combined revision and its remote CI remain pending; hosted integrations and full foundation gates remain unverified.
+
+### 2026-09-19 - working tree
+
+Verified all four CI jobs on `85d8105`; its independent Astra review closed M3/M4/M5/M7 and RJ1–RJ7 behavior findings while reproducing remaining financial M1/M2/M6 defects.
+Integrated Luna’s pushed `a1972fb` for selected-scope comparison, applicable included-charge chains and forecast rounding across all quantity states, plus Muse Spark’s pushed `36d5ba9` for precise deadline and getter-invocation regressions.
+The combined checkout passes 77 controlled proof tests, all 23 repository checks, strict TypeScript and whitespace checks.
+Updated the delivery skill to require all four current CI jobs; these remain proof and repository checks rather than evidence of a deployed application.
+Independent review and remote CI for this combined revision remain pending; application credentials, provider allowances, owner recipient and hosted foundation gates remain unresolved.
+
+### 2026-09-19 - working tree
+
+All four CI jobs passed on `d9487df`, and independent Astra review closed M1/M2 while identifying one remaining M6 component-allocation defect through settlement splitting.
+Integrated Luna’s pushed `979fdca`, which groups exact costs by financial state and assigns rounding remainders deterministically without charging a zero-cost component.
+The combined checkout passes 77 controlled proof tests with 305 assertions, all 23 repository checks, strict TypeScript and whitespace checks.
+Independent verification of the final allocation repair and this revision’s remote CI remain pending; no hosted or live-provider outcome is claimed.
+
+### 2026-09-19 - 595d30c
+
+The separate Astra reviewer found no actionable issues in the fixed combined proof checkpoint and verified the final M6 allocation repair, closing the controlled M1–M7 and RJ1–RJ7 review findings.
+Verification passed: 77 proof tests with 305 assertions, 23 repository tests, strict TypeScript, whitespace checks, 1,144 independent exact allocation/changed-price cases and 1,760 settlement split/reordering checks.
+All four expected jobs passed in the [GitHub check run](https://github.com/VasuBansal7576/openingos/actions/runs/35466163046).
+Marked the controlled proof integration step complete in the roadmap and updated README status while retaining all full foundation and product gates as open.
+Shut down the settled implementation and reviewer sessions, verified clean worktrees and pushed branch heads, then removed both worker worktrees through Orca without force; their branches remain available on GitHub.
+Native OpenCode approvals were supervised directly, with scoped routine permissions verified after restart using the requested model and high variant.
+All evidence remains controlled; no live application, hosted identity, shared provider budget, owner-email run or publication was verified.
+The next foundation stage requires the privately configured application credentials, approved provider allowances and owner recipient that remain unresolved.
+
+### 2026-09-20 - 6432e98
+
+Integrated the React/Vite and Convex application foundation, official Firecrawl, AgentMail and Workflow registration, Convex Auth scaffolding, controlled Jev boundary and the isolated browser-executor contract.
+The exact checkpoint passes typechecking, a production build, 23 repository tests, 77 proof tests, 155 browser-executor tests, 2 application tests, 19 provider-contract tests and 5 mounted user-path tests.
+Both exact-head GitHub workflows passed: application CI run `35479908327` and repository checks run `35479908303`.
+A separate GPT-6 Astra reviewer accepted the fixed commit after 66 fresh deadline/isolation tests, the prior 64-probe suite and 20 additional complete browser-suite repetitions, closing FR01 through FR08 with no actionable finding.
+The retained application browser evidence covers controlled loading, unavailable, interrupted and retry states at 1280px and 390px widths, keyboard activation, cleanup and horizontal-overflow checks; the application code was unchanged in the final browser-only repair.
+Accepted ADR-0003 through ADR-0008 only for their documented controlled implementation surfaces and added one evidence matrix for all 52 P/H/D requirements, 24 sponsor cases and 7 Jev cases.
+No hosted Convex deployment, live Jev/OpenAI/Firecrawl/AgentMail call, owner mailbox exchange, remote browser, genuine vendor result, public site or realized savings was observed.
+The next unblocked package is F1 durable shared-schema authority; NR03, hosted identity, live providers and publication remain open.
+
+### 2026-09-20 - 8abd7c1 local checkpoint
+
+Integrated F1R-01 through F1R-12 repairs for shared grant exposure, cancellation cleanup, early and late event application, graph and quote lineage, evidence and replay binding, numeric validation, typed watch targets and project-scoped selection idempotency.
+The exact local checkpoint passes both TypeScript checks, the production build, 23 repository tests, 77 money and Jev proofs, 186 F1 tests, 117 direct Convex tests, 155 browser-executor tests, 2 application tests, 19 provider-contract tests and 5 mounted user-path tests.
+The unchanged independent probe artifact passes 18 of 19 checks.
+Its remaining old F1R-07 setup expects a watch with nonexistent evidence to be accepted, which conflicts with the later F1R-10 requirement that missing evidence must block the write.
+The stronger F1R-10 contract remains in place, and a fresh Astra review will use resolvable evidence when checking replay behavior.
+F1R-13 durable multi-line order, acceptance and financial-adjustment lineage remains in implementation, so F1 and all dependent R1/C1/U1 roadmap gates remain open.
+
+### 2026-09-20 - 02209d6 local checkpoint
+
+Integrated F1R-13 durable line lineage for multi-item selection, partial ordering, per-line acceptance, typed immutable adjustment evidence and isolated linked credits/refunds.
+Coordinator review rejected the first implementation until the exact pre-F1R-13 no-key scalar selection identity was preserved and new quote-quantity caps ran after historical replay.
+The fixed checkpoint passes both TypeScript checks, production build, 23 repository tests, 77 money and Jev proofs, 190 F1 tests, 125 direct Convex tests, 155 browser-executor tests, 2 application tests, 19 provider-contract tests and 5 user-path tests.
+Opened ready-for-review PR #1 at `35abe0e`; all application and repository jobs passed and Greptile started its first real PR review.
+The PR has not yet been updated to this local checkpoint, and the fresh separate Astra review plus Greptile follow-through remain pending.
+All results are controlled local evidence only; no hosted deployment, provider call, supplier contact, genuine quote or realized saving is claimed.
+This checkpoint contains controlled local evidence only.
+No hosted Convex state, live provider call, owner-mailbox exchange, public site or commercial outcome was observed.
+
+### 2026-09-20 - 540d4a5 local checkpoint
+
+Integrated the two owner-isolated F1 repair packages without conflicts.
+The combined implementation addresses Astra findings F1R-06 and F1R-07 through bounded all-or-nothing compatibility invalidation and immutable ingestion identity, and addresses F1R-12 by separating receipt identity, binding facts and application state while retaining historical replay.
+It addresses F1R-14 through F1R-17 through cumulative split-order caps, order-bound quantity and unit checks, explicit incomplete-lineage responses and pre-F1R-13 replay compatibility.
+The exact local head passes both TypeScript checks, production build, 23 repository tests, 77 money and Jev proofs, 191 F1 tests, 148 direct Convex tests, 155 browser-executor tests, 2 application tests, 19 provider-contract tests and 5 mounted user-path tests.
+All 48 unchanged probes from Astra's rejected `8fedeb7` review pass against the combined head.
+PR #1 remains open and ready for review; this revision still requires a push, exact-head GitHub Actions, exact-head Greptile follow-through and a fresh independent Astra verdict before F1 can be checked complete or merged.
+All results are controlled evidence only.
+No hosted Convex state, live provider call, owner-mailbox exchange, public site or commercial outcome was observed.
+
+### 2026-09-20 - 1f17c00 local checkpoint
+
+Integrated the final owner-isolated F1 follow-up repairs prompted by Greptile and the separate Astra rejection review.
+Evidence invalidation now uses a sparse bounded reverse index, legacy evidence replay binds freshness and check time, commitment and history reads are bounded and paginated, new unresolved-unit adjustments fail closed, and legacy scalar order and acceptance mirrors survive reload without invented line allocation.
+The exact local head passes both TypeScript checks, production build, 23 repository tests, 77 money and Jev proofs, 191 F1 tests, 161 direct Convex tests, 155 browser-executor tests, 2 application tests, 19 provider-contract tests and 5 mounted user-path tests.
+The immutable rejection and historical-bridge suites pass 55 of 55 checks.
+The older 46-case fresh probe artifact has 43 passes and three superseded fanout expectations: it expects a candidate-specific update to fail merely because 257 unrelated candidates exist and expects a 257th evidence binding to be accepted before later invalidation.
+The accepted contract instead permits the sparse unrelated case and rejects the 257th dependent binding atomically at write time; a fresh independent Astra reviewer must verify that invariant on the pushed exact head.
+PR #1 remains open and ready for review, but `1f17c00` has not yet been pushed and therefore has no exact-head GitHub Actions or Greptile result.
+All results are controlled evidence only.
+No hosted Convex state, live provider call, owner-mailbox exchange, public site or commercial outcome was observed.
+
+### 2026-09-20 - c7637ba local checkpoint
+
+Integrated the strict job-authority and context repairs through `1b5310e`, then integrated Muse Spark's fixture-only repair `c7637ba` for the direct Convex suite.
+The fixture repair preserves every negative assertion while giving controlled communication jobs an anchored RFQ payload and exact project-scoped `communication.send` authority.
+The exact local head passes both TypeScript checks, production build, 23 repository tests, 77 money and Jev proofs, 226 F1 tests, 174 direct Convex tests, 155 browser-executor tests, 2 application tests, 19 provider-contract tests and 5 mounted user-path tests.
+The implementation worker ran as OpenCode Go Muse Spark 1.3 Contributor with the high variant, and its exact commit is preserved on `origin/Raghav-Bansal-15/f1-direct-fixtures`.
+Nine clean completed worktrees were removed through Orca after their exact commits were verified on remote branches, reclaiming approximately 1.13 GB without deleting remote branches.
+PR #1 still points to the older published head `19e6d9f` until this checkpoint and its factual log are committed and pushed.
+F1 remains open until the replacement exact head passes GitHub Actions, its actionable Greptile threads are closed, GitHub reports no conflicts and a separate Astra session accepts the same revision.
+All results are controlled evidence only.
+No hosted Convex state, live provider call, owner-mailbox exchange, public site or commercial outcome was observed.
+
+### 2026-09-20 - 5b5b0bd Greptile reconciliation repair
+
+Integrated Luna's bounded reconciliation-summary repair as `5b5b0bd` on the Vasu-owned PR branch.
+Later reconciliation pages now revalidate the durable unresolved-operation sample before carrying its count forward, and the new regression reproduces an earlier-page operation becoming terminal while a later page remains in progress.
+The exact integrated head passes both TypeScript checks, production build, 23 repository tests, 77 money and Jev proofs, 227 F1 tests, 174 direct Convex tests, 155 browser-executor tests, 2 application tests, 19 provider-contract tests and 5 mounted user-path tests.
+The actionable Greptile thread received exact commit and test evidence and was resolved.
+PR #1 now points to `5b5b0bd`; exact-head GitHub Actions and a new Greptile scan are running, and the separate Astra review remains intentionally deferred until that scan is settled.
+All results are controlled evidence only.
+No hosted Convex state, live provider call, owner-mailbox exchange, public site or commercial outcome was observed.
+
+### 2026-09-20 - 497636d exact-head P1 repair
+
+Integrated Luna's two exact-head Greptile P1 repairs as `497636d` on the Vasu-owned PR branch.
+The automatic no-grant path now admits only bounded research/read operations, while record-changing operations require an explicit version-bound grant and create zero rows when omitted.
+Cancellation reconciliation now takes bounded indexed current-state probes at the end of a page, replaces stale counts when the exact unresolved set fits, and stays explicitly incomplete and resumable when more than 16 unresolved operations remain.
+The exact integrated head passes both TypeScript checks, production build, 23 repository tests, 77 money and Jev proofs, 229 F1 tests, 174 direct Convex tests, 155 browser-executor tests, 2 application tests, 19 provider-contract tests and 5 mounted user-path tests.
+The focused authority and reconciliation suite passes 24 tests with 248 assertions, including zero-effect record-changing probes and a 17-unresolved-operation pagination case.
+The completed reconciliation and direct-fixture worker worktrees were removed through Orca after their exact commits were preserved on Vasu-named remote branches.
+PR #1 still requires exact-latest-head Actions and Greptile closure plus one separate Astra ACCEPT verdict before F1 can be checked complete or merged.
+All results are controlled evidence only.
+No hosted Convex state, live provider call, owner-mailbox exchange, public site or commercial outcome was observed.
+
+### 2026-09-20 - e21950e integrated Astra-repair checkpoint
+
+Integrated the two repairs required by the separate Astra rejection of the prior exact PR head.
+Both `research.read` and `comparison.read` now refuse unrelated explanations and generic-commercial requests before durable job rows or operation binding, while preserving server-owned contextual purchasing reads and automatic supplier collection.
+Cancellation reconciliation now uses bounded indexed current-state snapshots to correct a stale unsampled count after late delivery; the exact 49-operation regression keeps the returned, stored and paginated unresolved inventory at 32.
+The exact integrated head passes TypeScript, production build, 23 repository tests, 77 money and Jev proofs, 234 F1 tests, 174 direct Convex tests, 155 browser-executor tests, 2 application tests, 19 provider-contract tests and 5 mounted user-path tests.
+The completed Devin attempts were stopped without approving opaque native requests; their useful partial patch was preserved for the Luna repair owner, and the completed Luna terminals were released after both repair commits were verified on Vasu-owned remote branches.
+PR #1 has not yet been pushed to this local checkpoint, so exact-head GitHub Actions, Greptile closure, conflict status and a fresh separate Astra verdict remain pending.
+All results are controlled local evidence only.
+No hosted Convex state, live provider call, owner-mailbox exchange, public site or commercial outcome was observed.
+
+### 2026-09-20 - e78844f second Astra-repair checkpoint
+
+The separate GPT-6 Astra reviewer rejected exact PR head `ba07217` after controlled reproductions showed that lone record nouns could still authorize read jobs, a temporary approver could make its own access permanent, and selection and approval scanned the entire project quote history.
+Integrated Luna's P1 authority repair and Muse Spark's P2 bounded-read repair through `e78844f` on the Vasu-owned PR branch.
+Read authority now requires an explicit purchasing-read cue at admission, operation binding and claim; delegated membership expiry cannot outlive the authority used to issue it; quote-successor detection now uses a project-and-supersedes index with a one-row existence probe.
+The bounded-read regressions are wired into the standard direct-test command and exercise the actual selection and approval handlers with 300 unrelated quotes under a 64-document transaction budget.
+The exact integrated head passes TypeScript, production build, 23 repository tests, 77 money and Jev proofs, 236 F1 tests, 179 direct Convex tests, 155 browser-executor tests, 2 application tests, 19 provider-contract tests and 5 mounted user-path tests.
+The implementation sessions were verified as GPT-5.6 Luna at max effort and OpenCode Go Muse Spark 1.3 Contributor at high effort.
+Two temporary `/tmp` probe permissions were inspected and approved once each; no persistent or broad worker permission was granted.
+PR #1 has not yet been pushed to this checkpoint, so exact-head GitHub Actions, Greptile closure, conflict status and a fresh separate Astra verdict remain pending.
+
+### 2026-09-20 - fc3ff7b third Astra-repair checkpoint
+
+The separate GPT-6 Astra reviewer rejected exact PR head `bad0c12` after controlled handler probes found a mixed-role expiry regression, unbounded membership-history authorization reads and a cross-project revocation existence oracle.
+Luna implemented exact indexed current-authority resolution, scope-first uniform revocation denial and actual-handler regressions for open and restricted permanent-approver delegation, mixed legacy and projected authority, 300 unrelated membership rows under a 64-document read budget and organization-owner migration compatibility.
+Coordinator review rejected the first repair commit until the restricted test matched Astra's project-scoped case and a projected temporary or expired row could no longer mask a permanent legacy row of the same role.
+The corrected integrated head `fc3ff7b` passes TypeScript, production build, 23 repository tests, 77 money and Jev proofs, 241 F1 tests, 179 direct Convex tests, 155 browser-executor tests, 2 application tests, 19 provider-contract tests and 5 mounted user-path tests.
+All evidence is controlled local execution only.
+No live provider, hosted identity, deployment, vendor outreach or external effect was claimed.
+F1 and PR merge remain open until this replacement exact head passes GitHub Actions and Greptile, GitHub reports no conflict and a fresh separate Astra reviewer accepts the same revision.
+
+### 2026-09-21 - 52df491 fourth Astra-repair checkpoint
+
+The separate GPT-6 Astra reviewer rejected exact PR head `e9068fc` after controlled public-handler probes found three authority defects.
+A temporary approver combined with a permanent viewer or contributor could delegate that lower role permanently, a temporary organization owner received permanent project ownership, and a 25-row history prefix could hide valid organization authority.
+Luna repaired the three defects with role-qualified delegation horizons, propagated organization-owner expiry into project membership and authority projection rows, and replaced the history-prefix scan with bounded exact projection and legacy ranges.
+The exact integrated head passes both TypeScript checks, production build, 23 repository tests, 77 money and Jev proofs, 244 F1 tests, 180 direct Convex tests, 155 browser-executor tests, 2 application tests, 19 provider-contract tests and 5 mounted user-path tests.
+The implementation worker ran as GPT-5.6 Luna with max reasoning on the Vasu-owned branch, and its pushed commit `c6d2059c` matched the remote before integration as `52df491`.
+All evidence is controlled local execution only.
+No live provider, hosted identity, deployment, vendor outreach or external effect was claimed.
+F1 and PR merge remain open until this replacement exact head passes GitHub Actions and Greptile, GitHub reports no conflict and a fresh separate Astra reviewer accepts the same revision.

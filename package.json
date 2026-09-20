@@ -1,0 +1,45 @@
+{
+  "name": "openingos",
+  "private": true,
+  "type": "module",
+  "packageManager": "bun@1.3.11",
+  "scripts": {
+    "test:repository": "node --test scripts/check-pr.test.mjs scripts/check-workbench.test.mjs",
+    "test:proofs": "bun test proofs",
+    "test:browser": "bun test browser-executor",
+    "typecheck:proofs": "tsc --noEmit",
+    "typecheck:browser": "tsc -p tsconfig.browser-executor.json",
+    "typecheck": "tsc --noEmit",
+    "build": "vite build",
+    "test": "bun run test:repository && bun run test:proofs && bun run test:f1 && bun run test:browser && bun test app/tests/application.test.ts && bun run test:direct",
+    "test:direct": "bunx vitest run convex/handlers.direct.test.ts convex/domain/domainGraph.direct.test.ts convex/domain/waveB1.direct.test.ts convex/domain/waveB2.direct.test.ts convex/domain/f1r09.direct.test.ts convex/domain/f1r06r21.direct.test.ts convex/domain/f1r13.direct.test.ts convex/domain/quoteSuccessorBounded.direct.test.ts --environment edge-runtime",
+    "test:f1": "bun test convex/access convex/execution convex/purchasing convex/shared convex/domain/domainContracts.test.ts",
+    "test:provider-contracts": "bun test app/tests/provider-contracts.test.ts",
+    "test:user-path": "bun test app/tests/user-path.test.ts"
+  },
+  "devDependencies": {
+    "@edge-runtime/vm": "5.0.0",
+    "@types/bun": "1.3.11",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@types/validator": "13.15.10",
+    "@vitejs/plugin-react": "6.1.1",
+    "convex-test": "0.0.59",
+    "happy-dom": "20.14.5",
+    "typescript": "7.0.2",
+    "vite": "8.3.0",
+    "vitest": "5.0.1"
+  },
+  "dependencies": {
+    "@agentmail/convex": "0.1.0",
+    "@auth/core": "0.41.1",
+    "@convex-dev/auth": "0.0.95",
+    "@convex-dev/workflow": "0.4.6",
+    "@convex-dev/workpool": "0.4.7",
+    "@firecrawl/firecrawl-convex": "0.1.1",
+    "convex": "1.46.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "validator": "13.15.35"
+  }
+}

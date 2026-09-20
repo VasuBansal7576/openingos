@@ -2,7 +2,9 @@
 
 Use this plan when application implementation is authorized.
 This document does not authorize deployment, provider spending, external mail or account changes.
-No package below has been implemented or verified yet.
+The controlled portion of F0 is implemented and independently reviewed at `6432e98`.
+S-01 and S-03 pass under controlled evidence; S-02 and every hosted/live gate remain open.
+F1 and later packages remain incomplete.
 
 ## Read the contracts before taking a package
 
@@ -18,7 +20,7 @@ Use the [coordinator roadmap](../../ROADMAP.md) for setup and build order; `AGEN
 
 The PRD owns product requirements.
 Accepted ADRs own architecture choices; their linked contracts define the selected interfaces.
-Proposed ADRs permit only explicitly authorized proof work, not independent feature implementation.
+Each ADR's status and evidence amendment defines the accepted implementation surface; open hosted/live gates do not authorize provider effects.
 Keep requirement identifiers unchanged and record contrary evidence before amending a decision.
 All hackathon mail targets the owner's privately configured mailbox, with the owner playing the supplier.
 Read the [owner-only communication contract](../integrations/sponsor-contracts.md#hackathon-owner-only-communication) before implementing any provider write or recovery path.
@@ -28,8 +30,8 @@ Do not contact real vendors or substitute scripted supplier replies for the real
 
 The existing F0, F1, R1, C1, U1 and V1 package identifiers retain their meaning from ADR-0008.
 The entries here specify their sponsor-integration work, not a replacement for the rest of the product.
-All file paths in the ownership column are planned paths until the application foundation exists.
-The foundation owner may map them to the starter's layout once and record that mapping before dispatch.
+The application foundation now exists at the repository paths shown below.
+The foundation owner records any required path amendment before dispatch.
 
 | Package | Work and owned files | Prerequisites | Return before handoff |
 | --- | --- | --- | --- |
@@ -40,7 +42,7 @@ The foundation owner may map them to the starter's layout once and record that m
 | U1 workbench | Connect the accepted design to authorized paginated queries and explicit job/evidence/delivery states. Own the starter's UI directory and UI tests | Accepted F1 result contracts; controlled R1/C1 fixtures | S-20 UI results, keyboard/narrow-screen checks, no invented live outcomes |
 | V1 integrated path | Exercise real sponsor work through the published app and collect submission evidence. Own integrated user-path tests and their evidence manifest | Combined R1/C1/U1 result; approved OpenAI/Jev contracts; separate browser proof | S-21 result, original PRD evaluator checks, latest-head CI and explicit unmet requirements |
 
-F0 and F1 are proof work that helps accept or revise the ADR proposals.
+F0 and F1 are proof work that accepts or revises the ADR contracts without claiming live behavior.
 Do not require completed feature work to approve the contracts it needs.
 R1, C1 and U1 may run in parallel only after F1's shared contracts are committed and accepted.
 Only the foundation owner changes registration, routes, schema, shared validators or the lockfile.
@@ -153,7 +155,7 @@ Those 23 tests do not execute the planned sponsor integrations.
 | Shared schema needs a change | Ask the foundation owner for the contract amendment; continue independent owned work |
 
 Netherlands/EUR is the selected hackathon market; see PRD section 52 for representative sources.
-Astra resolves identity, browser hosting and model calibration through the ADR register's proof tasks without reducing the agreed product.
+The active OpeningOS coordinator resolves identity, browser hosting and model calibration through the ADR register's proof tasks without reducing the agreed product.
 
 ## Return a complete handoff
 

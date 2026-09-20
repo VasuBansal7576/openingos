@@ -16,6 +16,8 @@ That is a tracked project skill, loaded through this file rather than a global i
 The user selected the purchasing workbench and rejected the opening-scene and price-route designs.
 The complete selected fixture prototype is preserved in `design/purchasing-workbench.html`, including its images, fonts and runtime.
 It is a design reference, not production application code or an approved architecture.
+The production application must match the selected prototype's design quality, interaction smoothness and user flow while using real backend state and authorized provider integrations underneath it.
+Fixtures may support controlled tests, but they must never masquerade as live data or external success.
 Do not reintroduce rejected designs, a design switcher, or prototype build infrastructure.
 Keep future design explorations as lightweight clickable screens unless the user asks for application engineering.
 Do not treat proposed ADRs, a green tooling check, or demonstration fixtures as completed product behavior.
@@ -28,10 +30,12 @@ Do not treat proposed ADRs, a green tooling check, or demonstration fixtures as 
 - All hackathon outreach goes only to the owner's privately configured mailbox, with the owner playing the supplier; block real-vendor email, contact forms and alternate channels in every workspace.
 - Use real providers for live runs and preserve honest waiting/failure states; label owner-authored terms as controlled demo evidence, never genuine vendor quotes or realized savings.
 - Use Orca for developer orchestration when authorized; it is not the customer application's runtime.
-- Use Codex CLI `gpt-6-astra` as coordinator and a separate `gpt-6-astra` session as independent reviewer.
+- Use the active OpeningOS orchestrator as coordinator and a separate Codex CLI `gpt-6-astra` session as independent reviewer.
 - Use OpenCode Go `opencode-go/muse-spark-1.3-contributor` and Codex CLI `gpt-5.6-luna` as implementation workers; verify effective models before assigning work.
-- Astra owns setup, proof tasks and routine technical decisions; accept or amend proposed ADRs from evidence before dependent workers start.
+- The coordinator owns setup, proof tasks and routine technical decisions; accept or amend proposed ADRs from evidence before dependent workers start.
 - The coordinator handles routine worker permissions and recovery within existing authority, not blanket approvals, security bypasses or new spending.
+- Inspect each worker permission request, approve only a narrowly scoped command within its assigned package, and verify that the worker resumes after the decision.
+- Keep `ROADMAP.md` checkboxes factual and current after each verified wave; mark an item complete only from observed evidence.
 - Preserve existing uncommitted work and stable P-, H-, and D- requirement meanings.
 - Keep the customer assistant limited to shipped, enabled OpeningOS workflows; see the PRD's product capability boundary and D-17.
 - A clearly out-of-scope customer request receives a brief refusal and stops; do not answer it, launch tools for it, or retry it as an agent failure.
@@ -71,3 +75,19 @@ Use the project-local hackathon skill to update `hackathon.md` after meaningful 
 During multi-worker runs, the coordinator is the sole build-log writer; workers return commit/test evidence instead of editing the same log concurrently.
 Update and push the factual log after verified integrated checkpoints and before a pause or submission.
 Update README setup and status when those facts change; do not claim that instructions are a running background automation.
+Before UI handoff, test the complete integrated flow with Playwright or Computer Use at desktop and narrow widths, including keyboard navigation and loading, empty, error and recovery states.
+Compare the result against `design/purchasing-workbench.html` and any supplied prototype recording for visual polish, interaction smoothness and user-flow fidelity while verifying that all displayed outcomes come from real application state.
+
+<!-- convex-ai-start -->
+
+This project uses [Convex](https://convex.dev) as its backend.
+
+When working on Convex code, **always read
+`convex/_generated/ai/guidelines.md` first** for important guidelines on
+how to correctly use Convex APIs and patterns. The file contains rules that
+override what you may have learned about Convex from training data.
+
+Convex agent skills for common tasks can be installed by running
+`npx convex ai-files install`.
+
+<!-- convex-ai-end -->
