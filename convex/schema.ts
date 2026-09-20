@@ -903,7 +903,12 @@ export default defineSchema({
     .index("by_project", ["projectId"])
     .index("by_contentHash", ["contentHash"])
     .index("by_project_and_version", ["projectId", "version"])
-    .index("by_project_and_contentHash", ["projectId", "contentHash"]),
+    .index("by_project_and_contentHash", ["projectId", "contentHash"])
+    // Successor-existence lookup: find the bounded set of revisions whose
+    // `supersedes` points at a predecessor content hash inside one project.
+    // Rows without `supersedes` never enter this index; an existence probe
+    // reads at most one row instead of collecting the project's history.
+    .index("by_project_and_supersedes", ["projectId", "supersedes"]),
 
   scopeDecisions: defineTable({
     organizationId: v.id("organizations"),

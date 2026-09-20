@@ -452,11 +452,15 @@ export const recordSelection = f1Mutation({
     // recorded successor (supersedes === this content hash) makes a new
     // selection of the old terms a stale-basis denial. Historical
     // selections and orders stay intact; only new authority is refused.
-    const revisionSuccessors = await ctx.db
+    // Bounded indexed existence probe (PRD 30): reads at most one indexed
+    // successor row instead of collecting the project's quote history.
+    const revisionSuccessor = await ctx.db
       .query("quotes")
-      .withIndex("by_project", (q) => q.eq("projectId", args.projectId))
-      .collect();
-    if (revisionSuccessors.some((entry) => entry.supersedes === quote.contentHash)) {
+      .withIndex("by_project_and_supersedes", (q) =>
+        q.eq("projectId", args.projectId).eq("supersedes", quote.contentHash),
+      )
+      .first();
+    if (revisionSuccessor !== null) {
       return { ok: false as const, code: "stale-quote-version", message: "quote version has been superseded; select the current revision" };
     }
     if (
@@ -676,11 +680,15 @@ export const decideApproval = f1Mutation({
     for (const basisQuoteId of basisQuoteIds) {
       const basisQuote = await ctx.db.get(basisQuoteId);
       if (basisQuote === null) continue;
-      const basisSuccessors = await ctx.db
+      // Bounded indexed existence probe (PRD 30): one row at most per
+      // basis quote, never a full project collect per loop iteration.
+      const basisSuccessor = await ctx.db
         .query("quotes")
-        .withIndex("by_project", (q) => q.eq("projectId", args.projectId))
-        .collect();
-      if (basisSuccessors.some((entry) => entry.supersedes === basisQuote.contentHash)) {
+        .withIndex("by_project_and_supersedes", (q) =>
+          q.eq("projectId", args.projectId).eq("supersedes", basisQuote.contentHash),
+        )
+        .first();
+      if (basisSuccessor !== null) {
         return { ok: false as const, code: "stale-approval-basis", message: "quoted terms changed since approval; renewed authority required" };
       }
     }
