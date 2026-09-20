@@ -23,7 +23,7 @@ import * as operations from "../execution/operations.js";
 import { checkProjectAccess, denialValidator } from "../access/checks.js";
 import { lookupCapability } from "../shared/scope.js";
 import { canonicalJson, parseBoundedPayloadJson } from "../shared/hashing.js";
-import { sha256BindingOk } from "../shared/sha256.js";
+import { sha256BindingOk, sha256Hex } from "../shared/sha256.js";
 import { isExpired } from "../shared/time.js";
 
 export const OPENAI_ENDPOINT = "https://api.openai.com/v1/responses" as const;
@@ -37,6 +37,7 @@ export const OPENAI_MAX_OUTPUT_BYTES = 32 * 1024;
 export const OPENAI_MAX_SOURCE_COUNT = 16 as const;
 export const OPENAI_MAX_FIELDS = 32 as const;
 export const OPENAI_MAX_TOKEN_CEILING = 1_000_000 as const;
+export const OPENAI_WORKLOAD_BINDING_PREFIX = "[openingos-openai-workload:v1" as const;
 
 export const OPENAI_PRICING_ENV_VARS = {
   inputMicroUsdPerMillion: "OPENAI_INPUT_MICRO_USD_PER_MILLION",
@@ -85,6 +86,27 @@ export interface SupplierDraftWorkload {
 }
 
 export type OpenAIWorkload = CommercialExtractionWorkload | SupplierDraftWorkload;
+
+/**
+ * The workflow payload carries this exact digest because the generic F1
+ * operation contract intentionally admits only its workflow envelope.
+ * The digest covers the parsed workload, including every value used to build
+ * the provider prompt, rather than merely the input version or source refs.
+ */
+export interface OpenAIWorkloadBinding {
+  readonly kind: OpenAIWorkload["kind"];
+  readonly workloadSha256: string;
+}
+
+/** The exact generic F1 communication envelope used for supplier drafts. */
+export interface OpenAICommunicationPayload {
+  readonly profile: string;
+  readonly to: string;
+  readonly cc: readonly string[];
+  readonly bcc: readonly string[];
+  readonly subject: string;
+  readonly body: string;
+}
 
 export interface OpenAISourceRef {
   readonly sourceId: string;
@@ -326,6 +348,10 @@ function isNonEmptyString(value: unknown, maxBytes = 8_192): value is string {
   );
 }
 
+function isBoundedStringArray(value: unknown, maxBytes = 4_096): value is readonly string[] {
+  return Array.isArray(value) && value.every((entry) => isNonEmptyString(entry, maxBytes));
+}
+
 function isSafeNonNegativeInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
@@ -432,6 +458,119 @@ function parseWorkload(value: unknown, inputVersion: string): Valid<ParsedWorklo
     return { ok: true, value: { kind, inputVersion, draftKind, brief, sources: parsedSources } };
   }
   return { ok: false, reason: "unknown-workload" };
+}
+
+function workloadBindingText(binding: OpenAIWorkloadBinding): string {
+  return `${OPENAI_WORKLOAD_BINDING_PREFIX} kind=${binding.kind} sha256=${binding.workloadSha256}]`;
+}
+
+function parseOpenAIWorkloadBinding(
+  payload: unknown,
+): Valid<{
+  readonly carrier: "query" | "subject";
+  readonly binding: OpenAIWorkloadBinding;
+}> | Invalid {
+  if (!isPlainRecord(payload)) return { ok: false, reason: "openai-workload-binding-shape" };
+  const carrier = hasOnlyKeys(payload, ["query"])
+    ? "query"
+    : hasOnlyKeys(payload, ["profile", "to", "cc", "bcc", "subject", "body"])
+      ? "subject"
+      : null;
+  if (carrier === null) return { ok: false, reason: "openai-workload-binding-shape" };
+  const carrierValue = payload[carrier];
+  if (!isNonEmptyString(carrierValue, 65_536)) {
+    return { ok: false, reason: "openai-workload-binding-query" };
+  }
+  const markerIndex = carrierValue.indexOf(OPENAI_WORKLOAD_BINDING_PREFIX);
+  if (
+    markerIndex <= 0 ||
+    markerIndex !== carrierValue.lastIndexOf(OPENAI_WORKLOAD_BINDING_PREFIX) ||
+    carrierValue.slice(0, markerIndex).trim().length === 0
+  ) {
+    return { ok: false, reason: "openai-workload-binding-missing" };
+  }
+  const suffix = carrierValue.slice(markerIndex);
+  const match = /^\[openingos-openai-workload:v1 kind=(commercialExtraction|supplierDraft) sha256=([0-9a-f]{64})\]$/.exec(suffix);
+  if (match === null) return { ok: false, reason: "openai-workload-binding-shape" };
+  const kind = match[1];
+  const workloadSha256 = match[2];
+  if (kind !== "commercialExtraction" && kind !== "supplierDraft") {
+    return { ok: false, reason: "openai-workload-binding-kind" };
+  }
+  if (workloadSha256 === undefined) return { ok: false, reason: "openai-workload-binding-digest" };
+  return {
+    ok: true,
+    value: {
+      carrier,
+      binding: { kind, workloadSha256 },
+    },
+  };
+}
+
+function workloadBindingMatches(
+  payload: unknown,
+  workloadKind: OpenAIWorkload["kind"],
+  workloadSha256: string,
+): Valid<OpenAIWorkloadBinding> | Invalid {
+  const parsed = parseOpenAIWorkloadBinding(payload);
+  if (!parsed.ok) return parsed;
+  if (
+    parsed.value.carrier !== (workloadKind === "commercialExtraction" ? "query" : "subject") ||
+    parsed.value.binding.kind !== workloadKind ||
+    parsed.value.binding.workloadSha256 !== workloadSha256
+  ) {
+    return { ok: false, reason: "openai-workload-binding-mismatch" };
+  }
+  return { ok: true, value: parsed.value.binding };
+}
+
+/**
+ * Build the canonical F1 workflow payload for an OpenAI operation. F1's
+ * generic research and communication payloads intentionally carry only their
+ * workflow envelope, so this helper puts a cryptographic binding for the
+ * complete parsed workload in the query or communication subject. Callers must
+ * use the returned payload for both grant approval and operation creation;
+ * changing any prompt-affecting workload value then fails before an operation
+ * can be claimed.
+ */
+export async function bindOpenAIWorkloadPayload(
+  workload: OpenAIWorkload,
+  workflowPayload: string | OpenAICommunicationPayload,
+): Promise<string> {
+  const parsed = parseWorkload(workload, workload.inputVersion);
+  if (!parsed.ok) throw new Error(`invalid OpenAI workload: ${parsed.reason}`);
+  const workloadSha256 = await sha256Hex(parsed.value);
+  const binding = workloadBindingText({ kind: parsed.value.kind, workloadSha256 });
+  if (parsed.value.kind === "commercialExtraction") {
+    if (
+      typeof workflowPayload !== "string" ||
+      !isNonEmptyString(workflowPayload, 8_192) ||
+      workflowPayload.includes(OPENAI_WORKLOAD_BINDING_PREFIX)
+    ) {
+      throw new Error("commercial extraction requires an unbound workflow query");
+    }
+    return canonicalJson({ query: `${workflowPayload.trim()} ${binding}` });
+  }
+  if (typeof workflowPayload === "string") {
+    throw new Error("supplier draft requires an unbound communication payload");
+  }
+  const candidate: unknown = workflowPayload;
+  const cc = isPlainRecord(candidate) ? candidate["cc"] : undefined;
+  const bcc = isPlainRecord(candidate) ? candidate["bcc"] : undefined;
+  if (
+    !isPlainRecord(candidate) ||
+    !hasOnlyKeys(candidate, ["profile", "to", "cc", "bcc", "subject", "body"]) ||
+    !isNonEmptyString(candidate["profile"], 256) ||
+    !isNonEmptyString(candidate["to"], 4_096) ||
+    !isNonEmptyString(candidate["subject"], 8_192) ||
+    String(candidate["subject"]).includes(OPENAI_WORKLOAD_BINDING_PREFIX) ||
+    !isNonEmptyString(candidate["body"], OPENAI_MAX_OUTPUT_BYTES) ||
+    !isBoundedStringArray(cc) ||
+    !isBoundedStringArray(bcc)
+  ) {
+    throw new Error("supplier draft requires an exact communication payload");
+  }
+  return canonicalJson({ ...workflowPayload, subject: `${workflowPayload.subject.trim()} ${binding}` });
 }
 
 const SOURCE_REF_SCHEMA = {
@@ -1056,6 +1195,7 @@ export const attemptFence = f1InternalQuery({
     inputVersion: v.string(),
     payloadJson: v.string(),
     workloadKind: v.union(v.literal("commercialExtraction"), v.literal("supplierDraft")),
+    workloadSha256: v.string(),
   },
   returns: fenceResultValidator,
   handler: async (ctx, args) => {
@@ -1076,6 +1216,18 @@ export const attemptFence = f1InternalQuery({
     }
     if (operation.normalizedPayload !== args.payloadJson) {
       return { ok: false as const, code: "changed-draft", message: "approved payload changed during dispatch" };
+    }
+    const parsedPayload = parseBoundedPayloadJson(args.payloadJson);
+    if (!parsedPayload.ok || parsedPayload.payload.canonical !== args.payloadJson) {
+      return { ok: false as const, code: "invalid-payload", message: "payload must be canonical bounded JSON" };
+    }
+    const workloadBinding = workloadBindingMatches(
+      parsedPayload.payload.value,
+      args.workloadKind,
+      args.workloadSha256,
+    );
+    if (!workloadBinding.ok) {
+      return { ok: false as const, code: "changed-draft", message: "approved payload does not bind the exact OpenAI workload" };
     }
     const job = await ctx.db.get(operation.jobId);
     if (
@@ -1247,10 +1399,11 @@ const resultValidator = v.union(
 const actionResultValidator = v.union(resultValidator, denialValidator);
 
 function ambiguousOutcome(result: OpenAIOutcome): boolean {
-  return (
-    result.attempts === 1 &&
-    (result.outcome === "unavailable" || result.outcome === "stale")
-  );
+  // Any non-success after fetch has been invoked is unresolved. A 2xx body
+  // that is malformed, schema-invalid, model-drifted, or missing trustworthy
+  // usage is not evidence that OpenAI did not process the request. Only a
+  // definite pre-dispatch result (attempts === 0) may release its reservation.
+  return result.attempts === 1 && result.outcome !== "completed";
 }
 
 export const generate = internalAction({
@@ -1280,6 +1433,20 @@ export const generate = internalAction({
     if (!workload.ok) {
       return { ok: false as const, code: "invalid-payload", message: workload.reason };
     }
+    let workloadSha256: string;
+    try {
+      workloadSha256 = await sha256Hex(workload.value);
+    } catch {
+      return { ok: false as const, code: "invalid-payload", message: "OpenAI workload binding could not be computed" };
+    }
+    const workloadBinding = workloadBindingMatches(
+      parsedPayload.payload.value,
+      workload.value.kind,
+      workloadSha256,
+    );
+    if (!workloadBinding.ok) {
+      return { ok: false as const, code: "changed-draft", message: "approved payload does not bind the exact OpenAI workload" };
+    }
     // Build and size the workload before claim. The pure helper repeats these
     // checks from its immutable parsed snapshot before any provider call.
     const estimatedInputTokens = Math.ceil(new TextEncoder().encode(requestInput(workload.value)).byteLength / 4);
@@ -1304,6 +1471,7 @@ export const generate = internalAction({
           inputVersion: args.inputVersion,
           payloadJson: parsedPayload.payload.canonical,
           workloadKind: workload.value.kind,
+          workloadSha256,
         });
         return fence.ok ? fence : { ok: false as const, reason: fence.code };
       },
