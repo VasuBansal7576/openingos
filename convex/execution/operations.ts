@@ -721,19 +721,23 @@ export const create = f1Mutation({
     // snapshots are exact, owner-only envelopes under the current authority.
     // Unavailable bodies and supplier-evidence instructions were rejected
     // above and can never enter this branch.
+    const communicationPayloadMatchesGrant =
+      isCommunicationKind(args.kind) &&
+      sameCanonicalPayload(submittedCanonical, grant.canonicalPayload) &&
+      submittedHash === grant.payloadHash;
     const communicationScopeException =
       isCommunicationKind(args.kind) &&
       operationEnvelope?.ok === true &&
-      sameCanonicalPayload(submittedCanonical, grant.canonicalPayload) &&
-      submittedHash === grant.payloadHash &&
+      communicationPayloadMatchesGrant &&
       operationClassification.verdict === "unrelatedRefused" &&
       grantClassification.verdict === "unrelatedRefused" &&
       !isScopeInjectionRefusal(operationClassification) &&
       !isScopeInjectionRefusal(grantClassification);
     if (
       isCommunicationKind(args.kind) &&
-      (!sameCanonicalPayload(submittedCanonical, grant.canonicalPayload) ||
-        submittedHash !== grant.payloadHash)
+      operationClassification.verdict === "unrelatedRefused" &&
+      grantClassification.verdict === "unrelatedRefused" &&
+      !communicationPayloadMatchesGrant
     ) {
       return { ok: false as const, code: "changed-draft", message: "operation payload does not exactly match the approved grant" };
     }
