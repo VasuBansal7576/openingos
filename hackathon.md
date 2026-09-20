@@ -285,5 +285,13 @@ The exact integrated head passes TypeScript, production build, 23 repository tes
 The implementation sessions were verified as GPT-5.6 Luna at max effort and OpenCode Go Muse Spark 1.3 Contributor at high effort.
 Two temporary `/tmp` probe permissions were inspected and approved once each; no persistent or broad worker permission was granted.
 PR #1 has not yet been pushed to this checkpoint, so exact-head GitHub Actions, Greptile closure, conflict status and a fresh separate Astra verdict remain pending.
-All results are controlled local evidence only.
-No hosted Convex state, live provider call, owner-mailbox exchange, public site or commercial outcome was observed.
+
+### 2026-09-20 - fc3ff7b third Astra-repair checkpoint
+
+The separate GPT-6 Astra reviewer rejected exact PR head `bad0c12` after controlled handler probes found a mixed-role expiry regression, unbounded membership-history authorization reads and a cross-project revocation existence oracle.
+Luna implemented exact indexed current-authority resolution, scope-first uniform revocation denial and actual-handler regressions for open and restricted permanent-approver delegation, mixed legacy and projected authority, 300 unrelated membership rows under a 64-document read budget and organization-owner migration compatibility.
+Coordinator review rejected the first repair commit until the restricted test matched Astra's project-scoped case and a projected temporary or expired row could no longer mask a permanent legacy row of the same role.
+The corrected integrated head `fc3ff7b` passes TypeScript, production build, 23 repository tests, 77 money and Jev proofs, 241 F1 tests, 179 direct Convex tests, 155 browser-executor tests, 2 application tests, 19 provider-contract tests and 5 mounted user-path tests.
+All evidence is controlled local execution only.
+No live provider, hosted identity, deployment, vendor outreach or external effect was claimed.
+F1 and PR merge remain open until this replacement exact head passes GitHub Actions and Greptile, GitHub reports no conflict and a fresh separate Astra reviewer accepts the same revision.
