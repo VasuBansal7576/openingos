@@ -10,7 +10,7 @@ import { describe, expect, test } from "bun:test";
 import { chargeBlocksCompleteOffer, checkCurrency, checkMoney, makeCheckedMoney } from "./money.js";
 import { canonicalJson, payloadHash, requestKey } from "./hashing.js";
 import { isValidSingleMailbox, normalizeMailbox } from "./mailbox.js";
-import { sameCanonicalPayload, sha256BindingOk, sha256Hex } from "./sha256.js";
+import { sameCanonicalPayload, sha256BindingOk, sha256Hex, sha256HexSync } from "./sha256.js";
 
 describe("money (integer minor units, ISO currency)", () => {
   test("accepts integer minor units with ISO code", () => {
@@ -85,6 +85,21 @@ describe("canonical payload binding", () => {
     expect(first).toHaveLength(64);
     const changed = await sha256Hex({ to: "other@example.test", cc: [] as string[] });
     expect(changed).not.toBe(first);
+  });
+
+  test("synchronous SHA-256 matches crypto.subtle byte for byte", async () => {
+    const vectors = ["", "abc", "owner-supplier@example.test|communication.send|req-1"];
+    for (const text of vectors) {
+      const bytes = new TextEncoder().encode(text);
+      const subtle = await crypto.subtle.digest("SHA-256", bytes);
+      const expected = [...new Uint8Array(subtle)]
+        .map((byte) => byte.toString(16).padStart(2, "0"))
+        .join("");
+      expect(sha256HexSync(bytes)).toBe(expected);
+    }
+    expect(sha256HexSync(new TextEncoder().encode(""))).toBe(
+      "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    );
   });
 
   test("digest cross-check fails closed only on present mismatch", () => {

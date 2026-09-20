@@ -28,7 +28,7 @@ import {
 } from "./hashing.js";
 import { isValidSingleMailbox, normalizeMailbox } from "./mailbox.js";
 import { compareStoredQuotes, parseQuoteDocument, quoteDecisionFields, storedQuoteParts } from "./quoteSemantics.js";
-import { sameCanonicalPayload, sha256BindingOk } from "./sha256.js";
+import { sameCanonicalPayload, sha256BindingOk, sha256HexSync } from "./sha256.js";
 import { isExpired } from "./time.js";
 import {
   classifyScope,
@@ -1810,27 +1810,31 @@ export class ControlledBackend {
       }
     }
     const parts = storedQuoteParts(parsed);
+    const decision = quoteDecisionFields({
+      organizationId,
+      projectId,
+      version: parsed.version,
+      currency: parts.currency,
+      lines: parts.lines,
+      charges: parts.charges,
+      taxBasis: parts.taxBasis,
+      ...(parts.comparisonScope === undefined ? {} : { comparisonScope: parts.comparisonScope }),
+      evidenceRefs: parts.evidenceRefs,
+      counterpartyRole: input.counterpartyRole,
+      executionMode: input.executionMode,
+      ...(input.conversationId === undefined ? {} : { conversationId: input.conversationId }),
+      ...(input.supersedes === undefined ? {} : { supersedes: input.supersedes }),
+    });
+    // Controlled parity with the Convex handler: lineage is SHA-256 over
+    // the canonical decision fields, computed synchronously.
+    const contentHash = sha256HexSync(new TextEncoder().encode(canonicalJson(decision)));
     const quote: Quote = {
       id: this.next("quote"),
       organizationId,
       projectId,
       conversationId: input.conversationId ?? null,
       version: parsed.version,
-      contentHash: payloadHash(quoteDecisionFields({
-        organizationId,
-        projectId,
-        version: parsed.version,
-        currency: parts.currency,
-        lines: parts.lines,
-        charges: parts.charges,
-        taxBasis: parts.taxBasis,
-        ...(parts.comparisonScope === undefined ? {} : { comparisonScope: parts.comparisonScope }),
-        evidenceRefs: parts.evidenceRefs,
-        counterpartyRole: input.counterpartyRole,
-        executionMode: input.executionMode,
-        ...(input.conversationId === undefined ? {} : { conversationId: input.conversationId }),
-        ...(input.supersedes === undefined ? {} : { supersedes: input.supersedes }),
-      })),
+      contentHash,
       currency: parts.currency,
       lines: Object.freeze(parts.lines.map((line) => ({ ...line, evidenceRefs: [...line.evidenceRefs] }))),
       charges: Object.freeze(parts.charges.map((charge) => ({ ...charge, evidenceRefs: [...charge.evidenceRefs] }))),

@@ -2064,6 +2064,7 @@ describe("direct checkpoint-A authority hardening", () => {
     const asOwner = t.withIdentity(OWNER_A);
     const first = await asOwner.mutation(recordQuoteRef, quoteBArgs(setup.orgId, setup.projectId, "qb-lineage-a"));
     if (!first.ok) throw new Error("first setup failed");
+    expect(first.contentHash).toMatch(/^[0-9a-f]{64}$/);
     const lineage = await t.run(async (ctx) => {
       const row = await ctx.db.get(first.quoteId);
       return row?.counterpartyRole ?? null;
@@ -2075,6 +2076,7 @@ describe("direct checkpoint-A authority hardening", () => {
     });
     expect(second.ok).toBe(true);
     if (!second.ok) throw new Error("lineage revision failed");
+    expect(second.contentHash).toMatch(/^[0-9a-f]{64}$/);
     expect(second.contentHash).not.toBe(first.contentHash);
   });
 
