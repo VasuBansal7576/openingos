@@ -600,6 +600,7 @@ describe("direct full graph journey through required indexes", () => {
       quoteVersion: "q-journey-1",
       quantity: "1",
       requirementVersion: 1,
+      idempotencyKey: "selection-journey",
     });
     if (!selection.ok) throw new Error("selection failed");
 
@@ -885,6 +886,7 @@ describe("direct cross-project reference rejection", () => {
       quoteVersion: "q-a-1",
       quantity: "1",
       requirementVersion: 1,
+      idempotencyKey: "selection-foreign-reference",
     });
     expect(foreignSelection.ok).toBe(false);
     if (!foreignSelection.ok) expect(foreignSelection.code).toBe("denied-project");
@@ -898,6 +900,7 @@ describe("direct cross-project reference rejection", () => {
       quoteVersion: "q-b-1",
       quantity: "1",
       requirementVersion: 1,
+      idempotencyKey: "selection-project-b",
     });
     if (!selectionB.ok) throw new Error("selection B failed");
 
@@ -1206,6 +1209,7 @@ describe("direct dependency cycles, variant identity, and version keys", () => {
       quoteVersion: "q-col-1",
       quantity: "1",
       requirementVersion: 1,
+      idempotencyKey: "selection-column-lineage",
     });
     if (!selection.ok) throw new Error("selection failed");
     const orderArgs = {
@@ -1439,6 +1443,7 @@ describe("direct provenance and reuse boundaries", () => {
       quoteVersion: "q-reuse-1",
       quantity: "1",
       requirementVersion: 1,
+      idempotencyKey: "selection-reuse",
     });
     if (!selection.ok) throw new Error("selection failed");
     const order = await asOwner.mutation(recordOrderRef, {
@@ -1538,6 +1543,7 @@ describe("direct provenance and reuse boundaries", () => {
       quoteVersion: "q-ver-2",
       quantity: "1",
       requirementVersion: 1,
+      idempotencyKey: "selection-wrong-quote-version",
     });
     expect(wrongQuoteVersion.ok).toBe(false);
 
@@ -1550,6 +1556,7 @@ describe("direct provenance and reuse boundaries", () => {
       quoteVersion: "q-ver-1",
       quantity: "1",
       requirementVersion: 2,
+      idempotencyKey: "selection-stale-requirement",
     });
     expect(staleRequirement.ok).toBe(false);
 
@@ -1747,6 +1754,7 @@ describe("direct audit repairs: authority, hashes, bounds, lineage", () => {
       quoteVersion: "q-acc-1",
       quantity: "2",
       requirementVersion: 1,
+      idempotencyKey: "selection-acceptance",
     });
     if (!selection.ok) throw new Error("selection failed");
     const order = await asOwner.mutation(recordOrderRef, {
@@ -2484,6 +2492,7 @@ describe("direct second-round repairs: bindings, pins, replay, lineage", () => {
       quoteVersion: "q-ml-1",
       quantity: "1",
       requirementVersion: 1,
+      idempotencyKey: "selection-mixed-currency",
     });
     expect(mixed.ok).toBe(false);
     if (!mixed.ok) expect(mixed.code).toBe("invalid-payload");
@@ -2496,6 +2505,7 @@ describe("direct second-round repairs: bindings, pins, replay, lineage", () => {
       quoteVersion: "q-ml-1",
       quantity: "0",
       requirementVersion: 1,
+      idempotencyKey: "selection-zero-quantity",
     });
     expect(zeroQuantity.ok).toBe(false);
     const selection = await asOwner.mutation(recordSelectionRef, {
@@ -2507,6 +2517,7 @@ describe("direct second-round repairs: bindings, pins, replay, lineage", () => {
       quoteVersion: "q-ml-1",
       quantity: "1",
       requirementVersion: 1,
+      idempotencyKey: "selection-cost-lineage",
     });
     if (!selection.ok) throw new Error("selection failed");
     const order = await asOwner.mutation(recordOrderRef, {

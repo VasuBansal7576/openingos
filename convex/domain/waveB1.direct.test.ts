@@ -12,6 +12,8 @@
  *   decisions; history stays intact.
  * - F1R-05: approval replay identity covers scope, links, and canonical
  *   text; divergence conflicts instead of returning the old row.
+ * - F1R-11: selection replay identity binds the project, normalized payload,
+ *   and selecting actor across sequential and concurrent retries.
  */
 
 import { convexTest } from "convex-test";
@@ -66,6 +68,11 @@ const createProjectRef = makeFunctionReference<
   MutationArgs<typeof memberships.createProject>,
   MutationReturn<typeof memberships.createProject>
 >("access/memberships:createProject");
+const grantProjectAccessRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof memberships.grantProjectAccess>,
+  MutationReturn<typeof memberships.grantProjectAccess>
+>("access/memberships:grantProjectAccess");
 const createRequirementRef = makeFunctionReference<
   "mutation",
   MutationArgs<typeof requirements.create>,
@@ -214,6 +221,7 @@ async function select(
   graph: { requirementId: Id<"requirements">; candidateId: Id<"candidates"> },
   quote: { quoteId: Id<"quotes"> },
   version: string,
+  idempotencyKey = `selection-${quote.quoteId}-${version}`,
 ) {
   return t.withIdentity(OWNER).mutation(recordSelectionRef, {
     organizationId: project.orgId,
@@ -224,6 +232,7 @@ async function select(
     quoteVersion: version,
     quantity: "1",
     requirementVersion: 1,
+    idempotencyKey,
   });
 }
 
@@ -432,13 +441,16 @@ describe("F1R-04 superseded terms authorize nothing new", () => {
     const graph = await setupGraph(t, project, "main");
     const v1 = await asOwner.mutation(recordQuoteRef, quoteArgs(project, "v1"));
     if (!v1.ok) throw new Error("v1 failed");
-    const first = await select(t, project, graph, v1, "v1");
+    const first = await select(t, project, graph, v1, "v1", "historical-selection");
     if (!first.ok) throw new Error("historical selection failed");
     const v2 = await asOwner.mutation(recordQuoteRef, quoteArgs(project, "v2", { supersedes: v1.contentHash }));
     if (!v2.ok) throw new Error("v2 failed");
-    const retry = await select(t, project, graph, v1, "v1");
-    expect(retry.ok).toBe(false);
-    if (!retry.ok) expect(retry.code).toBe("stale-quote-version");
+    const retry = await select(t, project, graph, v1, "v1", "historical-selection");
+    expect(retry.ok).toBe(true);
+    if (retry.ok) expect(retry.selectionId).toBe(first.selectionId);
+    const newCommand = await select(t, project, graph, v1, "v1", "new-selection-command");
+    expect(newCommand.ok).toBe(false);
+    if (!newCommand.ok) expect(newCommand.code).toBe("stale-quote-version");
     const rows = await t.run((ctx) => ctx.db.query("selections").collect());
     expect(rows).toHaveLength(1);
   });
@@ -643,5 +655,133 @@ describe("F1R-05 approval replay identity covers every material field", () => {
       snapshotHash,
     });
     expect(foreign.ok).toBe(false);
+  });
+});
+
+describe("F1R-11 selection replay identity", () => {
+  test("sequential and concurrent retries deduplicate normalized selections", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, "selection-replay");
+    const asOwner = t.withIdentity(OWNER);
+    const graph = await setupGraph(t, project, "main");
+    const quote = await asOwner.mutation(recordQuoteRef, quoteArgs(project, "v1"));
+    if (!quote.ok) throw new Error("quote failed");
+    const base = {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      requirementId: graph.requirementId,
+      candidateId: graph.candidateId,
+      quoteId: quote.quoteId,
+      quoteVersion: "v1",
+      requirementVersion: 1,
+      idempotencyKey: "selection-replay-key",
+    };
+    const first = await asOwner.mutation(recordSelectionRef, { ...base, quantity: "1.0" });
+    if (!first.ok) throw new Error("first selection failed");
+    expect(first.deduplicated).toBe(false);
+    const sequential = await asOwner.mutation(recordSelectionRef, { ...base, quantity: "1.00" });
+    if (!sequential.ok) throw new Error("sequential replay failed");
+    expect(sequential.deduplicated).toBe(true);
+    expect(sequential.selectionId).toBe(first.selectionId);
+
+    const concurrentKey = "selection-concurrent-key";
+    const concurrent = await Promise.all(
+      Array.from({ length: 6 }, () =>
+        asOwner.mutation(recordSelectionRef, {
+          ...base,
+          quantity: "1.000",
+          idempotencyKey: concurrentKey,
+        }),
+      ),
+    );
+    expect(concurrent.every((result) => result.ok)).toBe(true);
+    expect(concurrent.filter((result) => result.ok && !result.deduplicated)).toHaveLength(1);
+    expect(concurrent.filter((result) => result.ok && result.deduplicated)).toHaveLength(5);
+    const concurrentIds = concurrent.flatMap((result) => result.ok ? [result.selectionId] : []);
+    expect(new Set(concurrentIds).size).toBe(1);
+    const rows = await t.run((ctx) => ctx.db.query("selections").collect());
+    expect(rows).toHaveLength(2);
+  });
+
+  test("every material field and actor conflict without writing a second row", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, "selection-collision");
+    const asOwner = t.withIdentity(OWNER);
+    const projectBResult = await asOwner.mutation(createProjectRef, {
+      organizationId: project.orgId,
+      name: "selection-collision-other-project",
+      visibility: "open",
+    });
+    if (!projectBResult.ok) throw new Error("second project setup failed");
+    const projectB = { orgId: project.orgId, projectId: projectBResult.projectId };
+    const graph = await setupGraph(t, project, "main");
+    const otherGraph = await setupGraph(t, project, "other");
+    const quote = await asOwner.mutation(recordQuoteRef, quoteArgs(project, "v1"));
+    const quoteB = await asOwner.mutation(recordQuoteRef, quoteArgs(project, "v2"));
+    if (!quote.ok || !quoteB.ok) throw new Error("quote setup failed");
+    const base = {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      requirementId: graph.requirementId,
+      candidateId: graph.candidateId,
+      quoteId: quote.quoteId,
+      quoteVersion: "v1",
+      quantity: "1",
+      requirementVersion: 1,
+      idempotencyKey: "selection-collision-key",
+    };
+    const first = await asOwner.mutation(recordSelectionRef, base);
+    if (!first.ok) throw new Error("selection setup failed");
+    const conflicts = [
+      { ...base, requirementId: otherGraph.requirementId },
+      { ...base, candidateId: otherGraph.candidateId },
+      { ...base, quoteId: quoteB.quoteId },
+      { ...base, quoteVersion: "v2" },
+      { ...base, quantity: "2.0" },
+      { ...base, requirementVersion: 2 },
+    ];
+    for (const changed of conflicts) {
+      const result = await asOwner.mutation(recordSelectionRef, changed);
+      expect(result).toMatchObject({ ok: false, code: "duplicate-conflict" });
+    }
+    const otherActor = { tokenIdentifier: "wave-b1-selection-other-actor" };
+    const grant = await asOwner.mutation(grantProjectAccessRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      targetIdentity: otherActor.tokenIdentifier,
+      role: "approver",
+    });
+    if (!grant.ok) throw new Error("actor access setup failed");
+    const actorConflict = await t.withIdentity(otherActor).mutation(recordSelectionRef, base);
+    expect(actorConflict).toMatchObject({ ok: false, code: "duplicate-conflict" });
+
+    const rows = await t.run((ctx) => ctx.db.query("selections").collect());
+    expect(rows).toHaveLength(1);
+    const deliberate = await asOwner.mutation(recordSelectionRef, {
+      ...base,
+      idempotencyKey: "selection-deliberate-new-key",
+    });
+    expect(deliberate.ok).toBe(true);
+    if (deliberate.ok) expect(deliberate.deduplicated).toBe(false);
+    expect(deliberate.ok && deliberate.selectionId).not.toBe(first.selectionId);
+
+    const projectBGraph = await setupGraph(t, projectB, "main");
+    const projectBQuote = await asOwner.mutation(recordQuoteRef, quoteArgs(projectB, "v1"));
+    if (!projectBQuote.ok) throw new Error("second project quote setup failed");
+    const independent = await asOwner.mutation(recordSelectionRef, {
+      organizationId: projectB.orgId,
+      projectId: projectB.projectId,
+      requirementId: projectBGraph.requirementId,
+      candidateId: projectBGraph.candidateId,
+      quoteId: projectBQuote.quoteId,
+      quoteVersion: "v1",
+      quantity: "1",
+      requirementVersion: 1,
+      idempotencyKey: base.idempotencyKey,
+    });
+    expect(independent.ok).toBe(true);
+    if (independent.ok) expect(independent.deduplicated).toBe(false);
+    const allRows = await t.run((ctx) => ctx.db.query("selections").collect());
+    expect(allRows).toHaveLength(3);
   });
 });
