@@ -239,17 +239,18 @@ async function createFixture(
     visibility: "open",
   });
   if (!project.ok) throw new Error(`project setup failed: ${project.message}`);
-  const payloadJson = await openai.bindOpenAIWorkloadPayload(
-    extractionWorkload(),
-    "Research suppliers for the espresso machine",
-  );
+  const workloadSha256 = await openai.openAIWorkloadSha256(extractionWorkload());
+  const payloadJson = canonicalJson({ query: "Research suppliers for the espresso machine" });
   const grant = await asOwner.mutation(issueGrantRef, {
     organizationId: organization.organizationId,
     projectId: project.projectId,
     operations: ["research.collect"],
     communicationProfile: "ownerRoleplay",
     recipientConfigVersion: 0,
-    inputVersions: { brief: "openai-v1" },
+    inputVersions: {
+      brief: "openai-v1",
+      [openai.OPENAI_WORKLOAD_INPUT_VERSION_KEY]: workloadSha256,
+    },
     payloadJson,
     costCeilingMicroUsd: Math.max(10_000, pricing.maxReservationMicroUsd * 2),
     roundLimit: 8,
@@ -289,6 +290,121 @@ async function createFixture(
     organizationId: organization.organizationId,
     projectId: project.projectId,
     kind: "research.collect",
+    requestId,
+    payloadJson,
+    grantId: grant.grantId,
+    reservationId: reservation.reservationId,
+  });
+  if (!operation.ok) throw new Error(`operation setup failed: ${operation.message}`);
+  return {
+    t,
+    pricing,
+    organizationId: organization.organizationId,
+    projectId: project.projectId,
+    grantId: grant.grantId,
+    jobId: started.jobId,
+    operationId: operation.operationId,
+    reservationId: reservation.reservationId,
+    payloadJson,
+  };
+}
+
+async function createSupplierDraftFixture(
+  t: TestConvex<typeof schema>,
+  requestId: string,
+): Promise<Fixture> {
+  const asOwner = t.withIdentity(OWNER);
+  const pricing = controlledPricing();
+  const organization = await asOwner.mutation(createOrganizationRef, {
+    name: "OpenAI controlled communication organization",
+    kind: "private",
+  });
+  if (!organization.ok) throw new Error(`organization setup failed: ${organization.message}`);
+  const project = await asOwner.mutation(createProjectRef, {
+    organizationId: organization.organizationId,
+    name: "OpenAI controlled communication project",
+    visibility: "open",
+  });
+  if (!project.ok) throw new Error(`project setup failed: ${project.message}`);
+  const workload = draftWorkload();
+  const workloadSha256 = await openai.openAIWorkloadSha256(workload);
+  const payloadJson = canonicalJson({
+    profile: "ownerRoleplay",
+    to: "owner@example.test",
+    cc: [],
+    bcc: [],
+    subject: "Clarification request",
+    body: "Send an RFQ clarification to the supplier.",
+  });
+  await t.run(async (ctx) => {
+    await ctx.db.insert("recipientConfigs", {
+      version: 1,
+      mailboxNormalized: "owner@example.test",
+      mailboxHash: "controlled-mailbox",
+      active: true,
+      configuredAt: Date.now(),
+      configuredBy: "controlled-test",
+    });
+  });
+  const grant = await asOwner.mutation(issueGrantRef, {
+    organizationId: organization.organizationId,
+    projectId: project.projectId,
+    operations: ["communication.send"],
+    communicationProfile: "ownerRoleplay",
+    recipientConfigVersion: 1,
+    inputVersions: {
+      brief: "openai-v1",
+      [openai.OPENAI_WORKLOAD_INPUT_VERSION_KEY]: workloadSha256,
+    },
+    payloadJson,
+    costCeilingMicroUsd: Math.max(10_000, pricing.maxReservationMicroUsd * 2),
+    roundLimit: 8,
+    expiresAt: Date.now() + 60 * 60 * 1000,
+  });
+  if (!grant.ok) throw new Error(`grant setup failed: ${grant.message}`);
+  await t.run(async (ctx) => {
+    await ctx.db.insert("providerBudgets", {
+      organizationId: organization.organizationId,
+      ceilingMicroUsd: pricing.maxReservationMicroUsd * 2,
+      reservedMicroUsd: 0,
+      spentMicroUsd: 0,
+      unresolvedMicroUsd: 0,
+      pricingBasis: pricing.reservationPricingBasis,
+      updatedAt: Date.now(),
+    });
+    const conversationId = await ctx.db.insert("conversations", {
+      organizationId: organization.organizationId,
+      projectId: project.projectId,
+      grantId: grant.grantId,
+      version: 1,
+      state: "awaitingReply",
+      recipientConfigVersion: 1,
+      updatedAt: Date.now(),
+    });
+    await ctx.db.patch(grant.grantId, { conversationId });
+  });
+  const started = await asOwner.mutation(startJobRef, {
+    organizationId: organization.organizationId,
+    projectId: project.projectId,
+    text: "Send an RFQ clarification to the supplier.",
+    operationId: "communication.send",
+    kind: "communication",
+    grantId: grant.grantId,
+  });
+  if (!started.ok) throw new Error(`job setup failed: ${started.message}`);
+  const reservation = await asOwner.mutation(reserveRef, {
+    jobId: started.jobId,
+    organizationId: organization.organizationId,
+    projectId: project.projectId,
+    amountMicroUsd: pricing.maxReservationMicroUsd,
+    pricingBasis: pricing.reservationPricingBasis,
+  });
+  if (!reservation.ok) throw new Error(`reservation setup failed: ${reservation.message}`);
+  const operation = await asOwner.mutation(createOperationRef, {
+    jobId: started.jobId,
+    organizationId: organization.organizationId,
+    projectId: project.projectId,
+    kind: "communication.send",
     requestId,
     payloadJson,
     grantId: grant.grantId,
@@ -385,28 +501,14 @@ describe("OpenAI Responses transport boundary", () => {
     expect(result).toMatchObject({ outcome: "completed", output: draftOutput() });
   });
 
-  test("binds a supplier draft's brief and sources into the approved communication payload", async () => {
-    const payload = await openai.bindOpenAIWorkloadPayload(draftWorkload(), {
-      profile: "ownerRoleplay",
-      to: "owner@example.test",
-      cc: [],
-      bcc: [],
-      subject: "Clarification request",
-      body: "Please send a clarification about installation and delivery.",
+  test("binds every prompt-affecting supplier draft field into the approved input version", async () => {
+    const digest = await openai.openAIWorkloadSha256(draftWorkload());
+    const changed = await openai.openAIWorkloadSha256({
+      ...draftWorkload(),
+      brief: "Ask for a confirmed installation date.",
     });
-    expect(payload).toContain("openingos-openai-workload:v1");
-    const changed = await openai.bindOpenAIWorkloadPayload(
-      { ...draftWorkload(), brief: "Ask for a confirmed installation date." },
-      {
-        profile: "ownerRoleplay",
-        to: "owner@example.test",
-        cc: [],
-        bcc: [],
-        subject: "Clarification request",
-        body: "Please send a clarification about installation and delivery.",
-      },
-    );
-    expect(changed).not.toBe(payload);
+    expect(digest).toMatch(/^[0-9a-f]{64}$/);
+    expect(changed).not.toBe(digest);
   });
 
   test("rejects malformed, incomplete, model-drifted, schema-invalid, and invalid-usage responses", async () => {
@@ -707,7 +809,54 @@ describe("OpenAI pricing and shared execution boundary", () => {
       payloadJson: fixture.payloadJson,
       workload: changedWorkload,
     });
-    expect(result).toMatchObject({ ok: false, code: "changed-draft" });
+    expect(result).toMatchObject({ ok: false, code: "stale-input-version" });
+    expect(fetchImpl).not.toHaveBeenCalled();
+    const state = await operationState(t, fixture);
+    expect(state.operation?.state).toBe("prepared");
+    expect(state.attempts).toHaveLength(0);
+    expect(state.reservation).toMatchObject({
+      state: "open",
+      reservedMicroUsd: fixture.pricing.maxReservationMicroUsd,
+      spentMicroUsd: 0,
+      unresolvedMicroUsd: 0,
+    });
+  });
+
+  test("approved supplier draft uses the exact owner-roleplay envelope", async () => {
+    const t = init();
+    const fixture = await createSupplierDraftFixture(t, "openai-supplier-success");
+    const fetchImpl = vi.fn(async () => providerResponse(draftOutput()));
+    vi.stubGlobal("fetch", fetchImpl);
+    const result = await t.withIdentity(OWNER).action(generateRef, {
+      operationId: fixture.operationId,
+      identity: OWNER.tokenIdentifier,
+      inputVersion: "openai-v1",
+      payloadJson: fixture.payloadJson,
+      workload: draftWorkload(),
+    });
+    expect(result).toMatchObject({ outcome: "completed", output: draftOutput() });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    const state = await operationState(t, fixture);
+    expect(state.operation?.state).toBe("observedSuccess");
+  });
+
+  test("changed supplier draft is blocked before claim with zero provider calls", async () => {
+    const t = init();
+    const fixture = await createSupplierDraftFixture(t, "openai-supplier-changed-workload");
+    const fetchImpl = vi.fn(async () => providerResponse(draftOutput()));
+    vi.stubGlobal("fetch", fetchImpl);
+    const changedWorkload: openai.SupplierDraftWorkload = {
+      ...draftWorkload(),
+      brief: "Ask for a confirmed installation date and delivery window.",
+    };
+    const result = await t.withIdentity(OWNER).action(generateRef, {
+      operationId: fixture.operationId,
+      identity: OWNER.tokenIdentifier,
+      inputVersion: "openai-v1",
+      payloadJson: fixture.payloadJson,
+      workload: changedWorkload,
+    });
+    expect(result).toMatchObject({ ok: false, code: "stale-input-version" });
     expect(fetchImpl).not.toHaveBeenCalled();
     const state = await operationState(t, fixture);
     expect(state.operation?.state).toBe("prepared");
