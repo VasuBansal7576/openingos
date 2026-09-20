@@ -229,3 +229,15 @@ The accepted contract instead permits the sparse unrelated case and rejects the 
 PR #1 remains open and ready for review, but `1f17c00` has not yet been pushed and therefore has no exact-head GitHub Actions or Greptile result.
 All results are controlled evidence only.
 No hosted Convex state, live provider call, owner-mailbox exchange, public site or commercial outcome was observed.
+
+### 2026-09-20 - c7637ba local checkpoint
+
+Integrated the strict job-authority and context repairs through `1b5310e`, then integrated Muse Spark's fixture-only repair `c7637ba` for the direct Convex suite.
+The fixture repair preserves every negative assertion while giving controlled communication jobs an anchored RFQ payload and exact project-scoped `communication.send` authority.
+The exact local head passes both TypeScript checks, production build, 23 repository tests, 77 money and Jev proofs, 226 F1 tests, 174 direct Convex tests, 155 browser-executor tests, 2 application tests, 19 provider-contract tests and 5 mounted user-path tests.
+The implementation worker ran as OpenCode Go Muse Spark 1.3 Contributor with the high variant, and its exact commit is preserved on `origin/Raghav-Bansal-15/f1-direct-fixtures`.
+Nine clean completed worktrees were removed through Orca after their exact commits were verified on remote branches, reclaiming approximately 1.13 GB without deleting remote branches.
+PR #1 still points to the older published head `19e6d9f` until this checkpoint and its factual log are committed and pushed.
+F1 remains open until the replacement exact head passes GitHub Actions, its actionable Greptile threads are closed, GitHub reports no conflicts and a separate Astra session accepts the same revision.
+All results are controlled evidence only.
+No hosted Convex state, live provider call, owner-mailbox exchange, public site or commercial outcome was observed.
