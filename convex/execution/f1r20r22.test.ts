@@ -376,6 +376,31 @@ async function seedPagedCancellationOperations(
   });
 }
 
+async function seedLaterPagedCancellationOperation(
+  setup: Awaited<ReturnType<typeof setupResearch>>,
+  jobId: Awaited<ReturnType<typeof startPurchasingJob>>,
+): Promise<Id<"operations">> {
+  return await setup.t.run(async (ctx) => {
+    const now = Date.now();
+    return await ctx.db.insert("operations", {
+      organizationId: setup.organizationId,
+      projectId: setup.projectId,
+      jobId,
+      kind: "research.collect",
+      requestId: "paged-later-unresolved",
+      requestKey: "paged-later-unresolved",
+      normalizedPayload: JSON.stringify({ query: "Research suppliers for espresso equipment" }),
+      normalizedPayloadHash: "paged-later-unresolved",
+      inputVersions: { brief: "v1" },
+      grantId: setup.grantId,
+      grantVersion: 1,
+      state: "outcomeUnknown",
+      createdAt: now,
+      updatedAt: now,
+    });
+  });
+}
+
 async function setupUnknownCancellation() {
   const setup = await setupResearch();
   const jobId = await startPurchasingJob(setup);
@@ -1013,6 +1038,59 @@ describe("F1R-22 finite admission and cancellation boundaries", () => {
     expect(reconciled.reconciliationComplete).toBe(true);
     expect(reconciled.unresolvedOperationCount).toBe(0);
     expect(reconciled.unresolvedOperationIds).toEqual([]);
+  });
+
+  test("reconciliation refreshes an earlier unresolved operation before finishing later pages", async () => {
+    const setup = await setupResearch();
+    const jobId = await startPurchasingJob(setup);
+    const earlierOperationId = await seedPagedCancellationOperations(setup, jobId, 33);
+    const laterOperationId = await seedLaterPagedCancellationOperation(setup, jobId);
+    const pages = await drainCancellation(setup, jobId);
+    const cancelled = pages.at(-1);
+    if (cancelled === undefined || !cancelled.ok) throw new Error("cancellation did not return a result");
+    expect(cancelled.complete).toBe(true);
+    expect(cancelled.reconciliationComplete).toBe(false);
+    expect(cancelled.unresolvedOperationCount).toBe(2);
+    expect(cancelled.unresolvedOperationIds).toEqual([earlierOperationId, laterOperationId]);
+
+    const firstReconciliationPage = await setup.asOwner.mutation(cancelRef, {
+      jobId,
+      reason: "controlled reconciliation first page",
+    });
+    expect(firstReconciliationPage.ok).toBe(true);
+    if (!firstReconciliationPage.ok) throw new Error("first reconciliation page failed");
+    expect(firstReconciliationPage.complete).toBe(true);
+    expect(firstReconciliationPage.reconciliationComplete).toBe(false);
+    expect(firstReconciliationPage.unresolvedOperationCount).toBe(1);
+    expect(firstReconciliationPage.unresolvedOperationIds).toEqual([earlierOperationId]);
+
+    await setup.t.run(async (ctx) => {
+      await ctx.db.patch(earlierOperationId, {
+        state: "observedFailure",
+        updatedAt: Date.now(),
+      });
+    });
+    const secondReconciliationPage = await setup.asOwner.mutation(cancelRef, {
+      jobId,
+      reason: "controlled reconciliation second page",
+    });
+    expect(secondReconciliationPage.ok).toBe(true);
+    if (!secondReconciliationPage.ok) throw new Error("second reconciliation page failed");
+    expect(secondReconciliationPage.complete).toBe(true);
+    expect(secondReconciliationPage.reconciliationComplete).toBe(false);
+    expect(secondReconciliationPage.unresolvedOperationCount).toBe(0);
+    expect(secondReconciliationPage.unresolvedOperationIds).toEqual([]);
+
+    const reconciled = await setup.asOwner.mutation(cancelRef, {
+      jobId,
+      reason: "controlled reconciliation final page",
+    });
+    expect(reconciled.ok).toBe(true);
+    if (!reconciled.ok) throw new Error("reconciliation failed");
+    expect(reconciled.complete).toBe(true);
+    expect(reconciled.reconciliationComplete).toBe(false);
+    expect(reconciled.unresolvedOperationCount).toBe(1);
+    expect(reconciled.unresolvedOperationIds).toEqual([laterOperationId]);
   });
 
   test("completed cancellation still exposes unresolved work on repeat", async () => {

@@ -148,6 +148,34 @@ function unresolvedSummary(job: CancellationJobProgress): UnresolvedSummary {
   };
 }
 
+async function refreshUnresolvedSummary(
+  ctx: F1MutationCtx,
+  jobId: Id<"jobs">,
+  summary: UnresolvedSummary,
+): Promise<UnresolvedSummary> {
+  // The durable sample is capped at 16 IDs, so refreshing it keeps each
+  // continuation bounded while allowing terminal provider outcomes to reduce
+  // the aggregate before the cursor reaches the end of the pass.
+  let resolvedCount = 0;
+  const ids: Id<"operations">[] = [];
+  for (const operationId of summary.ids) {
+    const operation = await ctx.db.get(operationId);
+    if (
+      operation !== null &&
+      operation.jobId === jobId &&
+      (operation.state === "dispatching" || operation.state === "outcomeUnknown")
+    ) {
+      ids.push(operationId);
+    } else {
+      resolvedCount += 1;
+    }
+  }
+  return {
+    count: Math.max(0, summary.count - resolvedCount),
+    ids,
+  };
+}
+
 function recordUnresolved(
   summary: UnresolvedSummary,
   operationId: Id<"operations">,
@@ -382,7 +410,9 @@ async function processReconciliationPage(
 ): Promise<CancellationResult> {
   const cursor = job.cancellationReconciliationCursor ?? null;
   let summary: UnresolvedSummary =
-    cursor === null ? { count: 0, ids: [] } : unresolvedSummary(job);
+    cursor === null
+      ? { count: 0, ids: [] }
+      : await refreshUnresolvedSummary(ctx, job._id, unresolvedSummary(job));
   const page = await ctx.db
     .query("operations")
     .withIndex("by_job", (q) => q.eq("jobId", job._id))
