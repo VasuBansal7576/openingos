@@ -318,6 +318,107 @@ test("keeps concurrent activity pages and live updates from regressing paginatio
     else actEnvironment.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment;
   }
 });
+test("discards stale head responses and failures after a live update", async () => {
+  const dayMs = 86400000;
+  const base = Date.UTC(2026, 8, 20);
+  const head = (projectName: string, events: readonly { readonly id: string; readonly at: number }[], continueCursor: string | null, isDone: boolean) => ({
+    ...projection,
+    project: { ...projection.project, name: projectName },
+    activity: {
+      page: events.map((event) => ({ id: event.id, kind: "quoteRecorded", createdAt: event.at })),
+      continueCursor,
+      isDone,
+    },
+  });
+
+  interface PendingLoad {
+    readonly resolve: (value: unknown) => void;
+    readonly reject: (error: unknown) => void;
+  }
+  const loads: PendingLoad[] = [];
+  let liveListener: ((snapshot: unknown) => void) | null = null;
+  const makeAdapter = () => ({
+    load: (_projectId: string, _cursor?: string | null) => new Promise<unknown>((resolve, reject) => {
+      loads.push({ resolve, reject });
+    }),
+    subscribe: (_projectId: string, onSnapshot: (snapshot: unknown) => void, _onError: (error: unknown) => void) => {
+      liveListener = onSnapshot;
+      return () => {
+        liveListener = null;
+      };
+    },
+    act: async () => ({ ok: true }),
+  });
+
+  const dom = new HappyWindow({ url: "https://openingos.test/" });
+  const previousWindow = globalThis.window;
+  const previousDocument = globalThis.document;
+  const previousNavigator = globalThis.navigator;
+  const actEnvironment = globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean };
+  const previousActEnvironment = actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+  const browserGlobals = globalThis as unknown as { window: unknown; document: unknown; navigator: unknown };
+  browserGlobals.window = dom as unknown as globalThis.Window;
+  browserGlobals.document = dom.document as unknown as globalThis.Document;
+  browserGlobals.navigator = dom.navigator as unknown as globalThis.Navigator;
+  actEnvironment.IS_REACT_ACT_ENVIRONMENT = true;
+  const container = dom.document.createElement("div");
+  dom.document.body.append(container);
+  const root = createRoot(container as unknown as globalThis.Element);
+  const renderApp = async (adapter: ReturnType<typeof makeAdapter>) => {
+    await act(async () => {
+      root.render(createElement(AdapterAwareApp, {
+        backendStatus: "connected",
+        onRetry: () => undefined,
+        projectId: "project-w1-1",
+        workbenchAdapter: adapter,
+      }));
+    });
+  };
+
+  try {
+    await renderApp(makeAdapter());
+    expect(loads.length).toBe(1);
+
+    // A live update lands while the initial head load is still in flight.
+    await act(async () => {
+      liveListener?.(head("Live project snapshot", [{ id: "event-live-0", at: base + 5 * dayMs }], "activity-cursor-live", false));
+    });
+    expect(container.textContent).toContain("Live project snapshot");
+
+    // The older head load now rejects: the newer live projection must stand
+    // and no error may overwrite it.
+    await act(async () => {
+      loads[0]?.reject(new Error("stale controlled head failure"));
+    });
+    expect(container.textContent).toContain("Live project snapshot");
+    expect(container.textContent).not.toContain("could not be read");
+
+    // A refetch is dispatched, superseded by another live update, then
+    // resolves with stale head fields and a stale cursor: all of it is
+    // discarded without touching the live head, cursor, or pagination.
+    await renderApp(makeAdapter());
+    expect(loads.length).toBe(2);
+    await act(async () => {
+      liveListener?.(head("Live project snapshot", [{ id: "event-live-0", at: base + 5 * dayMs }], "activity-cursor-live", false));
+    });
+    await act(async () => {
+      loads[1]?.resolve(head("Stale head snapshot", [{ id: "event-stale-0", at: base + 2 * dayMs }], "activity-cursor-stale", true));
+    });
+    expect(container.textContent).toContain("Live project snapshot");
+    expect(container.textContent).not.toContain("Stale head snapshot");
+    const loadMore = Array.from(container.querySelectorAll("button")).find((candidate) => candidate.textContent?.includes("Load older activity"));
+    if (loadMore === undefined) throw new Error("live cursor should still offer older activity");
+  } finally {
+    await act(async () => {
+      root.unmount();
+    });
+    browserGlobals.window = previousWindow;
+    browserGlobals.document = previousDocument;
+    browserGlobals.navigator = previousNavigator;
+    if (previousActEnvironment === undefined) delete actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+    else actEnvironment.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment;
+  }
+});
 test("places activity pagination in the activity area instead of supplier results", () => {
   const snapshot = parseWorkbenchSnapshot({
     ...projection,
