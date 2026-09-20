@@ -24,9 +24,16 @@
  * ledger, so two concurrent branches or jobs cannot each spend the full
  * shared allowance. The job reservation is a partition of the org ledger,
  * not an independent allowance.
+ *
+ * Auth tables (Astra F1-19): the official Convex Auth server writes its
+ * users/sessions/accounts/verifiers/rate-limits to APP tables declared
+ * here via `authTables`. Without them, anonymous sign-in fails on a
+ * missing `providerAndAccountId` index. These tables are auth
+ * infrastructure; product authority still lives in memberships/grants.
  */
 
 import { defineSchema, defineTable } from "convex/server";
+import { authTables } from "@convex-dev/auth/server";
 import { v } from "convex/values";
 
 const moneyValidator = v.object({
@@ -41,6 +48,7 @@ const evidenceRefValidator = v.object({
 });
 
 export default defineSchema({
+  ...authTables,
   organizations: defineTable({
     name: v.string(),
     kind: v.union(v.literal("guest"), v.literal("private")),
@@ -176,7 +184,8 @@ export default defineSchema({
     updatedAt: v.number(),
   })
     .index("by_requestKey", ["requestKey"])
-    .index("by_job", ["jobId"]),
+    .index("by_job", ["jobId"])
+    .index("by_grant", ["grantId"]),
 
   attempts: defineTable({
     operationId: v.id("operations"),
@@ -217,8 +226,9 @@ export default defineSchema({
     eventId: v.string(),
     processingVersion: v.number(),
     outcome: v.string(),
+    operationId: v.optional(v.id("operations")),
     createdAt: v.number(),
-  }).index("by_provider_and_event", ["provider", "eventId"]),
+  }).index("by_provider_environment_and_event", ["provider", "environment", "eventId"]),
 
   evidence: defineTable({
     organizationId: v.id("organizations"),
@@ -321,7 +331,9 @@ export default defineSchema({
     ),
     supersedes: v.optional(v.string()),
     createdAt: v.number(),
-  }).index("by_project", ["projectId"]),
+  })
+    .index("by_project", ["projectId"])
+    .index("by_contentHash", ["contentHash"]),
 
   scopeDecisions: defineTable({
     organizationId: v.id("organizations"),

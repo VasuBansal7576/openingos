@@ -28,6 +28,7 @@ import {
   payloadHash,
   requestKey,
 } from "./hashing.js";
+import { compareEquivalentScope } from "./compare.js";
 import { sameCanonicalPayload, sha256BindingOk } from "./sha256.js";
 import { isExpired } from "./time.js";
 import {
@@ -143,6 +144,8 @@ export interface OutcomeInput {
   readonly operationId: string;
   readonly token: string;
   readonly outcome: "success" | "failure" | "unknown";
+  readonly provider?: string;
+  readonly environment?: string;
   readonly providerEventId?: string;
   readonly unknownCharges?: boolean;
   readonly detail?: string;
@@ -332,6 +335,28 @@ export class ControlledBackend {
     }
     if (!Number.isSafeInteger(input.expiresAt) || input.expiresAt <= now) {
       return denial("invalid-payload", "grant expiry must be in the future");
+    }
+    if (!Number.isSafeInteger(input.roundLimit) || input.roundLimit < 1) {
+      return denial("invalid-payload", "round limit must be a positive safe integer");
+    }
+    const needsRecipient = input.operations.some(
+      (operationId) => operationId === "communication.send" || operationId === "communication.clarify",
+    );
+    if (needsRecipient) {
+      const recipient = this.getActiveRecipient();
+      if (!recipient || input.recipientConfigVersion !== recipient.version) {
+        return denial("invalid-payload", "grant must bind the active recipient version");
+      }
+    }
+    if (input.conversationId !== undefined && input.conversationId !== null) {
+      const conversation = this.conversations.get(input.conversationId);
+      if (
+        !conversation ||
+        conversation.organizationId !== input.organizationId ||
+        conversation.projectId !== input.projectId
+      ) {
+        return denial("denied-project", "conversation is not in this project");
+      }
     }
     const canonical = canonicalJson(input.payload);
     const grant: Grant = {
@@ -746,6 +771,18 @@ export class ControlledBackend {
     }
     if (grant.status !== "active") return denial("revoked-grant", "grant is not active");
     if (isExpired(now, grant.expiresAt)) return denial("expired-grant", "grant expired");
+    if (input.grantId !== job.grantId) {
+      return denial("denied-capability", "operation grant must match the job grant");
+    }
+    let roundsUsed = 0;
+    for (const operation of this.operations.values()) {
+      if (operation.grantId !== grant.id) continue;
+      if (operation.state === "cancelled" || operation.state === "denied") continue;
+      roundsUsed += 1;
+    }
+    if (roundsUsed >= grant.roundLimit) {
+      return denial("round-limit-exceeded", "grant round limit exhausted");
+    }
 
     const key = requestKey(job.organizationId, input.kind, input.requestId);
     const canonical = canonicalJson(input.payload);
@@ -797,6 +834,7 @@ export class ControlledBackend {
       canonicalPayload: canonical,
       normalizedPayloadHash: hash,
       payloadSha256: null,
+      inputVersions: Object.freeze({ ...grant.inputVersions }),
       grantId: grant.id,
       grantVersion: grant.revocationVersion,
       recipientConfigVersion: COMMUNICATION_KINDS.has(input.kind)
@@ -857,8 +895,22 @@ export class ControlledBackend {
       return denial("stale-grant-version", "grant was re-issued after this operation was prepared");
     }
     if (isExpired(now, grant.expiresAt)) return denial("grant-expired-at-claim", "grant expired before claim");
-    if (!recordsEqual(job.inputVersions, grant.inputVersions)) {
-      return denial("stale-input-version", "job inputs no longer match the current grant");
+    if (operation.grantId !== job.grantId) {
+      return denial("denied-capability", "operation grant must match the job grant");
+    }
+    if (
+      !recordsEqual(operation.inputVersions, grant.inputVersions) ||
+      !recordsEqual(job.inputVersions, grant.inputVersions)
+    ) {
+      return denial("stale-input-version", "prepared inputs no longer match the current grant");
+    }
+    let jobCommitted = 0;
+    for (const reservation of this.reservations.values()) {
+      if (reservation.jobId !== job.id) continue;
+      jobCommitted += reservation.reservedMicroUsd + reservation.spentMicroUsd + reservation.unresolvedMicroUsd;
+    }
+    if (jobCommitted > grant.costCeilingMicroUsd) {
+      return denial("grant-ceiling-exceeded", "job reservations exceed the grant cost ceiling");
     }
 
     // Communication envelope first: header injections (alternate recipient,
@@ -915,6 +967,16 @@ export class ControlledBackend {
       const reservation = this.reservations.get(operation.reservationId);
       if (!reservation || reservation.state !== "open") {
         return denial("allowance-exhausted", "reservation is not available");
+      }
+      if (reservation.jobId !== operation.jobId) {
+        return denial("allowance-exhausted", "reservation does not belong to this job");
+      }
+      if (reservation.organizationId !== operation.organizationId) {
+        return denial("denied-membership", "not authorized for this project");
+      }
+      const budget = this.budgets.get(reservation.budgetId);
+      if (!budget || budget.organizationId !== operation.organizationId) {
+        return denial("denied-membership", "not authorized for this project");
       }
     }
 
@@ -999,7 +1061,9 @@ export class ControlledBackend {
       return denial("already-claimed", "attempt token is not valid for this operation");
     }
     if (input.providerEventId !== undefined) {
-      const key = `controlled|${input.providerEventId}`;
+      const provider = input.provider ?? "controlled";
+      const environment = input.environment ?? "controlled";
+      const key = `${provider}|${environment}|${input.providerEventId}`;
       const seen = this.processedEvents.get(key);
       if (seen) {
         return approved(operation);
@@ -1052,6 +1116,7 @@ export class ControlledBackend {
     newRequestId: string,
     reviewerIdentity: string,
     now: number,
+    newReservationId?: string,
   ): AuthorityResult<{ operation: Operation; warning: string }> {
     const operation = this.operations.get(operationId);
     if (!operation) return denial("denied-membership", "not authorized for this project");
@@ -1070,6 +1135,41 @@ export class ControlledBackend {
     if (this.operationsByKey.has(key)) {
       return denial("duplicate-conflict", "resend requestId is already in use");
     }
+    const resendGrant = this.grants.get(operation.grantId);
+    if (resendGrant) {
+      let roundsUsed = 0;
+      for (const entry of this.operations.values()) {
+        if (entry.grantId !== resendGrant.id) continue;
+        if (entry.state === "cancelled" || entry.state === "denied") continue;
+        roundsUsed += 1;
+      }
+      if (roundsUsed >= resendGrant.roundLimit) {
+        return denial("round-limit-exceeded", "grant round limit exhausted");
+      }
+    }
+    // The resend never inherits the old reservation. While prior unknown
+    // exposure remains, a fresh open reservation for the same job is
+    // required; otherwise the resend is denied and the exposure stays
+    // locked.
+    let resendReservationId: string | null = null;
+    if (operation.reservationId !== null) {
+      const prior = this.reservations.get(operation.reservationId);
+      if (prior && prior.unresolvedMicroUsd > 0) {
+        if (newReservationId === undefined) {
+          return denial("unknown-charges-reserved", "prior unknown exposure remains; supply a fresh reservation");
+        }
+        const fresh = this.reservations.get(newReservationId);
+        if (
+          !fresh ||
+          fresh.state !== "open" ||
+          fresh.jobId !== operation.jobId ||
+          fresh.organizationId !== operation.organizationId
+        ) {
+          return denial("allowance-exhausted", "fresh reservation is not available for this job");
+        }
+        resendReservationId = fresh.id;
+      }
+    }
     const resent: Operation = {
       ...operation,
       id: this.next("op"),
@@ -1077,6 +1177,7 @@ export class ControlledBackend {
       requestKey: key,
       state: "prepared",
       attemptToken: null,
+      reservationId: resendReservationId,
       linkedResendOf: operation.id,
       createdAt: now,
       updatedAt: now,
@@ -1130,19 +1231,68 @@ export class ControlledBackend {
     token: string,
     providerEventId: string,
     now: number,
-  ): AuthorityResult<{ jobState: JobState; delivery: OperationState }> {
+    provider = "controlled",
+    environment = "controlled",
+  ): AuthorityResult<{ jobState: JobState; delivery: OperationState; deduplicated: boolean }> {
     const operation = this.operations.get(operationId);
     if (!operation) return denial("denied-membership", "not authorized for this project");
     const job = this.jobs.get(operation.jobId);
     if (!job) return denial("denied-membership", "not authorized for this project");
-    const outcome = this.recordOutcome(
-      { operationId, token, outcome: "success", providerEventId, detail: "late-confirmation" },
-      now,
-    );
-    if (!outcome.ok) return outcome;
+    if (operation.state !== "dispatching" && operation.state !== "outcomeUnknown") {
+      return denial("already-claimed", `operation is already ${operation.state}`);
+    }
+    if (operation.attemptToken !== token) {
+      return denial("already-claimed", "attempt token is not valid for this operation");
+    }
+    if (providerEventId.trim().length === 0) {
+      return denial("invalid-payload", "providerEventId required");
+    }
+    const eventKey = `${provider}|${environment}|${providerEventId}`;
+    const seen = this.processedEvents.get(eventKey);
+    if (seen) {
+      return approved({ jobState: job.state, delivery: operation.state, deduplicated: true });
+    }
+    this.processedEvents.set(eventKey, { outcome: "success", processingVersion: 1 });
+    const updated: Operation = { ...operation, state: "observedSuccess", updatedAt: now };
+    this.operations.set(operationId, updated);
+    if (operation.reservationId !== null) {
+      const reservation = this.reservations.get(operation.reservationId);
+      const budget = reservation ? this.budgets.get(reservation.budgetId) : undefined;
+      if (reservation) {
+        const amount = reservation.unresolvedMicroUsd + reservation.reservedMicroUsd;
+        if (budget && amount > 0) {
+          this.budgets.set(budget.id, {
+            ...budget,
+            reservedMicroUsd: Math.max(0, budget.reservedMicroUsd - reservation.reservedMicroUsd),
+            unresolvedMicroUsd: Math.max(0, budget.unresolvedMicroUsd - reservation.unresolvedMicroUsd),
+            spentMicroUsd: budget.spentMicroUsd + amount,
+            updatedAt: now,
+          });
+        }
+        this.reservations.set(reservation.id, {
+          ...reservation,
+          reservedMicroUsd: 0,
+          unresolvedMicroUsd: 0,
+          spentMicroUsd: reservation.spentMicroUsd + amount,
+          state: "closed",
+          updatedAt: now,
+        });
+      }
+    }
+    for (const attempt of this.attempts.values()) {
+      if (attempt.operationId === operationId && attempt.token === token) {
+        this.attempts.set(attempt.id, {
+          ...attempt,
+          state: "observedSuccess",
+          observedAt: now,
+          providerEventId,
+          detail: "late-confirmation",
+        });
+      }
+    }
     // Cancellation and confirmed late delivery remain separate facts: the
     // job keeps its cancelled state while the delivery is recorded.
-    return approved({ jobState: job.state, delivery: outcome.value.state });
+    return approved({ jobState: job.state, delivery: "observedSuccess", deduplicated: false });
   }
 
   // -- Shared budgets -----------------------------------------------------
@@ -1157,6 +1307,19 @@ export class ControlledBackend {
     if (!job) return denial("denied-membership", "not authorized for this project");
     if (!Number.isSafeInteger(amountMicroUsd) || amountMicroUsd <= 0) {
       return denial("invalid-payload", "reservation amount must be a positive safe integer");
+    }
+    const grant = this.grants.get(job.grantId);
+    if (!grant) return denial("denied-membership", "not authorized for this project");
+    if (amountMicroUsd > grant.costCeilingMicroUsd) {
+      return denial("grant-ceiling-exceeded", "reservation exceeds the grant cost ceiling");
+    }
+    let jobCommitted = 0;
+    for (const reservation of this.reservations.values()) {
+      if (reservation.jobId !== jobId) continue;
+      jobCommitted += reservation.reservedMicroUsd + reservation.spentMicroUsd + reservation.unresolvedMicroUsd;
+    }
+    if (jobCommitted + amountMicroUsd > grant.costCeilingMicroUsd) {
+      return denial("grant-ceiling-exceeded", "job reservations exceed the grant cost ceiling");
     }
     const budget = this.getBudgetForOrganization(job.organizationId);
     if (!budget) return denial("allowance-exhausted", "no provider budget configured");
@@ -1469,6 +1632,31 @@ export class ControlledBackend {
     },
     now: number,
   ): AuthorityResult<Quote> {
+    if (input.version.trim().length === 0) {
+      return denial("invalid-payload", "version required");
+    }
+    if (input.conversationId !== undefined) {
+      const conversation = this.conversations.get(input.conversationId);
+      if (
+        !conversation ||
+        conversation.organizationId !== organizationId ||
+        conversation.projectId !== projectId
+      ) {
+        return denial("denied-project", "conversation is not in this project");
+      }
+    }
+    if (input.supersedes !== undefined) {
+      const prior = [...this.quotes.values()].find(
+        (quote) => quote.contentHash === input.supersedes,
+      );
+      if (
+        !prior ||
+        prior.organizationId !== organizationId ||
+        prior.projectId !== projectId
+      ) {
+        return denial("invalid-payload", "supersedes unknown quote version");
+      }
+    }
     for (const line of input.lines) {
       try {
         checkMoney(line.unitPrice, `line ${line.lineId}`);
@@ -1519,9 +1707,9 @@ export class ControlledBackend {
   }
 
   /**
-   * Equivalent-scope comparison: unknown charges block any "cheaper" claim.
-   * Returns `complete` only when both totals are fully known on the same
-   * currency and tax basis; otherwise `incomplete` with the blocking reason.
+   * Equivalent-scope comparison through the shared exact engine: quantities
+   * scale totals, unknown charges block complete claims, and unequal scope
+   * refuses. Shared with the Convex compare handler.
    */
   compareControlledQuotes(leftId: string, rightId: string): AuthorityResult<{
     verdict: "complete" | "incomplete";
@@ -1535,51 +1723,19 @@ export class ControlledBackend {
     if (left.organizationId !== right.organizationId || left.projectId !== right.projectId) {
       return denial("denied-project", "quotes belong to different projects");
     }
-    if (left.currency !== right.currency) {
-      return approved({
-        verdict: "incomplete",
-        differenceMinorUnits: null,
-        cheaper: null,
-        reason: "mixed-currency-requires-accepted-conversion-basis",
-      });
-    }
-    if (left.taxBasis !== right.taxBasis) {
-      return approved({
-        verdict: "incomplete",
-        differenceMinorUnits: null,
-        cheaper: null,
-        reason: "mixed-tax-basis",
-      });
-    }
-    const total = (quote: Quote): { known: boolean; total: number } => {
-      let sum = 0;
-      for (const line of quote.lines) sum += line.unitPrice.minorUnits;
-      for (const charge of quote.charges) {
-        if (charge.state === "unknown") return { known: false, total: 0 };
-        if (charge.state === "known" || charge.state === "estimated") {
-          if (!charge.amount) return { known: false, total: 0 };
-          sum += charge.amount.minorUnits;
-        }
-      }
-      return { known: true, total: sum };
-    };
-    const leftTotal = total(left);
-    const rightTotal = total(right);
-    if (!leftTotal.known || !rightTotal.known) {
-      return approved({
-        verdict: "incomplete",
-        differenceMinorUnits: null,
-        cheaper: null,
-        reason: "unknown-charge-prevents-complete-claim",
-      });
-    }
-    const difference = leftTotal.total - rightTotal.total;
-    return approved({
-      verdict: "complete",
-      differenceMinorUnits: Math.abs(difference),
-      cheaper: difference === 0 ? "equal" : difference < 0 ? "left" : "right",
-      reason: "equivalent-scope",
+    const toComparable = (quote: Quote) => ({
+      currency: quote.currency,
+      taxBasis: quote.taxBasis,
+      lines: quote.lines.map((line) => ({
+        quantity: line.quantity,
+        unitPriceMinorUnits: line.unitPrice.minorUnits,
+      })),
+      charges: quote.charges.map((charge) => ({
+        state: charge.state,
+        ...(charge.amount === undefined ? {} : { amountMinorUnits: charge.amount.minorUnits }),
+      })),
     });
+    return approved(compareEquivalentScope(toComparable(left), toComparable(right)));
   }
 
   // -- Introspection -------------------------------------------------------

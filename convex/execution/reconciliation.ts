@@ -41,8 +41,8 @@ export const ingestEvent = f1InternalMutation({
     }
     const seen = await ctx.db
       .query("processedEvents")
-      .withIndex("by_provider_and_event", (q) =>
-        q.eq("provider", args.provider).eq("eventId", args.eventId),
+      .withIndex("by_provider_environment_and_event", (q) =>
+        q.eq("provider", args.provider).eq("environment", args.environment).eq("eventId", args.eventId),
       )
       .unique();
     if (seen !== null) {
@@ -63,15 +63,26 @@ export const ingestEvent = f1InternalMutation({
 /**
  * Internal: record a confirmed late delivery after cancellation. The job
  * keeps its cancelled state; the delivery is a separate recorded fact.
+ *
+ * Unknown allowance moves exactly once from unresolved to spent. Token and
+ * event binding hold even from outcomeUnknown, the provider event persists
+ * with global dedupe, and the attempt updates to the confirmed outcome.
  */
 export const recordLateDelivery = f1InternalMutation({
   args: {
     operationId: v.id("operations"),
     token: v.string(),
     providerEventId: v.string(),
+    provider: v.optional(v.string()),
+    environment: v.optional(v.string()),
   },
   returns: v.union(
-    v.object({ ok: v.literal(true), jobState: v.string(), delivery: v.string() }),
+    v.object({
+      ok: v.literal(true),
+      jobState: v.string(),
+      delivery: v.string(),
+      deduplicated: v.boolean(),
+    }),
     denialValidator,
   ),
   handler: async (ctx, args) => {
@@ -83,27 +94,72 @@ export const recordLateDelivery = f1InternalMutation({
     if (operation.state !== "dispatching" && operation.state !== "outcomeUnknown") {
       return { ok: false as const, code: "already-claimed", message: `operation is already ${operation.state}` };
     }
-    if (operation.state === "dispatching" && operation.attemptToken !== args.token) {
+    if (operation.attemptToken !== args.token) {
       return { ok: false as const, code: "already-claimed", message: "attempt token is not valid for this operation" };
     }
+    if (args.providerEventId.trim().length === 0) {
+      return { ok: false as const, code: "invalid-payload", message: "providerEventId required" };
+    }
+    const provider = args.provider ?? "controlled";
+    const environment = args.environment ?? "controlled";
+    const seen = await ctx.db
+      .query("processedEvents")
+      .withIndex("by_provider_environment_and_event", (q) =>
+        q.eq("provider", provider).eq("environment", environment).eq("eventId", args.providerEventId),
+      )
+      .unique();
+    if (seen !== null) {
+      const job = await ctx.db.get(operation.jobId);
+      return {
+        ok: true as const,
+        jobState: job?.state ?? "unknown",
+        delivery: operation.state,
+        deduplicated: true,
+      };
+    }
+    await ctx.db.insert("processedEvents", {
+      provider,
+      environment,
+      eventId: args.providerEventId,
+      processingVersion: 1,
+      outcome: "success",
+      operationId: args.operationId,
+      createdAt: now,
+    });
     await ctx.db.patch(args.operationId, { state: "observedSuccess", updatedAt: now });
     if (operation.reservationId !== undefined) {
       const reservation = await ctx.db.get(operation.reservationId);
       if (reservation !== null) {
-        const amount = reservation.reservedMicroUsd;
+        const amount = reservation.unresolvedMicroUsd + reservation.reservedMicroUsd;
         const budget = await ctx.db.get(reservation.budgetId);
-        if (budget !== null) {
+        if (budget !== null && amount > 0) {
           await ctx.db.patch(reservation.budgetId, {
-            reservedMicroUsd: Math.max(0, budget.reservedMicroUsd - amount),
+            reservedMicroUsd: Math.max(0, budget.reservedMicroUsd - reservation.reservedMicroUsd),
+            unresolvedMicroUsd: Math.max(0, budget.unresolvedMicroUsd - reservation.unresolvedMicroUsd),
             spentMicroUsd: budget.spentMicroUsd + amount,
             updatedAt: now,
           });
         }
         await ctx.db.patch(operation.reservationId, {
           reservedMicroUsd: 0,
+          unresolvedMicroUsd: 0,
           spentMicroUsd: reservation.spentMicroUsd + amount,
           state: "closed",
           updatedAt: now,
+        });
+      }
+    }
+    const attempts = await ctx.db
+      .query("attempts")
+      .withIndex("by_token", (q) => q.eq("token", args.token))
+      .collect();
+    for (const attempt of attempts) {
+      if (attempt.operationId === args.operationId) {
+        await ctx.db.patch(attempt._id, {
+          state: "observedSuccess",
+          observedAt: now,
+          providerEventId: args.providerEventId,
+          detail: "late-confirmation",
         });
       }
     }
@@ -112,6 +168,7 @@ export const recordLateDelivery = f1InternalMutation({
       ok: true as const,
       jobState: job?.state ?? "unknown",
       delivery: "observedSuccess",
+      deduplicated: false,
     };
   },
 });

@@ -27,7 +27,25 @@ import {
 } from "convex/server";
 import schema from "./schema.js";
 
-export type F1DataModel = DataModelFromSchemaDefinition<typeof schema>;
+type FullDataModel = DataModelFromSchemaDefinition<typeof schema>;
+
+/**
+ * F1 handlers never touch auth infrastructure tables (identity arrives via
+ * `ctx.auth`), and those tables' optional secrets are incompatible with
+ * this repo's `exactOptionalPropertyTypes` under the generic model
+ * constraint. Omit them here; the deployment schema still declares them
+ * so anonymous sign-in resolves (F1-19).
+ */
+export type F1DataModel = Omit<
+  FullDataModel,
+  | "users"
+  | "authSessions"
+  | "authAccounts"
+  | "authRefreshTokens"
+  | "authVerificationCodes"
+  | "authVerifiers"
+  | "authRateLimits"
+>;
 
 export const f1Query: QueryBuilder<F1DataModel, "public"> = queryGeneric;
 export const f1Mutation: MutationBuilder<F1DataModel, "public"> = mutationGeneric;

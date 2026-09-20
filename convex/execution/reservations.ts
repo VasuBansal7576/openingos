@@ -67,6 +67,28 @@ export const reserve = f1Mutation({
     if (job.state === "cancelled") {
       return { ok: false as const, code: "cancelled-before-claim", message: "job is cancelled" };
     }
+    const grant = await ctx.db.get(job.grantId);
+    if (grant === null) {
+      return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
+    }
+    // The reservation binds to the grant cost ceiling as well as the
+    // shared budget: neither the single amount nor the job's running
+    // total may exceed what the grant authorizes.
+    if (args.amountMicroUsd > grant.costCeilingMicroUsd) {
+      return { ok: false as const, code: "grant-ceiling-exceeded", message: "reservation exceeds the grant cost ceiling" };
+    }
+    const jobReservations = await ctx.db
+      .query("reservations")
+      .withIndex("by_job", (q) => q.eq("jobId", args.jobId))
+      .collect();
+    const jobCommitted = jobReservations.reduce(
+      (sum, reservation) =>
+        sum + reservation.reservedMicroUsd + reservation.spentMicroUsd + reservation.unresolvedMicroUsd,
+      0,
+    );
+    if (jobCommitted + args.amountMicroUsd > grant.costCeilingMicroUsd) {
+      return { ok: false as const, code: "grant-ceiling-exceeded", message: "job reservations exceed the grant cost ceiling" };
+    }
     const budget = await ctx.db
       .query("providerBudgets")
       .withIndex("by_organization", (q) => q.eq("organizationId", args.organizationId))

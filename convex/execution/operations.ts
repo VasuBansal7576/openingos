@@ -127,6 +127,24 @@ export const create = f1Mutation({
     if (isExpired(now, grant.expiresAt)) {
       return { ok: false as const, code: "expired-grant", message: "grant expired" };
     }
+    // F1-23: the operation grant must equal the job grant, so revoking the
+    // job grant cannot be bypassed through an alternate grant.
+    if (args.grantId !== job.grantId) {
+      return { ok: false as const, code: "denied-capability", message: "operation grant must match the job grant" };
+    }
+    // Round accounting for dependent C1 follow-ups: each prepared or
+    // in-flight operation consumes one round of its grant. Cancelled
+    // operations free their round; terminal and ambiguous ones keep it.
+    const grantOperations = await ctx.db
+      .query("operations")
+      .withIndex("by_grant", (q) => q.eq("grantId", args.grantId))
+      .collect();
+    const roundsUsed = grantOperations.filter(
+      (operation) => operation.state !== "cancelled" && operation.state !== "denied",
+    ).length;
+    if (roundsUsed >= grant.roundLimit) {
+      return { ok: false as const, code: "round-limit-exceeded", message: "grant round limit exhausted" };
+    }
 
     const parsed = parseBoundedPayloadJson(args.payloadJson);
     if (!parsed.ok) return { ok: false as const, code: parsed.code, message: parsed.message };
@@ -259,8 +277,34 @@ export const claim = f1InternalMutation({
     if (isExpired(now, grant.expiresAt)) {
       return { ok: false as const, code: "grant-expired-at-claim", message: "grant expired before claim" };
     }
-    if (!inputVersionsEqual(job.inputVersions, grant.inputVersions)) {
-      return { ok: false as const, code: "stale-input-version", message: "job inputs no longer match the current grant" };
+    // F1-23: the operation grant must still equal the job grant; an
+    // operation prepared under an alternate grant cannot outlive the
+    // job grant's revocation.
+    if (operation.grantId !== job.grantId || operation.grantId !== grant._id) {
+      return { ok: false as const, code: "denied-capability", message: "operation grant must match the job grant" };
+    }
+    // F1-22: compare the operation's captured versions against current
+    // authority. Coordinated job/grant advancement still stales prepared
+    // operations; equality of job and grant alone is insufficient.
+    if (
+      !inputVersionsEqual(operation.inputVersions, grant.inputVersions) ||
+      !inputVersionsEqual(job.inputVersions, grant.inputVersions)
+    ) {
+      return { ok: false as const, code: "stale-input-version", message: "prepared inputs no longer match the current grant" };
+    }
+    // The grant cost ceiling binds the claim: the job's running
+    // reservation total must still fit inside what the grant authorizes.
+    const jobReservations = await ctx.db
+      .query("reservations")
+      .withIndex("by_job", (q) => q.eq("jobId", operation.jobId))
+      .collect();
+    const jobCommitted = jobReservations.reduce(
+      (sum, reservation) =>
+        sum + reservation.reservedMicroUsd + reservation.spentMicroUsd + reservation.unresolvedMicroUsd,
+      0,
+    );
+    if (jobCommitted > grant.costCeilingMicroUsd) {
+      return { ok: false as const, code: "grant-ceiling-exceeded", message: "job reservations exceed the grant cost ceiling" };
     }
 
     const storedPayload = operation.normalizedPayload;
@@ -329,10 +373,23 @@ export const claim = f1InternalMutation({
       }
     }
 
+    // F1-24: recheck the full reservation relationship, not just its
+    // open state. A reservation from another job, organization, or budget
+    // cannot fund this claim.
     if (operation.reservationId !== undefined) {
       const reservation = await ctx.db.get(operation.reservationId);
       if (reservation === null || reservation.state !== "open") {
         return { ok: false as const, code: "allowance-exhausted", message: "reservation is not available" };
+      }
+      if (reservation.jobId !== operation.jobId) {
+        return { ok: false as const, code: "allowance-exhausted", message: "reservation does not belong to this job" };
+      }
+      if (reservation.organizationId !== operation.organizationId) {
+        return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
+      }
+      const budget = await ctx.db.get(reservation.budgetId);
+      if (budget === null || budget.organizationId !== operation.organizationId) {
+        return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
       }
     }
 

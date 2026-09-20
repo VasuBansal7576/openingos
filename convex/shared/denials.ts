@@ -34,6 +34,8 @@ export const DENIAL_CODES = [
   "cancelled-before-claim",
   "duplicate-conflict",
   "allowance-exhausted",
+  "grant-ceiling-exceeded",
+  "round-limit-exceeded",
   "unknown-charges-reserved",
   "already-claimed",
   "invalid-payload",

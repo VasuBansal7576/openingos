@@ -91,6 +91,138 @@ describe("P-07 equivalent-scope comparison", () => {
     expect(compared.value.reason).toContain("unknown-charge");
   });
 
+  test("quantities scale totals; unequal quantity scope refuses", () => {
+    const fixture = buildControlledFixture();
+    const scaled = (version: string, quantity: string, amount: number) => {
+      const result = fixture.store.ingestProviderQuote(
+        fixture.orgPrivateA,
+        fixture.projAOpen,
+        {
+          version,
+          currency: "EUR",
+          lines: [{
+            lineId: "machine",
+            description: "machine",
+            quantity,
+            unitPrice: { currency: "EUR", minorUnits: amount },
+            evidenceRefs: [source("m")],
+          }],
+          charges: [],
+          taxBasis: TAX,
+          evidenceRefs: [source(`${version}-source`)],
+          counterpartyRole: "ownerStandIn",
+          executionMode: "recorded",
+        },
+        fixture.now,
+      );
+      if (!result.ok) throw new Error("record failed");
+      return result.value;
+    };
+    const twoUnits = scaled("qq-two", "2", 1_000_00);
+    const oneUnit = scaled("qq-one", "1", 1_000_00);
+    const compared = fixture.store.compareControlledQuotes(twoUnits.id, oneUnit.id);
+    expect(compared.ok).toBe(true);
+    if (!compared.ok) throw new Error("compare failed");
+    expect(compared.value.verdict).toBe("incomplete");
+    expect(compared.value.reason).toBe("unequal-quantity-scope");
+
+    const twoCheap = scaled("qq-twocheap", "2", 900_00);
+    const even = fixture.store.compareControlledQuotes(twoUnits.id, twoCheap.id);
+    expect(even.ok && even.value.verdict).toBe("complete");
+    if (!even.ok) throw new Error("compare failed");
+    expect(even.value.differenceMinorUnits).toBe(200_00);
+    expect(even.value.cheaper).toBe("right");
+  });
+
+  test("invalid quantities and charge states refuse complete scope", () => {
+    const fixture = buildControlledFixture();
+    const badQuantity = recordQuote(fixture, "qb-badqty", [{ lineId: "machine", amount: 100_00 }], []);
+    const bad = fixture.store.quotes.get(badQuantity.id);
+    if (!bad) throw new Error("missing quote");
+    const tampered = { ...bad, lines: [{ ...bad.lines[0], quantity: "two" }] };
+    fixture.store.quotes.set(bad.id, tampered as typeof bad);
+    const compared = fixture.store.compareControlledQuotes(bad.id, bad.id);
+    expect(compared.ok).toBe(true);
+    if (!compared.ok) throw new Error("compare failed");
+    expect(compared.value.verdict).toBe("incomplete");
+    expect(compared.value.reason).toBe("invalid-quantity");
+
+    const mystery = recordQuote(fixture, "qb-mystery", [{ lineId: "machine", amount: 100_00 }], [
+      { chargeId: "x", state: "mystery", amount: 10_00 },
+    ]);
+    const mysteryCompared = fixture.store.compareControlledQuotes(mystery.id, mystery.id);
+    expect(mysteryCompared.ok && mysteryCompared.value.verdict).toBe("incomplete");
+    if (!mysteryCompared.ok) throw new Error("compare failed");
+    expect(mysteryCompared.value.reason).toBe("invalid-charge-state");
+  });
+
+  test("estimated charges compare with an explicit reason flag", () => {
+    const fixture = buildControlledFixture();
+    const left = recordQuote(fixture, "qe-a", [{ lineId: "machine", amount: 795000 }], []);
+    const right = recordQuote(fixture, "qe-b", [{ lineId: "machine", amount: 750000 }], [
+      { chargeId: "freight", state: "estimated", amount: 60000 },
+    ]);
+    const compared = fixture.store.compareControlledQuotes(left.id, right.id);
+    expect(compared.ok && compared.value.verdict).toBe("complete");
+    if (!compared.ok) throw new Error("compare failed");
+    expect(compared.value.reason).toBe("equivalent-scope-with-estimates");
+    expect(compared.value.differenceMinorUnits).toBe(15000);
+  });
+
+  test("record validates versions, supersedes, and conversation references", () => {
+    const fixture = buildControlledFixture();
+    const empty = fixture.store.ingestProviderQuote(
+      fixture.orgPrivateA,
+      fixture.projAOpen,
+      {
+        version: "  ",
+        currency: "EUR",
+        lines: [],
+        charges: [],
+        taxBasis: TAX,
+        evidenceRefs: [],
+        counterpartyRole: "ownerStandIn",
+        executionMode: "recorded",
+      },
+      fixture.now,
+    );
+    expect(empty.ok).toBe(false);
+    const dangling = fixture.store.ingestProviderQuote(
+      fixture.orgPrivateA,
+      fixture.projAOpen,
+      {
+        version: "v-dangle",
+        currency: "EUR",
+        lines: [],
+        charges: [],
+        taxBasis: TAX,
+        evidenceRefs: [],
+        counterpartyRole: "ownerStandIn",
+        executionMode: "recorded",
+        supersedes: "deadbeefdeadbeef",
+      },
+      fixture.now,
+    );
+    expect(dangling.ok).toBe(false);
+    const foreign = fixture.store.ingestProviderQuote(
+      fixture.orgPrivateA,
+      fixture.projAOpen,
+      {
+        version: "v-foreign-conv",
+        currency: "EUR",
+        lines: [],
+        charges: [],
+        taxBasis: TAX,
+        evidenceRefs: [],
+        counterpartyRole: "ownerStandIn",
+        executionMode: "recorded",
+        conversationId: "conv-elsewhere",
+      },
+      fixture.now,
+    );
+    expect(foreign.ok).toBe(false);
+  });
+
   test("unknown charges cannot be recorded with an amount (never zero)", () => {
     const fixture = buildControlledFixture();
     const result = fixture.store.recordQuote(

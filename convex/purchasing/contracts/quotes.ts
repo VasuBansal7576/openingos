@@ -18,6 +18,7 @@ import { v } from "convex/values";
 import type { Id } from "../../_generated/dataModel.js";
 import { f1InternalMutation, f1Mutation, f1Query, type F1MutationCtx } from "../../server.js";
 import { payloadHash } from "../../shared/hashing.js";
+import { compareEquivalentScope } from "../../shared/compare.js";
 import { checkMoney } from "../../shared/money.js";
 import { approved, denial, type AuthorityResult } from "../../shared/denials.js";
 import { checkProjectAccess, denialValidator, identityOf, requireCapability } from "../../access/checks.js";
@@ -129,6 +130,46 @@ function validateQuoteFields(fields: QuoteFields): AuthorityResult<QuoteFields> 
   return approved(fields);
 }
 
+/**
+ * Immutable version, supersedes, and conversation references. Versions are
+ * never overwritten; a revision must name the exact content hash it
+ * replaces, and conversations must live in the same project.
+ */
+async function checkQuoteReferences(
+  ctx: F1MutationCtx,
+  organizationId: Id<"organizations">,
+  projectId: Id<"projects">,
+  fields: Pick<QuoteFields, "version" | "conversationId" | "supersedes">,
+): Promise<AuthorityResult<true>> {
+  if (fields.version.trim().length === 0) {
+    return denial("invalid-payload", "version required");
+  }
+  if (fields.conversationId !== undefined) {
+    const conversation = await ctx.db.get(fields.conversationId);
+    if (
+      conversation === null ||
+      conversation.organizationId !== organizationId ||
+      conversation.projectId !== projectId
+    ) {
+      return denial("denied-project", "conversation is not in this project");
+    }
+  }
+  if (fields.supersedes !== undefined) {
+    const prior = await ctx.db
+      .query("quotes")
+      .withIndex("by_contentHash", (q) => q.eq("contentHash", fields.supersedes ?? ""))
+      .unique();
+    if (
+      prior === null ||
+      prior.organizationId !== organizationId ||
+      prior.projectId !== projectId
+    ) {
+      return denial("invalid-payload", "supersedes unknown quote version");
+    }
+  }
+  return approved(true);
+}
+
 async function insertQuoteVersion(
   ctx: F1MutationCtx,
   fields: QuoteFields,
@@ -194,6 +235,10 @@ export const record = f1Mutation({
       executionMode: "recorded",
     });
     if (!valid.ok) return { ok: false as const, code: valid.code, message: valid.message };
+    const references = await checkQuoteReferences(ctx, args.organizationId, args.projectId, args);
+    if (!references.ok) {
+      return { ok: false as const, code: references.code, message: references.message };
+    }
     const { quoteId, contentHash } = await insertQuoteVersion(ctx, valid.value, now);
     return { ok: true as const, quoteId, contentHash };
   },
@@ -213,6 +258,10 @@ export const ingestProviderQuote = f1InternalMutation({
     }
     const valid = validateQuoteFields(args);
     if (!valid.ok) return { ok: false as const, code: valid.code, message: valid.message };
+    const references = await checkQuoteReferences(ctx, args.organizationId, args.projectId, args);
+    if (!references.ok) {
+      return { ok: false as const, code: references.code, message: references.message };
+    }
     const { quoteId, contentHash } = await insertQuoteVersion(ctx, valid.value, Date.now());
     return { ok: true as const, quoteId, contentHash };
   },
@@ -262,56 +311,25 @@ export const compare = f1Query({
     ) {
       return { ok: false as const, code: "denied-project", message: "quotes are not in this project" };
     }
-    if (left.currency !== right.currency) {
-      return {
-        ok: true as const,
-        verdict: "incomplete",
-        differenceMinorUnits: null,
-        cheaper: null,
-        reason: "mixed-currency-requires-accepted-conversion-basis",
-      };
-    }
-    if (left.taxBasis !== right.taxBasis) {
-      return {
-        ok: true as const,
-        verdict: "incomplete",
-        differenceMinorUnits: null,
-        cheaper: null,
-        reason: "mixed-tax-basis",
-      };
-    }
-    const total = (
-      quote: typeof left,
-    ): number | null => {
-      let sum = 0;
-      for (const line of quote.lines) sum += line.unitPrice.minorUnits;
-      for (const charge of quote.charges) {
-        if (charge.state === "unknown") return null;
-        if (charge.state === "known" || charge.state === "estimated") {
-          if (charge.amount === undefined) return null;
-          sum += charge.amount.minorUnits;
-        }
-      }
-      return sum;
-    };
-    const leftTotal = total(left);
-    const rightTotal = total(right);
-    if (leftTotal === null || rightTotal === null) {
-      return {
-        ok: true as const,
-        verdict: "incomplete",
-        differenceMinorUnits: null,
-        cheaper: null,
-        reason: "unknown-charge-prevents-complete-claim",
-      };
-    }
-    const difference = leftTotal - rightTotal;
+    const toComparable = (quote: typeof left) => ({
+      currency: quote.currency,
+      taxBasis: quote.taxBasis,
+      lines: quote.lines.map((line) => ({
+        quantity: line.quantity,
+        unitPriceMinorUnits: line.unitPrice.minorUnits,
+      })),
+      charges: quote.charges.map((charge) => ({
+        state: charge.state,
+        ...(charge.amount === undefined ? {} : { amountMinorUnits: charge.amount.minorUnits }),
+      })),
+    });
+    const verdict = compareEquivalentScope(toComparable(left), toComparable(right));
     return {
       ok: true as const,
-      verdict: "complete",
-      differenceMinorUnits: Math.abs(difference),
-      cheaper: difference === 0 ? "equal" : difference < 0 ? "left" : "right",
-      reason: "equivalent-scope",
+      verdict: verdict.verdict,
+      differenceMinorUnits: verdict.differenceMinorUnits,
+      cheaper: verdict.cheaper,
+      reason: verdict.reason,
     };
   },
 });

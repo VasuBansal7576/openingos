@@ -142,6 +142,7 @@ export interface Operation {
   readonly canonicalPayload: string;
   readonly normalizedPayloadHash: string;
   readonly payloadSha256: string | null;
+  readonly inputVersions: Readonly<Record<string, string>>;
   readonly grantId: string;
   readonly grantVersion: number;
   readonly recipientConfigVersion: number | null;

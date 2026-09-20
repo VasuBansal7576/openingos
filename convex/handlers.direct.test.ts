@@ -24,6 +24,7 @@ import {
   type RegisteredMutation,
   type RegisteredQuery,
 } from "convex/server";
+import type { Id } from "./_generated/dataModel.js";
 import schema from "./schema.js";
 import * as memberships from "./access/memberships.js";
 import * as grants from "./access/grants.js";
@@ -45,6 +46,8 @@ const modules = import.meta.glob([
   "./purchasing/**/*.ts",
   "./shared/**/*.ts",
   "./server.ts",
+  "./auth.ts",
+  "./models/**/*.ts",
   "./_generated/*.js",
   "!./access/**/*.test.ts",
   "!./execution/**/*.test.ts",
@@ -97,6 +100,56 @@ const getOperationRef = makeFunctionReference<
   QueryArgs<typeof operations.get>,
   QueryReturn<typeof operations.get>
 >("execution/operations:get");
+const claimOperationRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof operations.claim>,
+  MutationReturn<typeof operations.claim>
+>("execution/operations:claim");
+const recordOutcomeRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof attempts.recordOutcome>,
+  MutationReturn<typeof attempts.recordOutcome>
+>("execution/attempts:recordOutcome");
+const lateDeliveryRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof reconciliation.recordLateDelivery>,
+  MutationReturn<typeof reconciliation.recordLateDelivery>
+>("execution/reconciliation:recordLateDelivery");
+const reviewedResendRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof attempts.reviewedResend>,
+  MutationReturn<typeof attempts.reviewedResend>
+>("execution/attempts:reviewedResend");
+const configureRecipientInternalRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof recipients.configure>,
+  MutationReturn<typeof recipients.configure>
+>("access/recipients:configure");
+const reserveBudgetRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof import("./execution/reservations.js").reserve>,
+  MutationReturn<typeof import("./execution/reservations.js").reserve>
+>("execution/reservations:reserve");
+const readLedgerRef = makeFunctionReference<
+  "query",
+  QueryArgs<typeof import("./execution/reservations.js").ledger>,
+  QueryReturn<typeof import("./execution/reservations.js").ledger>
+>("execution/reservations:ledger");
+const listAttemptsRef = makeFunctionReference<
+  "query",
+  QueryArgs<typeof import("./execution/attempts.js").attemptsForOperation>,
+  QueryReturn<typeof import("./execution/attempts.js").attemptsForOperation>
+>("execution/attempts:attemptsForOperation");
+const recordQuoteRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof quotes.record>,
+  MutationReturn<typeof quotes.record>
+>("purchasing/contracts/quotes:record");
+const compareQuotesRef = makeFunctionReference<
+  "query",
+  QueryArgs<typeof quotes.compare>,
+  QueryReturn<typeof quotes.compare>
+>("purchasing/contracts/quotes:compare");
 const revokeProjectAccessRef = makeFunctionReference<
   "mutation",
   MutationArgs<typeof memberships.revokeProjectAccess>,
@@ -112,12 +165,6 @@ const listEvidenceRef = makeFunctionReference<
   QueryArgs<typeof evidence.list>,
   QueryReturn<typeof evidence.list>
 >("purchasing/contracts/evidence:list");
-const recordQuoteRef = makeFunctionReference<
-  "mutation",
-  MutationArgs<typeof quotes.record>,
-  MutationReturn<typeof quotes.record>
->("purchasing/contracts/quotes:record");
-
 const OWNER_A = { tokenIdentifier: "direct-owner-a" };
 const APPROVER_A = { tokenIdentifier: "direct-approver-a" };
 const CONTRIB_A = { tokenIdentifier: "direct-contrib-a" };
@@ -459,6 +506,39 @@ describe("direct handler visibility and absent endpoints", () => {
   });
 });
 
+describe("direct F1-19 anonymous sign-in", () => {
+  test("anonymous sign-in resolves against the declared auth tables", async () => {
+    // Controlled ephemeral RS256 key for this test run only: generated in
+    // memory, never persisted, never committed, never a deployment secret.
+    const keypair = await crypto.subtle.generateKey(
+      {
+        name: "RSASSA-PKCS1-v1_5",
+        modulusLength: 2048,
+        publicExponent: new Uint8Array([1, 0, 1]),
+        hash: "SHA-256",
+      },
+      true,
+      ["sign", "verify"],
+    );
+    const pkcs8 = await crypto.subtle.exportKey("pkcs8", keypair.privateKey);
+    const bytes = new Uint8Array(pkcs8);
+    let binary = "";
+    for (let i = 0; i < bytes.length; i += 4096) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + 4096));
+    }
+    process.env.JWT_PRIVATE_KEY = `-----BEGIN PRIVATE KEY-----\n${btoa(binary)}\n-----END PRIVATE KEY-----`;
+    process.env.CONVEX_SITE_URL = "https://controlled-convex-test.test";
+    const t = convexTest(schema, modules);
+    const signIn: FunctionReference<"action", "public", Record<string, unknown>, unknown> =
+      makeFunctionReference("auth:signIn");
+    const result = (await t.action(signIn, { provider: "anonymous", params: {} })) as {
+      tokens?: { token: string; refreshToken: string };
+    } | null;
+    expect(result?.tokens?.token).toBeTypeOf("string");
+    expect(result?.tokens?.refreshToken).toBeTypeOf("string");
+  });
+});
+
 describe("direct checkpoint-1 authority boundaries", () => {
   test("recipient configuration is internal-only (no public rotation)", () => {
     expect(recipients.configure.isInternal === true).toBe(true);
@@ -703,6 +783,573 @@ describe("direct checkpoint-1 authority boundaries", () => {
     });
     expect(leaked.ok).toBe(false);
     if (!leaked.ok) expect(leaked.code).toBe("denied-membership");
+  });
+});
+
+describe("direct checkpoint-2 money, budgets, and reconciliation", () => {
+  async function setupBudgetedProject(
+    t: ReturnType<typeof convexTest>,
+    owner: { tokenIdentifier: string },
+  ) {
+    const setup = await setupCommsProject(t, owner);
+    await t.run(async (ctx) => {
+      await ctx.db.insert("providerBudgets", {
+        organizationId: setup.orgId,
+        ceilingMicroUsd: 1_000_000,
+        reservedMicroUsd: 0,
+        spentMicroUsd: 0,
+        unresolvedMicroUsd: 0,
+        pricingBasis: "controlled-direct",
+        updatedAt: Date.now(),
+      });
+    });
+    return setup;
+  }
+
+  function quoteArgs(
+    orgId: Id<"organizations">,
+    projectId: Id<"projects">,
+    version: string,
+    extra: {
+      supersedes?: string;
+      conversationId?: Id<"conversations">;
+    } = {},
+  ) {
+    return {
+      organizationId: orgId,
+      projectId,
+      version,
+      currency: "EUR",
+      lines: [{
+        lineId: "machine",
+        description: "machine",
+        quantity: "1",
+        unitPrice: { currency: "EUR", minorUnits: 795000 },
+        evidenceRefs: [],
+      }],
+      charges: [],
+      taxBasis: "NL-EUR-INCLUSIVE",
+      evidenceRefs: [],
+      ...extra,
+    };
+  }
+
+  test("comparison is quantity-aware and refuses unequal scope", async () => {
+    const t = convexTest(schema, modules);
+    const setup = await setupCommsProject(t, OWNER_A);
+    const asOwner = t.withIdentity(OWNER_A);
+    const two = await asOwner.mutation(recordQuoteRef, {
+      ...quoteArgs(setup.orgId, setup.projectId, "q-two"),
+      lines: [{
+        lineId: "machine",
+        description: "machine",
+        quantity: "2",
+        unitPrice: { currency: "EUR", minorUnits: 100_00 },
+        evidenceRefs: [],
+      }],
+    });
+    if (!two.ok) throw new Error("quote setup failed");
+    const one = await asOwner.mutation(recordQuoteRef, {
+      ...quoteArgs(setup.orgId, setup.projectId, "q-one"),
+      lines: [{
+        lineId: "machine",
+        description: "machine",
+        quantity: "1",
+        unitPrice: { currency: "EUR", minorUnits: 100_00 },
+        evidenceRefs: [],
+      }],
+    });
+    if (!one.ok) throw new Error("quote setup failed");
+    const compared = await asOwner.query(compareQuotesRef, {
+      leftQuoteId: two.quoteId,
+      rightQuoteId: one.quoteId,
+    });
+    expect(compared.ok).toBe(true);
+    if (!compared.ok) throw new Error("compare failed");
+    expect(compared.verdict).toBe("incomplete");
+    expect(compared.reason).toBe("unequal-quantity-scope");
+  });
+
+  test("record validates versions, supersedes, and conversation references", async () => {
+    const t = convexTest(schema, modules);
+    const setup = await setupCommsProject(t, OWNER_A);
+    const asOwner = t.withIdentity(OWNER_A);
+    const empty = await asOwner.mutation(recordQuoteRef, quoteArgs(setup.orgId, setup.projectId, "  "));
+    expect(empty.ok).toBe(false);
+    const dangling = await asOwner.mutation(recordQuoteRef, {
+      ...quoteArgs(setup.orgId, setup.projectId, "v-dangle"),
+      supersedes: "deadbeefdeadbeef",
+    });
+    expect(dangling.ok).toBe(false);
+    const foreignConv = await t.run(async (ctx) => {
+      const otherOrg = await ctx.db.insert("organizations", { name: "Other", kind: "private", createdAt: Date.now() });
+      const otherProj = await ctx.db.insert("projects", {
+        organizationId: otherOrg,
+        name: "Other project",
+        visibility: "open",
+        createdAt: Date.now(),
+      });
+      return await ctx.db.insert("conversations", {
+        organizationId: otherOrg,
+        projectId: otherProj,
+        grantId: setup.grantId,
+        version: 1,
+        state: "draft",
+        recipientConfigVersion: 1,
+        updatedAt: Date.now(),
+      });
+    });
+    const foreign = await asOwner.mutation(recordQuoteRef, {
+      ...quoteArgs(setup.orgId, setup.projectId, "v-foreign-conv"),
+      conversationId: foreignConv,
+    });
+    expect(foreign.ok).toBe(false);
+  });
+
+  test("grant issue validates rounds, recipient version, and conversation", async () => {
+    const t = convexTest(schema, modules);
+    const setup = await setupCommsProject(t, OWNER_A);
+    const asOwner = t.withIdentity(OWNER_A);
+    const base = {
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      operations: ["communication.send"],
+      communicationProfile: COMMUNICATION_PROFILE_OWNER_ROLEPLAY,
+      recipientConfigVersion: 1,
+      inputVersions: { brief: "v1" },
+      payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
+      costCeilingMicroUsd: 100_000,
+      expiresAt: Date.now() + 3_600_000,
+    };
+    const zeroRounds = await asOwner.mutation(issueGrantRef, { ...base, roundLimit: 0 });
+    expect(zeroRounds.ok).toBe(false);
+    const staleRecipient = await asOwner.mutation(issueGrantRef, {
+      ...base,
+      roundLimit: 2,
+      recipientConfigVersion: 999,
+    });
+    expect(staleRecipient.ok).toBe(false);
+    const foreignConv = await t.run(async (ctx) => {
+      const otherOrg = await ctx.db.insert("organizations", { name: "Other2", kind: "private", createdAt: Date.now() });
+      const otherProj = await ctx.db.insert("projects", {
+        organizationId: otherOrg,
+        name: "Other project 2",
+        visibility: "open",
+        createdAt: Date.now(),
+      });
+      return await ctx.db.insert("conversations", {
+        organizationId: otherOrg,
+        projectId: otherProj,
+        grantId: setup.grantId,
+        version: 1,
+        state: "draft",
+        recipientConfigVersion: 1,
+        updatedAt: Date.now(),
+      });
+    });
+    const foreign = await asOwner.mutation(issueGrantRef, {
+      ...base,
+      roundLimit: 2,
+      conversationId: foreignConv,
+    });
+    expect(foreign.ok).toBe(false);
+  });
+
+  test("reservations and rounds bind to the grant ceiling", async () => {
+    const t = convexTest(schema, modules);
+    const setup = await setupBudgetedProject(t, OWNER_A);
+    const asOwner = t.withIdentity(OWNER_A);
+    const job = await asOwner.mutation(startJobRef, {
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      text: "Send the RFQ to the demo supplier.",
+      kind: "communication",
+      grantId: setup.grantId,
+    });
+    if (!job.ok) throw new Error("job setup failed");
+    const over = await asOwner.mutation(reserveBudgetRef, {
+      jobId: job.jobId,
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      amountMicroUsd: 500_000,
+      pricingBasis: "controlled-direct",
+    });
+    expect(over.ok).toBe(false);
+    if (!over.ok) expect(over.code).toBe("grant-ceiling-exceeded");
+
+    const limited = await asOwner.mutation(issueGrantRef, {
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      operations: ["communication.send"],
+      communicationProfile: COMMUNICATION_PROFILE_OWNER_ROLEPLAY,
+      recipientConfigVersion: 1,
+      inputVersions: { brief: "rounds" },
+      payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
+      costCeilingMicroUsd: 500_000,
+      roundLimit: 1,
+      expiresAt: Date.now() + 3_600_000,
+    });
+    if (!limited.ok) throw new Error("grant setup failed");
+    const job2 = await asOwner.mutation(startJobRef, {
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      text: "Send the RFQ to the demo supplier.",
+      kind: "communication",
+      grantId: limited.grantId,
+    });
+    if (!job2.ok) throw new Error("job2 setup failed");
+    const first = await asOwner.mutation(createOperationRef, {
+      jobId: job2.jobId,
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      kind: "communication.send",
+      requestId: "req-round-1",
+      payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
+      grantId: limited.grantId,
+    });
+    expect(first.ok).toBe(true);
+    const second = await asOwner.mutation(createOperationRef, {
+      jobId: job2.jobId,
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      kind: "communication.send",
+      requestId: "req-round-2",
+      payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
+      grantId: limited.grantId,
+    });
+    expect(second.ok).toBe(false);
+    if (!second.ok) expect(second.code).toBe("round-limit-exceeded");
+  });
+
+  test("F1-23 alternate grants cannot ride a job past revocation", async () => {
+    const t = convexTest(schema, modules);
+    const setup = await setupCommsProject(t, OWNER_A);
+    const asOwner = t.withIdentity(OWNER_A);
+    const grant2 = await asOwner.mutation(issueGrantRef, {
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      operations: ["communication.send"],
+      communicationProfile: COMMUNICATION_PROFILE_OWNER_ROLEPLAY,
+      recipientConfigVersion: 1,
+      inputVersions: { brief: "v1" },
+      payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
+      costCeilingMicroUsd: 100_000,
+      roundLimit: 3,
+      expiresAt: Date.now() + 3_600_000,
+    });
+    if (!grant2.ok) throw new Error("grant2 setup failed");
+    const job = await asOwner.mutation(startJobRef, {
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      text: "Send the RFQ to the demo supplier.",
+      kind: "communication",
+      grantId: setup.grantId,
+    });
+    if (!job.ok) throw new Error("job setup failed");
+    const created = await asOwner.mutation(createOperationRef, {
+      jobId: job.jobId,
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      kind: "communication.send",
+      requestId: "req-alt-grant",
+      payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
+      grantId: grant2.grantId,
+    });
+    expect(created.ok).toBe(false);
+    if (!created.ok) expect(created.code).toBe("denied-capability");
+  });
+
+  test("F1-22 coordinated advancement stales prepared operations", async () => {
+    const t = convexTest(schema, modules);
+    const setup = await setupCommsProject(t, OWNER_A);
+    const asOwner = t.withIdentity(OWNER_A);
+    const job = await asOwner.mutation(startJobRef, {
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      text: "Send the RFQ to the demo supplier.",
+      kind: "communication",
+      grantId: setup.grantId,
+    });
+    if (!job.ok) throw new Error("job setup failed");
+    const created = await asOwner.mutation(createOperationRef, {
+      jobId: job.jobId,
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      kind: "communication.send",
+      requestId: "req-versions",
+      payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
+      grantId: setup.grantId,
+    });
+    if (!created.ok) throw new Error("operation setup failed");
+    await t.run(async (ctx) => {
+      const grantRow = await ctx.db.get(setup.grantId);
+      const jobRow = await ctx.db.get(job.jobId);
+      if (!grantRow || !jobRow) throw new Error("missing rows");
+      await ctx.db.patch(setup.grantId, { inputVersions: { brief: "v2" } });
+      await ctx.db.patch(job.jobId, { inputVersions: { brief: "v2" } });
+    });
+    const claim = await t.mutation(claimOperationRef, {
+      operationId: created.operationId,
+      identity: OWNER_A.tokenIdentifier,
+    });
+    expect(claim.ok).toBe(false);
+    if (!claim.ok) expect(claim.code).toBe("stale-input-version");
+  });
+
+  test("F1-24 tampered reservation relationships deny the claim", async () => {
+    const t = convexTest(schema, modules);
+    const setup = await setupBudgetedProject(t, OWNER_A);
+    const asOwner = t.withIdentity(OWNER_A);
+    const job = await asOwner.mutation(startJobRef, {
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      text: "Send the RFQ to the demo supplier.",
+      kind: "communication",
+      grantId: setup.grantId,
+    });
+    if (!job.ok) throw new Error("job setup failed");
+    const reservation = await asOwner.mutation(reserveBudgetRef, {
+      jobId: job.jobId,
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      amountMicroUsd: 50_000,
+      pricingBasis: "controlled-direct",
+    });
+    if (!reservation.ok) throw new Error("reserve failed");
+    const created = await asOwner.mutation(createOperationRef, {
+      jobId: job.jobId,
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      kind: "communication.send",
+      requestId: "req-resrel",
+      payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
+      grantId: setup.grantId,
+      reservationId: reservation.reservationId,
+    });
+    if (!created.ok) throw new Error("operation setup failed");
+    const foreignBudget = await t.run(async (ctx) => {
+      const otherOrg = await ctx.db.insert("organizations", { name: "Budget other", kind: "private", createdAt: Date.now() });
+      return await ctx.db.insert("providerBudgets", {
+        organizationId: otherOrg,
+        ceilingMicroUsd: 1_000_000,
+        reservedMicroUsd: 0,
+        spentMicroUsd: 0,
+        unresolvedMicroUsd: 0,
+        pricingBasis: "controlled-direct",
+        updatedAt: Date.now(),
+      });
+    });
+    await t.run(async (ctx) => {
+      await ctx.db.patch(reservation.reservationId, { budgetId: foreignBudget });
+    });
+    const claim = await t.mutation(claimOperationRef, {
+      operationId: created.operationId,
+      identity: OWNER_A.tokenIdentifier,
+    });
+    expect(claim.ok).toBe(false);
+    if (!claim.ok) expect(claim.code).toBe("denied-membership");
+  });
+
+  test("late delivery settles unknown allowance exactly once with bindings", async () => {
+    const t = convexTest(schema, modules);
+    const setup = await setupBudgetedProject(t, OWNER_A);
+    const asOwner = t.withIdentity(OWNER_A);
+    const job = await asOwner.mutation(startJobRef, {
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      text: "Send the RFQ to the demo supplier.",
+      kind: "communication",
+      grantId: setup.grantId,
+    });
+    if (!job.ok) throw new Error("job setup failed");
+    const reservation = await asOwner.mutation(reserveBudgetRef, {
+      jobId: job.jobId,
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      amountMicroUsd: 50_000,
+      pricingBasis: "controlled-direct",
+    });
+    if (!reservation.ok) throw new Error("reserve failed");
+    const created = await asOwner.mutation(createOperationRef, {
+      jobId: job.jobId,
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      kind: "communication.send",
+      requestId: "req-late-direct",
+      payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
+      grantId: setup.grantId,
+      reservationId: reservation.reservationId,
+    });
+    if (!created.ok) throw new Error("operation setup failed");
+    const claim = await t.mutation(claimOperationRef, {
+      operationId: created.operationId,
+      identity: OWNER_A.tokenIdentifier,
+    });
+    if (!claim.ok || !("attemptToken" in claim)) throw new Error("claim failed");
+    const outcome = await t.mutation(recordOutcomeRef, {
+      operationId: created.operationId,
+      token: claim.attemptToken,
+      outcome: "unknown",
+      providerEventId: "evt-direct-late-1",
+    });
+    expect(outcome.ok).toBe(true);
+    const before = await asOwner.query(readLedgerRef, {
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      jobId: job.jobId,
+    });
+    if (!before.ok) throw new Error("ledger failed");
+    expect(before.budget?.unresolvedMicroUsd).toBe(50_000);
+
+    const late = await t.mutation(lateDeliveryRef, {
+      operationId: created.operationId,
+      token: claim.attemptToken,
+      providerEventId: "evt-direct-late-2",
+    });
+    expect(late.ok).toBe(true);
+    if (!late.ok) throw new Error("late delivery failed");
+    expect(late.delivery).toBe("observedSuccess");
+    expect(late.deduplicated).toBe(false);
+    const after = await asOwner.query(readLedgerRef, {
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      jobId: job.jobId,
+    });
+    if (!after.ok) throw new Error("ledger failed");
+    expect(after.budget?.unresolvedMicroUsd).toBe(0);
+    expect(after.budget?.spentMicroUsd).toBe(50_000);
+    const attempts = await asOwner.query(listAttemptsRef, { operationId: created.operationId });
+    if (!attempts.ok) throw new Error("attempts failed");
+    expect(attempts.attempts[0]?.state).toBe("observedSuccess");
+
+    const repeat = await t.mutation(lateDeliveryRef, {
+      operationId: created.operationId,
+      token: claim.attemptToken,
+      providerEventId: "evt-direct-late-3",
+    });
+    expect(repeat.ok).toBe(false);
+    const settled = await asOwner.query(readLedgerRef, {
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      jobId: job.jobId,
+    });
+    if (!settled.ok) throw new Error("ledger failed");
+    expect(settled.budget?.spentMicroUsd).toBe(50_000);
+  });
+
+  test("reviewed resends require fresh reservations under exposure", async () => {
+    const t = convexTest(schema, modules);
+    const setup = await setupBudgetedProject(t, OWNER_A);
+    const asOwner = t.withIdentity(OWNER_A);
+    const job = await asOwner.mutation(startJobRef, {
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      text: "Send the RFQ to the demo supplier.",
+      kind: "communication",
+      grantId: setup.grantId,
+    });
+    if (!job.ok) throw new Error("job setup failed");
+    const reservation = await asOwner.mutation(reserveBudgetRef, {
+      jobId: job.jobId,
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      amountMicroUsd: 25_000,
+      pricingBasis: "controlled-direct",
+    });
+    if (!reservation.ok) throw new Error("reserve failed");
+    const created = await asOwner.mutation(createOperationRef, {
+      jobId: job.jobId,
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      kind: "communication.send",
+      requestId: "req-resend-direct",
+      payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
+      grantId: setup.grantId,
+      reservationId: reservation.reservationId,
+    });
+    if (!created.ok) throw new Error("operation setup failed");
+    const claim = await t.mutation(claimOperationRef, {
+      operationId: created.operationId,
+      identity: OWNER_A.tokenIdentifier,
+    });
+    if (!claim.ok || !("attemptToken" in claim)) throw new Error("claim failed");
+    const outcome = await t.mutation(recordOutcomeRef, {
+      operationId: created.operationId,
+      token: claim.attemptToken,
+      outcome: "unknown",
+      providerEventId: "evt-direct-resend-1",
+    });
+    expect(outcome.ok).toBe(true);
+    const denied = await t.mutation(reviewedResendRef, {
+      operationId: created.operationId,
+      identity: OWNER_A.tokenIdentifier,
+      newRequestId: "req-resend-direct-2",
+    });
+    expect(denied.ok).toBe(false);
+    if (!denied.ok) expect(denied.code).toBe("unknown-charges-reserved");
+  });
+
+  test("F1-20 duplicate events across operations settle nothing twice", async () => {
+    const t = convexTest(schema, modules);
+    const setup = await setupBudgetedProject(t, OWNER_A);
+    const asOwner = t.withIdentity(OWNER_A);
+    const mkOp = async (requestId: string) => {
+      const job = await asOwner.mutation(startJobRef, {
+        organizationId: setup.orgId,
+        projectId: setup.projectId,
+        text: "Send the RFQ to the demo supplier.",
+        kind: "communication",
+        grantId: setup.grantId,
+      });
+      if (!job.ok) throw new Error("job setup failed");
+      const created = await asOwner.mutation(createOperationRef, {
+        jobId: job.jobId,
+        organizationId: setup.orgId,
+        projectId: setup.projectId,
+        kind: "communication.send",
+        requestId,
+        payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
+        grantId: setup.grantId,
+      });
+      if (!created.ok) throw new Error("operation setup failed");
+      const claim = await t.mutation(claimOperationRef, {
+        operationId: created.operationId,
+        identity: OWNER_A.tokenIdentifier,
+      });
+      if (!claim.ok || !("attemptToken" in claim)) throw new Error("claim failed");
+      return { op: created.operationId, token: claim.attemptToken };
+    };
+    const first = await mkOp("req-evt-direct-a");
+    const second = await mkOp("req-evt-direct-b");
+    const done = await t.mutation(recordOutcomeRef, {
+      operationId: first.op,
+      token: first.token,
+      outcome: "success",
+      providerEventId: "evt-direct-shared-1",
+    });
+    expect(done.ok).toBe(true);
+    const duplicate = await t.mutation(recordOutcomeRef, {
+      operationId: second.op,
+      token: second.token,
+      outcome: "success",
+      providerEventId: "evt-direct-shared-1",
+    });
+    expect(duplicate.ok).toBe(true);
+    if (!duplicate.ok) throw new Error("dedupe failed");
+    expect(duplicate.deduplicated).toBe(true);
+    const secondState = await asOwner.query(getOperationRef, { operationId: second.op });
+    if (!secondState.ok) throw new Error("get failed");
+    expect(secondState.state).toBe("dispatching");
+  });
+
+  test("F1-21 comma mailboxes fail even on the server path", async () => {
+    const t = convexTest(schema, modules);
+    const rejected = await t.mutation(configureRecipientInternalRef, {
+      mailbox: "owner-supplier@example.test,other@example.test",
+      authorizedBy: "deployment",
+    });
+    expect(rejected.ok).toBe(false);
+    if (!rejected.ok) expect(rejected.code).toBe("invalid-payload");
   });
 
   test("unregistered paths fail to resolve in the test runtime", async () => {

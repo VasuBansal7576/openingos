@@ -85,8 +85,30 @@ export const issue = f1Mutation({
     if (!Number.isSafeInteger(args.costCeilingMicroUsd) || args.costCeilingMicroUsd < 0) {
       return { ok: false as const, code: "invalid-payload", message: "cost ceiling must be a non-negative safe integer" };
     }
+    if (!Number.isSafeInteger(args.roundLimit) || args.roundLimit < 1) {
+      return { ok: false as const, code: "invalid-payload", message: "round limit must be a positive safe integer" };
+    }
     if (!Number.isSafeInteger(args.expiresAt) || args.expiresAt <= now) {
       return { ok: false as const, code: "invalid-payload", message: "grant expiry must be in the future" };
+    }
+    if (needsRecipient) {
+      const recipient = await ctx.db
+        .query("recipientConfigs")
+        .withIndex("by_active", (q) => q.eq("active", true))
+        .unique();
+      if (recipient === null || args.recipientConfigVersion !== recipient.version) {
+        return { ok: false as const, code: "invalid-payload", message: "grant must bind the active recipient version" };
+      }
+    }
+    if (args.conversationId !== undefined) {
+      const conversation = await ctx.db.get(args.conversationId);
+      if (
+        conversation === null ||
+        conversation.organizationId !== args.organizationId ||
+        conversation.projectId !== args.projectId
+      ) {
+        return { ok: false as const, code: "denied-project", message: "conversation is not in this project" };
+      }
     }
     const parsed = parseBoundedPayloadJson(args.payloadJson);
     if (!parsed.ok) return { ok: false as const, code: parsed.code, message: parsed.message };
