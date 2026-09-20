@@ -275,7 +275,7 @@ export const recordProviderBinding = f1InternalMutation({
     for (const row of unboundRows) {
       if (row.provider !== "agentmail-callback" || row.environment !== "live") continue;
       const facts = bindingFacts(parseObject(row.outcome));
-      if (facts === null || facts.messageId !== args.messageId) continue;
+      if (facts === null || facts.messageId !== args.messageId || facts.threadId !== args.threadId || facts.inboxId !== args.inboxId) continue;
       if (row.organizationId !== undefined && row.organizationId !== scope.organizationId) {
         return denial("invalid-payload", "callback belongs to another organization");
       }
