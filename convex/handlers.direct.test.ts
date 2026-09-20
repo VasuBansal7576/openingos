@@ -38,7 +38,8 @@ import * as evidence from "./purchasing/contracts/evidence.js";
 import * as fixtures from "./purchasing/contracts/fixtures.js";
 import { commsPayload } from "./purchasing/contracts/fixtures.js";
 import { COMMUNICATION_PROFILE_OWNER_ROLEPLAY } from "./shared/provenance.js";
-import { normalizeMailbox, payloadHash } from "./shared/hashing.js";
+import { payloadHash } from "./shared/hashing.js";
+import { normalizeMailbox } from "./shared/mailbox.js";
 
 const modules = import.meta.glob([
   "./access/**/*.ts",
@@ -640,7 +641,7 @@ describe("direct checkpoint-1 authority boundaries", () => {
         currency: "EUR",
         lines: [],
         charges: [],
-        taxBasis: "NL-EUR-INCLUSIVE",
+        taxBasis: { kind: "inclusive", basisId: "NL-EUR-INCLUSIVE", evidenceRefs: [] },
         evidenceRefs: [],
         counterpartyRole: "vendor",
         executionMode: "live",
@@ -844,7 +845,12 @@ describe("direct checkpoint-2 money, budgets, and reconciliation", () => {
         evidenceRefs: [],
       }],
       charges: [],
-      taxBasis: "NL-EUR-INCLUSIVE",
+      taxBasis: { kind: "inclusive" as const, basisId: "NL-EUR-INCLUSIVE", evidenceRefs: [] },
+      comparisonScope: {
+        requirementId: "req-direct",
+        scopeId: "scope-direct",
+        items: [{ itemId: "machine", lineId: "machine", unit: "piece", requiredQuantity: "1" }],
+      },
       evidenceRefs: [],
       ...extra,
     };
@@ -854,6 +860,11 @@ describe("direct checkpoint-2 money, budgets, and reconciliation", () => {
     const t = convexTest(schema, modules);
     const setup = await setupCommsProject(t, OWNER_A);
     const asOwner = t.withIdentity(OWNER_A);
+    const scoped = (quantity: string) => ({
+      requirementId: "req-direct",
+      scopeId: "scope-direct",
+      items: [{ itemId: "machine", lineId: "machine", unit: "piece", requiredQuantity: quantity }],
+    });
     const two = await asOwner.mutation(recordQuoteRef, {
       ...quoteArgs(setup.orgId, setup.projectId, "q-two"),
       lines: [{
@@ -863,6 +874,7 @@ describe("direct checkpoint-2 money, budgets, and reconciliation", () => {
         unitPrice: { currency: "EUR", minorUnits: 100_00 },
         evidenceRefs: [],
       }],
+      comparisonScope: scoped("2"),
     });
     if (!two.ok) throw new Error("quote setup failed");
     const one = await asOwner.mutation(recordQuoteRef, {
@@ -874,6 +886,7 @@ describe("direct checkpoint-2 money, budgets, and reconciliation", () => {
         unitPrice: { currency: "EUR", minorUnits: 100_00 },
         evidenceRefs: [],
       }],
+      comparisonScope: scoped("1"),
     });
     if (!one.ok) throw new Error("quote setup failed");
     const compared = await asOwner.query(compareQuotesRef, {
@@ -883,7 +896,7 @@ describe("direct checkpoint-2 money, budgets, and reconciliation", () => {
     expect(compared.ok).toBe(true);
     if (!compared.ok) throw new Error("compare failed");
     expect(compared.verdict).toBe("incomplete");
-    expect(compared.reason).toBe("unequal-quantity-scope");
+    expect(compared.reason).toContain("not compatible");
   });
 
   test("record validates versions, supersedes, and conversation references", async () => {
@@ -1807,6 +1820,190 @@ describe("direct checkpoint-A authority hardening", () => {
     });
     expect(authority?.roundLimit).toBeGreaterThanOrEqual(1);
     expect(authority?.status).toBe("active");
+  });
+
+  function quoteBArgs(
+    orgId: Id<"organizations">,
+    projectId: Id<"projects">,
+    version: string,
+    extra: {
+      supersedes?: string;
+      conversationId?: Id<"conversations">;
+    } = {},
+  ) {
+    return {
+      organizationId: orgId,
+      projectId,
+      version,
+      currency: "EUR",
+      lines: [{
+        lineId: "machine",
+        description: "machine",
+        quantity: "1",
+        unitPrice: { currency: "EUR", minorUnits: 795000 },
+        evidenceRefs: [],
+      }],
+      charges: [],
+      taxBasis: { kind: "inclusive" as const, basisId: "NL-EUR-INCLUSIVE", evidenceRefs: [] },
+      comparisonScope: {
+        requirementId: "req-direct-b",
+        scopeId: "scope-direct-b",
+        items: [{ itemId: "machine", lineId: "machine", unit: "piece", requiredQuantity: "1" }],
+      },
+      evidenceRefs: [],
+      ...extra,
+    };
+  }
+
+  test("discriminated charge states require reasons or coveringIds", async () => {
+    const t = convexTest(schema, modules);
+    const setup = await setupCommsProject(t, OWNER_A);
+    const asOwner = t.withIdentity(OWNER_A);
+    const base = (version: string) => quoteBArgs(setup.orgId, setup.projectId, version);
+    const bareUnknown = await asOwner.mutation(recordQuoteRef, {
+      ...base("qb-bare-unknown"),
+      charges: [{
+        chargeId: "install",
+        label: "install",
+        state: { kind: "unknown", reason: "   " },
+        evidenceRefs: [],
+      }],
+    });
+    expect(bareUnknown.ok).toBe(false);
+    const bareIncluded = await asOwner.mutation(recordQuoteRef, {
+      ...base("qb-bare-included"),
+      charges: [{
+        chargeId: "freight",
+        label: "freight",
+        state: { kind: "included", coveringId: "  " },
+        evidenceRefs: [],
+      }],
+    });
+    expect(bareIncluded.ok).toBe(false);
+    const stated = await asOwner.mutation(recordQuoteRef, {
+      ...base("qb-stated"),
+      charges: [
+        {
+          chargeId: "install",
+          label: "install",
+          state: { kind: "unknown", reason: "supplier did not state installation" },
+          evidenceRefs: [],
+        },
+        { chargeId: "freight", label: "freight", state: { kind: "included", coveringId: "machine" }, evidenceRefs: [] },
+        {
+          chargeId: "warranty",
+          label: "warranty",
+          state: {
+            kind: "estimated",
+            estimate: {
+              kind: "range",
+              minimum: { currency: "EUR", minorUnits: 100_00 },
+              maximum: { currency: "EUR", minorUnits: 200_00 },
+            },
+          },
+          evidenceRefs: [],
+        },
+        { chargeId: "gift", label: "gift", state: { kind: "notApplicable", reason: "no gift wrap" }, evidenceRefs: [] },
+      ],
+    });
+    expect(stated.ok).toBe(true);
+  });
+
+  test("duplicate lines and versions are rejected; reorder still compares", async () => {
+    const t = convexTest(schema, modules);
+    const setup = await setupCommsProject(t, OWNER_A);
+    const asOwner = t.withIdentity(OWNER_A);
+    const line = (lineId: string) => ({
+      lineId,
+      description: lineId,
+      quantity: "1",
+      unitPrice: { currency: "EUR", minorUnits: 100_00 },
+      evidenceRefs: [],
+    });
+    const pairScope = {
+      requirementId: "req-pairs",
+      scopeId: "scope-pairs",
+      items: [
+        { itemId: "machine", lineId: "machine", unit: "piece", requiredQuantity: "1" },
+        { itemId: "freight-line", lineId: "freight-line", unit: "piece", requiredQuantity: "1" },
+      ],
+    };
+    const duplicated = await asOwner.mutation(recordQuoteRef, {
+      ...quoteBArgs(setup.orgId, setup.projectId, "qb-duplines"),
+      lines: [line("machine"), line("machine")],
+      comparisonScope: pairScope,
+    });
+    expect(duplicated.ok).toBe(false);
+    const left = await asOwner.mutation(recordQuoteRef, {
+      ...quoteBArgs(setup.orgId, setup.projectId, "qb-order-a"),
+      lines: [line("machine"), line("freight-line")],
+      comparisonScope: pairScope,
+    });
+    if (!left.ok) throw new Error("left setup failed");
+    const versionAgain = await asOwner.mutation(recordQuoteRef, {
+      ...quoteBArgs(setup.orgId, setup.projectId, "qb-order-a"),
+      lines: [line("machine"), line("freight-line")],
+      comparisonScope: pairScope,
+    });
+    expect(versionAgain.ok).toBe(false);
+    const right = await asOwner.mutation(recordQuoteRef, {
+      ...quoteBArgs(setup.orgId, setup.projectId, "qb-order-b"),
+      lines: [line("freight-line"), line("machine")],
+      comparisonScope: pairScope,
+    });
+    if (!right.ok) throw new Error("right setup failed");
+    const compared = await asOwner.query(compareQuotesRef, {
+      leftQuoteId: left.quoteId,
+      rightQuoteId: right.quoteId,
+    });
+    expect(compared.ok).toBe(true);
+    if (!compared.ok) throw new Error("compare failed");
+    expect(compared.verdict).toBe("complete");
+    expect(compared.cheaper).toBe("equal");
+  });
+
+  test("unrelated aggregate-equal lines never compare", async () => {
+    const t = convexTest(schema, modules);
+    const setup = await setupCommsProject(t, OWNER_A);
+    const asOwner = t.withIdentity(OWNER_A);
+    const left = await asOwner.mutation(recordQuoteRef, quoteBArgs(setup.orgId, setup.projectId, "qb-unrel-a"));
+    if (!left.ok) throw new Error("left setup failed");
+    const right = await asOwner.mutation(recordQuoteRef, {
+      ...quoteBArgs(setup.orgId, setup.projectId, "qb-unrel-b"),
+      comparisonScope: {
+        requirementId: "req-other",
+        scopeId: "scope-other",
+        items: [{ itemId: "machine", lineId: "machine", unit: "hour", requiredQuantity: "1" }],
+      },
+    });
+    if (!right.ok) throw new Error("right setup failed");
+    const compared = await asOwner.query(compareQuotesRef, {
+      leftQuoteId: left.quoteId,
+      rightQuoteId: right.quoteId,
+    });
+    expect(compared.ok).toBe(true);
+    if (!compared.ok) throw new Error("compare failed");
+    expect(compared.verdict).toBe("incomplete");
+  });
+
+  test("supersedes binds counterparty lineage and hashes decision fields", async () => {
+    const t = convexTest(schema, modules);
+    const setup = await setupCommsProject(t, OWNER_A);
+    const asOwner = t.withIdentity(OWNER_A);
+    const first = await asOwner.mutation(recordQuoteRef, quoteBArgs(setup.orgId, setup.projectId, "qb-lineage-a"));
+    if (!first.ok) throw new Error("first setup failed");
+    const lineage = await t.run(async (ctx) => {
+      const row = await ctx.db.get(first.quoteId);
+      return row?.counterpartyRole ?? null;
+    });
+    expect(lineage).toBe("userImport");
+    const second = await asOwner.mutation(recordQuoteRef, {
+      ...quoteBArgs(setup.orgId, setup.projectId, "qb-lineage-b"),
+      supersedes: first.contentHash,
+    });
+    expect(second.ok).toBe(true);
+    if (!second.ok) throw new Error("lineage revision failed");
+    expect(second.contentHash).not.toBe(first.contentHash);
   });
 
   test("unregistered paths fail to resolve in the test runtime", async () => {

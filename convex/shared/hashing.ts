@@ -65,21 +65,12 @@ export function requestKey(organizationId: string, operationKind: string, reques
   return `${organizationId}|${operationKind}|${requestId}`;
 }
 
-/** Normalize an email mailbox for exact comparison (no dot/plus folding). */
-export function normalizeMailbox(mailbox: string): string {
-  return mailbox.trim().toLowerCase();
-}
-
 /**
- * Strict single-mailbox validation (F1-21). The local part and domain
- * exclude commas, semicolons, whitespace, angle brackets, quotes, and
- * display-name forms, so "a@b.test,c@d.test" or "Name <a@b.test>" can
- * never pass as one recipient.
+ * Mailbox helpers live in `./mailbox.js` on the maintained validator
+ * library path. These re-exports preserve the historical import site for
+ * existing callers; new code imports from `./mailbox.js` directly.
  */
-export function isValidSingleMailbox(mailbox: string): boolean {
-  if (mailbox.length === 0 || mailbox.length > 320) return false;
-  return /^[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}$/.test(mailbox);
-}
+export { isValidSingleMailbox, normalizeMailbox } from "./mailbox.js";
 
 export interface BoundedPayload {
   readonly canonical: string;

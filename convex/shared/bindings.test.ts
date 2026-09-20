@@ -8,7 +8,8 @@
 
 import { describe, expect, test } from "bun:test";
 import { chargeBlocksCompleteOffer, checkCurrency, checkMoney, makeCheckedMoney } from "./money.js";
-import { canonicalJson, normalizeMailbox, payloadHash, requestKey } from "./hashing.js";
+import { canonicalJson, payloadHash, requestKey } from "./hashing.js";
+import { isValidSingleMailbox, normalizeMailbox } from "./mailbox.js";
 import { sameCanonicalPayload, sha256BindingOk, sha256Hex } from "./sha256.js";
 
 describe("money (integer minor units, ISO currency)", () => {
@@ -58,10 +59,22 @@ describe("canonical payload binding", () => {
     );
   });
 
-  test("mailbox normalization preserves local-part semantics", () => {
-    expect(normalizeMailbox("  Owner-Supplier@Example.TEST ")).toBe("owner-supplier@example.test");
+  test("mailbox normalization preserves the local part and lowercases only the domain", () => {
+    expect(normalizeMailbox("  Owner-Supplier@Example.TEST ")).toBe("Owner-Supplier@example.test");
+    expect(normalizeMailbox("owner-supplier@example.test")).toBe("owner-supplier@example.test");
     // No dot/plus folding: distinct local parts stay distinct.
     expect(normalizeMailbox("first.last+x@example.test")).not.toBe(normalizeMailbox("firstlast@example.test"));
+  });
+
+  test("single-mailbox validation admits one address and rejects the rest", () => {
+    expect(isValidSingleMailbox("owner-supplier@example.test")).toBe(true);
+    expect(isValidSingleMailbox("Owner-Supplier@Example.TEST")).toBe(true);
+    expect(isValidSingleMailbox("owner-supplier@example.test,other@example.test")).toBe(false);
+    expect(isValidSingleMailbox("Demo Supplier <owner-supplier@example.test>")).toBe(false);
+    expect(isValidSingleMailbox("owner supplier@example.test")).toBe(false);
+    expect(isValidSingleMailbox("owner-supplier@example.test;other@example.test")).toBe(false);
+    expect(isValidSingleMailbox("not-an-address")).toBe(false);
+    expect(isValidSingleMailbox("")).toBe(false);
   });
 
   test("SHA-256 digest is deterministic and exact (async validated boundary)", async () => {

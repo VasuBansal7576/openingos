@@ -18,7 +18,8 @@
 import { v } from "convex/values";
 import type { Id } from "../_generated/dataModel.js";
 import { f1InternalMutation, f1Mutation, f1Query } from "../server.js";
-import { canonicalJson, normalizeMailbox, parseBoundedPayloadJson, requestKey } from "../shared/hashing.js";
+import { canonicalJson, parseBoundedPayloadJson, requestKey } from "../shared/hashing.js";
+import { normalizeMailbox } from "../shared/mailbox.js";
 import { sameCanonicalPayload, sha256BindingOk, sha256HexOfCanonical } from "../shared/sha256.js";
 import { isExpired } from "../shared/time.js";
 import { lookupCapability } from "../shared/scope.js";

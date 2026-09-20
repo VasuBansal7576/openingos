@@ -236,19 +236,64 @@ export interface Conversation {
   readonly updatedAt: number;
 }
 
+export interface QuoteEvidenceRef {
+  readonly sourceId: string;
+  readonly version: string;
+  readonly locator?: string;
+}
+
 export interface QuoteLine {
   readonly lineId: string;
   readonly description: string;
   readonly quantity: string;
   readonly unitPrice: { readonly currency: string; readonly minorUnits: number };
-  readonly evidenceRefs: readonly { readonly sourceId: string; readonly version: string; readonly locator: string }[];
+  readonly evidenceRefs: readonly QuoteEvidenceRef[];
 }
+
+export type QuoteChargeScope =
+  | Readonly<{ kind: "quote" }>
+  | Readonly<{ kind: "line"; lineId: string }>
+  | Readonly<{ kind: "allocated"; lineId: string; method: "fixed" | "proportional" }>;
+
+export type QuoteChargeState =
+  | Readonly<{ kind: "known"; amount: { readonly currency: string; readonly minorUnits: number } }>
+  | Readonly<{ kind: "included"; coveringId: string }>
+  | Readonly<{
+    kind: "estimated";
+    estimate:
+    | Readonly<{ kind: "point"; amount: { readonly currency: string; readonly minorUnits: number } }>
+    | Readonly<{
+      kind: "range";
+      minimum: { readonly currency: string; readonly minorUnits: number };
+      maximum: { readonly currency: string; readonly minorUnits: number };
+    }>;
+  }>
+  | Readonly<{ kind: "unknown"; reason: string }>
+  | Readonly<{ kind: "notApplicable"; reason: string }>;
 
 export interface QuoteCharge {
   readonly chargeId: string;
   readonly label: string;
-  readonly state: string;
-  readonly amount?: { readonly currency: string; readonly minorUnits: number };
+  readonly scope: QuoteChargeScope;
+  readonly state: QuoteChargeState;
+  readonly evidenceRefs: readonly QuoteEvidenceRef[];
+}
+
+export type QuoteTaxBasis =
+  | Readonly<{ kind: "inclusive" | "exclusive"; basisId: string; evidenceRefs: readonly QuoteEvidenceRef[] }>
+  | Readonly<{ kind: "unknown"; reason: string; evidenceRefs: readonly QuoteEvidenceRef[] }>;
+
+export interface QuoteComparisonScopeItem {
+  readonly itemId: string;
+  readonly lineId: string;
+  readonly unit: string;
+  readonly requiredQuantity: string;
+}
+
+export interface QuoteComparisonScope {
+  readonly requirementId: string;
+  readonly scopeId: string;
+  readonly items: readonly QuoteComparisonScopeItem[];
 }
 
 export interface Quote {
@@ -261,8 +306,9 @@ export interface Quote {
   readonly currency: string;
   readonly lines: readonly QuoteLine[];
   readonly charges: readonly QuoteCharge[];
-  readonly taxBasis: string;
-  readonly evidenceRefs: readonly { readonly sourceId: string; readonly version: string; readonly locator: string }[];
+  readonly taxBasis: QuoteTaxBasis;
+  readonly comparisonScope: QuoteComparisonScope | null;
+  readonly evidenceRefs: readonly QuoteEvidenceRef[];
   readonly counterpartyRole: string;
   readonly executionMode: ExecutionMode;
   readonly supersedes: string | null;

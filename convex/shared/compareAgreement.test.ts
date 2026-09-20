@@ -1,11 +1,12 @@
 /**
  * F1 comparison agreement with the accepted money-proof model (controlled).
  *
- * The F1 equivalent-scope engine (convex/shared/compare.ts) must agree
- * with the reviewed proofs/money contract on every shared scenario:
- * complete offers produce equal deltas, unknown charges stay unknown on
- * both sides, and estimated charges are flagged rather than silent. This
- * keeps the durable F1 contract from drifting off the accepted proof.
+ * The stored-quote comparison (convex/shared/compare.ts over
+ * quoteSemantics.ts) must agree with the reviewed proofs/money contract
+ * on every shared scenario: complete offers produce equal deltas,
+ * unknown charges stay unknown on both sides, and estimated charges are
+ * flagged rather than silent. This keeps the durable F1 contract from
+ * drifting off the accepted proof.
  */
 
 import { describe, expect, test } from "bun:test";
@@ -22,7 +23,8 @@ import {
   unknownCharge,
   evidenceRef,
 } from "../../proofs/money/index.js";
-import { compareEquivalentScope } from "./compare.js";
+import { compareStoredQuoteDocuments } from "./compare.js";
+import { storedQuoteParts } from "./quoteSemantics.js";
 
 const source = (id: string) => evidenceRef({ sourceId: id, version: "v1", locator: "controlled" });
 
@@ -34,6 +36,19 @@ function proofLine(lineId: string, amount: number, quantityValue = "1") {
     unitPrice: money(EUR, amount),
     evidenceRefs: [source(`${lineId}-source`)],
   });
+}
+
+function proofScope(lines: readonly ReturnType<typeof proofLine>[]) {
+  return {
+    requirementId: "req-purchase",
+    scopeId: "scope-purchase",
+    items: lines.map((value) => ({
+      itemId: value.lineId,
+      lineId: value.lineId,
+      unit: "piece",
+      requiredQuantity: value.quantity,
+    })),
+  };
 }
 
 function proofQuote(
@@ -48,37 +63,22 @@ function proofQuote(
     lines,
     charges,
     taxBasis: inclusiveTaxBasis("NL-EUR-INCLUSIVE", [source(`${quoteId}-source`)]),
-    comparisonScope: {
-      requirementId: "req-purchase",
-      scopeId: "scope-purchase",
-      items: lines.map((value) => ({
-        itemId: value.lineId,
-        lineId: value.lineId,
-        unit: "piece",
-        requiredQuantity: value.quantity,
-      })),
-    },
+    comparisonScope: proofScope(lines),
     evidenceRefs: [source(`${quoteId}-source`)],
   });
 }
 
-function engineQuote(
-  lines: { quantity: string; amount: number }[],
-  charges: { state: string; amount?: number }[],
-) {
+function storedQuote(version: string, lines: readonly ReturnType<typeof proofLine>[], charges: readonly ReturnType<typeof knownCharge>[]) {
+  const quote = proofQuote(version, lines, charges);
+  const parts = storedQuoteParts(quote);
   return {
-    currency: EUR,
-    taxBasis: "NL-EUR-INCLUSIVE",
-    lines: lines.map((line, index) => ({
-      quantity: line.quantity,
-      unitPriceMinorUnits: line.amount,
-      lineId: `line-${index}`,
-    })),
-    charges: charges.map((charge, index) => ({
-      state: charge.state,
-      ...(charge.amount === undefined ? {} : { amountMinorUnits: charge.amount }),
-      chargeId: `charge-${index}`,
-    })),
+    version,
+    currency: parts.currency,
+    lines: parts.lines,
+    charges: parts.charges,
+    taxBasis: parts.taxBasis,
+    ...(parts.comparisonScope === undefined ? {} : { comparisonScope: parts.comparisonScope }),
+    evidenceRefs: parts.evidenceRefs,
   };
 }
 
@@ -97,15 +97,15 @@ describe("money-proof agreement", () => {
     expect(proof.equivalent?.delta.minorUnits).toBe(-55000);
     expect(proof.equivalent?.cheaperQuoteId).toBe("left");
 
-    const engine = compareEquivalentScope(
-      engineQuote([{ quantity: "1", amount: 795000 }], []),
-      engineQuote(
-        [{ quantity: "1", amount: 750000 }],
-        [
-          { state: "known", amount: 60000 },
-          { state: "known", amount: 40000 },
-        ],
-      ),
+    const engine = compareStoredQuoteDocuments(
+      storedQuote("left", [proofLine("equipment", 795000)], [
+        includedCharge({ chargeId: "freight", label: "Freight", coveringId: "equipment" }),
+        includedCharge({ chargeId: "installation", label: "Installation", coveringId: "equipment" }),
+      ]),
+      storedQuote("right", [proofLine("equipment", 750000)], [
+        knownCharge({ chargeId: "freight", label: "Freight", amount: money(EUR, 60000) }),
+        knownCharge({ chargeId: "installation", label: "Installation", amount: money(EUR, 40000) }),
+      ]),
     );
     expect(engine.verdict).toBe("complete");
     expect(engine.differenceMinorUnits).toBe(55000);
@@ -127,14 +127,18 @@ describe("money-proof agreement", () => {
     expect(proof.status).toBe("incomplete");
     expect(proof.equivalent).toBeUndefined();
 
-    const engine = compareEquivalentScope(
-      engineQuote([{ quantity: "1", amount: 795000 }], []),
-      engineQuote([{ quantity: "1", amount: 850000 }], [{ state: "unknown" }]),
+    const engine = compareStoredQuoteDocuments(
+      storedQuote("left", [proofLine("equipment", 795000)], [
+        includedCharge({ chargeId: "freight", label: "Freight", coveringId: "equipment" }),
+        unknownCharge({ chargeId: "installation", label: "Installation", reason: "supplier did not state it" }),
+      ]),
+      storedQuote("right", [proofLine("equipment", 850000)], [
+        includedCharge({ chargeId: "freight", label: "Freight", coveringId: "equipment" }),
+        includedCharge({ chargeId: "installation", label: "Installation", coveringId: "equipment" }),
+      ]),
     );
-    // Engine sides differ from the proof fixture (unknown on the right),
-    // but the contract holds: no complete verdict on unknown scope.
     expect(engine.verdict).toBe("incomplete");
-    expect(engine.reason).toBe("unknown-charge-prevents-complete-claim");
+    expect(engine.differenceMinorUnits).toBeNull();
   });
 
   test("estimated charges are flagged on both models, never silent", () => {
@@ -145,9 +149,11 @@ describe("money-proof agreement", () => {
     const proof = compareQuotes(leftProof, rightProof);
     expect(proof.status).toBe("estimated");
 
-    const engine = compareEquivalentScope(
-      engineQuote([{ quantity: "1", amount: 795000 }], []),
-      engineQuote([{ quantity: "1", amount: 750000 }], [{ state: "estimated", amount: 60000 }]),
+    const engine = compareStoredQuoteDocuments(
+      storedQuote("left", [proofLine("equipment", 795000)], []),
+      storedQuote("right", [proofLine("equipment", 750000)], [
+        estimatedCharge({ chargeId: "freight", label: "Freight", amount: money(EUR, 60000) }),
+      ]),
     );
     expect(engine.verdict).toBe("complete");
     expect(engine.reason).toBe("equivalent-scope-with-estimates");

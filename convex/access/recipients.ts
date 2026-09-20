@@ -10,7 +10,8 @@
 
 import { v } from "convex/values";
 import { f1InternalMutation, f1Query } from "../server.js";
-import { isValidSingleMailbox, normalizeMailbox, payloadHash } from "../shared/hashing.js";
+import { payloadHash } from "../shared/hashing.js";
+import { isValidSingleMailbox, normalizeMailbox } from "../shared/mailbox.js";
 import { denialValidator } from "./checks.js";
 
 const describeValidator = v.union(
