@@ -371,3 +371,19 @@ This is controlled local evidence only.
 No hosted Convex read, service mutation, live provider call, owner-mailbox exchange or external effect was observed.
 The direct PR-thread audit also found four additional actionable Greptile discussions that were not represented by the green aggregate check: an activity-cursor race, duplicate J-06 IDs, ambiguous OpenAI response accounting and unbound OpenAI workload input.
 Focused Luna and Muse repairs are active, so PR #2 remains unmergeable until those fixes are integrated, tested, pushed and reviewed.
+
+### 2026-09-21 - PR #2 review-repair integration checkpoint
+
+Integrated the U1 activity race and J-06 duplicate-ID repairs through `b7c4002`.
+Stale head responses and failures can no longer overwrite newer live state, older activity pages cannot move the cursor backwards, and duplicate evaluation IDs are rejected before metric access or scoring.
+Integrated the E1 empty-field and W1 reactive-expiry repairs through `3a73e65`.
+Empty optional equipment strings now render as unrecorded metadata, while every newly created temporary project membership schedules an idempotent membership-scoped expiry transition that changes the watched database rows.
+Integrated the OpenAI review repairs through `de46ec6`.
+The complete parsed workload is now bound by a digest copied through grant, job and operation input versions and rechecked before claim and fetch; every non-success after fetch remains unresolved exposure rather than releasing allowance.
+Integrated the C1 short-draft repair and the coordinator-requested D-17 follow-up through `d734bba`.
+Exact generic owner-only drafts require current envelope, recipient, workflow, conversation and grant bindings, while mixed supported communication still persists and claims only its canonical supported segment.
+The combined latest local head passes `bun run test`, both TypeScript checks, the production build and `git diff --check`.
+The default matrix includes 23 repository checks, 77 money and Jev boundary proofs, 15 J-06 evaluation tests, 155 browser-executor tests, 21 application and communication tests, and 231 direct Convex tests.
+All evidence in this checkpoint is controlled local execution only.
+No hosted Convex run, live OpenAI, Jev, Firecrawl or AgentMail call, owner-mailbox exchange, genuine vendor result, public deployment or realized savings was observed.
+PR #2 remains open until this documented head is pushed, exact-head GitHub Actions and direct review-thread audit pass, a separate GPT-6 Astra session accepts the same revision, GitHub reports no conflict, and the selected desktop and narrow user flow is inspected.

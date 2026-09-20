@@ -98,10 +98,12 @@ This file supplies order, not duplicate contracts or a running automation.
 - [x] Integrate the controlled J-06 versioned Jev evaluation corpus and runner through local commit `1f98a60`; 12 focused tests and strict TypeScript pass, and the suite is now part of `bun run test`.
 - [x] Integrate the controlled server-only OpenAI Responses boundary through local commit `a0ec63f`; the dated model, strict extraction/draft schemas, source and token bounds, shared reservation fence, one-attempt transport and ambiguous accounting pass 17 focused tests and the combined full matrix.
 - [x] Integrate the real E1 equipment projection into the workbench UI through local commit `8ac84de`; the independent rerun passes 47 app tests, strict TypeScript and the production build, with no live backend or service mutation claimed.
-- [ ] Repair Greptile P1 discussion `4058171616`, which found that short exact-grant communication drafts can be refused before communication-envelope validation.
-- [ ] Repair Greptile P1 discussion `4058206836`, which found that out-of-order activity page responses can regress the current cursor.
-- [ ] Repair Greptile P2 discussion `4058227807`, which found that duplicate J-06 corpus IDs can skew metrics.
-- [ ] Repair Greptile P1 discussions `4058238262` and `4058238267`, which require ambiguous accounting after a billable invalid OpenAI response and exact binding of the complete model workload.
+- [x] Repair Greptile P1 discussion `4058171616` through integrated commit `d734bba`: exact owner-only short drafts pass only under current grant, recipient, workflow and conversation authority, while D-17 supported-segment canonicalization remains intact for mixed communication.
+- [x] Repair Greptile P1 discussion `4058206836` through integrated commit `b7c4002`: monotonic request generations discard stale head responses and failures, preserve live head state and prevent older activity pages from regressing the cursor.
+- [x] Repair Greptile P2 discussion `4058227807` through integrated commit `b7c4002`: duplicate J-06 case IDs are rejected before metric access, grouping or scoring.
+- [x] Repair Greptile P1 discussions `4058238262` and `4058238267` through integrated commit `de46ec6`: every post-fetch non-success retains unresolved exposure, and a digest of the complete parsed workload is bound through the grant, job and operation input-version snapshots before claim and fetch.
+- [x] Repair Greptile E1 P1 discussion `4058268105` through integrated commit `3a73e65`: backend-valid empty optional equipment strings become absent display metadata without dropping the authorized projection, while defined non-string values still fail closed.
+- [x] Repair Greptile W1 P2 discussion `4058268108` through integrated commit `3a73e65`: temporary membership creation schedules an idempotent membership-scoped expiry mutation whose database write invalidates reactive project and workbench queries.
 - [ ] Finish the U1 backend-shape adapter, connect the UI to Convex, inspect the selected flow at desktop and narrow widths, then obtain exact-head CI, Greptile and separate Astra review.
 
 The completed money and Jev proof wave contains controlled proofs only, reviewed at `595d30c` with no actionable findings remaining.
