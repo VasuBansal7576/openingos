@@ -35,6 +35,13 @@
 import { defineSchema, defineTable } from "convex/server";
 import { authTables } from "@convex-dev/auth/server";
 import { v } from "convex/values";
+import {
+  quoteComparisonScopeValidator,
+  quoteEvidenceRefValidator,
+  quoteTaxBasisValidator,
+  storedQuoteChargeValidator,
+  storedQuoteLineValidator,
+} from "./shared/quoteSemantics.js";
 
 const moneyValidator = v.object({
   currency: v.string(),
@@ -303,26 +310,13 @@ export default defineSchema({
     conversationId: v.optional(v.id("conversations")),
     version: v.string(),
     contentHash: v.string(),
+    payloadSha256: v.optional(v.string()),
     currency: v.string(),
-    lines: v.array(
-      v.object({
-        lineId: v.string(),
-        description: v.string(),
-        quantity: v.string(),
-        unitPrice: moneyValidator,
-        evidenceRefs: v.array(evidenceRefValidator),
-      }),
-    ),
-    charges: v.array(
-      v.object({
-        chargeId: v.string(),
-        label: v.string(),
-        state: v.string(),
-        amount: v.optional(moneyValidator),
-      }),
-    ),
-    taxBasis: v.string(),
-    evidenceRefs: v.array(evidenceRefValidator),
+    lines: v.array(storedQuoteLineValidator),
+    charges: v.array(storedQuoteChargeValidator),
+    taxBasis: quoteTaxBasisValidator,
+    comparisonScope: v.optional(quoteComparisonScopeValidator),
+    evidenceRefs: v.array(quoteEvidenceRefValidator),
     counterpartyRole: v.string(),
     executionMode: v.union(
       v.literal("live"),

@@ -47,7 +47,7 @@ describe("S-04 cross-tenant isolation", () => {
       currency: "EUR",
       lines: [],
       charges: [],
-      taxBasis: "NL-EUR-INCLUSIVE",
+      taxBasis: { kind: "inclusive", basisId: "NL-EUR-INCLUSIVE", evidenceRefs: [] },
       evidenceRefs: [],
     }, now);
     expect(quote.ok).toBe(false);
@@ -90,7 +90,7 @@ describe("S-04 cross-tenant isolation", () => {
       currency: "EUR",
       lines: [],
       charges: [],
-      taxBasis: "NL-EUR-INCLUSIVE",
+      taxBasis: { kind: "inclusive", basisId: "NL-EUR-INCLUSIVE", evidenceRefs: [] },
       evidenceRefs: [],
     }, now);
     expect(quote.ok).toBe(false);

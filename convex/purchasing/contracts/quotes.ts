@@ -1,44 +1,45 @@
 /**
- * F1 immutable quote versions and equivalent-scope comparison
+ * F1 immutable quote versions and exact-scope comparison
  * (controlled contract, ADR-0003).
  *
  * Quote versions are immutable: revisions create new versions that
- * supersede, never overwrite. Money is integer minor units; unknown
- * charges carry no amount and block any "cheaper" claim. Owner-authored
- * terms keep `counterpartyRole: ownerStandIn` and never overwrite
- * researched vendor facts.
+ * supersede, never overwrite. Every document parses through the accepted
+ * proofs/money/quote.ts constructors, so discriminated charge states
+ * (known/included/estimated point-or-range/unknown/notApplicable with
+ * required reasons or coveringIds), quote/line/allocated scopes with
+ * evidence, exact comparison scopes, duplicate rejection, currency and
+ * range validation, and dangling/cyclic coverage rejection all hold on
+ * the real backend exactly as proven. Comparison runs through the
+ * accepted proofs/money/comparison.ts engine over stable scope items, so
+ * reorder is tolerated while unrelated aggregate-equal lines never
+ * compare. Owner-authored terms keep `counterpartyRole: ownerStandIn`
+ * and never overwrite researched vendor facts.
  *
  * Visibility: `record` is a public user import (corrections and manual
  * quotes under project capability); `ingestProviderQuote` is the
  * internal provider write for the extraction pipeline. Both share one
- * money/provenance validation core.
+ * proofs-backed validation core.
  */
 
 import { v } from "convex/values";
 import type { Id } from "../../_generated/dataModel.js";
 import { f1InternalMutation, f1Mutation, f1Query, type F1MutationCtx } from "../../server.js";
-import { payloadHash } from "../../shared/hashing.js";
-import { compareEquivalentScope } from "../../shared/compare.js";
-import { checkMoney } from "../../shared/money.js";
+import { canonicalJson, payloadHash } from "../../shared/hashing.js";
+import { sha256HexOfCanonical } from "../../shared/sha256.js";
+import {
+  compareStoredQuotes,
+  parseQuoteDocument,
+  quoteChargeInputValidator,
+  quoteComparisonScopeValidator,
+  quoteDecisionFields,
+  quoteEvidenceRefValidator,
+  quoteLineInputValidator,
+  quoteTaxBasisValidator,
+  storedQuoteParts,
+} from "../../shared/quoteSemantics.js";
+import type { Quote } from "../../shared/quoteSemantics.js";
 import { approved, denial, type AuthorityResult } from "../../shared/denials.js";
 import { checkProjectAccess, denialValidator, identityOf, requireCapability } from "../../access/checks.js";
-
-const moneyInputValidator = v.object({ currency: v.string(), minorUnits: v.number() });
-
-const lineValidator = v.object({
-  lineId: v.string(),
-  description: v.string(),
-  quantity: v.string(),
-  unitPrice: moneyInputValidator,
-  evidenceRefs: v.array(v.object({ sourceId: v.string(), version: v.string(), locator: v.string() })),
-});
-
-const chargeValidator = v.object({
-  chargeId: v.string(),
-  label: v.string(),
-  state: v.string(),
-  amount: v.optional(moneyInputValidator),
-});
 
 /**
  * Public user-import fields. Provenance is NOT caller-supplied: the
@@ -51,10 +52,11 @@ const userQuoteFieldsValidator = v.object({
   projectId: v.id("projects"),
   version: v.string(),
   currency: v.string(),
-  lines: v.array(lineValidator),
-  charges: v.array(chargeValidator),
-  taxBasis: v.string(),
-  evidenceRefs: v.array(v.object({ sourceId: v.string(), version: v.string(), locator: v.string() })),
+  lines: v.array(quoteLineInputValidator),
+  charges: v.optional(v.array(quoteChargeInputValidator)),
+  taxBasis: quoteTaxBasisValidator,
+  comparisonScope: v.optional(quoteComparisonScopeValidator),
+  evidenceRefs: v.optional(v.array(quoteEvidenceRefValidator)),
   conversationId: v.optional(v.id("conversations")),
   supersedes: v.optional(v.string()),
 });
@@ -65,10 +67,11 @@ const providerQuoteFieldsValidator = v.object({
   projectId: v.id("projects"),
   version: v.string(),
   currency: v.string(),
-  lines: v.array(lineValidator),
-  charges: v.array(chargeValidator),
-  taxBasis: v.string(),
-  evidenceRefs: v.array(v.object({ sourceId: v.string(), version: v.string(), locator: v.string() })),
+  lines: v.array(quoteLineInputValidator),
+  charges: v.optional(v.array(quoteChargeInputValidator)),
+  taxBasis: quoteTaxBasisValidator,
+  comparisonScope: v.optional(quoteComparisonScopeValidator),
+  evidenceRefs: v.optional(v.array(quoteEvidenceRefValidator)),
   counterpartyRole: v.union(v.literal("vendor"), v.literal("ownerStandIn")),
   executionMode: v.union(v.literal("live"), v.literal("recorded")),
   conversationId: v.optional(v.id("conversations")),
@@ -80,69 +83,59 @@ type QuoteFields = {
   projectId: Id<"projects">;
   version: string;
   currency: string;
-  lines: {
-    lineId: string;
-    description: string;
-    quantity: string;
-    unitPrice: { currency: string; minorUnits: number };
-    evidenceRefs: { sourceId: string; version: string; locator: string }[];
-  }[];
-  charges: {
-    chargeId: string;
-    label: string;
-    state: string;
-    amount?: { currency: string; minorUnits: number };
-  }[];
-  taxBasis: string;
-  evidenceRefs: { sourceId: string; version: string; locator: string }[];
+  lines: unknown[];
+  charges?: unknown[];
+  taxBasis: unknown;
+  comparisonScope?: unknown;
+  evidenceRefs?: unknown;
   counterpartyRole: string;
   executionMode: "live" | "recorded" | "fixture";
   conversationId?: Id<"conversations">;
   supersedes?: string;
 };
 
-function validateQuoteFields(fields: QuoteFields): AuthorityResult<QuoteFields> {
-  if (!/^[A-Z]{3}$/.test(fields.currency)) {
-    return denial("invalid-payload", "currency must be ISO 4217");
+function validateQuoteFields(fields: QuoteFields): AuthorityResult<Quote> {
+  try {
+    return approved(
+      parseQuoteDocument({
+        quoteId: fields.version,
+        version: fields.version,
+        currency: fields.currency,
+        lines: fields.lines,
+        ...(fields.charges === undefined ? {} : { charges: fields.charges }),
+        taxBasis: fields.taxBasis,
+        ...(fields.comparisonScope === undefined ? {} : { comparisonScope: fields.comparisonScope }),
+        ...(fields.evidenceRefs === undefined ? {} : { evidenceRefs: fields.evidenceRefs }),
+      }),
+    );
+  } catch (error) {
+    return denial("invalid-payload", error instanceof Error ? error.message : "quote is invalid");
   }
-  for (const line of fields.lines) {
-    try {
-      checkMoney(line.unitPrice, `line ${line.lineId}`);
-    } catch {
-      return denial("invalid-payload", `line ${line.lineId} is not valid minor-unit money`);
-    }
-    if (line.unitPrice.currency !== fields.currency) {
-      return denial("invalid-payload", `line ${line.lineId} mixes currency`);
-    }
-  }
-  for (const charge of fields.charges) {
-    if (charge.amount !== undefined) {
-      try {
-        checkMoney(charge.amount, `charge ${charge.chargeId}`);
-      } catch {
-        return denial("invalid-payload", `charge ${charge.chargeId} is not valid minor-unit money`);
-      }
-    }
-    if (charge.state === "unknown" && charge.amount !== undefined) {
-      return denial("invalid-payload", `unknown charge ${charge.chargeId} must not carry an amount`);
-    }
-  }
-  return approved(fields);
 }
 
 /**
- * Immutable version, supersedes, and conversation references. Versions are
- * never overwritten; a revision must name the exact content hash it
- * replaces, and conversations must live in the same project.
+ * Immutable version, supersedes lineage, and conversation references.
+ * Versions are never overwritten and are unique per project; a revision
+ * must name the exact content hash it replaces, and the superseded
+ * version must share the same project, conversation binding, and
+ * counterparty lineage. Conversations must live in the same project.
  */
 async function checkQuoteReferences(
   ctx: F1MutationCtx,
   organizationId: Id<"organizations">,
   projectId: Id<"projects">,
-  fields: Pick<QuoteFields, "version" | "conversationId" | "supersedes">,
+  fields: Pick<QuoteFields, "version" | "conversationId" | "supersedes" | "counterpartyRole">,
 ): Promise<AuthorityResult<true>> {
   if (fields.version.trim().length === 0) {
     return denial("invalid-payload", "version required");
+  }
+  const siblings = await ctx.db
+    .query("quotes")
+    .withIndex("by_project", (q) => q.eq("projectId", projectId))
+    .collect();
+  const duplicate = siblings.some((sibling) => sibling.version === fields.version);
+  if (duplicate) {
+    return denial("invalid-payload", `duplicate quote version ${fields.version}`);
   }
   if (fields.conversationId !== undefined) {
     const conversation = await ctx.db.get(fields.conversationId);
@@ -166,6 +159,13 @@ async function checkQuoteReferences(
     ) {
       return denial("invalid-payload", "supersedes unknown quote version");
     }
+    const sameConversation = (prior.conversationId ?? undefined) === fields.conversationId;
+    if (!sameConversation) {
+      return denial("invalid-payload", "supersedes must share the conversation binding");
+    }
+    if (prior.counterpartyRole !== fields.counterpartyRole) {
+      return denial("invalid-payload", "supersedes must share the counterparty lineage");
+    }
   }
   return approved(true);
 }
@@ -173,26 +173,62 @@ async function checkQuoteReferences(
 async function insertQuoteVersion(
   ctx: F1MutationCtx,
   fields: QuoteFields,
+  quote: Quote,
   now: number,
 ): Promise<{ quoteId: Id<"quotes">; contentHash: string }> {
-  const contentHash = payloadHash({
-    version: fields.version,
-    currency: fields.currency,
-    lines: fields.lines,
-    charges: fields.charges,
-    taxBasis: fields.taxBasis,
+  const parts = storedQuoteParts(quote);
+  const decision = quoteDecisionFields({
+    version: quote.version,
+    currency: parts.currency,
+    lines: parts.lines,
+    charges: parts.charges,
+    taxBasis: parts.taxBasis,
+    ...(parts.comparisonScope === undefined ? {} : { comparisonScope: parts.comparisonScope }),
+    evidenceRefs: parts.evidenceRefs,
+    counterpartyRole: fields.counterpartyRole,
+    executionMode: fields.executionMode,
+    ...(fields.conversationId === undefined ? {} : { conversationId: fields.conversationId }),
   });
+  const canonical = canonicalJson(decision);
+  const contentHash = payloadHash(decision);
+  const payloadSha256 = await sha256HexOfCanonical(canonical);
+  const storedTaxBasis = parts.taxBasis.kind === "unknown"
+    ? {
+      kind: "unknown" as const,
+      reason: parts.taxBasis.reason,
+      evidenceRefs: [...parts.taxBasis.evidenceRefs],
+    }
+    : parts.taxBasis.kind === "inclusive"
+      ? {
+        kind: "inclusive" as const,
+        basisId: parts.taxBasis.basisId,
+        evidenceRefs: [...parts.taxBasis.evidenceRefs],
+      }
+      : {
+        kind: "exclusive" as const,
+        basisId: parts.taxBasis.basisId,
+        evidenceRefs: [...parts.taxBasis.evidenceRefs],
+      };
   const quoteId = await ctx.db.insert("quotes", {
     organizationId: fields.organizationId,
     projectId: fields.projectId,
     ...(fields.conversationId === undefined ? {} : { conversationId: fields.conversationId }),
-    version: fields.version,
+    version: quote.version,
     contentHash,
-    currency: fields.currency,
-    lines: fields.lines.map((line) => ({ ...line, evidenceRefs: [...line.evidenceRefs] })),
-    charges: fields.charges.map((charge) => ({ ...charge })),
-    taxBasis: fields.taxBasis,
-    evidenceRefs: [...fields.evidenceRefs],
+    payloadSha256,
+    currency: parts.currency,
+    lines: parts.lines.map((line) => ({ ...line, evidenceRefs: [...line.evidenceRefs] })),
+    charges: parts.charges.map((charge) => ({ ...charge, evidenceRefs: [...charge.evidenceRefs] })),
+    taxBasis: storedTaxBasis,
+    ...(parts.comparisonScope === undefined
+      ? {}
+      : {
+        comparisonScope: {
+          ...parts.comparisonScope,
+          items: parts.comparisonScope.items.map((item) => ({ ...item })),
+        },
+      }),
+    evidenceRefs: [...parts.evidenceRefs],
     counterpartyRole: fields.counterpartyRole,
     executionMode: fields.executionMode,
     ...(fields.supersedes === undefined ? {} : { supersedes: fields.supersedes }),
@@ -229,23 +265,34 @@ export const record = f1Mutation({
     if (!capability.ok) {
       return { ok: false as const, code: capability.code, message: capability.message };
     }
-    const valid = validateQuoteFields({
-      ...args,
+    const fields: QuoteFields = {
+      organizationId: args.organizationId,
+      projectId: args.projectId,
+      version: args.version,
+      currency: args.currency,
+      lines: [...args.lines],
+      ...(args.charges === undefined ? {} : { charges: [...args.charges] }),
+      taxBasis: args.taxBasis,
+      ...(args.comparisonScope === undefined ? {} : { comparisonScope: args.comparisonScope }),
+      ...(args.evidenceRefs === undefined ? {} : { evidenceRefs: [...args.evidenceRefs] }),
       counterpartyRole: "userImport",
       executionMode: "recorded",
-    });
+      ...(args.conversationId === undefined ? {} : { conversationId: args.conversationId }),
+      ...(args.supersedes === undefined ? {} : { supersedes: args.supersedes }),
+    };
+    const valid = validateQuoteFields(fields);
     if (!valid.ok) return { ok: false as const, code: valid.code, message: valid.message };
-    const references = await checkQuoteReferences(ctx, args.organizationId, args.projectId, args);
+    const references = await checkQuoteReferences(ctx, args.organizationId, args.projectId, fields);
     if (!references.ok) {
       return { ok: false as const, code: references.code, message: references.message };
     }
-    const { quoteId, contentHash } = await insertQuoteVersion(ctx, valid.value, now);
+    const { quoteId, contentHash } = await insertQuoteVersion(ctx, fields, valid.value, now);
     return { ok: true as const, quoteId, contentHash };
   },
 });
 
 /**
- * Internal provider write: extraction pipeline only, same money rules.
+ * Internal provider write: extraction pipeline only, same proofs rules.
  * Fixture execution mode is unavailable here and in public runtime.
  */
 export const ingestProviderQuote = f1InternalMutation({
@@ -256,13 +303,28 @@ export const ingestProviderQuote = f1InternalMutation({
     if (project === null || project.organizationId !== args.organizationId) {
       return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
     }
-    const valid = validateQuoteFields(args);
+    const fields: QuoteFields = {
+      organizationId: args.organizationId,
+      projectId: args.projectId,
+      version: args.version,
+      currency: args.currency,
+      lines: [...args.lines],
+      ...(args.charges === undefined ? {} : { charges: [...args.charges] }),
+      taxBasis: args.taxBasis,
+      ...(args.comparisonScope === undefined ? {} : { comparisonScope: args.comparisonScope }),
+      ...(args.evidenceRefs === undefined ? {} : { evidenceRefs: [...args.evidenceRefs] }),
+      counterpartyRole: args.counterpartyRole,
+      executionMode: args.executionMode,
+      ...(args.conversationId === undefined ? {} : { conversationId: args.conversationId }),
+      ...(args.supersedes === undefined ? {} : { supersedes: args.supersedes }),
+    };
+    const valid = validateQuoteFields(fields);
     if (!valid.ok) return { ok: false as const, code: valid.code, message: valid.message };
-    const references = await checkQuoteReferences(ctx, args.organizationId, args.projectId, args);
+    const references = await checkQuoteReferences(ctx, args.organizationId, args.projectId, fields);
     if (!references.ok) {
       return { ok: false as const, code: references.code, message: references.message };
     }
-    const { quoteId, contentHash } = await insertQuoteVersion(ctx, valid.value, Date.now());
+    const { quoteId, contentHash } = await insertQuoteVersion(ctx, fields, valid.value, Date.now());
     return { ok: true as const, quoteId, contentHash };
   },
 });
@@ -278,7 +340,7 @@ const compareResultValidator = v.union(
   denialValidator,
 );
 
-/** Equivalent-scope comparison; unknown charges block complete claims. */
+/** Exact-scope comparison over stable scope items; reorder-tolerant. */
 export const compare = f1Query({
   args: {
     leftQuoteId: v.id("quotes"),
@@ -311,19 +373,26 @@ export const compare = f1Query({
     ) {
       return { ok: false as const, code: "denied-project", message: "quotes are not in this project" };
     }
-    const toComparable = (quote: typeof left) => ({
-      currency: quote.currency,
-      taxBasis: quote.taxBasis,
-      lines: quote.lines.map((line) => ({
-        quantity: line.quantity,
-        unitPriceMinorUnits: line.unitPrice.minorUnits,
-      })),
-      charges: quote.charges.map((charge) => ({
-        state: charge.state,
-        ...(charge.amount === undefined ? {} : { amountMinorUnits: charge.amount.minorUnits }),
-      })),
-    });
-    const verdict = compareEquivalentScope(toComparable(left), toComparable(right));
+    const verdict = compareStoredQuotes(
+      {
+        version: left.version,
+        currency: left.currency,
+        lines: left.lines.map((line) => ({ ...line, evidenceRefs: [...line.evidenceRefs] })),
+        charges: left.charges.map((charge) => ({ ...charge, evidenceRefs: [...charge.evidenceRefs] })),
+        taxBasis: left.taxBasis,
+        ...(left.comparisonScope === undefined ? {} : { comparisonScope: left.comparisonScope }),
+        evidenceRefs: [...left.evidenceRefs],
+      },
+      {
+        version: right.version,
+        currency: right.currency,
+        lines: right.lines.map((line) => ({ ...line, evidenceRefs: [...line.evidenceRefs] })),
+        charges: right.charges.map((charge) => ({ ...charge, evidenceRefs: [...charge.evidenceRefs] })),
+        taxBasis: right.taxBasis,
+        ...(right.comparisonScope === undefined ? {} : { comparisonScope: right.comparisonScope }),
+        evidenceRefs: [...right.evidenceRefs],
+      },
+    );
     return {
       ok: true as const,
       verdict: verdict.verdict,

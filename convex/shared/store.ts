@@ -23,12 +23,11 @@
 
 import {
   canonicalJson,
-  isValidSingleMailbox,
-  normalizeMailbox,
   payloadHash,
   requestKey,
 } from "./hashing.js";
-import { compareEquivalentScope } from "./compare.js";
+import { isValidSingleMailbox, normalizeMailbox } from "./mailbox.js";
+import { compareStoredQuotes, parseQuoteDocument, quoteDecisionFields, storedQuoteParts } from "./quoteSemantics.js";
 import { sameCanonicalPayload, sha256BindingOk } from "./sha256.js";
 import { isExpired } from "./time.js";
 import {
@@ -39,7 +38,6 @@ import {
 } from "./scope.js";
 import { COMMUNICATION_PROFILE_OWNER_ROLEPLAY } from "./provenance.js";
 import { approved, denial, type AuthorityResult, type Denial } from "./denials.js";
-import { checkMoney } from "./money.js";
 import type {
   Attempt,
   Conversation,
@@ -1685,12 +1683,13 @@ export class ControlledBackend {
     organizationId: string,
     projectId: string,
     input: {
-      version: string;
-      currency: string;
-      lines: readonly QuoteLine[];
-      charges: readonly QuoteCharge[];
-      taxBasis: string;
-      evidenceRefs: Quote["evidenceRefs"];
+      version: unknown;
+      currency: unknown;
+      lines: readonly unknown[];
+      charges?: readonly unknown[];
+      taxBasis: unknown;
+      comparisonScope?: unknown;
+      evidenceRefs?: readonly unknown[];
       conversationId?: string;
       supersedes?: string;
     },
@@ -1715,12 +1714,13 @@ export class ControlledBackend {
     organizationId: string,
     projectId: string,
     input: {
-      version: string;
-      currency: string;
-      lines: readonly QuoteLine[];
-      charges: readonly QuoteCharge[];
-      taxBasis: string;
-      evidenceRefs: Quote["evidenceRefs"];
+      version: unknown;
+      currency: unknown;
+      lines: readonly unknown[];
+      charges?: readonly unknown[];
+      taxBasis: unknown;
+      comparisonScope?: unknown;
+      evidenceRefs?: readonly unknown[];
       counterpartyRole: "vendor" | "ownerStandIn";
       executionMode: "live" | "recorded";
       conversationId?: string;
@@ -1740,12 +1740,13 @@ export class ControlledBackend {
     organizationId: string,
     projectId: string,
     input: {
-      version: string;
-      currency: string;
-      lines: readonly QuoteLine[];
-      charges: readonly QuoteCharge[];
-      taxBasis: string;
-      evidenceRefs: Quote["evidenceRefs"];
+      version: unknown;
+      currency: unknown;
+      lines: readonly unknown[];
+      charges?: readonly unknown[];
+      taxBasis: unknown;
+      comparisonScope?: unknown;
+      evidenceRefs?: readonly unknown[];
       counterpartyRole: string;
       executionMode: ExecutionMode;
       conversationId?: string;
@@ -1753,8 +1754,32 @@ export class ControlledBackend {
     },
     now: number,
   ): AuthorityResult<Quote> {
-    if (input.version.trim().length === 0) {
+    if (typeof input.version !== "string" || input.version.trim().length === 0) {
       return denial("invalid-payload", "version required");
+    }
+    let parsed: ReturnType<typeof parseQuoteDocument>;
+    try {
+      parsed = parseQuoteDocument({
+        quoteId: input.version,
+        version: input.version,
+        currency: input.currency,
+        lines: input.lines,
+        ...(input.charges === undefined ? {} : { charges: input.charges }),
+        taxBasis: input.taxBasis,
+        ...(input.comparisonScope === undefined ? {} : { comparisonScope: input.comparisonScope }),
+        ...(input.evidenceRefs === undefined ? {} : { evidenceRefs: [...input.evidenceRefs] }),
+      });
+    } catch (error) {
+      return denial("invalid-payload", error instanceof Error ? error.message : "quote is invalid");
+    }
+    for (const sibling of this.quotes.values()) {
+      if (
+        sibling.organizationId === organizationId &&
+        sibling.projectId === projectId &&
+        sibling.version === parsed.version
+      ) {
+        return denial("invalid-payload", `duplicate quote version ${parsed.version}`);
+      }
     }
     if (input.conversationId !== undefined) {
       const conversation = this.conversations.get(input.conversationId);
@@ -1777,47 +1802,38 @@ export class ControlledBackend {
       ) {
         return denial("invalid-payload", "supersedes unknown quote version");
       }
-    }
-    for (const line of input.lines) {
-      try {
-        checkMoney(line.unitPrice, `line ${line.lineId}`);
-      } catch {
-        return denial("invalid-payload", `line ${line.lineId} is not valid minor-unit money`);
+      if ((prior.conversationId ?? undefined) !== input.conversationId) {
+        return denial("invalid-payload", "supersedes must share the conversation binding");
       }
-      if (line.unitPrice.currency !== input.currency) {
-        return denial("invalid-payload", `line ${line.lineId} mixes currency`);
+      if (prior.counterpartyRole !== input.counterpartyRole) {
+        return denial("invalid-payload", "supersedes must share the counterparty lineage");
       }
     }
-    for (const charge of input.charges) {
-      if (charge.amount !== undefined) {
-        try {
-          checkMoney(charge.amount, `charge ${charge.chargeId}`);
-        } catch {
-          return denial("invalid-payload", `charge ${charge.chargeId} is not valid minor-unit money`);
-        }
-      }
-      if (charge.state === "unknown" && charge.amount !== undefined) {
-        return denial("invalid-payload", `unknown charge ${charge.chargeId} must not carry an amount`);
-      }
-    }
+    const parts = storedQuoteParts(parsed);
     const quote: Quote = {
       id: this.next("quote"),
       organizationId,
       projectId,
       conversationId: input.conversationId ?? null,
-      version: input.version,
-      contentHash: payloadHash({
-        version: input.version,
-        currency: input.currency,
-        lines: input.lines,
-        charges: input.charges,
-        taxBasis: input.taxBasis,
-      }),
-      currency: input.currency,
-      lines: Object.freeze([...input.lines]),
-      charges: Object.freeze([...input.charges]),
-      taxBasis: input.taxBasis,
-      evidenceRefs: Object.freeze([...input.evidenceRefs]),
+      version: parsed.version,
+      contentHash: payloadHash(quoteDecisionFields({
+        version: parsed.version,
+        currency: parts.currency,
+        lines: parts.lines,
+        charges: parts.charges,
+        taxBasis: parts.taxBasis,
+        ...(parts.comparisonScope === undefined ? {} : { comparisonScope: parts.comparisonScope }),
+        evidenceRefs: parts.evidenceRefs,
+        counterpartyRole: input.counterpartyRole,
+        executionMode: input.executionMode,
+        ...(input.conversationId === undefined ? {} : { conversationId: input.conversationId }),
+      })),
+      currency: parts.currency,
+      lines: Object.freeze(parts.lines.map((line) => ({ ...line, evidenceRefs: [...line.evidenceRefs] }))),
+      charges: Object.freeze(parts.charges.map((charge) => ({ ...charge, evidenceRefs: [...charge.evidenceRefs] }))),
+      taxBasis: parts.taxBasis,
+      comparisonScope: parts.comparisonScope ?? null,
+      evidenceRefs: Object.freeze([...parts.evidenceRefs]),
       counterpartyRole: input.counterpartyRole,
       executionMode: input.executionMode,
       supersedes: input.supersedes ?? null,
@@ -1828,9 +1844,9 @@ export class ControlledBackend {
   }
 
   /**
-   * Equivalent-scope comparison through the shared exact engine: quantities
-   * scale totals, unknown charges block complete claims, and unequal scope
-   * refuses. Shared with the Convex compare handler.
+   * Exact comparison through the shared proofs-backed engine: matched by
+   * stable scope items (reorder-tolerant), unknown charges blocking, and
+   * unrelated scope refusing. Shared with the Convex compare handler.
    */
   compareControlledQuotes(leftId: string, rightId: string): AuthorityResult<{
     verdict: "complete" | "incomplete";
@@ -1845,18 +1861,15 @@ export class ControlledBackend {
       return denial("denied-project", "quotes belong to different projects");
     }
     const toComparable = (quote: Quote) => ({
+      version: quote.version,
       currency: quote.currency,
+      lines: quote.lines.map((line) => ({ ...line, evidenceRefs: [...line.evidenceRefs] })),
+      charges: quote.charges.map((charge) => ({ ...charge, evidenceRefs: [...charge.evidenceRefs] })),
       taxBasis: quote.taxBasis,
-      lines: quote.lines.map((line) => ({
-        quantity: line.quantity,
-        unitPriceMinorUnits: line.unitPrice.minorUnits,
-      })),
-      charges: quote.charges.map((charge) => ({
-        state: charge.state,
-        ...(charge.amount === undefined ? {} : { amountMinorUnits: charge.amount.minorUnits }),
-      })),
+      ...(quote.comparisonScope === null ? {} : { comparisonScope: quote.comparisonScope }),
+      evidenceRefs: [...quote.evidenceRefs],
     });
-    return approved(compareEquivalentScope(toComparable(left), toComparable(right)));
+    return approved(compareStoredQuotes(toComparable(left), toComparable(right)));
   }
 
   // -- Introspection -------------------------------------------------------

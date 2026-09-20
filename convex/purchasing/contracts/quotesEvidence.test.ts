@@ -1,25 +1,63 @@
 /**
  * F1 quote/evidence contract tests (controlled, P-06/P-07/P-08 / D-02/D-08).
  *
- * €7,950 complete versus €7,500 + €600 + €400 = €8,500: the equivalent-scope
+ * €7,950 complete versus €7,500 + €600 + €400 = €8,500: the exact-scope
  * difference is €550 (55,000 minor units). Unknown charges block complete
  * claims. Versions are immutable; owner terms keep their provenance.
+ * Every document parses through the accepted proofs quote semantics with
+ * discriminated charge states and stable comparison scopes.
  */
 
 import { describe, expect, test } from "bun:test";
 import { buildControlledFixture } from "./fixtures.js";
 import { provenanceLabel } from "../../shared/provenance.js";
 
-const TAX = "NL-EUR-INCLUSIVE";
+const TAX = { kind: "inclusive", basisId: "NL-EUR-INCLUSIVE", evidenceRefs: [] };
 const source = (id: string) => ({ sourceId: id, version: "v1", locator: "controlled" });
+
+type ChargeSpec =
+  | { chargeId: string; state: "known"; amount: number }
+  | { chargeId: string; state: "estimated"; amount: number }
+  | { chargeId: string; state: "unknown" }
+  | { chargeId: string; state: "included"; coveringId: string };
+
+function chargeState(spec: ChargeSpec): Record<string, unknown> {
+  if (spec.state === "known") {
+    return { kind: "known", amount: { currency: "EUR", minorUnits: spec.amount } };
+  }
+  if (spec.state === "estimated") {
+    return {
+      kind: "estimated",
+      estimate: { kind: "point", amount: { currency: "EUR", minorUnits: spec.amount } },
+    };
+  }
+  if (spec.state === "included") {
+    return { kind: "included", coveringId: spec.coveringId };
+  }
+  return { kind: "unknown", reason: `${spec.chargeId} was not stated by the supplier` };
+}
+
+function scopeFor(lines: { lineId: string; quantity: string }[]) {
+  return {
+    requirementId: "req-purchase",
+    scopeId: "scope-purchase",
+    items: lines.map((line) => ({
+      itemId: line.lineId,
+      lineId: line.lineId,
+      unit: "piece",
+      requiredQuantity: line.quantity,
+    })),
+  };
+}
 
 function recordQuote(
   fixture: ReturnType<typeof buildControlledFixture>,
   version: string,
-  lines: { lineId: string; amount: number }[],
-  charges: { chargeId: string; state: string; amount?: number }[],
+  lines: { lineId: string; amount: number; quantity?: string }[],
+  charges: ChargeSpec[],
   counterpartyRole: "vendor" | "ownerStandIn" = "ownerStandIn",
 ) {
+  const normalized = lines.map((line) => ({ lineId: line.lineId, quantity: line.quantity ?? "1" }));
   const result = fixture.store.ingestProviderQuote(
     fixture.orgPrivateA,
     fixture.projAOpen,
@@ -29,17 +67,18 @@ function recordQuote(
       lines: lines.map((line) => ({
         lineId: line.lineId,
         description: line.lineId,
-        quantity: "1",
+        quantity: line.quantity ?? "1",
         unitPrice: { currency: "EUR", minorUnits: line.amount },
         evidenceRefs: [source(`${line.lineId}-source`)],
       })),
       charges: charges.map((charge) => ({
         chargeId: charge.chargeId,
         label: charge.chargeId,
-        state: charge.state,
-        ...(charge.amount === undefined ? {} : { amount: { currency: "EUR", minorUnits: charge.amount } }),
+        state: chargeState(charge),
+        evidenceRefs: [source(`${charge.chargeId}-source`)],
       })),
       taxBasis: TAX,
+      comparisonScope: scopeFor(normalized),
       evidenceRefs: [source(`${version}-source`)],
       counterpartyRole,
       executionMode: "recorded",
@@ -50,7 +89,7 @@ function recordQuote(
   return result.value;
 }
 
-describe("P-07 equivalent-scope comparison", () => {
+describe("P-07 exact-scope comparison", () => {
   test("€7,950 complete versus €8,500 complete differs by €550", () => {
     const fixture = buildControlledFixture();
     const left = recordQuote(fixture, "qa-v1", [{ lineId: "machine", amount: 795000 }], []);
@@ -88,7 +127,7 @@ describe("P-07 equivalent-scope comparison", () => {
     if (!compared.ok) throw new Error("compare failed");
     expect(compared.value.verdict).toBe("incomplete");
     expect(compared.value.differenceMinorUnits).toBeNull();
-    expect(compared.value.reason).toContain("unknown-charge");
+    expect(compared.value.reason).toContain("unknown");
   });
 
   test("quantities scale totals; unequal quantity scope refuses", () => {
@@ -109,6 +148,7 @@ describe("P-07 equivalent-scope comparison", () => {
           }],
           charges: [],
           taxBasis: TAX,
+          comparisonScope: scopeFor([{ lineId: "machine", quantity }]),
           evidenceRefs: [source(`${version}-source`)],
           counterpartyRole: "ownerStandIn",
           executionMode: "recorded",
@@ -124,7 +164,7 @@ describe("P-07 equivalent-scope comparison", () => {
     expect(compared.ok).toBe(true);
     if (!compared.ok) throw new Error("compare failed");
     expect(compared.value.verdict).toBe("incomplete");
-    expect(compared.value.reason).toBe("unequal-quantity-scope");
+    expect(compared.value.reason).toContain("not compatible");
 
     const twoCheap = scaled("qq-twocheap", "2", 900_00);
     const even = fixture.store.compareControlledQuotes(twoUnits.id, twoCheap.id);
@@ -145,15 +185,103 @@ describe("P-07 equivalent-scope comparison", () => {
     expect(compared.ok).toBe(true);
     if (!compared.ok) throw new Error("compare failed");
     expect(compared.value.verdict).toBe("incomplete");
-    expect(compared.value.reason).toBe("invalid-quantity");
+    expect(compared.value.reason).toContain("quantity");
 
-    const mystery = recordQuote(fixture, "qb-mystery", [{ lineId: "machine", amount: 100_00 }], [
-      { chargeId: "x", state: "mystery", amount: 10_00 },
+    const mysteryBase = recordQuote(fixture, "qb-mystery", [{ lineId: "machine", amount: 100_00 }], [
+      { chargeId: "x", state: "known", amount: 10_00 },
     ]);
-    const mysteryCompared = fixture.store.compareControlledQuotes(mystery.id, mystery.id);
+    const mysteryRow = fixture.store.quotes.get(mysteryBase.id);
+    if (!mysteryRow) throw new Error("missing quote");
+    const tamperedState = {
+      ...mysteryRow,
+      charges: [{ ...mysteryRow.charges[0], state: { kind: "mystery" } }],
+    };
+    fixture.store.quotes.set(mysteryRow.id, tamperedState as unknown as typeof mysteryRow);
+    const mysteryCompared = fixture.store.compareControlledQuotes(mysteryRow.id, mysteryRow.id);
     expect(mysteryCompared.ok && mysteryCompared.value.verdict).toBe("incomplete");
     if (!mysteryCompared.ok) throw new Error("compare failed");
-    expect(mysteryCompared.value.reason).toBe("invalid-charge-state");
+    expect(mysteryCompared.value.reason).toContain("charge state");
+  });
+
+  test("unrelated aggregate-equal lines never compare", () => {
+    const fixture = buildControlledFixture();
+    const left = recordQuote(fixture, "qu-a", [{ lineId: "machine", amount: 100_00 }], []);
+    const other = fixture.store.ingestProviderQuote(
+      fixture.orgPrivateA,
+      fixture.projAOpen,
+      {
+        version: "qu-b",
+        currency: "EUR",
+        lines: [{
+          lineId: "service",
+          description: "service",
+          quantity: "1",
+          unitPrice: { currency: "EUR", minorUnits: 100_00 },
+          evidenceRefs: [source("s")],
+        }],
+        charges: [],
+        taxBasis: TAX,
+        comparisonScope: {
+          requirementId: "req-other",
+          scopeId: "scope-other",
+          items: [{ itemId: "service", lineId: "service", unit: "hour", requiredQuantity: "1" }],
+        },
+        evidenceRefs: [source("qu-b-source")],
+        counterpartyRole: "ownerStandIn",
+        executionMode: "recorded",
+      },
+      fixture.now,
+    );
+    if (!other.ok) throw new Error("record failed");
+    // Equal totals, unrelated scopes: no equivalent claim.
+    const compared = fixture.store.compareControlledQuotes(left.id, other.value.id);
+    expect(compared.ok && compared.value.verdict).toBe("incomplete");
+  });
+
+  test("reordered lines still compare on stable items", () => {
+    const fixture = buildControlledFixture();
+    const lines = (order: string[]) => order.map((lineId) => ({
+      lineId,
+      description: lineId,
+      quantity: "1",
+      unitPrice: { currency: "EUR", minorUnits: lineId === "machine" ? 700_00 : 50_00 },
+      evidenceRefs: [source(`${lineId}-source`)],
+    }));
+    const scope = {
+      requirementId: "req-purchase",
+      scopeId: "scope-purchase",
+      items: [
+        { itemId: "machine", lineId: "machine", unit: "piece", requiredQuantity: "1" },
+        { itemId: "freight-line", lineId: "freight-line", unit: "piece", requiredQuantity: "1" },
+      ],
+    };
+    const mk = (version: string, order: string[]) => {
+      const result = fixture.store.ingestProviderQuote(
+        fixture.orgPrivateA,
+        fixture.projAOpen,
+        {
+          version,
+          currency: "EUR",
+          lines: lines(order),
+          charges: [],
+          taxBasis: TAX,
+          comparisonScope: scope,
+          evidenceRefs: [source(`${version}-source`)],
+          counterpartyRole: "ownerStandIn",
+          executionMode: "recorded",
+        },
+        fixture.now,
+      );
+      if (!result.ok) throw new Error("record failed");
+      return result.value;
+    };
+    const left = mk("qr-a", ["machine", "freight-line"]);
+    const right = mk("qr-b", ["freight-line", "machine"]);
+    const compared = fixture.store.compareControlledQuotes(left.id, right.id);
+    expect(compared.ok && compared.value.verdict).toBe("complete");
+    if (!compared.ok) throw new Error("compare failed");
+    expect(compared.value.cheaper).toBe("equal");
+    expect(compared.value.differenceMinorUnits).toBe(0);
   });
 
   test("estimated charges compare with an explicit reason flag", () => {
@@ -169,58 +297,199 @@ describe("P-07 equivalent-scope comparison", () => {
     expect(compared.value.differenceMinorUnits).toBe(15000);
   });
 
-  test("record validates versions, supersedes, and conversation references", () => {
+  test("record validates versions, duplicates, supersedes, and conversation references", () => {
     const fixture = buildControlledFixture();
+    const validLines = [{
+      lineId: "machine",
+      description: "machine",
+      quantity: "1",
+      unitPrice: { currency: "EUR", minorUnits: 100_00 },
+      evidenceRefs: [source("m")],
+    }];
+    const base = {
+      currency: "EUR",
+      lines: validLines,
+      charges: [],
+      taxBasis: TAX,
+      comparisonScope: scopeFor([{ lineId: "machine", quantity: "1" }]),
+      evidenceRefs: [source("base-source")],
+      counterpartyRole: "ownerStandIn" as const,
+      executionMode: "recorded" as const,
+    };
     const empty = fixture.store.ingestProviderQuote(
       fixture.orgPrivateA,
       fixture.projAOpen,
-      {
-        version: "  ",
-        currency: "EUR",
-        lines: [],
-        charges: [],
-        taxBasis: TAX,
-        evidenceRefs: [],
-        counterpartyRole: "ownerStandIn",
-        executionMode: "recorded",
-      },
+      { ...base, version: "  " },
       fixture.now,
     );
     expect(empty.ok).toBe(false);
+    const first = fixture.store.ingestProviderQuote(
+      fixture.orgPrivateA,
+      fixture.projAOpen,
+      { ...base, version: "v-dup" },
+      fixture.now,
+    );
+    expect(first.ok).toBe(true);
+    const duplicate = fixture.store.ingestProviderQuote(
+      fixture.orgPrivateA,
+      fixture.projAOpen,
+      { ...base, version: "v-dup" },
+      fixture.now,
+    );
+    expect(duplicate.ok).toBe(false);
     const dangling = fixture.store.ingestProviderQuote(
       fixture.orgPrivateA,
       fixture.projAOpen,
-      {
-        version: "v-dangle",
-        currency: "EUR",
-        lines: [],
-        charges: [],
-        taxBasis: TAX,
-        evidenceRefs: [],
-        counterpartyRole: "ownerStandIn",
-        executionMode: "recorded",
-        supersedes: "deadbeefdeadbeef",
-      },
+      { ...base, version: "v-dangle", supersedes: "deadbeefdeadbeef" },
       fixture.now,
     );
     expect(dangling.ok).toBe(false);
     const foreign = fixture.store.ingestProviderQuote(
       fixture.orgPrivateA,
       fixture.projAOpen,
-      {
-        version: "v-foreign-conv",
-        currency: "EUR",
-        lines: [],
-        charges: [],
-        taxBasis: TAX,
-        evidenceRefs: [],
-        counterpartyRole: "ownerStandIn",
-        executionMode: "recorded",
-        conversationId: "conv-elsewhere",
-      },
+      { ...base, version: "v-foreign-conv", conversationId: "conv-elsewhere" },
       fixture.now,
     );
     expect(foreign.ok).toBe(false);
+  });
+
+  test("dangling and cyclic included coverage is rejected", () => {
+    const fixture = buildControlledFixture();
+    const validLines = [{
+      lineId: "machine",
+      description: "machine",
+      quantity: "1",
+      unitPrice: { currency: "EUR", minorUnits: 100_00 },
+      evidenceRefs: [source("m")],
+    }];
+    const base = {
+      currency: "EUR",
+      lines: validLines,
+      taxBasis: TAX,
+      comparisonScope: scopeFor([{ lineId: "machine", quantity: "1" }]),
+      evidenceRefs: [source("cov-source")],
+      counterpartyRole: "ownerStandIn" as const,
+      executionMode: "recorded" as const,
+    };
+    const dangling = fixture.store.ingestProviderQuote(
+      fixture.orgPrivateA,
+      fixture.projAOpen,
+      {
+        ...base,
+        version: "v-dangle-cover",
+        charges: [{ chargeId: "x", label: "x", state: { kind: "included", coveringId: "ghost" }, evidenceRefs: [] }],
+      },
+      fixture.now,
+    );
+    expect(dangling.ok).toBe(false);
+    const cyclic = fixture.store.ingestProviderQuote(
+      fixture.orgPrivateA,
+      fixture.projAOpen,
+      {
+        ...base,
+        version: "v-cycle-cover",
+        charges: [
+          { chargeId: "a", label: "a", state: { kind: "included", coveringId: "b" }, evidenceRefs: [] },
+          { chargeId: "b", label: "b", state: { kind: "included", coveringId: "a" }, evidenceRefs: [] },
+        ],
+      },
+      fixture.now,
+    );
+    expect(cyclic.ok).toBe(false);
+    const covered = fixture.store.ingestProviderQuote(
+      fixture.orgPrivateA,
+      fixture.projAOpen,
+      {
+        ...base,
+        version: "v-covered",
+        charges: [{ chargeId: "x", label: "x", state: { kind: "included", coveringId: "machine" }, evidenceRefs: [] }],
+      },
+      fixture.now,
+    );
+    expect(covered.ok).toBe(true);
+  });
+
+  test("bad currencies and invalid ranges are rejected", () => {
+    const fixture = buildControlledFixture();
+    const validLines = [{
+      lineId: "machine",
+      description: "machine",
+      quantity: "1",
+      unitPrice: { currency: "EUR", minorUnits: 100_00 },
+      evidenceRefs: [source("m")],
+    }];
+    const base = {
+      currency: "EUR",
+      lines: validLines,
+      taxBasis: TAX,
+      comparisonScope: scopeFor([{ lineId: "machine", quantity: "1" }]),
+      evidenceRefs: [source("fx-source")],
+      counterpartyRole: "ownerStandIn" as const,
+      executionMode: "recorded" as const,
+    };
+    const mixedLine = fixture.store.ingestProviderQuote(
+      fixture.orgPrivateA,
+      fixture.projAOpen,
+      {
+        ...base,
+        version: "v-mixed-line",
+        lines: [{
+          lineId: "machine",
+          description: "machine",
+          quantity: "1",
+          unitPrice: { currency: "USD", minorUnits: 100_00 },
+          evidenceRefs: [source("m")],
+        }],
+      },
+      fixture.now,
+    );
+    expect(mixedLine.ok).toBe(false);
+    const badRange = fixture.store.ingestProviderQuote(
+      fixture.orgPrivateA,
+      fixture.projAOpen,
+      {
+        ...base,
+        version: "v-bad-range",
+        charges: [{
+          chargeId: "freight",
+          label: "freight",
+          state: {
+            kind: "estimated",
+            estimate: {
+              kind: "range",
+              minimum: { currency: "EUR", minorUnits: 900_00 },
+              maximum: { currency: "EUR", minorUnits: 100_00 },
+            },
+          },
+          evidenceRefs: [],
+        }],
+      },
+      fixture.now,
+    );
+    expect(badRange.ok).toBe(false);
+    const rangeCurrency = fixture.store.ingestProviderQuote(
+      fixture.orgPrivateA,
+      fixture.projAOpen,
+      {
+        ...base,
+        version: "v-range-fx",
+        charges: [{
+          chargeId: "freight",
+          label: "freight",
+          state: {
+            kind: "estimated",
+            estimate: {
+              kind: "range",
+              minimum: { currency: "EUR", minorUnits: 100_00 },
+              maximum: { currency: "USD", minorUnits: 900_00 },
+            },
+          },
+          evidenceRefs: [],
+        }],
+      },
+      fixture.now,
+    );
+    expect(rangeCurrency.ok).toBe(false);
   });
 
   test("unknown charges cannot be recorded with an amount (never zero)", () => {
@@ -232,9 +501,20 @@ describe("P-07 equivalent-scope comparison", () => {
       {
         version: "bad-v1",
         currency: "EUR",
-        lines: [],
-        charges: [{ chargeId: "install", label: "install", state: "unknown", amount: { currency: "EUR", minorUnits: 0 } }],
+        lines: [{
+          lineId: "machine",
+          description: "machine",
+          quantity: "1",
+          unitPrice: { currency: "EUR", minorUnits: 100_00 },
+          evidenceRefs: [source("m")],
+        }],
+        charges: [{
+          chargeId: "install",
+          label: "install",
+          state: { kind: "unknown", reason: "not stated", amount: { currency: "EUR", minorUnits: 0 } },
+        }],
         taxBasis: TAX,
+        comparisonScope: scopeFor([{ lineId: "machine", quantity: "1" }]),
         evidenceRefs: [],
       },
       fixture.now,
@@ -252,9 +532,16 @@ describe("P-07 equivalent-scope comparison", () => {
       {
         version: "user-v1",
         currency: "EUR",
-        lines: [],
+        lines: [{
+          lineId: "machine",
+          description: "machine",
+          quantity: "1",
+          unitPrice: { currency: "EUR", minorUnits: 100_00 },
+          evidenceRefs: [source("m")],
+        }],
         charges: [],
         taxBasis: TAX,
+        comparisonScope: scopeFor([{ lineId: "machine", quantity: "1" }]),
         evidenceRefs: [],
       },
       fixture.now,
@@ -276,7 +563,8 @@ describe("P-07 equivalent-scope comparison", () => {
         currency: "EUR",
         lines: [{ lineId: "machine", description: "machine", quantity: "1", unitPrice: { currency: "EUR", minorUnits: 750000 }, evidenceRefs: [source("m")] }],
         charges: [],
-        taxBasis: "NL-EUR-EXCLUSIVE",
+        taxBasis: { kind: "exclusive", basisId: "NL-EUR-EXCLUSIVE", evidenceRefs: [] },
+        comparisonScope: scopeFor([{ lineId: "machine", quantity: "1" }]),
         evidenceRefs: [source("qd-v1-source")],
         counterpartyRole: "ownerStandIn",
         executionMode: "recorded",
@@ -302,6 +590,7 @@ describe("P-06 versions, P-08 distinct totals, D-02/D-08/D-15", () => {
         lines: [{ lineId: "machine", description: "machine", quantity: "1", unitPrice: { currency: "EUR", minorUnits: 740000 }, evidenceRefs: [source("m")] }],
         charges: [],
         taxBasis: TAX,
+        comparisonScope: scopeFor([{ lineId: "machine", quantity: "1" }]),
         evidenceRefs: [source("q-v2-source")],
         counterpartyRole: "ownerStandIn",
         executionMode: "recorded",
@@ -313,6 +602,57 @@ describe("P-06 versions, P-08 distinct totals, D-02/D-08/D-15", () => {
     expect(second.value.contentHash).not.toBe(first.contentHash);
     expect(second.value.supersedes).toBe(first.contentHash);
     expect(fixture.store.quotes.get(first.id)?.contentHash).toBe(first.contentHash);
+  });
+
+  test("supersedes binds same project, conversation, and counterparty lineage", () => {
+    const fixture = buildControlledFixture();
+    const first = recordQuote(fixture, "qs-v1", [{ lineId: "machine", amount: 750000 }], [], "vendor");
+    const crossCounterparty = fixture.store.ingestProviderQuote(
+      fixture.orgPrivateA,
+      fixture.projAOpen,
+      {
+        version: "qs-v2",
+        currency: "EUR",
+        lines: [{ lineId: "machine", description: "machine", quantity: "1", unitPrice: { currency: "EUR", minorUnits: 740000 }, evidenceRefs: [source("m")] }],
+        charges: [],
+        taxBasis: TAX,
+        comparisonScope: scopeFor([{ lineId: "machine", quantity: "1" }]),
+        evidenceRefs: [source("qs-v2-source")],
+        counterpartyRole: "ownerStandIn",
+        executionMode: "recorded",
+        supersedes: first.contentHash,
+      },
+      fixture.now,
+    );
+    expect(crossCounterparty.ok).toBe(false);
+    const sameLineage = fixture.store.ingestProviderQuote(
+      fixture.orgPrivateA,
+      fixture.projAOpen,
+      {
+        version: "qs-v2",
+        currency: "EUR",
+        lines: [{ lineId: "machine", description: "machine", quantity: "1", unitPrice: { currency: "EUR", minorUnits: 740000 }, evidenceRefs: [source("m")] }],
+        charges: [],
+        taxBasis: TAX,
+        comparisonScope: scopeFor([{ lineId: "machine", quantity: "1" }]),
+        evidenceRefs: [source("qs-v2-source")],
+        counterpartyRole: "vendor",
+        executionMode: "recorded",
+        supersedes: first.contentHash,
+      },
+      fixture.now,
+    );
+    expect(sameLineage.ok).toBe(true);
+  });
+
+  test("every decision field participates in the version hash", () => {
+    const fixture = buildControlledFixture();
+    const lines = [{ lineId: "machine", amount: 750000 }];
+    const left = recordQuote(fixture, "qh-v1", lines, []);
+    const twin = recordQuote(fixture, "qh-v2", lines, [
+      { chargeId: "freight", state: "included", coveringId: "machine" },
+    ]);
+    expect(twin.contentHash).not.toBe(left.contentHash);
   });
 
   test("changed terms re-evaluate without overwriting history (D-15)", () => {
