@@ -23,7 +23,12 @@ import {
 import { canonicalJson } from "../shared/hashing.js";
 import {
   approvalInputValidator,
+  normalizeLineQuantity,
+  normalizeLineUnit,
+  scopedLineUnit,
   selectionInputValidator,
+  sortLinesById,
+  type NormalizedOrderLine,
 } from "../shared/domainContracts.js";
 import { requireDomainAccess, requireOwnedRef } from "./guards.js";
 
@@ -39,12 +44,12 @@ type SelectionReplayFields = {
   readonly candidateId: Id<"candidates">;
   readonly quoteId: Id<"quotes">;
   readonly quoteVersion: string;
-  readonly quantity: string;
+  readonly selectionLines: readonly NormalizedOrderLine[];
   readonly requirementVersion: number;
   readonly actor: string;
 };
 
-function legacySelectionKey(
+function selectionReplayKey(
   args: SelectionReplayFields,
 ): string {
   return `legacy:${canonicalJson({
@@ -54,22 +59,36 @@ function legacySelectionKey(
     candidateId: args.candidateId,
     quoteId: args.quoteId,
     quoteVersion: args.quoteVersion,
-    quantity: args.quantity,
+    selectionLines: sortLinesById(args.selectionLines),
     requirementVersion: args.requirementVersion,
     actor: args.actor,
   })}`;
+}
+
+function sameSelectionLines(
+  left: readonly NormalizedOrderLine[],
+  right: readonly NormalizedOrderLine[],
+): boolean {
+  const orderedLeft = sortLinesById(left);
+  const orderedRight = sortLinesById(right);
+  if (orderedLeft.length !== orderedRight.length) return false;
+  return orderedLeft.every(
+    (line, index) => {
+      const other = orderedRight[index];
+      return (
+        other !== undefined &&
+        line.quoteLineId === other.quoteLineId &&
+        line.quantity === other.quantity &&
+        line.unit === other.unit
+      );
+    },
+  );
 }
 
 function sameSelectionReplay(
   existing: SelectionReplayFields,
   wanted: SelectionReplayFields,
 ): boolean {
-  let existingQuantity: string;
-  try {
-    existingQuantity = decimalToString(quantity(existing.quantity));
-  } catch {
-    return false;
-  }
   return (
     existing.organizationId === wanted.organizationId &&
     existing.projectId === wanted.projectId &&
@@ -77,17 +96,44 @@ function sameSelectionReplay(
     existing.candidateId === wanted.candidateId &&
     existing.quoteId === wanted.quoteId &&
     existing.quoteVersion === wanted.quoteVersion &&
-    existingQuantity === wanted.quantity &&
+    sameSelectionLines(existing.selectionLines, wanted.selectionLines) &&
     existing.requirementVersion === wanted.requirementVersion &&
     existing.actor === wanted.actor
   );
 }
 
 /**
+ * Read the effective normalized selection lines of a stored selection
+ * row. Rows written before F1R-13 carry only the legacy scalar
+ * `quantity`: they are single-line by construction, and the quote line
+ * id resolves from the selection's own quote at the call site. Exported
+ * for the fulfillment line-validation path, which enforces per-line
+ * order and acceptance caps against the same effective lines.
+ */
+export function storedSelectionLines(
+  row: { readonly quantity?: string; readonly selectionLines?: readonly NormalizedOrderLine[] },
+  singleQuoteLineId: string,
+  singleQuoteLineUnit: string,
+): NormalizedOrderLine[] {
+  if (row.selectionLines !== undefined) return [...row.selectionLines];
+  if (row.quantity === undefined) return [];
+  let normalized: string;
+  try {
+    normalized = decimalToString(quantity(row.quantity));
+  } catch {
+    return [];
+  }
+  return [{ quoteLineId: singleQuoteLineId, quantity: normalized, unit: singleQuoteLineUnit }];
+}
+
+/**
  * Record a selection. Requirement, candidate, and quote must all live in
  * the caller's project, the quote version must match exactly, and the
- * requirement version must be current. The quantity is a validated
- * positive decimal, and mixed currencies are refused until an explicit
+ * requirement version must be current. Quantities are normalized
+ * per-line decimals with units (F1R-13): explicit `selectionLines` name
+ * every quoted line, while the legacy scalar `quantity` derives the
+ * single effective line for one-line quotes only and is rejected as
+ * ambiguous otherwise. Mixed currencies are refused until an explicit
  * dated conversion basis is accepted (PRD 17): a requirement currency
  * that disagrees with the quote currency blocks the selection.
  */
@@ -107,15 +153,90 @@ export const recordSelection = f1Mutation({
     if (args.idempotencyKey !== undefined && args.idempotencyKey.trim().length === 0) {
       return { ok: false as const, code: "invalid-payload", message: "idempotency key required" };
     }
-    let normalizedQuantity: string;
+    if (args.selectionLines !== undefined && args.quantity !== undefined) {
+      return { ok: false as const, code: "invalid-payload", message: "supply either selection lines or a single quantity, not both" };
+    }
+    const quote = await ctx.db.get(args.quoteId);
+    if (
+      quote === null ||
+      quote.organizationId !== args.organizationId ||
+      quote.projectId !== args.projectId
+    ) {
+      return { ok: false as const, code: "denied-project", message: "quote is not in this project" };
+    }
+    // Derive the complete normalized effective line payload before the
+    // replay lookup, so idempotency binds every line (not a scalar) plus
+    // the actor. The quote is immutable, so resolving lines here keeps
+    // exact historical replays stable after supersession.
+    let effectiveLines: NormalizedOrderLine[];
     try {
-      const selected = quantity(args.quantity);
-      if (decimalCompare(selected, decimalZero()) <= 0) {
-        return { ok: false as const, code: "invalid-payload", message: "selected quantity must be positive" };
+      if (args.selectionLines !== undefined) {
+        if (args.selectionLines.length === 0) {
+          return { ok: false as const, code: "invalid-payload", message: "selection lines required" };
+        }
+        const seen = new Set<string>();
+        effectiveLines = args.selectionLines.map((line) => {
+          const lineId = line.quoteLineId.trim();
+          if (lineId.length === 0) {
+            throw new Error("selection line id required");
+          }
+          if (seen.has(lineId)) {
+            throw new Error(`selection line ${lineId} is duplicated`);
+          }
+          seen.add(lineId);
+          if (!quote.lines.some((entry) => entry.lineId === lineId)) {
+            throw new Error(`selection line ${lineId} is not on this quote`);
+          }
+          const normalizedQuantity = normalizeLineQuantity(line.quantity, `selection line ${lineId} quantity`);
+          const unit = normalizeLineUnit(line.unit, `selection line ${lineId} unit`);
+          const scoped = scopedLineUnit(quote.comparisonScope, lineId);
+          if (scoped !== undefined && scoped !== unit) {
+            throw new Error(`selection line ${lineId} unit does not match the quoted scope`);
+          }
+          return { quoteLineId: lineId, quantity: normalizedQuantity, unit };
+        });
+      } else {
+        if (args.quantity === undefined) {
+          return { ok: false as const, code: "invalid-payload", message: "selection quantity or selection lines required" };
+        }
+        // Safe compatibility path: a bare scalar is unambiguous only for
+        // a one-line quote. Multi-line quotes must name every line.
+        if (quote.lines.length !== 1) {
+          return { ok: false as const, code: "invalid-payload", message: "multi-line quotes require explicit selection lines" };
+        }
+        const only = quote.lines[0];
+        if (only === undefined) {
+          return { ok: false as const, code: "invalid-payload", message: "quote has no lines" };
+        }
+        const normalizedQuantity = normalizeLineQuantity(args.quantity, "selected quantity");
+        if (decimalCompare(quantity(normalizedQuantity), decimalZero()) <= 0) {
+          return { ok: false as const, code: "invalid-payload", message: "selected quantity must be positive" };
+        }
+        effectiveLines = [{
+          quoteLineId: only.lineId,
+          quantity: normalizedQuantity,
+          unit: scopedLineUnit(quote.comparisonScope, only.lineId) ?? "",
+        }];
       }
-      normalizedQuantity = decimalToString(selected);
-    } catch {
-      return { ok: false as const, code: "invalid-payload", message: "selected quantity is not a valid decimal" };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "selection lines are invalid";
+      // A line naming another quote's line id, or a unit contradicting
+      // the quoted scope, is a cross-reference denial; malformed
+      // quantities, missing units, and duplicates are payload denials.
+      // No row writes before this point, so every denial is no-write.
+      if (message.includes("is not on this quote") || message.includes("does not match")) {
+        return { ok: false as const, code: "denied-project" as const, message };
+      }
+      return { ok: false as const, code: "invalid-payload" as const, message };
+    }
+    for (const line of effectiveLines) {
+      try {
+        if (decimalCompare(quantity(line.quantity), decimalZero()) <= 0) {
+          return { ok: false as const, code: "invalid-payload", message: "selected quantity must be positive" };
+        }
+      } catch {
+        return { ok: false as const, code: "invalid-payload", message: "selected quantity is not a valid decimal" };
+      }
     }
     const replayFields = {
       organizationId: args.organizationId,
@@ -124,11 +245,11 @@ export const recordSelection = f1Mutation({
       candidateId: args.candidateId,
       quoteId: args.quoteId,
       quoteVersion: args.quoteVersion,
-      quantity: normalizedQuantity,
+      selectionLines: sortLinesById(effectiveLines),
       requirementVersion: args.requirementVersion,
       actor: access.value.identity,
     } satisfies SelectionReplayFields;
-    const idempotencyKey = args.idempotencyKey?.trim() ?? legacySelectionKey(replayFields);
+    const idempotencyKey = args.idempotencyKey?.trim() ?? selectionReplayKey(replayFields);
     // Replay lookup follows project authorization but precedes all current
     // basis checks. An exact historical selection remains replayable after
     // its quote is superseded; any changed field or actor conflicts without
@@ -141,7 +262,31 @@ export const recordSelection = f1Mutation({
       )
       .unique();
     if (existingInProject !== null) {
-      if (!sameSelectionReplay(existingInProject, replayFields)) {
+      // Pre-F1R-13 rows carry only the legacy scalar quantity. Their
+      // effective lines resolve single-line from the selection's own
+      // quote; a multi-line quote behind a legacy row can never match a
+      // normalized payload, so it conflicts instead of merging.
+      const existingLines = existingInProject.selectionLines !== undefined
+        ? [...existingInProject.selectionLines]
+        : storedSelectionLines(
+          existingInProject,
+          quote.lines.length === 1 ? (quote.lines[0]?.lineId ?? "") : "",
+          quote.lines.length === 1
+            ? (scopedLineUnit(quote.comparisonScope, quote.lines[0]?.lineId ?? "") ?? "")
+            : "",
+        );
+      const existingReplay: SelectionReplayFields = {
+        organizationId: existingInProject.organizationId,
+        projectId: existingInProject.projectId,
+        requirementId: existingInProject.requirementId,
+        candidateId: existingInProject.candidateId,
+        quoteId: existingInProject.quoteId,
+        quoteVersion: existingInProject.quoteVersion,
+        selectionLines: existingLines,
+        requirementVersion: existingInProject.requirementVersion,
+        actor: existingInProject.actor,
+      };
+      if (!sameSelectionReplay(existingReplay, replayFields)) {
         return { ok: false as const, code: "duplicate-conflict", message: "idempotency key already used with different fields" };
       }
       return { ok: true as const, selectionId: existingInProject._id, deduplicated: true };
@@ -164,14 +309,6 @@ export const recordSelection = f1Mutation({
     }
     if (candidate.value.requirementId !== args.requirementId) {
       return { ok: false as const, code: "denied-project", message: "candidate is for another requirement" };
-    }
-    const quote = await ctx.db.get(args.quoteId);
-    if (
-      quote === null ||
-      quote.organizationId !== args.organizationId ||
-      quote.projectId !== args.projectId
-    ) {
-      return { ok: false as const, code: "denied-project", message: "quote is not in this project" };
     }
     if (quote.version !== args.quoteVersion) {
       return { ok: false as const, code: "invalid-payload", message: "quote version mismatch" };
@@ -223,6 +360,10 @@ export const recordSelection = f1Mutation({
     ) {
       return { ok: false as const, code: "invalid-payload", message: "mixed-currency-requires-accepted-conversion-basis" };
     }
+    // The stored row keeps the authoritative normalized selection lines.
+    // The legacy scalar mirror is written only for single-line
+    // selections so pre-F1R-13 readers keep their shape; multi-line
+    // selections carry lines alone and never a summed quantity.
     const selectionId = await ctx.db.insert("selections", {
       organizationId: args.organizationId,
       projectId: args.projectId,
@@ -231,7 +372,10 @@ export const recordSelection = f1Mutation({
       candidateId: args.candidateId,
       quoteId: args.quoteId,
       quoteVersion: args.quoteVersion,
-      quantity: normalizedQuantity,
+      ...(effectiveLines.length === 1 && effectiveLines[0] !== undefined
+        ? { quantity: effectiveLines[0].quantity }
+        : {}),
+      selectionLines: sortLinesById(effectiveLines),
       requirementVersion: args.requirementVersion,
       actor: access.value.identity,
       createdAt: Date.now(),

@@ -24,6 +24,7 @@
  */
 
 import { v, type Infer } from "convex/values";
+import { decimalToString, quantity } from "../../proofs/money/decimal.js";
 
 // -- Shared primitives ------------------------------------------------------
 
@@ -442,7 +443,23 @@ export const negotiationInputValidator = v.object({
 });
 export type NegotiationInput = Infer<typeof negotiationInputValidator>;
 
-/** Selection pins the exact quote version and quantity (ADR-0003). */
+/** Selection pins the exact quote version and quantity (ADR-0003).
+ *
+ * F1R-13 line lineage: a selection carries an explicit `selectionLines`
+ * array (one entry per quoted line, with normalized decimal quantity and
+ * unit). The legacy scalar `quantity` remains as a safe compatibility
+ * path for single-line quotes only: handlers derive the single effective
+ * line from it and reject the scalar as ambiguous for multi-line quotes.
+ * Supplying both forms together is rejected; the stored row always keeps
+ * the authoritative normalized `selectionLines`.
+ */
+export const selectionLineInputValidator = v.object({
+  quoteLineId: v.string(),
+  quantity: v.string(),
+  unit: v.string(),
+});
+export type SelectionLineInput = Infer<typeof selectionLineInputValidator>;
+
 export const selectionInputValidator = v.object({
   organizationId: v.id("organizations"),
   projectId: v.id("projects"),
@@ -453,7 +470,10 @@ export const selectionInputValidator = v.object({
   candidateId: v.id("candidates"),
   quoteId: v.id("quotes"),
   quoteVersion: v.string(),
-  quantity: v.string(),
+  // Legacy single-line compatibility path (F1R-13): present only when
+  // `selectionLines` is absent and the quote carries exactly one line.
+  quantity: v.optional(v.string()),
+  selectionLines: v.optional(v.array(selectionLineInputValidator)),
   requirementVersion: v.number(),
 });
 export type SelectionInput = Infer<typeof selectionInputValidator>;
@@ -470,12 +490,49 @@ export const approvalInputValidator = v.object({
 });
 export type ApprovalInput = Infer<typeof approvalInputValidator>;
 
+/**
+ * F1R-13 order and event lines. An order carries an explicit `orderLines`
+ * array (per quoted line, normalized decimal quantity and unit); order
+ * events carry per-line acceptances. Legacy scalars (`orderedQuantity`,
+ * `acceptedQuantity`) remain as a safe compatibility path for single-line
+ * orders only and are rejected as ambiguous otherwise. The stored rows
+ * always keep the authoritative normalized line arrays.
+ */
+export const orderLineInputValidator = v.object({
+  quoteLineId: v.string(),
+  quantity: v.string(),
+  unit: v.string(),
+});
+export type OrderLineInput = Infer<typeof orderLineInputValidator>;
+
+export const acceptanceLineInputValidator = v.object({
+  quoteLineId: v.string(),
+  acceptedQuantity: v.string(),
+  unit: v.string(),
+});
+export type AcceptanceLineInput = Infer<typeof acceptanceLineInputValidator>;
+
+/**
+ * F1R-13 financial evidence reference. A typed, resolvable pointer to an
+ * immutable `evidence` row: handlers verify the row lives in the
+ * authorized project and its stored `contentHash` equals the referenced
+ * hash before replay or write, then store the exact reference.
+ */
+export const financialEvidenceRefValidator = v.object({
+  evidenceId: v.id("evidence"),
+  contentHash: v.string(),
+});
+export type FinancialEvidenceRef = Infer<typeof financialEvidenceRefValidator>;
+
 export const orderInputValidator = v.object({
   organizationId: v.id("organizations"),
   projectId: v.id("projects"),
   selectionId: v.id("selections"),
   idempotencyKey: v.string(),
-  orderedQuantity: v.string(),
+  // Legacy single-line compatibility path (F1R-13): present only when
+  // `orderLines` is absent and the selection carries exactly one line.
+  orderedQuantity: v.optional(v.string()),
+  orderLines: v.optional(v.array(orderLineInputValidator)),
   supplierReference: v.optional(v.string()),
 });
 export type OrderInput = Infer<typeof orderInputValidator>;
@@ -485,7 +542,10 @@ export const orderEventInputValidator = v.object({
   projectId: v.id("projects"),
   orderId: v.id("orders"),
   kind: orderEventKindValidator,
+  // Legacy single-line compatibility path (F1R-13): present only when
+  // `acceptanceLines` is absent and the order carries exactly one line.
   acceptedQuantity: v.optional(v.string()),
+  acceptanceLines: v.optional(v.array(acceptanceLineInputValidator)),
   note: v.optional(v.string()),
   idempotencyKey: v.string(),
 });
@@ -499,6 +559,14 @@ export const costEntryInputValidator = v.object({
   amount: domainMoneyValidator,
   idempotencyKey: v.string(),
   linkedEntryId: v.optional(v.id("costEntries")),
+  // F1R-13 adjustment lineage: credits and refunds must name the affected
+  // order line and quantity with nonempty evidence. Payments and settled
+  // costs may stay order-level (all three absent); a partial triple is
+  // rejected, so a line without a quantity (or vice versa) never writes.
+  quoteLineId: v.optional(v.string()),
+  affectedQuantity: v.optional(v.string()),
+  affectedUnit: v.optional(v.string()),
+  evidenceRefs: v.optional(v.array(financialEvidenceRefValidator)),
 });
 export type CostEntryInput = Infer<typeof costEntryInputValidator>;
 
@@ -591,6 +659,107 @@ export const templateInputValidator = v.object({
   constraintSnapshot: v.string(),
 });
 export type TemplateInput = Infer<typeof templateInputValidator>;
+
+// -- F1R-13 durable line lineage (normalized, units, exact money) ----------
+
+/**
+ * Stored line shapes mirror the input shapes with normalized decimal
+ * quantities and trimmed units. Quote-level shared charges stay
+ * quote-level on the quote record: handlers never infer a line
+ * allocation from charge descriptions.
+ */
+export const storedSelectionLineValidator = v.object({
+  quoteLineId: v.string(),
+  quantity: v.string(),
+  unit: v.string(),
+});
+export type StoredSelectionLine = Infer<typeof storedSelectionLineValidator>;
+
+export const storedOrderLineValidator = v.object({
+  quoteLineId: v.string(),
+  quantity: v.string(),
+  unit: v.string(),
+});
+export type StoredOrderLine = Infer<typeof storedOrderLineValidator>;
+
+export const storedAcceptanceLineValidator = v.object({
+  quoteLineId: v.string(),
+  acceptedQuantity: v.string(),
+  unit: v.string(),
+});
+export type StoredAcceptanceLine = Infer<typeof storedAcceptanceLineValidator>;
+
+export const storedFinancialEvidenceRefValidator = v.object({
+  evidenceId: v.id("evidence"),
+  contentHash: v.string(),
+});
+export type StoredFinancialEvidenceRef = Infer<typeof storedFinancialEvidenceRefValidator>;
+
+/** Normalized effective line (canonical decimal quantity, trimmed unit). */
+export interface NormalizedOrderLine {
+  readonly quoteLineId: string;
+  readonly quantity: string;
+  readonly unit: string;
+}
+
+/** Normalized effective acceptance (canonical decimal quantity, trimmed unit). */
+export interface NormalizedAcceptanceLine {
+  readonly quoteLineId: string;
+  readonly acceptedQuantity: string;
+  readonly unit: string;
+}
+
+/**
+ * Normalize a positive decimal quantity to canonical form. Throws on
+ * malformed, zero, or negative input; handlers map the throw to an
+ * `invalid-payload` denial before any write.
+ */
+export function normalizeLineQuantity(raw: string, label: string): string {
+  try {
+    return decimalToString(quantity(raw));
+  } catch {
+    throw new Error(`${label} is not a valid positive decimal`);
+  }
+}
+
+/**
+ * Normalize an explicit line unit. Throws on an empty unit; handlers map
+ * the throw to an `invalid-payload` denial before any write. Legacy
+ * single-line derivations may carry an empty unit only when neither the
+ * quote comparison scope nor the requirement supplies one.
+ */
+export function normalizeLineUnit(raw: string, label: string): string {
+  const unit = raw.trim();
+  if (unit.length === 0) {
+    throw new Error(`${label} required`);
+  }
+  return unit;
+}
+
+/**
+ * Deterministic line order for replay binding: byte-wise by quote line
+ * id, so equivalent payloads in different input orders bind identically.
+ */
+export function sortLinesById<T extends { readonly quoteLineId: string }>(
+  lines: readonly T[],
+): T[] {
+  return [...lines].sort((left, right) =>
+    left.quoteLineId < right.quoteLineId ? -1 : left.quoteLineId > right.quoteLineId ? 1 : 0,
+  );
+}
+
+/**
+ * Resolve the authoritative unit for a quoted line: the comparison-scope
+ * item unit when the quote names one for this line, else undefined. An
+ * explicit selection/order line unit must equal the scoped unit when one
+ * exists; otherwise any nonempty unit is accepted as caller-declared.
+ */
+export function scopedLineUnit(
+  comparisonScope: { readonly items: readonly { readonly lineId: string; readonly unit: string }[] } | undefined,
+  quoteLineId: string,
+): string | undefined {
+  return comparisonScope?.items.find((item) => item.lineId === quoteLineId)?.unit;
+}
 
 // -- Typed handoffs ----------------------------------------------------------
 

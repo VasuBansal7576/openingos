@@ -42,6 +42,12 @@ import {
   storedQuoteChargeValidator,
   storedQuoteLineValidator,
 } from "./shared/quoteSemantics.js";
+import {
+  storedAcceptanceLineValidator,
+  storedFinancialEvidenceRefValidator,
+  storedOrderLineValidator,
+  storedSelectionLineValidator,
+} from "./shared/domainContracts.js";
 
 /**
  * Field-level evidence references for the F1 shared-domain graph use the
@@ -313,7 +319,12 @@ export default defineSchema({
     candidateId: v.id("candidates"),
     quoteId: v.id("quotes"),
     quoteVersion: v.string(),
-    quantity: v.string(),
+    // F1R-13: `selectionLines` is the authoritative normalized per-line
+    // selection (quote line id, canonical decimal quantity, unit).
+    // `quantity` is the legacy single-line mirror, present only when the
+    // selection carries exactly one line.
+    quantity: v.optional(v.string()),
+    selectionLines: v.optional(v.array(storedSelectionLineValidator)),
     requirementVersion: v.number(),
     actor: v.string(),
     createdAt: v.number(),
@@ -353,7 +364,11 @@ export default defineSchema({
     quoteVersion: v.string(),
     requirementVersion: v.number(),
     idempotencyKey: v.string(),
-    orderedQuantity: v.string(),
+    // F1R-13: `orderLines` is the authoritative normalized per-line
+    // commitment. `orderedQuantity` is the legacy single-line mirror,
+    // present only when the order carries exactly one line.
+    orderedQuantity: v.optional(v.string()),
+    orderLines: v.optional(v.array(storedOrderLineValidator)),
     supplierReference: v.optional(v.string()),
     state: v.union(v.literal("recorded"), v.literal("amended"), v.literal("cancelled")),
     amendmentCount: v.number(),
@@ -376,7 +391,12 @@ export default defineSchema({
       v.literal("installation"),
       v.literal("commissioning"),
     ),
+    // F1R-13: `acceptanceLines` is the authoritative per-line acceptance
+    // (quote line id, canonical decimal accepted quantity, unit).
+    // `acceptedQuantity` is the legacy single-line mirror, present only
+    // when the event carries exactly one acceptance line.
     acceptedQuantity: v.optional(v.string()),
+    acceptanceLines: v.optional(v.array(storedAcceptanceLineValidator)),
     note: v.optional(v.string()),
     recordedBy: v.string(),
     idempotencyKey: v.string(),
@@ -399,6 +419,15 @@ export default defineSchema({
     amount: moneyValidator,
     idempotencyKey: v.string(),
     linkedEntryId: v.optional(v.id("costEntries")),
+    // F1R-13 adjustment lineage: the affected order line and quantity
+    // (required for credits/refunds, optional as a complete triple for
+    // payments/settled costs) plus typed immutable evidence references.
+    // Quote-level shared charges stay quote-level: no line allocation is
+    // ever inferred from descriptions.
+    quoteLineId: v.optional(v.string()),
+    affectedQuantity: v.optional(v.string()),
+    affectedUnit: v.optional(v.string()),
+    evidenceRefs: v.optional(v.array(storedFinancialEvidenceRefValidator)),
     recordedBy: v.string(),
     createdAt: v.number(),
   })
