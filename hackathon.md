@@ -274,3 +274,16 @@ The completed Devin attempts were stopped without approving opaque native reques
 PR #1 has not yet been pushed to this local checkpoint, so exact-head GitHub Actions, Greptile closure, conflict status and a fresh separate Astra verdict remain pending.
 All results are controlled local evidence only.
 No hosted Convex state, live provider call, owner-mailbox exchange, public site or commercial outcome was observed.
+
+### 2026-09-20 - e78844f second Astra-repair checkpoint
+
+The separate GPT-6 Astra reviewer rejected exact PR head `ba07217` after controlled reproductions showed that lone record nouns could still authorize read jobs, a temporary approver could make its own access permanent, and selection and approval scanned the entire project quote history.
+Integrated Luna's P1 authority repair and Muse Spark's P2 bounded-read repair through `e78844f` on the Vasu-owned PR branch.
+Read authority now requires an explicit purchasing-read cue at admission, operation binding and claim; delegated membership expiry cannot outlive the authority used to issue it; quote-successor detection now uses a project-and-supersedes index with a one-row existence probe.
+The bounded-read regressions are wired into the standard direct-test command and exercise the actual selection and approval handlers with 300 unrelated quotes under a 64-document transaction budget.
+The exact integrated head passes TypeScript, production build, 23 repository tests, 77 money and Jev proofs, 236 F1 tests, 179 direct Convex tests, 155 browser-executor tests, 2 application tests, 19 provider-contract tests and 5 mounted user-path tests.
+The implementation sessions were verified as GPT-5.6 Luna at max effort and OpenCode Go Muse Spark 1.3 Contributor at high effort.
+Two temporary `/tmp` probe permissions were inspected and approved once each; no persistent or broad worker permission was granted.
+PR #1 has not yet been pushed to this checkpoint, so exact-head GitHub Actions, Greptile closure, conflict status and a fresh separate Astra verdict remain pending.
+All results are controlled local evidence only.
+No hosted Convex state, live provider call, owner-mailbox exchange, public site or commercial outcome was observed.
