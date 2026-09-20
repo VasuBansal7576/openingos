@@ -241,6 +241,7 @@ describe("F1R-20 allowlisted workflow purpose", () => {
     for (const text of [
       "What changes if the weather forecast changes?",
       "What changes if they choose another football rumor?",
+      "What changes if they choose another football option?",
       "What changes if they choose another option? and find the weather forecast in Mumbai",
       "Research football sources",
       "Research football evidence",
