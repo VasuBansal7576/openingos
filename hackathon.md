@@ -217,3 +217,15 @@ All 48 unchanged probes from Astra's rejected `8fedeb7` review pass against the 
 PR #1 remains open and ready for review; this revision still requires a push, exact-head GitHub Actions, exact-head Greptile follow-through and a fresh independent Astra verdict before F1 can be checked complete or merged.
 All results are controlled evidence only.
 No hosted Convex state, live provider call, owner-mailbox exchange, public site or commercial outcome was observed.
+
+### 2026-09-20 - 1f17c00 local checkpoint
+
+Integrated the final owner-isolated F1 follow-up repairs prompted by Greptile and the separate Astra rejection review.
+Evidence invalidation now uses a sparse bounded reverse index, legacy evidence replay binds freshness and check time, commitment and history reads are bounded and paginated, new unresolved-unit adjustments fail closed, and legacy scalar order and acceptance mirrors survive reload without invented line allocation.
+The exact local head passes both TypeScript checks, production build, 23 repository tests, 77 money and Jev proofs, 191 F1 tests, 161 direct Convex tests, 155 browser-executor tests, 2 application tests, 19 provider-contract tests and 5 mounted user-path tests.
+The immutable rejection and historical-bridge suites pass 55 of 55 checks.
+The older 46-case fresh probe artifact has 43 passes and three superseded fanout expectations: it expects a candidate-specific update to fail merely because 257 unrelated candidates exist and expects a 257th evidence binding to be accepted before later invalidation.
+The accepted contract instead permits the sparse unrelated case and rejects the 257th dependent binding atomically at write time; a fresh independent Astra reviewer must verify that invariant on the pushed exact head.
+PR #1 remains open and ready for review, but `1f17c00` has not yet been pushed and therefore has no exact-head GitHub Actions or Greptile result.
+All results are controlled evidence only.
+No hosted Convex state, live provider call, owner-mailbox exchange, public site or commercial outcome was observed.
