@@ -378,16 +378,47 @@ export class ControlledDriver {
       this.expire(input.jobId, input.nowMs);
       return denied("lease-invalid", "the authorized request lease reached its expiry");
     }
+    // Mandatory job-expiry freshness at authorize time: a reached job deadline
+    // fences through the single transition before returning the denial, so a
+    // running job authorized exactly at its expiry cannot stay running with a
+    // tracked and registry-live session.
+    if (input.nowMs >= job.request.expiresAt) {
+      this.expire(input.jobId, input.nowMs);
+      return denied("job-expired", "job reached its expiry; fenced with session release");
+    }
     const context = this.leaseContext(input.jobId) as LeaseContext;
     const live = this.sessions.resolve(input.sessionHandle, context, input.nowMs);
     if (isDenial(live)) {
-      // Non-active invariant (documented, not fenced): a failed resolve means
-      // no live session exists for this handle — released handles are untracked
-      // via releaseLease, and waiting jobs hold no session by design — so the
-      // denial leaves no executable session tracked. Dispatch-time and
-      // settlement-time checks own actual deadline fencing; authorizing here
-      // must not convert a waiting job into cancelled merely for presenting a
-      // stale handle.
+      // A reached acquired-lease deadline on the currently tracked handle
+      // fences through the single transition before denying: the inspected
+      // record exposes the deadline without widening any authority.
+      // Unknown, cross-context, already-released, or stale untracked handles
+      // keep the documented non-active invariant below and never fence while
+      // another valid tracked session is active.
+      const inspected = this.sessions.inspect(input.sessionHandle);
+      if (
+        inspected !== undefined &&
+        this.leases.get(input.jobId) === input.sessionHandle &&
+        inspected.organizationId === context.organizationId &&
+        inspected.projectId === context.projectId &&
+        inspected.jobId === input.jobId &&
+        inspected.leaseId === record.request.sessionLease.leaseId &&
+        !inspected.released &&
+        input.nowMs >= inspected.expiresAtMs
+      ) {
+        this.expire(input.jobId, input.nowMs, undefined, inspected.expiresAtMs);
+        return denied(
+          "lease-invalid",
+          `session lease "${inspected.leaseId}" reached its expiry; fenced with session release`,
+        );
+      }
+      // Non-active invariant (documented, not fenced): any other failed
+      // resolve means no live session exists for this handle — unknown
+      // handles, cross-context handles, released handles, and stale untracked
+      // handles while another valid tracked session is active — so the denial
+      // leaves state untouched. Waiting jobs hold no session by design, and
+      // authorizing must not convert a waiting job into cancelled merely for
+      // presenting a stale handle.
       return denied("lease-invalid", "no live session lease for this organization/project/job");
     }
     const lease: SessionLease = live as SessionLease;
@@ -405,6 +436,12 @@ export class ControlledDriver {
     if ("ok" in checked) {
       const denial = checked as Denial;
       if (denial.ok === false) {
+        // Defensive: any job-expiry denial from the static checks fences
+        // through the single transition (the pre-check above already covers
+        // the live path).
+        if (denial.reason === "job-expired") {
+          this.expire(input.jobId, input.nowMs);
+        }
         return denial;
       }
     }
@@ -861,7 +898,7 @@ export class ControlledDriver {
    * session; unresolved in-flight attempts keep their dispatching state for
    * truthful reconciliation.
    */
-  expire(jobId: string, nowMs: number, claimExpiryMs?: number): BrowserJob {
+  expire(jobId: string, nowMs: number, claimExpiryMs?: number, acquiredExpiryMs?: number): BrowserJob {
     const job = this.jobs.get(jobId);
     if (job === undefined) {
       throw new Error(`job "${jobId}" is not registered`);
@@ -869,6 +906,7 @@ export class ControlledDriver {
     const record = this.requests.get(jobId);
     const fenced = fenceExpired(job, nowMs, {
       ...(record === undefined ? {} : { leaseExpiryMs: record.request.sessionLease.expiresAtMs }),
+      ...(acquiredExpiryMs === undefined ? {} : { acquiredExpiryMs }),
       ...(claimExpiryMs === undefined ? {} : { claimExpiryMs }),
       ceilingAtMs: activeCeilingAt(job),
     });

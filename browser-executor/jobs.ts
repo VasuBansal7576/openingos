@@ -608,16 +608,18 @@ export function cancelJob(job: BrowserJob, nowMs: number, reason: string): Brows
 /**
  * Fence an expired job: active work becomes cancelled with reason "expired".
  * This is the single fencing transition for every enforced deadline: the job
- * deadline, the signed-request lease expiry, the live lease/claim expiry and
- * the active-execution ceiling. Any reached deadline fences active work (and
- * the driver releases the tracked session); waiting work is fenced like
- * running work because neither may hold an active session past a deadline.
+ * deadline, the signed-request lease expiry, the acquired live-session lease
+ * expiry, the live lease/claim expiry and the active-execution ceiling. Any
+ * reached deadline fences active work (and the driver releases the tracked
+ * session); waiting work is fenced like running work because neither may
+ * hold an active session past a deadline.
  */
 export function fenceExpired(
   job: BrowserJob,
   nowMs: number,
   extra?: {
     readonly leaseExpiryMs?: number;
+    readonly acquiredExpiryMs?: number;
     readonly claimExpiryMs?: number;
     readonly ceilingAtMs?: number;
   },
@@ -634,6 +636,9 @@ export function fenceExpired(
   const deadlines = [job.request.expiresAt];
   if (extra?.leaseExpiryMs !== undefined) {
     deadlines.push(extra.leaseExpiryMs);
+  }
+  if (extra?.acquiredExpiryMs !== undefined) {
+    deadlines.push(extra.acquiredExpiryMs);
   }
   if (extra?.claimExpiryMs !== undefined) {
     deadlines.push(extra.claimExpiryMs);
