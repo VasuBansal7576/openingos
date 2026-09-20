@@ -35,6 +35,9 @@ export const MAX_ATTEMPTS_PER_OPERATION = 4;
 export const MAX_ATTEMPTS_PER_JOB = MAX_OPERATIONS_PER_JOB * MAX_ATTEMPTS_PER_OPERATION;
 export const MAX_DECISIONS = 24;
 export const MAX_ACTIVITY_PAGE = 24;
+export const MAX_EQUIPMENT_ASSETS = 12;
+export const MAX_ASSET_DOCUMENTS = 8;
+export const MAX_ASSET_CASES = 8;
 
 const roleValidator = v.union(
   v.literal("owner"),
@@ -242,6 +245,45 @@ const activityItemValidator = v.object({
   createdAt: v.number(),
 });
 
+// E1 installed-equipment views project only real bounded rows from the
+// assets, assetDocuments, and serviceCases tables. Asset documents expose
+// kind and createdAt only: storageRef (and any locator/idempotency
+// material) never leaves the backend. Service cases expose state and
+// outcome. Nothing is ever synthesized from selection or order state.
+const assetDocumentValidator = v.object({
+  id: v.id("assetDocuments"),
+  kind: v.string(),
+  createdAt: v.number(),
+});
+
+const serviceCaseValidator = v.object({
+  id: v.id("serviceCases"),
+  urgency: v.string(),
+  summary: v.string(),
+  state: v.string(),
+  outcome: v.optional(v.string()),
+  createdAt: v.number(),
+  updatedAt: v.number(),
+});
+
+const installedAssetValidator = v.object({
+  id: v.id("assets"),
+  label: v.string(),
+  serial: v.optional(v.string()),
+  constraints: v.optional(v.string()),
+  purchaseProvenance: v.optional(v.string()),
+  createdAt: v.number(),
+  documents: v.array(assetDocumentValidator),
+  documentsTruncated: v.boolean(),
+  serviceCases: v.array(serviceCaseValidator),
+  serviceCasesTruncated: v.boolean(),
+});
+
+const equipmentValidator = v.object({
+  assets: v.array(installedAssetValidator),
+  assetsTruncated: v.boolean(),
+});
+
 const activityValidator = v.object({
   page: v.array(activityItemValidator),
   continueCursor: v.union(v.string(), v.null()),
@@ -271,6 +313,7 @@ const projectionValidator = v.object({
   jobsTruncated: v.boolean(),
   decisions: v.array(decisionValidator),
   decisionsTruncated: v.boolean(),
+  equipment: equipmentValidator,
   activity: activityValidator,
   provenance: provenanceValidator,
 });
@@ -708,6 +751,113 @@ function uniqueModes(views: readonly ProvenanceView[]): ProvenanceView {
   return combineProvenance(views);
 }
 
+type EquipmentView = {
+  readonly assets: Array<{
+    readonly id: Id<"assets">;
+    readonly label: string;
+    readonly serial?: string;
+    readonly constraints?: string;
+    readonly purchaseProvenance?: string;
+    readonly createdAt: number;
+    readonly documents: Array<{
+      readonly id: Id<"assetDocuments">;
+      readonly kind: string;
+      readonly createdAt: number;
+    }>;
+    readonly documentsTruncated: boolean;
+    readonly serviceCases: Array<{
+      readonly id: Id<"serviceCases">;
+      readonly urgency: string;
+      readonly summary: string;
+      readonly state: string;
+      readonly outcome?: string;
+      readonly createdAt: number;
+      readonly updatedAt: number;
+    }>;
+    readonly serviceCasesTruncated: boolean;
+  }>;
+  readonly assetsTruncated: boolean;
+};
+
+/**
+ * E1 installed-equipment projection (P-18). Reads only real rows from the
+ * assets, assetDocuments, and serviceCases tables inside the caller's
+ * project, in stable ascending creation order. Each collection reads one
+ * row past its bound so over-limit state is reported through explicit
+ * truncation flags instead of a silent prefix. Asset documents project
+ * kind and createdAt only — storageRef never leaves the backend — and
+ * service cases project state and outcome. Selections and orders are
+ * never consulted, so no installed asset is invented from purchase
+ * intent alone.
+ */
+async function readEquipment(
+  ctx: import("../server.js").F1QueryCtx,
+  organizationId: Id<"organizations">,
+  projectId: Id<"projects">,
+): Promise<EquipmentView> {
+  const assetPage = await ctx.db
+    .query("assets")
+    .withIndex("by_project", (q) => q.eq("projectId", projectId))
+    .order("asc")
+    .take(MAX_EQUIPMENT_ASSETS + 1);
+  const assetsTruncated = assetPage.length > MAX_EQUIPMENT_ASSETS;
+  const inScopeAssets = assetPage
+    .filter((row) => row.organizationId === organizationId && row.projectId === projectId)
+    .slice(0, MAX_EQUIPMENT_ASSETS);
+  const assets: EquipmentView["assets"] = [];
+  for (const asset of inScopeAssets) {
+    const documentPage = await ctx.db
+      .query("assetDocuments")
+      .withIndex("by_asset", (q) => q.eq("assetId", asset._id))
+      .order("asc")
+      .take(MAX_ASSET_DOCUMENTS + 1);
+    const documents = documentPage
+      .filter(
+        (row) =>
+          row.organizationId === organizationId &&
+          row.projectId === projectId &&
+          row.assetId === asset._id,
+      )
+      .slice(0, MAX_ASSET_DOCUMENTS)
+      .map((row) => ({ id: row._id, kind: row.kind, createdAt: row.createdAt }));
+    const casePage = await ctx.db
+      .query("serviceCases")
+      .withIndex("by_asset", (q) => q.eq("assetId", asset._id))
+      .order("asc")
+      .take(MAX_ASSET_CASES + 1);
+    const serviceCases = casePage
+      .filter(
+        (row) =>
+          row.organizationId === organizationId &&
+          row.projectId === projectId &&
+          row.assetId === asset._id,
+      )
+      .slice(0, MAX_ASSET_CASES)
+      .map((row) => ({
+        id: row._id,
+        urgency: row.urgency,
+        summary: row.summary,
+        state: row.state,
+        ...(row.outcome === undefined ? {} : { outcome: row.outcome }),
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt,
+      }));
+    assets.push({
+      id: asset._id,
+      label: asset.label,
+      ...(asset.serial === undefined ? {} : { serial: asset.serial }),
+      ...(asset.constraints === undefined ? {} : { constraints: asset.constraints }),
+      ...(asset.purchaseProvenance === undefined ? {} : { purchaseProvenance: asset.purchaseProvenance }),
+      createdAt: asset.createdAt,
+      documents,
+      documentsTruncated: documentPage.length > MAX_ASSET_DOCUMENTS,
+      serviceCases,
+      serviceCasesTruncated: casePage.length > MAX_ASSET_CASES,
+    });
+  }
+  return { assets, assetsTruncated };
+}
+
 /** List projects visible to the authenticated identity through authority pages. */
 export const listAccessibleProjects = f1Query({
   args: {
@@ -1047,6 +1197,7 @@ export const getProjection = f1Query({
       isDone: activityPage.isDone,
       continueCursor: activityPage.isDone ? null : activityPage.continueCursor,
     };
+    const equipment = await readEquipment(ctx, project.organizationId, args.projectId);
     const summary = await readProjectSummary(ctx, project);
     return {
       ok: true as const,
@@ -1060,6 +1211,7 @@ export const getProjection = f1Query({
       jobsTruncated: jobsPage.length > Math.min(pageSize, MAX_JOBS),
       decisions,
       decisionsTruncated,
+      equipment,
       activity,
       provenance: uniqueModes(provenanceEntries),
     };

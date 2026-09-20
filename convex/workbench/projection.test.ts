@@ -508,3 +508,224 @@ describe("U1 workbench projection", () => {
     expect(second.activity.page[0]?.id).not.toBe(first.activity.page[0]?.id);
   });
 });
+
+describe("E1 equipment and service projection", () => {
+  async function insertAsset(
+    t: ReturnType<typeof convexTest>,
+    project: { organizationId: Id<"organizations">; projectId: Id<"projects"> },
+    suffix: string,
+    createdAt: number,
+  ) {
+    return await t.run(async (ctx) =>
+      ctx.db.insert("assets", {
+        organizationId: project.organizationId,
+        projectId: project.projectId,
+        label: `Espresso machine ${suffix}`,
+        serial: `serial-${suffix}`,
+        constraints: "220V clearance",
+        purchaseProvenance: "recorded owner order",
+        idempotencyKey: `asset-${suffix}`,
+        createdAt,
+      }),
+    );
+  }
+
+  test("returns empty equipment state for a fresh project", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, OWNER, "bare");
+    const result = await t.withIdentity(OWNER).query(getProjectionRef, { projectId: project.projectId });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("projection denied");
+    expect(result.equipment.assets).toEqual([]);
+    expect(result.equipment.assetsTruncated).toBe(false);
+  });
+
+  test("projects installed asset with purchase and warranty documents and open plus resolved cases without leaking storageRef", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, OWNER, "equipment");
+    const assetId = await insertAsset(t, project, "e1", 100);
+    await t.run(async (ctx) => {
+      await ctx.db.insert("assetDocuments", {
+        organizationId: project.organizationId,
+        projectId: project.projectId,
+        assetId,
+        kind: "purchase",
+        storageRef: "secret-storage-ref-purchase",
+        idempotencyKey: "document-purchase",
+        createdAt: 110,
+      });
+      await ctx.db.insert("assetDocuments", {
+        organizationId: project.organizationId,
+        projectId: project.projectId,
+        assetId,
+        kind: "warranty",
+        storageRef: "secret-storage-ref-warranty",
+        idempotencyKey: "document-warranty",
+        createdAt: 120,
+      });
+      await ctx.db.insert("serviceCases", {
+        organizationId: project.organizationId,
+        projectId: project.projectId,
+        assetId,
+        urgency: "high",
+        summary: "Pressure fault on group head",
+        state: "open",
+        idempotencyKey: "case-open",
+        createdAt: 130,
+        updatedAt: 130,
+      });
+      await ctx.db.insert("serviceCases", {
+        organizationId: project.organizationId,
+        projectId: project.projectId,
+        assetId,
+        urgency: "normal",
+        summary: "Annual descaling visit",
+        state: "resolved",
+        outcome: "replaced heating element",
+        idempotencyKey: "case-resolved",
+        createdAt: 140,
+        updatedAt: 150,
+      });
+    });
+
+    const result = await t.withIdentity(OWNER).query(getProjectionRef, { projectId: project.projectId });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("projection denied");
+    expect(result.equipment.assets.length).toBe(1);
+    expect(result.equipment.assetsTruncated).toBe(false);
+    const asset = result.equipment.assets[0];
+    expect(asset?.label).toBe("Espresso machine e1");
+    expect(asset?.serial).toBe("serial-e1");
+    expect(asset?.constraints).toBe("220V clearance");
+    expect(asset?.purchaseProvenance).toBe("recorded owner order");
+    expect(asset?.createdAt).toBe(100);
+    expect(asset?.documents.map((document) => document.kind)).toEqual(["purchase", "warranty"]);
+    expect(asset?.documentsTruncated).toBe(false);
+    expect(asset?.serviceCases.map((serviceCase) => serviceCase.state)).toEqual(["open", "resolved"]);
+    expect(asset?.serviceCasesTruncated).toBe(false);
+    expect(asset?.serviceCases[1]?.outcome).toBe("replaced heating element");
+    expect(asset?.serviceCases[0]).not.toHaveProperty("outcome");
+    for (const document of asset?.documents ?? []) {
+      expect(document).not.toHaveProperty("storageRef");
+    }
+    const serialized = JSON.stringify(result);
+    expect(serialized).not.toContain("secret-storage-ref-purchase");
+    expect(serialized).not.toContain("secret-storage-ref-warranty");
+    expect(serialized).not.toContain("storageRef");
+  });
+
+  test("bounds over-limit equipment with explicit truncation flags in stable order", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, OWNER, "crowded");
+    const firstAssetId = await insertAsset(t, project, "asset-0", 1);
+    for (let index = 1; index < projection.MAX_EQUIPMENT_ASSETS + 3; index += 1) {
+      await insertAsset(t, project, `asset-${index}`, 1 + index);
+    }
+    await t.run(async (ctx) => {
+      for (let index = 0; index < projection.MAX_ASSET_DOCUMENTS + 2; index += 1) {
+        await ctx.db.insert("assetDocuments", {
+          organizationId: project.organizationId,
+          projectId: project.projectId,
+          assetId: firstAssetId,
+          kind: index % 2 === 0 ? "purchase" : "warranty",
+          storageRef: `secret-overflow-ref-${index}`,
+          idempotencyKey: `overflow-document-${index}`,
+          createdAt: 100 + index,
+        });
+      }
+      for (let index = 0; index < projection.MAX_ASSET_CASES + 1; index += 1) {
+        await ctx.db.insert("serviceCases", {
+          organizationId: project.organizationId,
+          projectId: project.projectId,
+          assetId: firstAssetId,
+          urgency: "normal",
+          summary: `Overflow case ${index}`,
+          state: "open",
+          idempotencyKey: `overflow-case-${index}`,
+          createdAt: 200 + index,
+          updatedAt: 200 + index,
+        });
+      }
+    });
+
+    const result = await t.withIdentity(OWNER).query(getProjectionRef, { projectId: project.projectId });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("projection denied");
+    expect(result.equipment.assets.length).toBe(projection.MAX_EQUIPMENT_ASSETS);
+    expect(result.equipment.assetsTruncated).toBe(true);
+    expect(result.equipment.assets[0]?.label).toBe("Espresso machine asset-0");
+    expect(result.equipment.assets[0]?.documents.length).toBe(projection.MAX_ASSET_DOCUMENTS);
+    expect(result.equipment.assets[0]?.documentsTruncated).toBe(true);
+    expect(result.equipment.assets[0]?.serviceCases.length).toBe(projection.MAX_ASSET_CASES);
+    expect(result.equipment.assets[0]?.serviceCasesTruncated).toBe(true);
+    const repeat = await t.withIdentity(OWNER).query(getProjectionRef, { projectId: project.projectId });
+    expect(repeat.ok).toBe(true);
+    if (!repeat.ok) throw new Error("projection repeat denied");
+    expect(repeat.equipment.assets.map((asset) => asset.id)).toEqual(
+      result.equipment.assets.map((asset) => asset.id),
+    );
+    const serialized = JSON.stringify(result);
+    expect(serialized).not.toContain("secret-overflow-ref");
+    expect(serialized).not.toContain("storageRef");
+  });
+
+  test("denies cross-project equipment reads and never leaks foreign records", async () => {
+    const t = convexTest(schema, modules);
+    const home = await setupProject(t, OWNER, "home");
+    const away = await setupProject(t, OWNER, "away", "restricted");
+    await insertAsset(t, away, "foreign", 100);
+
+    const denied = await t.withIdentity(OTHER).query(getProjectionRef, { projectId: away.projectId });
+    expect(denied).toEqual({ ok: false, code: "denied-membership", message: "not authorized for this project" });
+
+    const isolated = await t.withIdentity(OWNER).query(getProjectionRef, { projectId: home.projectId });
+    expect(isolated.ok).toBe(true);
+    if (!isolated.ok) throw new Error("projection denied");
+    expect(isolated.equipment.assets).toEqual([]);
+    expect(isolated.equipment.assetsTruncated).toBe(false);
+  });
+
+  test("never invents installed assets from selection or order state", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, OWNER, "selected");
+    const graph = await setupCandidate(t, project, "no-asset");
+    const quoteId = await insertOwnerQuote(t, project, graph, "v1", "hash-no-asset-1", undefined, 100);
+    await t.run(async (ctx) => {
+      const selectionId = await ctx.db.insert("selections", {
+        organizationId: project.organizationId,
+        projectId: project.projectId,
+        idempotencyKey: "selection-no-asset",
+        requirementId: graph.requirementId,
+        candidateId: graph.candidateId,
+        quoteId,
+        quoteVersion: "v1",
+        selectionLines: [{ quoteLineId: "machine", quantity: "1", unit: "piece" }],
+        requirementVersion: 1,
+        actor: OWNER.tokenIdentifier,
+        createdAt: 200,
+      });
+      await ctx.db.insert("orders", {
+        organizationId: project.organizationId,
+        projectId: project.projectId,
+        selectionId,
+        requirementId: graph.requirementId,
+        quoteId,
+        quoteVersion: "v1",
+        requirementVersion: 1,
+        idempotencyKey: "order-no-asset",
+        orderLines: [{ quoteLineId: "machine", quantity: "1", unit: "piece" }],
+        state: "recorded",
+        amendmentCount: 0,
+        createdAt: 300,
+        updatedAt: 300,
+      });
+    });
+
+    const result = await t.withIdentity(OWNER).query(getProjectionRef, { projectId: project.projectId });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("projection denied");
+    expect(result.decisions.length).toBeGreaterThan(0);
+    expect(result.equipment.assets).toEqual([]);
+    expect(result.equipment.assetsTruncated).toBe(false);
+  });
+});
