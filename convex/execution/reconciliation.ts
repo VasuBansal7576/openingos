@@ -111,24 +111,41 @@ export const recordLateDelivery = f1InternalMutation({
         q.eq("provider", provider).eq("environment", environment).eq("eventId", args.providerEventId),
       )
       .unique();
+    // F1R-12: receipt and application are separate. An unbound early
+    // receipt binds to this operation exactly once; an event already
+    // applied to this operation dedupes; an event bound elsewhere stays
+    // fenced with zero new effect.
     if (seen !== null) {
-      const job = await ctx.db.get(operation.jobId);
-      return {
-        ok: true as const,
-        jobState: job?.state ?? "unknown",
-        delivery: operation.state,
-        deduplicated: true,
-      };
+      if (seen.operationId === args.operationId) {
+        const job = await ctx.db.get(operation.jobId);
+        return {
+          ok: true as const,
+          jobState: job?.state ?? "unknown",
+          delivery: "observedSuccess",
+          deduplicated: true,
+        };
+      }
+      if (seen.operationId !== undefined) {
+        const job = await ctx.db.get(operation.jobId);
+        return {
+          ok: true as const,
+          jobState: job?.state ?? "unknown",
+          delivery: operation.state,
+          deduplicated: true,
+        };
+      }
+      await ctx.db.patch(seen._id, { operationId: args.operationId });
+    } else {
+      await ctx.db.insert("processedEvents", {
+        provider,
+        environment,
+        eventId: args.providerEventId,
+        processingVersion: 1,
+        outcome: "success",
+        operationId: args.operationId,
+        createdAt: now,
+      });
     }
-    await ctx.db.insert("processedEvents", {
-      provider,
-      environment,
-      eventId: args.providerEventId,
-      processingVersion: 1,
-      outcome: "success",
-      operationId: args.operationId,
-      createdAt: now,
-    });
     await ctx.db.patch(args.operationId, { state: "observedSuccess", updatedAt: now });
     // No fund movement here: unresolved allowance remains reserved until
     // `reconcileActualCost` authoritatively settles the real charge.

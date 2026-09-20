@@ -123,18 +123,29 @@ export const recordOutcome = f1InternalMutation({
             .eq("eventId", args.providerEventId ?? ""),
         )
         .unique();
+      // F1R-12: receipt and application are separate. An unbound early
+      // receipt binds to this operation and the outcome below applies
+      // exactly once; an event already applied here dedupes; an event
+      // bound elsewhere stays fenced with zero new effect.
       if (seen !== null) {
-        return { ok: true as const, state: operation.state, deduplicated: true, outcome: seen.outcome };
+        if (seen.operationId === args.operationId) {
+          return { ok: true as const, state: operation.state, deduplicated: true, outcome: seen.outcome };
+        }
+        if (seen.operationId !== undefined) {
+          return { ok: true as const, state: operation.state, deduplicated: true, outcome: seen.outcome };
+        }
+        await ctx.db.patch(seen._id, { operationId: args.operationId });
+      } else {
+        await ctx.db.insert("processedEvents", {
+          provider,
+          environment,
+          eventId: args.providerEventId,
+          processingVersion: 1,
+          outcome: args.outcome,
+          operationId: args.operationId,
+          createdAt: now,
+        });
       }
-      await ctx.db.insert("processedEvents", {
-        provider,
-        environment,
-        eventId: args.providerEventId,
-        processingVersion: 1,
-        outcome: args.outcome,
-        operationId: args.operationId,
-        createdAt: now,
-      });
     }
     let state: "observedSuccess" | "observedFailure" | "outcomeUnknown" = "observedSuccess";
     if (args.outcome === "unknown" || (args.outcome === "failure" && args.unknownCharges === true)) {

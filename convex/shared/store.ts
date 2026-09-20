@@ -173,7 +173,7 @@ export class ControlledBackend {
   readonly operationsByKey = new Map<string, string>();
   readonly attempts = new Map<string, Attempt>();
   readonly reservations = new Map<string, Reservation>();
-  readonly processedEvents = new Map<string, { outcome: string; processingVersion: number }>();
+  readonly processedEvents = new Map<string, { outcome: string; processingVersion: number; operationId?: string }>();
   readonly evidenceRecords = new Map<string, Evidence>();
   readonly files = new Map<string, EvidenceFile>();
   readonly outboundSnapshots = new Map<string, OutboundSnapshot>();
@@ -937,13 +937,16 @@ export class ControlledBackend {
     ) {
       return denial("stale-input-version", "prepared inputs no longer match the current grant");
     }
-    let jobCommitted = 0;
-    for (const reservation of this.reservations.values()) {
-      if (reservation.jobId !== job.id) continue;
-      jobCommitted += reservation.reservedMicroUsd + reservation.spentMicroUsd + reservation.unresolvedMicroUsd;
+    let grantCommitted = 0;
+    for (const jobRow of this.jobs.values()) {
+      if (jobRow.grantId !== grant.id) continue;
+      for (const reservation of this.reservations.values()) {
+        if (reservation.jobId !== jobRow.id) continue;
+        grantCommitted += reservation.reservedMicroUsd + reservation.spentMicroUsd + reservation.unresolvedMicroUsd;
+      }
     }
-    if (jobCommitted > grant.costCeilingMicroUsd) {
-      return denial("grant-ceiling-exceeded", "job reservations exceed the grant cost ceiling");
+    if (grantCommitted > grant.costCeilingMicroUsd) {
+      return denial("grant-ceiling-exceeded", "grant-wide reservations exceed the grant cost ceiling");
     }
 
     // Communication envelope first: header injections (alternate recipient,
@@ -1125,9 +1128,18 @@ export class ControlledBackend {
       const key = `${provider}|${environment}|${input.providerEventId}`;
       const seen = this.processedEvents.get(key);
       if (seen) {
-        return approved(operation);
+        // F1R-12: unbound early receipts bind here and apply below
+        // exactly once; events bound elsewhere stay fenced.
+        if (seen.operationId === input.operationId) {
+          return approved(operation);
+        }
+        if (seen.operationId !== undefined) {
+          return approved(operation);
+        }
+        this.processedEvents.set(key, { ...seen, operationId: input.operationId });
+      } else {
+        this.processedEvents.set(key, { outcome: input.outcome, processingVersion: 1, operationId: input.operationId });
       }
-      this.processedEvents.set(key, { outcome: input.outcome, processingVersion: 1 });
     }
     let state: OperationState = "observedSuccess";
     if (input.outcome === "unknown" || (input.outcome === "failure" && input.unknownCharges === true)) {
@@ -1303,6 +1315,48 @@ export class ControlledBackend {
         unresolved.push(operation.id);
       }
     }
+    // F1R-02: release orphan reservations with no dispatched or
+    // unresolved exposure. In-flight holds and settled exposure stay.
+    const inFlight = new Set<string>();
+    for (const operation of this.operations.values()) {
+      if (operation.jobId !== jobId) continue;
+      if (
+        (operation.state === "dispatching" || operation.state === "outcomeUnknown") &&
+        operation.reservationId !== null
+      ) {
+        inFlight.add(operation.reservationId);
+      }
+    }
+    for (const reservation of this.reservations.values()) {
+      if (reservation.jobId !== jobId) continue;
+      if (reservation.state !== "open" || reservation.reservedMicroUsd <= 0) continue;
+      if (reservation.spentMicroUsd > 0 || reservation.unresolvedMicroUsd > 0) continue;
+      if (inFlight.has(reservation.id)) continue;
+      let boundLive = false;
+      for (const operation of this.operations.values()) {
+        if (operation.reservationId !== reservation.id) continue;
+        if (operation.state !== "cancelled" && operation.state !== "denied") {
+          boundLive = true;
+          break;
+        }
+      }
+      if (boundLive) continue;
+      const released = reservation.reservedMicroUsd;
+      this.reservations.set(reservation.id, {
+        ...reservation,
+        reservedMicroUsd: 0,
+        state: "closed",
+        updatedAt: now,
+      });
+      const budget = this.budgets.get(reservation.budgetId);
+      if (budget) {
+        this.budgets.set(budget.id, {
+          ...budget,
+          reservedMicroUsd: Math.max(0, budget.reservedMicroUsd - released),
+          updatedAt: now,
+        });
+      }
+    }
     const cancelled: Job = {
       ...job,
       state: "cancelled",
@@ -1337,10 +1391,21 @@ export class ControlledBackend {
     }
     const eventKey = `${provider}|${environment}|${providerEventId}`;
     const seen = this.processedEvents.get(eventKey);
+    // F1R-12: receipt and application are separate. An unbound early
+    // receipt binds here and applies below exactly once; an event
+    // already applied here dedupes; an event bound elsewhere stays
+    // fenced with zero new effect.
     if (seen) {
-      return approved({ jobState: job.state, delivery: operation.state, deduplicated: true });
+      if (seen.operationId === operationId) {
+        return approved({ jobState: job.state, delivery: "observedSuccess", deduplicated: true });
+      }
+      if (seen.operationId !== undefined) {
+        return approved({ jobState: job.state, delivery: operation.state, deduplicated: true });
+      }
+      this.processedEvents.set(eventKey, { ...seen, operationId });
+    } else {
+      this.processedEvents.set(eventKey, { outcome: "success", processingVersion: 1, operationId });
     }
-    this.processedEvents.set(eventKey, { outcome: "success", processingVersion: 1 });
     const updated: Operation = { ...operation, state: "observedSuccess", updatedAt: now };
     this.operations.set(operationId, updated);
     // No fund movement here: unresolved allowance stays reserved until
@@ -1432,13 +1497,17 @@ export class ControlledBackend {
     if (amountMicroUsd > grant.costCeilingMicroUsd) {
       return denial("grant-ceiling-exceeded", "reservation exceeds the grant cost ceiling");
     }
-    let jobCommitted = 0;
-    for (const reservation of this.reservations.values()) {
-      if (reservation.jobId !== jobId) continue;
-      jobCommitted += reservation.reservedMicroUsd + reservation.spentMicroUsd + reservation.unresolvedMicroUsd;
+    // F1R-01: grant-wide exposure spans every job bound to this grant.
+    let grantCommitted = 0;
+    for (const jobRow of this.jobs.values()) {
+      if (jobRow.grantId !== grant.id) continue;
+      for (const reservation of this.reservations.values()) {
+        if (reservation.jobId !== jobRow.id) continue;
+        grantCommitted += reservation.reservedMicroUsd + reservation.spentMicroUsd + reservation.unresolvedMicroUsd;
+      }
     }
-    if (jobCommitted + amountMicroUsd > grant.costCeilingMicroUsd) {
-      return denial("grant-ceiling-exceeded", "job reservations exceed the grant cost ceiling");
+    if (grantCommitted + amountMicroUsd > grant.costCeilingMicroUsd) {
+      return denial("grant-ceiling-exceeded", "grant-wide reservations exceed the grant cost ceiling");
     }
     const budget = this.getBudgetForOrganization(job.organizationId);
     if (!budget) return denial("allowance-exhausted", "no provider budget configured");
