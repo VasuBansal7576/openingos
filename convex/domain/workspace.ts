@@ -14,6 +14,12 @@ import type { Id } from "../_generated/dataModel.js";
 import { f1InternalMutation, f1Mutation, f1Query } from "../server.js";
 import { denialValidator } from "../access/checks.js";
 import {
+  decimalCompare,
+  decimalToString,
+  decimalZero,
+  quantity,
+} from "../../proofs/money/decimal.js";
+import {
   TEMPLATE_REUSE_COLLECTIONS,
   dependencyCreatesCycle,
   projectEventInputValidator,
@@ -478,17 +484,26 @@ function parseSnapshotRequirements(snapshot: string): SnapshotRequirement[] | nu
   const out: SnapshotRequirement[] = [];
   for (const entry of parsed) {
     if (!isRecord(entry)) return null;
-    const { key, title, category, quantity, unit } = entry;
+    const { key, title, category, quantity: rawQuantity, unit } = entry;
     if (
       typeof key !== "string" ||
       typeof title !== "string" ||
       typeof category !== "string" ||
-      typeof quantity !== "string" ||
+      typeof rawQuantity !== "string" ||
       typeof unit !== "string"
     ) {
       return null;
     }
-    out.push({ key, title, category, quantity, unit });
+    // F1R-09: snapshot quantities validate through the accepted
+    // proofs/money contract at parse time, so a broken template can
+    // never occupy its version slot or instantiate partial rows.
+    try {
+      const parsedQuantity = quantity(rawQuantity);
+      if (decimalCompare(parsedQuantity, decimalZero()) <= 0) return null;
+    } catch {
+      return null;
+    }
+    out.push({ key, title, category, quantity: rawQuantity, unit });
   }
   return out;
 }
@@ -570,14 +585,28 @@ export const instantiateTemplate = f1Mutation({
     if (!templateReuseExcludesHistoricFinancials([...TEMPLATE_REUSE_COLLECTIONS])) {
       return { ok: false as const, code: "invalid-payload", message: "reuse scope includes financials" };
     }
-    // Snapshot-internal validation before any write: unique keys, known
-    // endpoints, no self edges, no cycles.
+    // Snapshot-internal validation before any write: unique keys,
+    // proofs/money quantities (positive, supported precision), known
+    // endpoints, no self edges, no cycles. Any failure denies whole,
+    // leaving zero partial requirements or dependencies.
     const seenKeys = new Set<string>();
+    const normalizedQuantities = new Map<string, string>();
     for (const item of wanted) {
       if (seenKeys.has(item.key)) {
         return { ok: false as const, code: "invalid-payload", message: `duplicate requirement key ${item.key}` };
       }
       seenKeys.add(item.key);
+      // Defense in depth: templates stored before F1R-09 hardening
+      // re-validate here, before the first write.
+      try {
+        const parsedQuantity = quantity(item.quantity);
+        if (decimalCompare(parsedQuantity, decimalZero()) <= 0) {
+          return { ok: false as const, code: "invalid-payload", message: "template requirement quantity must be positive" };
+        }
+        normalizedQuantities.set(item.key, decimalToString(parsedQuantity));
+      } catch {
+        return { ok: false as const, code: "invalid-payload", message: "template requirement quantity is not a valid decimal" };
+      }
     }
     const edgeShapes: { from: string; to: string }[] = [];
     for (const edge of edges) {
@@ -638,13 +667,17 @@ export const instantiateTemplate = f1Mutation({
     const now = Date.now();
     const requirementIds: Id<"requirements">[] = [];
     for (const item of wanted) {
+      const normalizedQuantity = normalizedQuantities.get(item.key);
+      if (normalizedQuantity === undefined) {
+        throw new Error("instantiation invariant violated: validated quantity missing");
+      }
       const requirementId = await ctx.db.insert("requirements", {
         organizationId: args.organizationId,
         projectId: args.targetProjectId,
         key: item.key,
         title: item.title,
         category: item.category,
-        quantity: item.quantity,
+        quantity: normalizedQuantity,
         unit: item.unit,
         priority: "P1",
         state: "draft",

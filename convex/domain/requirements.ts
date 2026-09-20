@@ -12,6 +12,13 @@ import { v } from "convex/values";
 import { f1Mutation, f1Query } from "../server.js";
 import { denialValidator } from "../access/checks.js";
 import {
+  decimalCompare,
+  decimalToString,
+  decimalZero,
+  quantity,
+} from "../../proofs/money/decimal.js";
+import { currencyCode, money as makeMoney } from "../../proofs/money/money.js";
+import {
   dependencyCreatesCycle,
   dependencyInputValidator,
   requirementInputValidator,
@@ -43,6 +50,46 @@ export const create = f1Mutation({
     if (args.title.trim().length === 0) {
       return { ok: false as const, code: "invalid-payload", message: "title required" };
     }
+    // F1R-09: quantities and money validate through the accepted
+    // proofs/money contract before any read-or-write side effect beyond
+    // the access check. Positive decimals only; malformed or
+    // unsupported-precision input is denied, and normalized decimals
+    // (e.g. "1.0") persist in canonical form.
+    let normalizedQuantity: string;
+    try {
+      const parsed = quantity(args.quantity);
+      if (decimalCompare(parsed, decimalZero()) <= 0) {
+        return { ok: false as const, code: "invalid-payload", message: "quantity must be positive" };
+      }
+      normalizedQuantity = decimalToString(parsed);
+    } catch {
+      return { ok: false as const, code: "invalid-payload", message: "quantity is not a valid decimal" };
+    }
+    if (args.currency !== undefined) {
+      try {
+        currencyCode(args.currency);
+      } catch {
+        return { ok: false as const, code: "invalid-payload", message: "currency is invalid" };
+      }
+    }
+    if (args.budgetMinorUnits !== undefined) {
+      if (
+        typeof args.budgetMinorUnits !== "number" ||
+        !Number.isSafeInteger(args.budgetMinorUnits)
+      ) {
+        return { ok: false as const, code: "invalid-payload", message: "budget amount must be a safe integer" };
+      }
+      if (args.budgetMinorUnits < 0) {
+        return { ok: false as const, code: "invalid-payload", message: "budget amount cannot be negative" };
+      }
+      if (args.currency !== undefined) {
+        try {
+          makeMoney(args.currency, args.budgetMinorUnits);
+        } catch {
+          return { ok: false as const, code: "invalid-payload", message: "budget money is invalid" };
+        }
+      }
+    }
     const duplicate = await ctx.db
       .query("requirements")
       .withIndex("by_project_and_key", (q) =>
@@ -59,7 +106,7 @@ export const create = f1Mutation({
       key: args.key,
       title: args.title,
       category: args.category,
-      quantity: args.quantity,
+      quantity: normalizedQuantity,
       unit: args.unit,
       priority: args.priority,
       state: "draft",
