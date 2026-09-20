@@ -8,7 +8,7 @@
  * and no request can reach the pinned external origin.
  */
 
-import { afterEach, describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { convexTest, type TestConvex } from "convex-test";
 import {
   makeFunctionReference,
@@ -99,6 +99,18 @@ const classifyRef = makeFunctionReference<
 >("models/jev:classify");
 
 const OWNER = { tokenIdentifier: "j03-jev-owner" };
+const CONTROLLED_PRICING = {
+  [jev.JEV_PRICING_ENV_VARS.attemptMaxCostMicroUsd]: "1000",
+  [jev.JEV_PRICING_ENV_VARS.pricingVersion]: "controlled-v1",
+  [jev.JEV_PRICING_ENV_VARS.pricingBasis]: "controlled-jev-pricing",
+} as const;
+const CONTROLLED_ENV_KEYS = [
+  "TYPESAFE_API_KEY",
+  ...Object.values(jev.JEV_PRICING_ENV_VARS),
+] as const;
+const ORIGINAL_ENV = new Map(
+  CONTROLLED_ENV_KEYS.map((key) => [key, process.env[key]] as const),
+);
 const QUESTIONS = {
   urgency: {
     type: "noul" as const,
@@ -110,6 +122,7 @@ const STATE = { requirement: "espresso machine", supplier: "Acme" };
 
 interface Fixture {
   readonly t: TestConvex<typeof schema>;
+  readonly pricing: jev.JevPricingPolicy;
   readonly identity: string;
   readonly organizationId: Id<"organizations">;
   readonly projectId: Id<"projects">;
@@ -120,16 +133,22 @@ interface Fixture {
 }
 
 function init(): TestConvex<typeof schema> {
-  process.env.TYPESAFE_API_KEY = "controlled-jev-key";
   return convexTest(schema, modules);
+}
+
+function controlledPricing(): jev.JevPricingPolicy {
+  const result = jev.loadJevPricingPolicy();
+  if (!result.ok) throw new Error(`controlled Jev pricing setup failed: ${result.message}`);
+  return result.policy;
 }
 
 async function createFixture(
   t: TestConvex<typeof schema>,
   requestId: string,
-  reservationAmount = jev.JEV_MAX_RESERVATION_MICRO_USD,
+  reservationAmount?: number,
 ): Promise<Fixture> {
   const asOwner = t.withIdentity(OWNER);
+  const pricing = controlledPricing();
   const organization = await asOwner.mutation(createOrganizationRef, {
     name: "J-03 controlled organization",
     kind: "private",
@@ -158,11 +177,11 @@ async function createFixture(
   await t.run(async (ctx) => {
     await ctx.db.insert("providerBudgets", {
       organizationId: organization.organizationId,
-      ceilingMicroUsd: jev.JEV_MAX_RESERVATION_MICRO_USD,
+      ceilingMicroUsd: pricing.maxReservationMicroUsd,
       reservedMicroUsd: 0,
       spentMicroUsd: 0,
       unresolvedMicroUsd: 0,
-      pricingBasis: jev.JEV_PRICING_BASIS,
+      pricingBasis: pricing.reservationPricingBasis,
       updatedAt: Date.now(),
     });
   });
@@ -179,8 +198,8 @@ async function createFixture(
     jobId: started.jobId,
     organizationId: organization.organizationId,
     projectId: project.projectId,
-    amountMicroUsd: reservationAmount,
-    pricingBasis: jev.JEV_PRICING_BASIS,
+    amountMicroUsd: reservationAmount ?? pricing.maxReservationMicroUsd,
+    pricingBasis: pricing.reservationPricingBasis,
   });
   if (!reservation.ok) throw new Error(`reservation setup failed: ${reservation.message}`);
   const operation = await asOwner.mutation(createOperationRef, {
@@ -196,6 +215,7 @@ async function createFixture(
   if (!operation.ok) throw new Error(`operation setup failed: ${operation.message}`);
   return {
     t,
+    pricing,
     identity: OWNER.tokenIdentifier,
     organizationId: organization.organizationId,
     projectId: project.projectId,
@@ -227,9 +247,172 @@ async function waitForCalls(calls: readonly unknown[], count: number): Promise<v
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  for (const key of CONTROLLED_ENV_KEYS) {
+    const original = ORIGINAL_ENV.get(key);
+    if (original === undefined) delete process.env[key];
+    else process.env[key] = original;
+  }
 });
 
+beforeEach(() => {
+  process.env.TYPESAFE_API_KEY = "controlled-jev-key";
+  for (const [key, value] of Object.entries(CONTROLLED_PRICING)) {
+    process.env[key] = value;
+  }
+});
+
+async function expectNoClaim(t: TestConvex<typeof schema>, fixture: Fixture): Promise<void> {
+  const state = await t.run(async (ctx) => ({
+    operation: await ctx.db.get(fixture.operationId),
+    attempts: await ctx.db
+      .query("attempts")
+      .withIndex("by_operation", (q) => q.eq("operationId", fixture.operationId))
+      .collect(),
+    reservation: await ctx.db.get(fixture.reservationId),
+  }));
+  expect(state.operation?.state).toBe("prepared");
+  expect(state.operation?.attemptToken).toBeUndefined();
+  expect(state.attempts).toHaveLength(0);
+  expect(state.reservation).toMatchObject({
+    state: "open",
+    reservedMicroUsd: fixture.pricing.maxReservationMicroUsd,
+    spentMicroUsd: 0,
+    unresolvedMicroUsd: 0,
+  });
+}
+
 describe("J-03 Jev shared allowance and durable authority", () => {
+  test("missing pricing configuration refuses before claim or provider call", async () => {
+    const t = init();
+    const fixture = await createFixture(t, "jev-pricing-missing");
+    delete process.env[jev.JEV_PRICING_ENV_VARS.attemptMaxCostMicroUsd];
+    const calls: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      calls.push(String(input));
+      return response();
+    }));
+
+    const result = await t.withIdentity(OWNER).action(classifyRef, {
+      operationId: fixture.operationId,
+      identity: fixture.identity,
+      state: STATE,
+      questions: QUESTIONS,
+      inputVersion: "jev-v1",
+    });
+    expect(result).toMatchObject({ ok: false, code: "invalid-pricing-config" });
+    expect(calls).toHaveLength(0);
+    await expectNoClaim(t, fixture);
+  });
+
+  test("invalid pricing configuration refuses before claim or provider call", async () => {
+    const t = init();
+    const fixture = await createFixture(t, "jev-pricing-invalid");
+    process.env[jev.JEV_PRICING_ENV_VARS.attemptMaxCostMicroUsd] = "0";
+    process.env[jev.JEV_PRICING_ENV_VARS.pricingVersion] = "   ";
+    const calls: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      calls.push(String(input));
+      return response();
+    }));
+
+    const result = await t.withIdentity(OWNER).action(classifyRef, {
+      operationId: fixture.operationId,
+      identity: fixture.identity,
+      state: STATE,
+      questions: QUESTIONS,
+      inputVersion: "jev-v1",
+    });
+    expect(result).toMatchObject({ ok: false, code: "invalid-pricing-config" });
+    expect(calls).toHaveLength(0);
+    await expectNoClaim(t, fixture);
+  });
+
+  test("overflowing three-attempt pricing configuration refuses before claim or provider call", async () => {
+    const t = init();
+    const fixture = await createFixture(t, "jev-pricing-overflow");
+    process.env[jev.JEV_PRICING_ENV_VARS.attemptMaxCostMicroUsd] = "9007199254740991";
+    const calls: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      calls.push(String(input));
+      return response();
+    }));
+
+    const result = await t.withIdentity(OWNER).action(classifyRef, {
+      operationId: fixture.operationId,
+      identity: fixture.identity,
+      state: STATE,
+      questions: QUESTIONS,
+      inputVersion: "jev-v1",
+    });
+    expect(result).toMatchObject({ ok: false, code: "invalid-pricing-config" });
+    expect(calls).toHaveLength(0);
+    await expectNoClaim(t, fixture);
+  });
+
+  test("stale pricing basis refuses before provider dispatch", async () => {
+    const t = init();
+    const fixture = await createFixture(t, "jev-pricing-stale-basis");
+    await t.run(async (ctx) => {
+      await ctx.db.patch(fixture.reservationId, { pricingBasis: "caller-invented-pricing" });
+    });
+    const calls: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      calls.push(String(input));
+      return response();
+    }));
+
+    const result = await t.withIdentity(OWNER).action(classifyRef, {
+      operationId: fixture.operationId,
+      identity: fixture.identity,
+      state: STATE,
+      questions: QUESTIONS,
+      inputVersion: "jev-v1",
+    });
+    expect(result).toMatchObject({ outcome: "stale", reason: "stale-pricing-basis", attempts: 0 });
+    expect(calls).toHaveLength(0);
+  });
+
+  test("pricing version drift refuses an old reservation before provider dispatch", async () => {
+    const t = init();
+    const fixture = await createFixture(t, "jev-pricing-stale-version");
+    process.env[jev.JEV_PRICING_ENV_VARS.pricingVersion] = "controlled-v2";
+    const calls: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      calls.push(String(input));
+      return response();
+    }));
+
+    const result = await t.withIdentity(OWNER).action(classifyRef, {
+      operationId: fixture.operationId,
+      identity: fixture.identity,
+      state: STATE,
+      questions: QUESTIONS,
+      inputVersion: "jev-v1",
+    });
+    expect(result).toMatchObject({ outcome: "stale", reason: "stale-pricing-basis", attempts: 0 });
+    expect(calls).toHaveLength(0);
+  });
+
+  test("an undersized reservation refuses before provider dispatch", async () => {
+    const t = init();
+    const fixture = await createFixture(t, "jev-pricing-undersized", 1_000);
+    const calls: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      calls.push(String(input));
+      return response();
+    }));
+
+    const result = await t.withIdentity(OWNER).action(classifyRef, {
+      operationId: fixture.operationId,
+      identity: fixture.identity,
+      state: STATE,
+      questions: QUESTIONS,
+      inputVersion: "jev-v1",
+    });
+    expect(result).toMatchObject({ outcome: "stale", reason: "allowance-exhausted", attempts: 0 });
+    expect(calls).toHaveLength(0);
+  });
+
   test("concurrent actual actions admit one full reservation and make zero second fetch calls", async () => {
     const t = init();
     const first = await createFixture(t, "jev-concurrent-first");
@@ -258,8 +441,8 @@ describe("J-03 Jev shared allowance and durable authority", () => {
       jobId: secondJob.jobId,
       organizationId: first.organizationId,
       projectId: first.projectId,
-      amountMicroUsd: jev.JEV_MAX_RESERVATION_MICRO_USD,
-      pricingBasis: jev.JEV_PRICING_BASIS,
+      amountMicroUsd: first.pricing.maxReservationMicroUsd,
+      pricingBasis: first.pricing.reservationPricingBasis,
     });
     expect(secondReservation).toMatchObject({ ok: false, code: "allowance-exhausted" });
 
@@ -326,12 +509,12 @@ describe("J-03 Jev shared allowance and durable authority", () => {
     expect(accounting.reservation).toMatchObject({
       state: "closed",
       reservedMicroUsd: 0,
-      spentMicroUsd: jev.JEV_MAX_RESERVATION_MICRO_USD,
+      spentMicroUsd: fixture.pricing.maxReservationMicroUsd,
       unresolvedMicroUsd: 0,
     });
     expect(accounting.budget).toMatchObject({
       reservedMicroUsd: 0,
-      spentMicroUsd: jev.JEV_MAX_RESERVATION_MICRO_USD,
+      spentMicroUsd: fixture.pricing.maxReservationMicroUsd,
       unresolvedMicroUsd: 0,
     });
   });
@@ -405,12 +588,12 @@ describe("J-03 Jev shared allowance and durable authority", () => {
       state: "open",
       reservedMicroUsd: 0,
       spentMicroUsd: 0,
-      unresolvedMicroUsd: jev.JEV_MAX_RESERVATION_MICRO_USD,
+      unresolvedMicroUsd: fixture.pricing.maxReservationMicroUsd,
     });
     expect(accounting.budget).toMatchObject({
       reservedMicroUsd: 0,
       spentMicroUsd: 0,
-      unresolvedMicroUsd: jev.JEV_MAX_RESERVATION_MICRO_USD,
+      unresolvedMicroUsd: fixture.pricing.maxReservationMicroUsd,
     });
   });
 
