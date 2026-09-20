@@ -51,10 +51,10 @@ const modules = import.meta.glob([
   "!./shared/**/*.test.ts",
 ]);
 
-type MutationArgs<T> = T extends RegisteredMutation<any, infer A, any> ? A : never;
-type MutationReturn<T> = T extends RegisteredMutation<any, any, infer R> ? R : never;
-type QueryArgs<T> = T extends RegisteredQuery<any, infer A, any> ? A : never;
-type QueryReturn<T> = T extends RegisteredQuery<any, any, infer R> ? R : never;
+type MutationArgs<T> = T extends RegisteredMutation<infer _V, infer A, infer _R> ? A : never;
+type MutationReturn<T> = T extends RegisteredMutation<infer _V, infer _A, infer R> ? R : never;
+type QueryArgs<T> = T extends RegisteredQuery<infer _V, infer A, infer _R> ? A : never;
+type QueryReturn<T> = T extends RegisteredQuery<infer _V, infer _A, infer R> ? R : never;
 
 const createOrganizationRef = makeFunctionReference<
   "mutation",
@@ -427,10 +427,9 @@ describe("direct handler visibility and absent endpoints", () => {
     expect("seed" in fixtures).toBe(false);
     for (const value of Object.values(fixtures)) {
       if (typeof value === "function") {
-        const handler = value as { isMutation?: boolean; isQuery?: boolean; isAction?: boolean };
-        expect(handler.isMutation === true).toBe(false);
-        expect(handler.isQuery === true).toBe(false);
-        expect(handler.isAction === true).toBe(false);
+        expect(Reflect.get(value, "isMutation") === true).toBe(false);
+        expect(Reflect.get(value, "isQuery") === true).toBe(false);
+        expect(Reflect.get(value, "isAction") === true).toBe(false);
       }
     }
   });
