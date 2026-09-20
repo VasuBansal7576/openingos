@@ -22,6 +22,7 @@ import {
 } from "./contracts.js";
 import { operationLabel } from "./transport.js";
 import { denialValidator } from "../access/checks.js";
+import { isValidSingleMailbox, normalizeMailbox } from "../shared/mailbox.js";
 
 type LocalMutationArgs<T> = T extends RegisteredMutation<infer _Visibility, infer Args, infer _Return> ? Args : never;
 type LocalMutationReturn<T> = T extends RegisteredMutation<infer _Visibility, infer _Args, infer Return> ? Awaited<Return> : never;
@@ -116,6 +117,15 @@ export const reconcile = internalAction({
     const apiKey = env.AGENTMAIL_API_KEY;
     if (apiKey === undefined || apiKey.trim().length === 0) {
       return { ok: false as const, code: "provider-unavailable", message: "AgentMail is unavailable for reconciliation" };
+    }
+    const owner = env.HACKATHON_OWNER_RECIPIENT;
+    if (
+      owner === undefined ||
+      !isValidSingleMailbox(owner) ||
+      !isValidSingleMailbox(args.recipient) ||
+      normalizeMailbox(owner) !== normalizeMailbox(args.recipient)
+    ) {
+      return { ok: false as const, code: "recipient-mismatch", message: "reconciliation recipient is not the configured owner mailbox" };
     }
     const baseUrl = env.AGENTMAIL_BASE_URL ?? DEFAULT_AGENTMAIL_BASE_URL;
     const result = await reconcileAgentMailOnce({

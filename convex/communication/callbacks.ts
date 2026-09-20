@@ -107,13 +107,14 @@ function parseProviderEvent(value: unknown): ParsedProviderEvent | Communication
   };
 }
 
-function bindingValue(value: string): { readonly messageId?: string; readonly threadId?: string } | null {
+function bindingValue(value: string): { readonly messageId?: string; readonly threadId?: string; readonly inboxId?: string } | null {
   try {
     const parsed: unknown = JSON.parse(value);
     if (!isRecord(parsed)) return null;
     return {
       ...(typeof parsed["messageId"] === "string" ? { messageId: parsed["messageId"] } : {}),
       ...(typeof parsed["threadId"] === "string" ? { threadId: parsed["threadId"] } : {}),
+      ...(typeof parsed["inboxId"] === "string" ? { inboxId: parsed["inboxId"] } : {}),
     };
   } catch {
     return null;
@@ -225,7 +226,7 @@ async function conversationForMessage(
   for (const row of rows) {
     if (row.provider !== "agentmail-binding" || row.environment !== "live" || row.operationId === undefined) continue;
     const binding = bindingValue(row.outcome);
-    if (binding === null || binding.threadId !== message.threadId) continue;
+    if (binding === null || binding.threadId !== message.threadId || binding.inboxId !== message.inboxId) continue;
     const operation = await ctx.db.get(row.operationId);
     if (operation === null || operation.grantId === undefined || operation.organizationId === undefined || operation.projectId === undefined) continue;
     const grant = await ctx.db.get(operation.grantId);
@@ -248,6 +249,9 @@ export const ingestMessage = f1InternalMutation({
   handler: async (ctx, args) => {
     const parsed = parseInboundMessage(args.message);
     if (isCommunicationDenial(parsed)) return parsed;
+    if (isRecord(args.thread) && typeof args.thread["thread_id"] === "string" && args.thread["thread_id"] !== parsed.threadId) {
+      return denial("invalid-payload", "inbound message and thread identifiers conflict");
+    }
     const configRows = await ctx.db
       .query("recipientConfigs")
       .withIndex("by_active", (q) => q.eq("active", true))
