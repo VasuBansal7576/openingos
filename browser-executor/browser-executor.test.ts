@@ -31,6 +31,7 @@ import type {
   TransportResult,
 } from "./index.ts";
 import {
+  ACTIVE_JOB_CEILING_MS,
   ControlledDriver,
   OPERATION_CATALOG_VERSION,
   authorizeOperation,
@@ -1141,7 +1142,7 @@ describe("authoritative driver dispatch (BR3/BR4)", () => {
     const resumed = setup.driver.reacquireLease(setup.jobId, {
       organizationId: "org-a",
       projectId: "proj-a",
-      leaseId: "lease-2",
+      leaseId: "lease-1",
       expiresAtMs: NOW + 60_000,
       guest: false,
     }, NOW);
@@ -1291,7 +1292,7 @@ describe("lease lifecycle on wait/cancel/expiry (R11)", () => {
     const second = setup.driver.reacquireLease(setup.jobId, {
       organizationId: "org-a",
       projectId: "proj-a",
-      leaseId: "lease-2",
+      leaseId: "lease-1",
       expiresAtMs: NOW + 60_000,
       guest: false,
     }, NOW);
@@ -1300,7 +1301,7 @@ describe("lease lifecycle on wait/cancel/expiry (R11)", () => {
     const afterCancel = setup.driver.reacquireLease(setup.jobId, {
       organizationId: "org-a",
       projectId: "proj-a",
-      leaseId: "lease-3",
+      leaseId: "lease-1",
       expiresAtMs: NOW + 60_000,
       guest: false,
     }, NOW + 2);
@@ -1509,7 +1510,7 @@ describe("NR02 request-bound lease authority", () => {
     const fresh = waitingSetup.driver.reacquireLease(waitingSetup.jobId, {
       organizationId: "org-a",
       projectId: "proj-a",
-      leaseId: "lease-2",
+      leaseId: "lease-1",
       expiresAtMs: NOW + 60_000,
       guest: false,
     }, NOW);
@@ -1664,6 +1665,10 @@ describe("NR05 authoritative clock and expiry fencing", () => {
     // the cancelled job without reopening it.
     expect(driver.snapshot(jobId)?.state).toBe("cancelled");
     void result;
+    await Bun.sleep(5);
+    const fenced = driver.snapshot(jobId) as BrowserJob;
+    expect(fenced.attempts[0]?.observation?.url).toBe(GOOD_URL);
+    expect(fenced.lateResults.length).toBe(1);
   });
 
   it("enforces the 15-minute active-execution ceiling", () => {
@@ -1917,7 +1922,7 @@ describe("NR10 terminal lease release", () => {
     mustDenialReason(setup.driver.reacquireLease(setup.jobId, {
       organizationId: "org-a",
       projectId: "proj-a",
-      leaseId: "lease-2",
+      leaseId: "lease-1",
       expiresAtMs: NOW + 60_000,
       guest: false,
     }, NOW), "lease-invalid");
@@ -1974,5 +1979,325 @@ describe("NR15 synchronous transport errors", () => {
     // No automatic redispatch: exactly one attempt, still unknown.
     expect(setup.driver.snapshot(setup.jobId)?.attempts.length).toBe(1);
     expect(setup.driver.snapshot(setup.jobId)?.attempts[0]?.state).toBe("outcomeUnknown");
+  });
+});
+
+describe("FR01 additional forbidden numeric ranges", () => {
+  it("denies non-mapped prefixes ending in a mapped tail, directly and per hop", () => {
+    for (const raw of ["https://[0:1::ffff:808:808]/", "https://[0:abcd::ffff:808:808]/"]) {
+      const origins = [new URL(raw).origin, "https://supplier-a.example"];
+      expect(validateDestination(raw, origins).ok).toBe(false);
+      for (let n = 0; n < 5; n += 1) {
+        const hops = Array(5).fill(GOOD_URL);
+        hops[n] = raw;
+        expect(validateNavigation(GOOD_URL, hops, origins).ok).toBe(false);
+      }
+    }
+  });
+
+  it("denies the 3fff::/20 documentation block and keeps mapped public allowed", () => {
+    const doc = "https://[3fff::1]/";
+    expect(validateDestination(doc, [new URL(doc).origin]).ok).toBe(false);
+    // Boundary: top 4 bits of g1 set (3fff:1000::) is outside /20, global path applies.
+    const outside = "https://[3fff:1000::1]/";
+    expect(validateDestination(outside, [new URL(outside).origin]).ok).toBe(true);
+    const mappedPublic = "https://[::ffff:8.8.8.8]/";
+    expect(validateDestination(mappedPublic, [new URL(mappedPublic).origin]).ok).toBe(true);
+  });
+});
+
+describe("FR02 no running-state lease rotation", () => {
+  it("denies replacement identity on a running job with zero transport calls", async () => {
+    const driver = new ControlledDriver(SECRET);
+    const req = parseJobRequest(requestFixture());
+    const jobId = driver.registerJob(req, NOW) as string;
+    const lease = driver.acquireLease(jobId, {
+      organizationId: req.organizationId,
+      projectId: req.projectId,
+      leaseId: "lease-1",
+      expiresAtMs: NOW + 60_000,
+      guest: false,
+    }, NOW);
+    const first = driver.authorize({
+      jobId,
+      nowMs: NOW,
+      operationId: "readVisibleText",
+      viaRecovery: false,
+      sessionHandle: (lease as SessionLease).handle,
+    });
+    if (isDenial(first)) {
+      throw new Error("expected first claim");
+    }
+    const stub = driverStub(driver);
+    const settled = await driver.dispatch(jobId, (first as IssuedClaim).claimId, stub.transport, { nowMs: NOW });
+    expect(settled.receipt.outcome).toBe("observed-success");
+    expect(driver.releaseLease(jobId).ok).toBe(true);
+    const rotated = driver.reacquireLease(jobId, {
+      organizationId: "org-a",
+      projectId: "proj-a",
+      leaseId: "replacement",
+      expiresAtMs: NOW + 60_000,
+      guest: false,
+    }, NOW);
+    mustDenialReason(rotated, "lease-invalid");
+    expect(stub.calls.length).toBe(1);
+  });
+
+  it("same authorized identity may resume after waiting plus strategy transition", async () => {
+    const setup = setupDriver();
+    const out = await runDispatch(setup, issue(setup), [{ outcome: "waiting" }]);
+    expect(out.job.state).toBe("waitingForSupplier");
+    mustJob(setup.driver.changeStrategy(setup.jobId, "explicit controlled resume"));
+    const lease = setup.driver.reacquireLease(setup.jobId, {
+      organizationId: "org-a",
+      projectId: "proj-a",
+      leaseId: "lease-1",
+      expiresAtMs: NOW + 60_000,
+      guest: false,
+    }, NOW);
+    expect(isDenial(lease)).toBe(false);
+    const claim: unknown = setup.driver.authorize({
+      jobId: setup.jobId,
+      nowMs: NOW,
+      operationId: "readVisibleText",
+      viaRecovery: false,
+      sessionHandle: (lease as SessionLease).handle,
+    });
+    expect(isDenial(claim)).toBe(false);
+  });
+});
+
+describe("FR03 every deadline fences with lease release", () => {
+  it("authorize at signed-request expiry fences instead of leaving executable state", () => {
+    const driver = new ControlledDriver(SECRET);
+    const req = parseJobRequest(requestFixture({
+      expiresAt: NOW + 100_000,
+      sessionLease: { leaseId: "lease-1", expiresAtMs: NOW + 20 },
+    }));
+    const jobId = driver.registerJob(req, NOW) as string;
+    const lease = driver.acquireLease(jobId, {
+      organizationId: req.organizationId,
+      projectId: req.projectId,
+      leaseId: "lease-1",
+      expiresAtMs: NOW + 20,
+      guest: false,
+    }, NOW);
+    const deniedClaim: unknown = driver.authorize({
+      jobId,
+      nowMs: NOW + 20,
+      operationId: "readVisibleText",
+      viaRecovery: false,
+      sessionHandle: (lease as SessionLease).handle,
+    });
+    mustDenialReason(deniedClaim, "lease-invalid");
+    expect(driver.snapshot(jobId)?.state).toBe("cancelled");
+    expect(driver.trackedLease(jobId)).toBeUndefined();
+  });
+
+  it("request, acquired, and ceiling deadlines each fence with release", async () => {
+    const start = Date.now();
+    // Signed-request lease deadline with a later job deadline.
+    {
+      const driver = new ControlledDriver(SECRET);
+      const req = parseJobRequest(requestFixture({
+        expiresAt: start + 100_000,
+        sessionLease: { leaseId: "lease-1", expiresAtMs: start + 25 },
+      }));
+      const jobId = driver.registerJob(req, start) as string;
+      const lease = driver.acquireLease(jobId, {
+        organizationId: req.organizationId,
+        projectId: req.projectId,
+        leaseId: "lease-1",
+        expiresAtMs: start + 25,
+        guest: false,
+      }, start);
+      const claim = driver.authorize({
+        jobId, nowMs: start, operationId: "readVisibleText", viaRecovery: false,
+        sessionHandle: (lease as SessionLease).handle,
+      }) as IssuedClaim;
+      const result = await driver.dispatch(jobId, claim.claimId, {
+        execute: () => new Promise<TransportResult>(() => undefined),
+      }, { nowMs: start });
+      expect(result.job.state).toBe("cancelled");
+      expect(driver.trackedLease(jobId)).toBeUndefined();
+      expect(result.job.attempts[0]?.state).toBe("dispatching");
+    }
+    // Active-ceiling deadline with later job and lease deadlines.
+    {
+      const driver = new ControlledDriver(SECRET);
+      const createdAt = start;
+      const req = parseJobRequest(requestFixture({
+        expiresAt: createdAt + 5_000_000,
+        sessionLease: { leaseId: "lease-1", expiresAtMs: createdAt + 5_000_000 },
+      }));
+      const jobId = driver.registerJob(req, createdAt) as string;
+      const lease = driver.acquireLease(jobId, {
+        organizationId: req.organizationId,
+        projectId: req.projectId,
+        leaseId: "lease-1",
+        expiresAtMs: createdAt + 5_000_000,
+        guest: false,
+      }, createdAt);
+      const atMs = createdAt + ACTIVE_JOB_CEILING_MS - 25;
+      const claim = driver.authorize({
+        jobId, nowMs: atMs, operationId: "readVisibleText", viaRecovery: false,
+        sessionHandle: (lease as SessionLease).handle,
+      }) as IssuedClaim;
+      const result = await driver.dispatch(jobId, claim.claimId, {
+        execute: () => new Promise<TransportResult>(() => undefined),
+      }, { nowMs: atMs });
+      expect(result.job.state).toBe("cancelled");
+      expect(driver.trackedLease(jobId)).toBeUndefined();
+    }
+  });
+});
+
+describe("FR04 monotonic step deadline and rollback", () => {
+  it("synchronous overrun past the step budget is a timeout, not success", async () => {
+    const setup = setupDriver();
+    const result = await setup.driver.dispatch(setup.jobId, issue(setup).claimId, {
+      execute: (input: TransportInput) => {
+        const until = performance.now() + 25;
+        while (performance.now() < until) {
+          // Intentional synchronous event-loop block past a 5ms budget.
+        }
+        const digest = setup.driver.requestDigestOf(setup.jobId) as string;
+        const raw = observationFixture(input.attemptId, { requestDigest: digest });
+        const observation = parseObservation(raw);
+        return Promise.resolve({
+          envelope: { observation: raw, callbackNonce: input.callbackNonce },
+          signature: signObservation(SECRET, observation, input.callbackNonce),
+        });
+      },
+    }, { nowMs: NOW, timeoutMs: 5 });
+    expect(result.receipt.outcome).toBe("transport-timeout");
+  });
+
+  it("wall-clock rollback cannot extend elapsed job execution", async () => {
+    const setup = setupDriver({ expiresAt: NOW + 10 });
+    const originalNow = Date.now;
+    const clockStart = originalNow();
+    let rolledBack = false;
+    Date.now = () => (rolledBack ? clockStart - 60_000 : clockStart);
+    try {
+      const result = await setup.driver.dispatch(setup.jobId, issue(setup).claimId, {
+        execute: (input: TransportInput) => {
+          rolledBack = true;
+          const until = performance.now() + 25;
+          while (performance.now() < until) {
+            // Real monotonic elapsed time passes despite the Date.now fault.
+          }
+          const digest = setup.driver.requestDigestOf(setup.jobId) as string;
+          const raw = observationFixture(input.attemptId, { requestDigest: digest });
+          const observation = parseObservation(raw);
+          return Promise.resolve({
+            envelope: { observation: raw, callbackNonce: input.callbackNonce },
+            signature: signObservation(SECRET, observation, input.callbackNonce),
+          });
+        },
+      }, { nowMs: NOW });
+      expect(result.job.state).toBe("cancelled");
+    } finally {
+      Date.now = originalNow;
+    }
+  });
+});
+
+describe("FR05 bounded reconciliation after the execution cutoff", () => {
+  it("one authenticated late outcome settles on the fenced job", async () => {
+    const start = Date.now();
+    const driver = new ControlledDriver(SECRET);
+    const req = parseJobRequest(requestFixture({
+      expiresAt: start + 25,
+      sessionLease: { leaseId: "lease-1", expiresAtMs: start + 120_000 },
+    }));
+    const jobId = driver.registerJob(req, start) as string;
+    const lease = driver.acquireLease(jobId, {
+      organizationId: req.organizationId,
+      projectId: req.projectId,
+      leaseId: "lease-1",
+      expiresAtMs: start + 120_000,
+      guest: false,
+    }, start);
+    const claim = driver.authorize({
+      jobId, nowMs: start, operationId: "readVisibleText", viaRecovery: false,
+      sessionHandle: (lease as SessionLease).handle,
+    }) as IssuedClaim;
+    let deliver!: (value: TransportResult) => void;
+    const pending = driver.dispatch(jobId, claim.claimId, {
+      execute: () => new Promise<TransportResult>((resolve) => {
+        deliver = resolve;
+      }),
+    }, { nowMs: start });
+    const timedOut = await pending;
+    expect(timedOut.job.state).toBe("cancelled");
+    const digest = driver.requestDigestOf(jobId) as string;
+    const expectation = driver.expectationFor(jobId, `a_${jobId}_1`);
+    const raw = observationFixture(`a_${jobId}_1`, {
+      jobId,
+      observationVersion: expectation?.version ?? 1,
+      requestDigest: digest,
+    });
+    const observation = parseObservation(raw);
+    deliver({
+      envelope: { observation: raw, callbackNonce: claim.callbackNonce },
+      signature: signObservation(SECRET, observation, claim.callbackNonce),
+    });
+    await Bun.sleep(5);
+    const fenced = driver.snapshot(jobId) as BrowserJob;
+    expect(fenced.state).toBe("cancelled");
+    expect(fenced.lateResults.length).toBe(1);
+    expect(fenced.attempts[0]?.observation?.url).toBe(GOOD_URL);
+  });
+});
+
+describe("FR06 cancelled policy rejection retains evidence, nonce reusable", () => {
+  it("forbidden late callback quarantines without burning the rightful nonce", async () => {
+    const setup = setupDriver();
+    const claim = issue(setup);
+    let input!: TransportInput;
+    let deliver!: (value: TransportResult) => void;
+    const pending = setup.driver.dispatch(setup.jobId, claim.claimId, {
+      execute: (seen: TransportInput) => new Promise<TransportResult>((resolve) => {
+        input = seen;
+        deliver = resolve;
+      }),
+    }, { nowMs: NOW });
+    mustJob(setup.driver.cancel(setup.jobId, NOW + 1, "controlled cancel"));
+    const digest = setup.driver.requestDigestOf(setup.jobId) as string;
+    const expectation = setup.driver.expectationFor(setup.jobId, input.attemptId);
+    const badRaw = observationFixture(input.attemptId, {
+      jobId: setup.jobId,
+      url: "https://127.0.0.1/",
+      observationVersion: expectation?.version ?? 1,
+      requestDigest: digest,
+    });
+    deliver({
+      envelope: { observation: badRaw, callbackNonce: input.callbackNonce },
+      signature: signObservation(SECRET, parseObservation(badRaw), input.callbackNonce),
+    });
+    const rejected = await pending;
+    expect(rejected.receipt.outcome).toBe("callback-rejected");
+    expect(rejected.job.quarantined.length).toBe(1);
+    expect(rejected.job.quarantined[0]?.reason).toBe("private-network");
+    // Rightful allowed callback with the same nonce still reconciles.
+    const goodRaw = observationFixture(input.attemptId, {
+      jobId: setup.jobId,
+      observationVersion: expectation?.version ?? 1,
+      requestDigest: digest,
+    });
+    const recovered = setup.driver.recordLate(
+      setup.jobId,
+      input.attemptId,
+      { observation: goodRaw, callbackNonce: input.callbackNonce },
+      signObservation(SECRET, parseObservation(goodRaw), input.callbackNonce),
+      NOW + 2,
+    );
+    if (isDenial(recovered)) {
+      throw new Error(`expected recovery: ${recovered.detail}`);
+    }
+    expect(recovered.recorded).toBe(true);
+    expect(recovered.job.state).toBe("cancelled");
+    expect(recovered.job.lateResults.length).toBe(1);
   });
 });

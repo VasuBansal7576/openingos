@@ -275,6 +275,22 @@ function quarantine(job: BrowserJob, entry: QuarantinedCallback): BrowserJob {
 }
 
 /**
+ * Bounded rejected-callback recording shared by normal and late
+ * reconciliation: preserves the explicit policy reason on the job snapshot
+ * without accepting success, consuming the rightful nonce, settling the
+ * awaiting attempt, or reopening the job. Controlled proof only.
+ */
+export function quarantinePolicyRejection(
+  job: BrowserJob,
+  attemptId: string,
+  reason: string,
+  detail: string,
+  nowMs: number,
+): BrowserJob {
+  return quarantine(job, { attemptId, reason, detail, receivedAtMs: nowMs });
+}
+
+/**
  * Claim one dispatch: recheck liveness and expiry at the commit point and
  * record a dispatching attempt. Cancellation before this claim prevents the
  * send; after it, the attempt is in flight and needs reconciliation. This
@@ -589,15 +605,44 @@ export function cancelJob(job: BrowserJob, nowMs: number, reason: string): Brows
   });
 }
 
-/** Fence an expired job: active work becomes cancelled with reason "expired". */
-export function fenceExpired(job: BrowserJob, nowMs: number): BrowserJob {
+/**
+ * Fence an expired job: active work becomes cancelled with reason "expired".
+ * This is the single fencing transition for every enforced deadline: the job
+ * deadline, the signed-request lease expiry, the live lease/claim expiry and
+ * the active-execution ceiling. Any reached deadline fences active work (and
+ * the driver releases the tracked session); waiting work is fenced like
+ * running work because neither may hold an active session past a deadline.
+ */
+export function fenceExpired(
+  job: BrowserJob,
+  nowMs: number,
+  extra?: {
+    readonly leaseExpiryMs?: number;
+    readonly claimExpiryMs?: number;
+    readonly ceilingAtMs?: number;
+  },
+): BrowserJob {
   const active =
     job.state === "queued" ||
     job.state === "running" ||
     job.state === "waitingForSupplier" ||
     job.state === "waitingForUser" ||
     job.state === "pausedBudget";
-  if (!active || nowMs < job.request.expiresAt) {
+  if (!active) {
+    return job;
+  }
+  const deadlines = [job.request.expiresAt];
+  if (extra?.leaseExpiryMs !== undefined) {
+    deadlines.push(extra.leaseExpiryMs);
+  }
+  if (extra?.claimExpiryMs !== undefined) {
+    deadlines.push(extra.claimExpiryMs);
+  }
+  if (extra?.ceilingAtMs !== undefined) {
+    deadlines.push(extra.ceilingAtMs);
+  }
+  const fenced = deadlines.some((deadline) => nowMs >= deadline);
+  if (!fenced) {
     return job;
   }
   const cancelled = cancelJob(job, nowMs, "expired");

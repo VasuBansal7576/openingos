@@ -177,10 +177,14 @@ function ipv6Verdict(host: string): NumericVerdict {
   if (g0 === 0 && groups.slice(1, 7).every((value) => value === 0) && groups[7] === 1) {
     return "private-network";
   }
-  // IPv4-mapped ::ffff:0:0/96 — classify by the embedded IPv4 address so a
-  // public embedded address stays reachable while loopback/private stays shut.
+  // IPv4-mapped ::ffff:0:0/96 (RFC 4291 section 2.5.5.2: 80 leading zero
+  // bits followed by 16 one bits) — classify by the embedded IPv4 address so
+  // a public embedded address stays reachable while loopback/private stays
+  // shut. Every leading group must be checked: omitting g1 admits prefixes
+  // such as 0:1::ffff:808:808 that merely end in the mapped tail.
   if (
     g0 === 0 &&
+    g1 === 0 &&
     groups[2] === 0 &&
     groups[3] === 0 &&
     groups[4] === 0 &&
@@ -229,6 +233,12 @@ function ipv6Verdict(host: string): NumericVerdict {
   }
   // Documentation 2001:db8::/32 (outside 2001::/23, inside global unicast).
   if (g0 === 0x2001 && g1 === 0x0db8) {
+    return "private-network";
+  }
+  // Documentation 3fff::/20 (IANA special-purpose registry: Destination,
+  // Forwardable and Globally Reachable all false). /20 covers the first 20
+  // bits, i.e. g0 === 0x3fff with the top 4 bits of g1 zero.
+  if (g0 === 0x3fff && (g1 & 0xf000) === 0x0000) {
     return "private-network";
   }
   // Explicit Teredo 2001::/32 guard (also covered by 2001::/23).
