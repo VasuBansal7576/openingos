@@ -1471,15 +1471,46 @@ export const getOrderLineage = f1Query({
 });
 
 /**
+ * Greptile pagination hardening: caller-controlled page sizes are
+ * clamped server-side to this documented safe positive maximum before
+ * they reach `paginate`, so an oversized, fractional, zero, negative,
+ * or non-finite `numItems` can never broaden the read. Cursor semantics
+ * and all other pagination options pass through unchanged.
+ */
+const ORDER_HISTORY_PAGE_MAX = 200;
+
+function clampHistoryPageOpts(paginationOpts: {
+  readonly numItems: number;
+  readonly cursor: string | null;
+  readonly endCursor?: string | null;
+  readonly maximumRowsRead?: number;
+  readonly maximumBytesRead?: number;
+  readonly id?: number;
+}): {
+  readonly numItems: number;
+  readonly cursor: string | null;
+  readonly endCursor?: string | null;
+  readonly maximumRowsRead?: number;
+  readonly maximumBytesRead?: number;
+  readonly id?: number;
+} {
+  const floored = Math.floor(paginationOpts.numItems);
+  const numItems = Number.isFinite(floored)
+    ? Math.min(Math.max(floored, 1), ORDER_HISTORY_PAGE_MAX)
+    : ORDER_HISTORY_PAGE_MAX;
+  return { ...paginationOpts, numItems };
+}
+
+/**
  * Paged order history (Greptile r4056517362). When an order's history
  * exceeds the lineage summary bound, every row stays reloadable and
  * reconcilable through this bounded cursor path: each call reads one
- * page over the order's own index with the caller's page size, so no
- * call can approach transaction limits however long the history grows.
- * The existing `getOrderLineage` summary response is unchanged for
- * under-bound histories. Authorization matches the summary on every
- * page: viewer role plus order, selection, and quote ownership in the
- * caller's project.
+ * page over the order's own index with the caller-supplied cursor and a
+ * server-clamped page size, so no call can approach transaction limits
+ * however long the history grows. The existing `getOrderLineage`
+ * summary response is unchanged for under-bound histories.
+ * Authorization matches the summary on every page: viewer role plus
+ * order, selection, and quote ownership in the caller's project.
  */
 export const listOrderHistoryPage = f1Query({
   args: {
@@ -1541,7 +1572,7 @@ export const listOrderHistoryPage = f1Query({
       const result = await ctx.db
         .query("orderEvents")
         .withIndex("by_order", (q) => q.eq("orderId", args.orderId))
-        .paginate(args.paginationOpts);
+        .paginate(clampHistoryPageOpts(args.paginationOpts));
       return {
         ok: true as const,
         kind: args.kind,
@@ -1564,7 +1595,7 @@ export const listOrderHistoryPage = f1Query({
     const result = await ctx.db
       .query("costEntries")
       .withIndex("by_order", (q) => q.eq("orderId", args.orderId))
-      .paginate(args.paginationOpts);
+      .paginate(clampHistoryPageOpts(args.paginationOpts));
     return {
       ok: true as const,
       kind: args.kind,

@@ -2501,6 +2501,88 @@ describe("Greptile r4056517362: paginated history stays reloadable", () => {
     expect(stranger.ok).toBe(false);
   });
 
+  test("oversized and non-positive page sizes are clamped server-side", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, "page-clamp");
+    const graph = await setupTwoLineGraph(t, project, "page-clamp");
+    const asOwner = t.withIdentity(OWNER);
+    const single = await recordMachineQuote(t, project, graph, "v-page-clamp-single", "1", "page-clamp");
+    if (!single.ok) throw new Error("quote setup failed");
+    const selection = await asOwner.mutation(recordSelectionRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      requirementId: graph.requirementId,
+      candidateId: graph.candidateId,
+      quoteId: single.quoteId,
+      quoteVersion: "v-page-clamp-single",
+      quantity: "1",
+      requirementVersion: 1,
+      idempotencyKey: "sel-page-clamp",
+    });
+    if (!selection.ok) throw new Error("selection setup failed");
+    const order = await asOwner.mutation(recordOrderRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      selectionId: selection.selectionId,
+      idempotencyKey: "ord-page-clamp",
+      orderedQuantity: "1",
+    });
+    if (!order.ok) throw new Error("order setup failed");
+    for (let i = 0; i < 201; i += 1) {
+      const event = await asOwner.mutation(appendOrderEventRef, {
+        organizationId: project.orgId,
+        projectId: project.projectId,
+        orderId: order.orderId,
+        kind: "acceptance",
+        acceptedQuantity: "0.001",
+        idempotencyKey: `evt-clamp-${i}`,
+      });
+      if (!event.ok) throw new Error(`event ${i} failed`);
+    }
+    const pageArgs = (numItems: number, cursor: string | null) => ({
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      orderId: order.orderId,
+      kind: "events" as const,
+      paginationOpts: { numItems, cursor },
+    });
+    // An oversized request cannot broaden the read past the documented
+    // maximum: 200 rows with more to come.
+    const oversized = await asOwner.query(
+      listOrderHistoryPageRef,
+      pageArgs(10000, null) as QueryArgs<typeof fulfillment.listOrderHistoryPage>,
+    );
+    if (!oversized.ok) throw new Error(`oversized page failed: ${JSON.stringify(oversized)}`);
+    expect(oversized.page).toHaveLength(200);
+    expect(oversized.isDone).toBe(false);
+    // The returned cursor still continues exactly where the clamped page
+    // stopped: cursor semantics survive clamping.
+    const tail = await asOwner.query(
+      listOrderHistoryPageRef,
+      pageArgs(10000, oversized.continueCursor) as QueryArgs<typeof fulfillment.listOrderHistoryPage>,
+    );
+    if (!tail.ok) throw new Error("tail page failed");
+    expect(tail.page).toHaveLength(1);
+    expect(tail.isDone).toBe(true);
+    // Non-positive requests clamp to a single row, never zero or error.
+    for (const numItems of [0, -5]) {
+      const narrow = await asOwner.query(
+        listOrderHistoryPageRef,
+        pageArgs(numItems, null) as QueryArgs<typeof fulfillment.listOrderHistoryPage>,
+      );
+      if (!narrow.ok) throw new Error(`narrow page failed for ${numItems}`);
+      expect(narrow.page).toHaveLength(1);
+      expect(narrow.isDone).toBe(false);
+    }
+    // Fractional sizes floor before the read.
+    const fractional = await asOwner.query(
+      listOrderHistoryPageRef,
+      pageArgs(2.7, null) as QueryArgs<typeof fulfillment.listOrderHistoryPage>,
+    );
+    if (!fractional.ok) throw new Error("fractional page failed");
+    expect(fractional.page).toHaveLength(2);
+  });
+
   test("201 entries page through with links and evidence intact", async () => {
     const t = convexTest(schema, modules);
     const project = await setupProject(t, "pages-entries");
