@@ -9,9 +9,9 @@
  */
 
 import { v } from "convex/values";
-import { f1Mutation, f1Query } from "../server.js";
-import { normalizeMailbox, payloadHash } from "../shared/hashing.js";
-import { denialValidator, identityOf } from "./checks.js";
+import { f1InternalMutation, f1Query } from "../server.js";
+import { isValidSingleMailbox, normalizeMailbox, payloadHash } from "../shared/hashing.js";
+import { denialValidator } from "./checks.js";
 
 const describeValidator = v.union(
   v.object({
@@ -46,43 +46,30 @@ export const describe = f1Query({
 });
 
 /**
- * Configure (or rotate) the owner recipient. Requires an owner role in the
- * named organization; the value is protected backend configuration and
- * never comes from project inputs, prompts, or reply headers.
+ * Server-controlled recipient setup (deployment boundary for
+ * HACKATHON_OWNER_RECIPIENT). Internal only: no organization owner can
+ * change the global recipient through any public call; rotation happens
+ * through protected deployment configuration and invalidates queued
+ * grants at claim time via the version binding.
  */
-export const configure = f1Mutation({
-  args: { organizationId: v.id("organizations"), mailbox: v.string() },
+export const configure = f1InternalMutation({
+  args: { mailbox: v.string(), authorizedBy: v.string() },
   returns: v.union(
     v.object({ ok: v.literal(true), version: v.number() }),
     denialValidator,
   ),
   handler: async (ctx, args) => {
-    const identity = await identityOf(ctx);
-    if (identity === null) {
-      return { ok: false as const, code: "forged-identity", message: "unauthenticated" };
+    // Server-controlled boundary: the caller is deployment automation, not
+    // an organization member. No org owner can reach this function through
+    // any public call, so no membership check could authorize them.
+    if (args.authorizedBy.trim().length === 0) {
+      return { ok: false as const, code: "forged-identity", message: "server authority required" };
     }
     const normalized = normalizeMailbox(args.mailbox);
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized)) {
-      return { ok: false as const, code: "invalid-payload", message: "mailbox is not valid" };
+    if (!isValidSingleMailbox(normalized)) {
+      return { ok: false as const, code: "invalid-payload", message: "mailbox is not a single valid address" };
     }
-    const organization = await ctx.db.get(args.organizationId);
-    if (organization === null) {
-      return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
-    }
-    const rows = await ctx.db
-      .query("memberships")
-      .withIndex("by_organization_and_identity", (q) =>
-        q.eq("organizationId", args.organizationId).eq("identity", identity),
-      )
-      .collect();
     const now = Date.now();
-    const current = rows.filter(
-      (row) => row.status === "active" && (row.expiresAt === undefined || row.expiresAt > now),
-    );
-    const isOwner = current.some((row) => row.role === "owner");
-    if (!isOwner) {
-      return { ok: false as const, code: "denied-capability", message: "only an owner configures the recipient" };
-    }
     const activeConfigs = await ctx.db
       .query("recipientConfigs")
       .withIndex("by_active", (q) => q.eq("active", true))
@@ -102,7 +89,7 @@ export const configure = f1Mutation({
       mailboxHash: payloadHash(normalized),
       active: true,
       configuredAt: now,
-      configuredBy: identity,
+      configuredBy: args.authorizedBy,
     });
     return { ok: true as const, version };
   },

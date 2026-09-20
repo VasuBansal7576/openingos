@@ -70,6 +70,17 @@ export function normalizeMailbox(mailbox: string): string {
   return mailbox.trim().toLowerCase();
 }
 
+/**
+ * Strict single-mailbox validation (F1-21). The local part and domain
+ * exclude commas, semicolons, whitespace, angle brackets, quotes, and
+ * display-name forms, so "a@b.test,c@d.test" or "Name <a@b.test>" can
+ * never pass as one recipient.
+ */
+export function isValidSingleMailbox(mailbox: string): boolean {
+  if (mailbox.length === 0 || mailbox.length > 320) return false;
+  return /^[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}$/.test(mailbox);
+}
+
 export interface BoundedPayload {
   readonly canonical: string;
   readonly hash: string;

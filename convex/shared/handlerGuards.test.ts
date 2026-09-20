@@ -67,7 +67,7 @@ const ALLOWLIST: Record<string, Record<string, Visibility>> = {
     revokeProjectAccess: "mutation",
   },
   "access/grants.ts": { get: "query", issue: "mutation", revoke: "mutation" },
-  "access/recipients.ts": { describe: "query", configure: "mutation" },
+  "access/recipients.ts": { describe: "query", configure: "internalMutation" },
   "execution/jobs.ts": { get: "query", start: "mutation", cancel: "mutation" },
   "execution/operations.ts": { get: "query", create: "mutation", claim: "internalMutation" },
   "execution/reservations.ts": { ledger: "query", reserve: "mutation" },

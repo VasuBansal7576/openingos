@@ -18,10 +18,9 @@ function recordQuote(
   version: string,
   lines: { lineId: string; amount: number }[],
   charges: { chargeId: string; state: string; amount?: number }[],
-  counterpartyRole = "ownerStandIn",
+  counterpartyRole: "vendor" | "ownerStandIn" = "ownerStandIn",
 ) {
-  const result = fixture.store.recordQuote(
-    fixture.ownerA,
+  const result = fixture.store.ingestProviderQuote(
     fixture.orgPrivateA,
     fixture.projAOpen,
     {
@@ -43,7 +42,7 @@ function recordQuote(
       taxBasis: TAX,
       evidenceRefs: [source(`${version}-source`)],
       counterpartyRole,
-      executionMode: "fixture",
+      executionMode: "recorded",
     },
     fixture.now,
   );
@@ -105,8 +104,6 @@ describe("P-07 equivalent-scope comparison", () => {
         charges: [{ chargeId: "install", label: "install", state: "unknown", amount: { currency: "EUR", minorUnits: 0 } }],
         taxBasis: TAX,
         evidenceRefs: [],
-        counterpartyRole: "ownerStandIn",
-        executionMode: "fixture",
       },
       fixture.now,
     );
@@ -114,11 +111,32 @@ describe("P-07 equivalent-scope comparison", () => {
     if (!result.ok) expect(result.code).toBe("invalid-payload");
   });
 
+  test("public imports cannot self-assert provenance (server derives it)", () => {
+    const fixture = buildControlledFixture();
+    const result = fixture.store.recordQuote(
+      fixture.ownerA,
+      fixture.orgPrivateA,
+      fixture.projAOpen,
+      {
+        version: "user-v1",
+        currency: "EUR",
+        lines: [],
+        charges: [],
+        taxBasis: TAX,
+        evidenceRefs: [],
+      },
+      fixture.now,
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("record failed");
+    expect(result.value.counterpartyRole).toBe("userImport");
+    expect(result.value.executionMode).toBe("recorded");
+  });
+
   test("mixed tax bases stay incomparable until the basis is accepted", () => {
     const fixture = buildControlledFixture();
     const left = recordQuote(fixture, "qa-v1", [{ lineId: "machine", amount: 795000 }], []);
-    const other = fixture.store.recordQuote(
-      fixture.ownerA,
+    const other = fixture.store.ingestProviderQuote(
       fixture.orgPrivateA,
       fixture.projAOpen,
       {
@@ -129,7 +147,7 @@ describe("P-07 equivalent-scope comparison", () => {
         taxBasis: "NL-EUR-EXCLUSIVE",
         evidenceRefs: [source("qd-v1-source")],
         counterpartyRole: "ownerStandIn",
-        executionMode: "fixture",
+        executionMode: "recorded",
       },
       fixture.now,
     );
@@ -143,8 +161,7 @@ describe("P-06 versions, P-08 distinct totals, D-02/D-08/D-15", () => {
   test("revisions create new immutable versions; old approvals keep their hash", () => {
     const fixture = buildControlledFixture();
     const first = recordQuote(fixture, "q-v1", [{ lineId: "machine", amount: 750000 }], []);
-    const second = fixture.store.recordQuote(
-      fixture.ownerA,
+    const second = fixture.store.ingestProviderQuote(
       fixture.orgPrivateA,
       fixture.projAOpen,
       {
@@ -155,7 +172,7 @@ describe("P-06 versions, P-08 distinct totals, D-02/D-08/D-15", () => {
         taxBasis: TAX,
         evidenceRefs: [source("q-v2-source")],
         counterpartyRole: "ownerStandIn",
-        executionMode: "fixture",
+        executionMode: "recorded",
         supersedes: first.contentHash,
       },
       fixture.now,
@@ -184,11 +201,11 @@ describe("P-06 versions, P-08 distinct totals, D-02/D-08/D-15", () => {
     const fixture = buildControlledFixture();
     const quote = recordQuote(fixture, "demo-v1", [{ lineId: "machine", amount: 740000 }], []);
     expect(quote.counterpartyRole).toBe("ownerStandIn");
-    expect(quote.executionMode).toBe("fixture");
-    expect(provenanceLabel({ counterpartyRole: "ownerStandIn", executionMode: "fixture" })).toBe(
-      "Controlled demo quote",
+    expect(quote.executionMode).toBe("recorded");
+    expect(provenanceLabel({ counterpartyRole: "ownerStandIn", executionMode: "recorded" })).toBe(
+      "Recorded demo exchange",
     );
-    expect(provenanceLabel({ counterpartyRole: "ownerStandIn", executionMode: "fixture" })).not.toContain("saving");
+    expect(provenanceLabel({ counterpartyRole: "ownerStandIn", executionMode: "recorded" })).not.toContain("saving");
   });
 
   test("applicable scope stays inspectable rather than hidden (D-08)", () => {
@@ -201,8 +218,6 @@ describe("P-06 versions, P-08 distinct totals, D-02/D-08/D-15", () => {
         sourceKind: "supplier-page",
         contentHash: "partial-page",
         completeness: "partial",
-        counterpartyRole: "vendor",
-        executionMode: "fixture",
         locator: "delivery-section-missing",
       },
       fixture.now,

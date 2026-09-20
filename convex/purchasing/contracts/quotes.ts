@@ -39,7 +39,13 @@ const chargeValidator = v.object({
   amount: v.optional(moneyInputValidator),
 });
 
-const quoteFieldsValidator = v.object({
+/**
+ * Public user-import fields. Provenance is NOT caller-supplied: the
+ * handler derives `counterpartyRole: userImport` and `executionMode:
+ * recorded` server-side. Passing live/vendor assertions is a validator
+ * rejection, not a silent override.
+ */
+const userQuoteFieldsValidator = v.object({
   organizationId: v.id("organizations"),
   projectId: v.id("projects"),
   version: v.string(),
@@ -48,8 +54,22 @@ const quoteFieldsValidator = v.object({
   charges: v.array(chargeValidator),
   taxBasis: v.string(),
   evidenceRefs: v.array(v.object({ sourceId: v.string(), version: v.string(), locator: v.string() })),
-  counterpartyRole: v.string(),
-  executionMode: v.union(v.literal("live"), v.literal("recorded"), v.literal("fixture")),
+  conversationId: v.optional(v.id("conversations")),
+  supersedes: v.optional(v.string()),
+});
+
+/** Provider-ingest fields: provenance travels with the verified pipeline. */
+const providerQuoteFieldsValidator = v.object({
+  organizationId: v.id("organizations"),
+  projectId: v.id("projects"),
+  version: v.string(),
+  currency: v.string(),
+  lines: v.array(lineValidator),
+  charges: v.array(chargeValidator),
+  taxBasis: v.string(),
+  evidenceRefs: v.array(v.object({ sourceId: v.string(), version: v.string(), locator: v.string() })),
+  counterpartyRole: v.union(v.literal("vendor"), v.literal("ownerStandIn")),
+  executionMode: v.union(v.literal("live"), v.literal("recorded")),
   conversationId: v.optional(v.id("conversations")),
   supersedes: v.optional(v.string()),
 });
@@ -147,7 +167,7 @@ const recordResultValidator = v.union(
 
 /** Public user import: record an immutable quote version with capability. */
 export const record = f1Mutation({
-  args: quoteFieldsValidator,
+  args: userQuoteFieldsValidator,
   returns: recordResultValidator,
   handler: async (ctx, args) => {
     const identity = await identityOf(ctx);
@@ -168,16 +188,23 @@ export const record = f1Mutation({
     if (!capability.ok) {
       return { ok: false as const, code: capability.code, message: capability.message };
     }
-    const valid = validateQuoteFields(args);
+    const valid = validateQuoteFields({
+      ...args,
+      counterpartyRole: "userImport",
+      executionMode: "recorded",
+    });
     if (!valid.ok) return { ok: false as const, code: valid.code, message: valid.message };
     const { quoteId, contentHash } = await insertQuoteVersion(ctx, valid.value, now);
     return { ok: true as const, quoteId, contentHash };
   },
 });
 
-/** Internal provider write: extraction pipeline only, same money rules. */
+/**
+ * Internal provider write: extraction pipeline only, same money rules.
+ * Fixture execution mode is unavailable here and in public runtime.
+ */
 export const ingestProviderQuote = f1InternalMutation({
-  args: quoteFieldsValidator,
+  args: providerQuoteFieldsValidator,
   returns: recordResultValidator,
   handler: async (ctx, args) => {
     const project = await ctx.db.get(args.projectId);

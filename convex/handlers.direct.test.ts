@@ -37,6 +37,7 @@ import * as evidence from "./purchasing/contracts/evidence.js";
 import * as fixtures from "./purchasing/contracts/fixtures.js";
 import { commsPayload } from "./purchasing/contracts/fixtures.js";
 import { COMMUNICATION_PROFILE_OWNER_ROLEPLAY } from "./shared/provenance.js";
+import { normalizeMailbox, payloadHash } from "./shared/hashing.js";
 
 const modules = import.meta.glob([
   "./access/**/*.ts",
@@ -76,11 +77,6 @@ const myProjectRoleRef = makeFunctionReference<
   QueryArgs<typeof memberships.myProjectRole>,
   QueryReturn<typeof memberships.myProjectRole>
 >("access/memberships:myProjectRole");
-const configureRecipientRef = makeFunctionReference<
-  "mutation",
-  MutationArgs<typeof recipients.configure>,
-  MutationReturn<typeof recipients.configure>
->("access/recipients:configure");
 const issueGrantRef = makeFunctionReference<
   "mutation",
   MutationArgs<typeof grants.issue>,
@@ -101,6 +97,26 @@ const getOperationRef = makeFunctionReference<
   QueryArgs<typeof operations.get>,
   QueryReturn<typeof operations.get>
 >("execution/operations:get");
+const revokeProjectAccessRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof memberships.revokeProjectAccess>,
+  MutationReturn<typeof memberships.revokeProjectAccess>
+>("access/memberships:revokeProjectAccess");
+const recordEvidenceRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof evidence.record>,
+  MutationReturn<typeof evidence.record>
+>("purchasing/contracts/evidence:record");
+const listEvidenceRef = makeFunctionReference<
+  "query",
+  QueryArgs<typeof evidence.list>,
+  QueryReturn<typeof evidence.list>
+>("purchasing/contracts/evidence:list");
+const recordQuoteRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof quotes.record>,
+  MutationReturn<typeof quotes.record>
+>("purchasing/contracts/quotes:record");
 
 const OWNER_A = { tokenIdentifier: "direct-owner-a" };
 const APPROVER_A = { tokenIdentifier: "direct-approver-a" };
@@ -143,11 +159,19 @@ async function setupCommsProject(
       }
     });
   }
-  const recipient = await asOwner.mutation(configureRecipientRef, {
-    organizationId: org.organizationId,
-    mailbox: OWNER_MAILBOX,
+  // Server-controlled recipient seeding (the test harness acts as the
+  // deployment boundary): recipient configuration is never a public call.
+  await t.run(async (ctx) => {
+    await ctx.db.insert("recipientConfigs", {
+      version: 1,
+      mailboxNormalized: normalizeMailbox(OWNER_MAILBOX),
+      mailboxHash: payloadHash(normalizeMailbox(OWNER_MAILBOX)),
+      active: true,
+      configuredAt: Date.now(),
+      configuredBy: "deployment",
+    });
   });
-  if (!recipient.ok) throw new Error("recipient setup failed");
+  const recipient = { version: 1 };
   const grant = await t.withIdentity(issuer).mutation(issueGrantRef, {
     organizationId: org.organizationId,
     projectId: proj.projectId,
@@ -432,6 +456,253 @@ describe("direct handler visibility and absent endpoints", () => {
         expect(Reflect.get(value, "isAction") === true).toBe(false);
       }
     }
+  });
+});
+
+describe("direct checkpoint-1 authority boundaries", () => {
+  test("recipient configuration is internal-only (no public rotation)", () => {
+    expect(recipients.configure.isInternal === true).toBe(true);
+    expect("isPublic" in recipients.configure).toBe(false);
+    expect(recipients.describe.isPublic === true).toBe(true);
+  });
+
+  test("public evidence imports cannot self-assert provenance or provider IDs", async () => {
+    const t = convexTest(schema, modules);
+    const asOwner = t.withIdentity(OWNER_A);
+    const org = await asOwner.mutation(createOrganizationRef, { name: "Prov org", kind: "private" });
+    if (!org.ok) throw new Error("org setup failed");
+    const proj = await asOwner.mutation(createProjectRef, {
+      organizationId: org.organizationId,
+      name: "Prov project",
+      visibility: "open",
+    });
+    if (!proj.ok) throw new Error("project setup failed");
+    const looseRecord: FunctionReference<"mutation", "public", Record<string, unknown>, unknown> =
+      makeFunctionReference("purchasing/contracts/evidence:record");
+    await expect(
+      asOwner.mutation(looseRecord, {
+        organizationId: org.organizationId,
+        projectId: proj.projectId,
+        sourceKind: "supplier-page",
+        contentHash: "hash-live",
+        completeness: "complete",
+        counterpartyRole: "vendor",
+        executionMode: "live",
+        providerIds: "inbox-1/message-1",
+      }),
+    ).rejects.toThrow(/Unexpected field/);
+  });
+
+  test("recorded evidence carries server-derived user provenance", async () => {
+    const t = convexTest(schema, modules);
+    const asOwner = t.withIdentity(OWNER_A);
+    const org = await asOwner.mutation(createOrganizationRef, { name: "Prov org 2", kind: "private" });
+    if (!org.ok) throw new Error("org setup failed");
+    const proj = await asOwner.mutation(createProjectRef, {
+      organizationId: org.organizationId,
+      name: "Prov project 2",
+      visibility: "open",
+    });
+    if (!proj.ok) throw new Error("project setup failed");
+    const recorded = await asOwner.mutation(recordEvidenceRef, {
+      organizationId: org.organizationId,
+      projectId: proj.projectId,
+      sourceKind: "user-document",
+      contentHash: "hash-user-doc",
+      completeness: "complete",
+    });
+    expect(recorded.ok).toBe(true);
+    const listed = await asOwner.query(listEvidenceRef, {
+      organizationId: org.organizationId,
+      projectId: proj.projectId,
+      limit: 10,
+    });
+    if (!listed.ok) throw new Error("list failed");
+    expect(listed.evidence).toHaveLength(1);
+    expect(listed.evidence[0]?.counterpartyRole).toBe("userImport");
+    expect(listed.evidence[0]?.executionMode).toBe("recorded");
+  });
+
+  test("public quote imports cannot self-assert live or vendor provenance", async () => {
+    const t = convexTest(schema, modules);
+    const asOwner = t.withIdentity(OWNER_A);
+    const org = await asOwner.mutation(createOrganizationRef, { name: "Quote prov org", kind: "private" });
+    if (!org.ok) throw new Error("org setup failed");
+    const proj = await asOwner.mutation(createProjectRef, {
+      organizationId: org.organizationId,
+      name: "Quote prov project",
+      visibility: "open",
+    });
+    if (!proj.ok) throw new Error("project setup failed");
+    const looseQuote: FunctionReference<"mutation", "public", Record<string, unknown>, unknown> =
+      makeFunctionReference("purchasing/contracts/quotes:record");
+    await expect(
+      asOwner.mutation(looseQuote, {
+        organizationId: org.organizationId,
+        projectId: proj.projectId,
+        version: "v1",
+        currency: "EUR",
+        lines: [],
+        charges: [],
+        taxBasis: "NL-EUR-INCLUSIVE",
+        evidenceRefs: [],
+        counterpartyRole: "vendor",
+        executionMode: "live",
+      }),
+    ).rejects.toThrow(/Unexpected field/);
+  });
+
+  test("approvers cannot grant owner or roles above themselves", async () => {
+    const t = convexTest(schema, modules);
+    const asOwner = t.withIdentity(OWNER_A);
+    const org = await asOwner.mutation(createOrganizationRef, { name: "Esc org", kind: "private" });
+    if (!org.ok) throw new Error("org setup failed");
+    const proj = await asOwner.mutation(createProjectRef, {
+      organizationId: org.organizationId,
+      name: "Esc project",
+      visibility: "open",
+    });
+    if (!proj.ok) throw new Error("project setup failed");
+    const elevated = await asOwner.mutation(grantProjectAccessRef, {
+      organizationId: org.organizationId,
+      projectId: proj.projectId,
+      targetIdentity: APPROVER_A.tokenIdentifier,
+      role: "approver",
+    });
+    expect(elevated.ok).toBe(true);
+    const asApprover = t.withIdentity(APPROVER_A);
+    const sameLevel = await asApprover.mutation(grantProjectAccessRef, {
+      organizationId: org.organizationId,
+      projectId: proj.projectId,
+      targetIdentity: CONTRIB_A.tokenIdentifier,
+      role: "approver",
+    });
+    expect(sameLevel.ok).toBe(true);
+    const escalate = await asApprover.mutation(grantProjectAccessRef, {
+      organizationId: org.organizationId,
+      projectId: proj.projectId,
+      targetIdentity: OWNER_B.tokenIdentifier,
+      role: "owner",
+    });
+    expect(escalate.ok).toBe(false);
+    if (!escalate.ok) expect(escalate.code).toBe("denied-capability");
+  });
+
+  test("revoke binds the target membership to the stated project", async () => {
+    const t = convexTest(schema, modules);
+    const asOwner = t.withIdentity(OWNER_A);
+    const org = await asOwner.mutation(createOrganizationRef, { name: "Revoke org", kind: "private" });
+    if (!org.ok) throw new Error("org setup failed");
+    const projA = await asOwner.mutation(createProjectRef, {
+      organizationId: org.organizationId,
+      name: "Revoke A",
+      visibility: "open",
+    });
+    if (!projA.ok) throw new Error("project A setup failed");
+    const projB = await asOwner.mutation(createProjectRef, {
+      organizationId: org.organizationId,
+      name: "Revoke B",
+      visibility: "open",
+    });
+    if (!projB.ok) throw new Error("project B setup failed");
+    for (const proj of [projA, projB]) {
+      const elevated = await asOwner.mutation(grantProjectAccessRef, {
+        organizationId: org.organizationId,
+        projectId: proj.projectId,
+        targetIdentity: APPROVER_A.tokenIdentifier,
+        role: "approver",
+      });
+      expect(elevated.ok).toBe(true);
+    }
+    const member = await asOwner.mutation(grantProjectAccessRef, {
+      organizationId: org.organizationId,
+      projectId: projA.projectId,
+      targetIdentity: CONTRIB_A.tokenIdentifier,
+      role: "viewer",
+    });
+    if (!member.ok) throw new Error("member setup failed");
+    const asApprover = t.withIdentity(APPROVER_A);
+    const crossRevoke = await asApprover.mutation(revokeProjectAccessRef, {
+      organizationId: org.organizationId,
+      projectId: projB.projectId,
+      membershipId: member.membershipId,
+    });
+    expect(crossRevoke.ok).toBe(false);
+    const boundRevoke = await asApprover.mutation(revokeProjectAccessRef, {
+      organizationId: org.organizationId,
+      projectId: projA.projectId,
+      membershipId: member.membershipId,
+    });
+    expect(boundRevoke.ok).toBe(true);
+  });
+
+  test("project-scoped owners cannot administer the organization", async () => {
+    const t = convexTest(schema, modules);
+    const asOwner = t.withIdentity(OWNER_A);
+    const org = await asOwner.mutation(createOrganizationRef, { name: "Scoped org", kind: "private" });
+    if (!org.ok) throw new Error("org setup failed");
+    const proj = await asOwner.mutation(createProjectRef, {
+      organizationId: org.organizationId,
+      name: "Scoped project",
+      visibility: "open",
+    });
+    if (!proj.ok) throw new Error("project setup failed");
+    const SCOPED = { tokenIdentifier: "direct-scoped-owner" };
+    await t.run(async (ctx) => {
+      await ctx.db.insert("memberships", {
+        organizationId: org.organizationId,
+        projectId: proj.projectId,
+        identity: SCOPED.tokenIdentifier,
+        role: "owner",
+        status: "active",
+        version: 1,
+        updatedAt: Date.now(),
+      });
+    });
+    const attempt = await t.withIdentity(SCOPED).mutation(createProjectRef, {
+      organizationId: org.organizationId,
+      name: "Lateral project",
+      visibility: "open",
+    });
+    expect(attempt.ok).toBe(false);
+    if (!attempt.ok) expect(attempt.code).toBe("denied-capability");
+  });
+
+  test("project-scoped-only roles cannot leak into another project", async () => {
+    const t = convexTest(schema, modules);
+    const asOwner = t.withIdentity(OWNER_A);
+    const org = await asOwner.mutation(createOrganizationRef, { name: "Leak org", kind: "private" });
+    if (!org.ok) throw new Error("org setup failed");
+    const projOpen = await asOwner.mutation(createProjectRef, {
+      organizationId: org.organizationId,
+      name: "Leak open",
+      visibility: "open",
+    });
+    if (!projOpen.ok) throw new Error("open project setup failed");
+    const projRestricted = await asOwner.mutation(createProjectRef, {
+      organizationId: org.organizationId,
+      name: "Leak restricted",
+      visibility: "restricted",
+    });
+    if (!projRestricted.ok) throw new Error("restricted project setup failed");
+    const SCOPED = { tokenIdentifier: "direct-scoped-only" };
+    await t.run(async (ctx) => {
+      await ctx.db.insert("memberships", {
+        organizationId: org.organizationId,
+        projectId: projRestricted.projectId,
+        identity: SCOPED.tokenIdentifier,
+        role: "contributor",
+        status: "active",
+        version: 1,
+        updatedAt: Date.now(),
+      });
+    });
+    const leaked = await t.withIdentity(SCOPED).query(myProjectRoleRef, {
+      organizationId: org.organizationId,
+      projectId: projOpen.projectId,
+    });
+    expect(leaked.ok).toBe(false);
+    if (!leaked.ok) expect(leaked.code).toBe("denied-membership");
   });
 
   test("unregistered paths fail to resolve in the test runtime", async () => {

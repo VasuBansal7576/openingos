@@ -21,7 +21,13 @@
  * unknown charges stay unknown and remain reserved after failure.
  */
 
-import { canonicalJson, normalizeMailbox, payloadHash, requestKey } from "./hashing.js";
+import {
+  canonicalJson,
+  isValidSingleMailbox,
+  normalizeMailbox,
+  payloadHash,
+  requestKey,
+} from "./hashing.js";
 import { sameCanonicalPayload, sha256BindingOk } from "./sha256.js";
 import { isExpired } from "./time.js";
 import {
@@ -252,7 +258,7 @@ export class ControlledBackend {
 
   configureRecipient(mailbox: string, configuredBy: string, now: number): RecipientConfig {
     const normalized = normalizeMailbox(mailbox);
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized)) throw new Error("invalid mailbox");
+    if (!isValidSingleMailbox(normalized)) throw new Error("invalid mailbox");
     for (const config of this.recipientConfigs.values()) {
       if (config.active) {
         this.recipientConfigs.set(config.id, { ...config, active: false });
@@ -476,23 +482,105 @@ export class ControlledBackend {
     if (!project || project.organizationId !== organizationId) {
       return denial("denied-membership", "not authorized for this project");
     }
-    let role: MembershipRole = currentOrg
-      .map((entry) => entry.role)
-      .sort((left, right) => ROLE_RANK[right] - ROLE_RANK[left])[0] ?? "viewer";
-
-    if (project.visibility === "restricted") {
-      const projectRows = currentOrg.filter((entry) => entry.projectId === projectId);
-      if (projectRows.length === 0) {
-        return denial("denied-membership", "not authorized for this project");
-      }
-      role =
-        projectRows.map((entry) => entry.role).sort((left, right) => ROLE_RANK[right] - ROLE_RANK[left])[0] ??
-        "viewer";
+    // A membership scoped to one project never leaks authority into another
+    // project. Open projects honor org-scoped rows plus rows scoped to this
+    // project; restricted projects honor only rows scoped to this project.
+    const eligible =
+      project.visibility === "restricted"
+        ? currentOrg.filter((entry) => entry.projectId === projectId)
+        : currentOrg.filter((entry) => entry.projectId === null || entry.projectId === projectId);
+    if (eligible.length === 0) {
+      return denial("denied-membership", "not authorized for this project");
     }
+    const role: MembershipRole =
+      eligible.map((entry) => entry.role).sort((left, right) => ROLE_RANK[right] - ROLE_RANK[left])[0] ??
+      "viewer";
     if (!roleSatisfies(role, minRole)) {
       return denial("denied-capability", `role ${role} cannot perform ${minRole}-level work`);
     }
     return approved(role);
+  }
+
+  /**
+   * Organization administration requires current org-scoped owner
+   * authority. Mirrors the project-creation gate in Convex handlers.
+   */
+  authorizeOrgAdmin(
+    identity: string,
+    organizationId: string,
+    now: number,
+  ): AuthorityResult<MembershipRole> {
+    if (typeof identity !== "string" || identity.trim().length === 0) {
+      return denial("forged-identity", "missing identity proof");
+    }
+    const organization = this.organizations.get(organizationId);
+    if (!organization) return denial("denied-membership", "not authorized for this project");
+    const current = [...this.memberships.values()].filter(
+      (entry) =>
+        entry.organizationId === organizationId &&
+        entry.identity === identity &&
+        entry.status === "active" &&
+        entry.projectId === null &&
+        (entry.expiresAt === null || !isExpired(now, entry.expiresAt)),
+    );
+    if (!current.some((entry) => entry.role === "owner")) {
+      return denial("denied-capability", "only an organization owner administers the organization");
+    }
+    return approved("owner");
+  }
+
+  /**
+   * Authorized membership grant with rank cap and project binding. The
+   * granted role cannot exceed the granter's own role in the stated
+   * project. Mirrors `grantProjectAccess`.
+   */
+  grantMembership(
+    issuerIdentity: string,
+    organizationId: string,
+    projectId: string,
+    targetIdentity: string,
+    role: MembershipRole,
+    now: number,
+    expiresAt: number | null = null,
+  ): AuthorityResult<Membership> {
+    const access = this.checkProjectAccess(issuerIdentity, organizationId, projectId, "approver", now);
+    if (!access.ok) return access;
+    if (typeof targetIdentity !== "string" || targetIdentity.trim().length === 0) {
+      return denial("forged-identity", "target identity required");
+    }
+    if (!roleSatisfies(access.value, role)) {
+      return denial("denied-capability", "cannot grant a role above your own");
+    }
+    return approved(this.addMembership(organizationId, projectId, targetIdentity, role, now, expiresAt));
+  }
+
+  /**
+   * Authorized revocation bound to the stated project. Org-level rows
+   * additionally require org-scoped owner authority. Mirrors
+   * `revokeProjectAccess`.
+   */
+  revokeMembershipBound(
+    callerIdentity: string,
+    organizationId: string,
+    projectId: string,
+    membershipId: string,
+    now: number,
+  ): AuthorityResult<boolean> {
+    const access = this.checkProjectAccess(callerIdentity, organizationId, projectId, "approver", now);
+    if (!access.ok) return access;
+    const row = this.memberships.get(membershipId);
+    if (!row || row.organizationId !== organizationId) {
+      return denial("denied-membership", "not authorized for this project");
+    }
+    if (row.projectId !== projectId) {
+      if (row.projectId !== null) {
+        return denial("denied-project", "membership is not in this project");
+      }
+      const admin = this.authorizeOrgAdmin(callerIdentity, organizationId, now);
+      if (!admin.ok) return admin;
+    }
+    this.revokeMembership(membershipId, now);
+    return approved(true);
   }
 
   requireCapability(operationKind: string, role: MembershipRole): AuthorityResult<true> {
@@ -1190,11 +1278,8 @@ export class ControlledBackend {
     input: {
       sourceKind: string;
       sourceUrl?: string;
-      providerIds?: string;
       contentHash: string;
       completeness: Evidence["completeness"];
-      counterpartyRole: string;
-      executionMode: ExecutionMode;
       locator?: string;
     },
     now: number,
@@ -1204,6 +1289,65 @@ export class ControlledBackend {
     const entry = lookupCapability("evidence.record");
     if (!entry || !roleSatisfies(access.value, entry.requiredRole)) {
       return denial("denied-capability", "cannot record evidence");
+    }
+    return this.insertEvidenceRecord(organizationId, projectId, {
+      sourceKind: input.sourceKind,
+      ...(input.sourceUrl === undefined ? {} : { sourceUrl: input.sourceUrl }),
+      contentHash: input.contentHash,
+      completeness: input.completeness,
+      counterpartyRole: "userImport",
+      executionMode: "recorded",
+      ...(input.locator === undefined ? {} : { locator: input.locator }),
+    }, now);
+  }
+
+  /**
+   * Provider-pipeline evidence with explicit provenance. Test-fixture and
+   * production-callable parity for the internal ingest path.
+   */
+  ingestProviderEvidence(
+    organizationId: string,
+    projectId: string,
+    input: {
+      sourceKind: string;
+      sourceUrl?: string;
+      providerIds?: string;
+      contentHash: string;
+      completeness: Evidence["completeness"];
+      counterpartyRole: "vendor" | "ownerStandIn";
+      executionMode: "live" | "recorded";
+      locator?: string;
+    },
+    now: number,
+  ): AuthorityResult<Evidence> {
+    const organization = this.organizations.get(organizationId);
+    const project = this.projects.get(projectId);
+    if (!organization || !project || project.organizationId !== organizationId) {
+      return denial("denied-membership", "not authorized for this project");
+    }
+    return this.insertEvidenceRecord(organizationId, projectId, input, now);
+  }
+
+  private insertEvidenceRecord(
+    organizationId: string,
+    projectId: string,
+    input: {
+      sourceKind: string;
+      sourceUrl?: string;
+      providerIds?: string;
+      contentHash: string;
+      completeness: Evidence["completeness"];
+      counterpartyRole: string;
+      executionMode: ExecutionMode;
+      locator?: string;
+    },
+    now: number,
+  ): AuthorityResult<Evidence> {
+    if (input.sourceKind.trim().length === 0) {
+      return denial("invalid-payload", "sourceKind required");
+    }
+    if (input.contentHash.trim().length === 0) {
+      return denial("invalid-payload", "contentHash required");
     }
     const evidence: Evidence = {
       id: this.next("ev"),
@@ -1263,8 +1407,6 @@ export class ControlledBackend {
       charges: readonly QuoteCharge[];
       taxBasis: string;
       evidenceRefs: Quote["evidenceRefs"];
-      counterpartyRole: string;
-      executionMode: ExecutionMode;
       conversationId?: string;
       supersedes?: string;
     },
@@ -1274,6 +1416,59 @@ export class ControlledBackend {
     if (!access.ok) return access;
     const capability = this.requireCapability("quote.record", access.value);
     if (!capability.ok) return capability;
+    return this.insertQuoteRecord(organizationId, projectId, {
+      ...input,
+      counterpartyRole: "userImport",
+      executionMode: "recorded",
+    }, now);
+  }
+
+  /**
+   * Provider-pipeline quote with explicit provenance. Test-fixture and
+   * production-callable parity for the internal ingest path.
+   */
+  ingestProviderQuote(
+    organizationId: string,
+    projectId: string,
+    input: {
+      version: string;
+      currency: string;
+      lines: readonly QuoteLine[];
+      charges: readonly QuoteCharge[];
+      taxBasis: string;
+      evidenceRefs: Quote["evidenceRefs"];
+      counterpartyRole: "vendor" | "ownerStandIn";
+      executionMode: "live" | "recorded";
+      conversationId?: string;
+      supersedes?: string;
+    },
+    now: number,
+  ): AuthorityResult<Quote> {
+    const organization = this.organizations.get(organizationId);
+    const project = this.projects.get(projectId);
+    if (!organization || !project || project.organizationId !== organizationId) {
+      return denial("denied-membership", "not authorized for this project");
+    }
+    return this.insertQuoteRecord(organizationId, projectId, input, now);
+  }
+
+  private insertQuoteRecord(
+    organizationId: string,
+    projectId: string,
+    input: {
+      version: string;
+      currency: string;
+      lines: readonly QuoteLine[];
+      charges: readonly QuoteCharge[];
+      taxBasis: string;
+      evidenceRefs: Quote["evidenceRefs"];
+      counterpartyRole: string;
+      executionMode: ExecutionMode;
+      conversationId?: string;
+      supersedes?: string;
+    },
+    now: number,
+  ): AuthorityResult<Quote> {
     for (const line of input.lines) {
       try {
         checkMoney(line.unitPrice, `line ${line.lineId}`);

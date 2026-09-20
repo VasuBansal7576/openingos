@@ -11,6 +11,7 @@
 import { v } from "convex/values";
 import { f1Mutation, f1Query } from "../server.js";
 import { checkProjectAccess, denialValidator, identityOf } from "./checks.js";
+import { roleSatisfies } from "../shared/scope.js";
 
 const roleValidator = v.union(
   v.literal("owner"),
@@ -99,13 +100,23 @@ export const createProject = f1Mutation({
     if (organization === null) {
       return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
     }
+    const now = Date.now();
     const rows = await ctx.db
       .query("memberships")
       .withIndex("by_organization_and_identity", (q) =>
         q.eq("organizationId", args.organizationId).eq("identity", identity),
       )
       .collect();
-    const owner = rows.some((row) => row.status === "active" && row.role === "owner");
+    // Organization administration requires current ORG-SCOPED owner
+    // authority: a project-scoped owner row administers nothing outside
+    // its own project.
+    const owner = rows.some(
+      (row) =>
+        row.status === "active" &&
+        row.role === "owner" &&
+        row.projectId === undefined &&
+        (row.expiresAt === undefined || row.expiresAt > now),
+    );
     if (!owner) {
       return { ok: false as const, code: "denied-capability", message: "only an owner creates projects" };
     }
@@ -153,6 +164,11 @@ export const grantProjectAccess = f1Mutation({
     if (args.targetIdentity.trim().length === 0) {
       return { ok: false as const, code: "forged-identity", message: "target identity required" };
     }
+    // No escalation or lateral grants: the granted role cannot exceed the
+    // granter's own role in the stated project.
+    if (!roleSatisfies(access.value, args.role)) {
+      return { ok: false as const, code: "denied-capability", message: "cannot grant a role above your own" };
+    }
     const membershipId = await ctx.db.insert("memberships", {
       organizationId: args.organizationId,
       projectId: args.projectId,
@@ -196,6 +212,29 @@ export const revokeProjectAccess = f1Mutation({
     const row = await ctx.db.get(args.membershipId);
     if (row === null || row.organizationId !== args.organizationId) {
       return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
+    }
+    // The target membership must belong to the stated project. An org-level
+    // row additionally requires org-scoped owner authority to revoke.
+    if (row.projectId !== args.projectId) {
+      if (row.projectId !== undefined) {
+        return { ok: false as const, code: "denied-project", message: "membership is not in this project" };
+      }
+      const revokerRows = await ctx.db
+        .query("memberships")
+        .withIndex("by_organization_and_identity", (q) =>
+          q.eq("organizationId", args.organizationId).eq("identity", identity),
+        )
+        .collect();
+      const orgOwner = revokerRows.some(
+        (revoker) =>
+          revoker.status === "active" &&
+          revoker.role === "owner" &&
+          revoker.projectId === undefined &&
+          (revoker.expiresAt === undefined || revoker.expiresAt > now),
+      );
+      if (!orgOwner) {
+        return { ok: false as const, code: "denied-capability", message: "only an organization owner revokes organization membership" };
+      }
     }
     await ctx.db.patch(args.membershipId, { status: "revoked", revokedAt: now, updatedAt: now });
     return { ok: true as const, revoked: true };
