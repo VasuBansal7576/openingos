@@ -2583,6 +2583,96 @@ describe("Greptile r4056517362: paginated history stays reloadable", () => {
     expect(fractional.page).toHaveLength(2);
   });
 
+  test("endCursor ranges and caller budgets stay bounded", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, "page-budgets");
+    const graph = await setupTwoLineGraph(t, project, "page-budgets");
+    const asOwner = t.withIdentity(OWNER);
+    const single = await recordMachineQuote(t, project, graph, "v-page-budgets-single", "1", "page-budgets");
+    if (!single.ok) throw new Error("quote setup failed");
+    const selection = await asOwner.mutation(recordSelectionRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      requirementId: graph.requirementId,
+      candidateId: graph.candidateId,
+      quoteId: single.quoteId,
+      quoteVersion: "v-page-budgets-single",
+      quantity: "1",
+      requirementVersion: 1,
+      idempotencyKey: "sel-page-budgets",
+    });
+    if (!selection.ok) throw new Error("selection setup failed");
+    const order = await asOwner.mutation(recordOrderRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      selectionId: selection.selectionId,
+      idempotencyKey: "ord-page-budgets",
+      orderedQuantity: "1",
+    });
+    if (!order.ok) throw new Error("order setup failed");
+    for (let i = 0; i < 5; i += 1) {
+      const event = await asOwner.mutation(appendOrderEventRef, {
+        organizationId: project.orgId,
+        projectId: project.projectId,
+        orderId: order.orderId,
+        kind: "acceptance",
+        acceptedQuantity: "0.1",
+        idempotencyKey: `evt-budgets-${i}`,
+      });
+      if (!event.ok) throw new Error(`event ${i} failed`);
+    }
+    const base = {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      orderId: order.orderId,
+      kind: "events" as const,
+    };
+    const first = await asOwner.query(listOrderHistoryPageRef, {
+      ...base,
+      paginationOpts: { numItems: 2, cursor: null },
+    });
+    if (!first.ok) throw new Error("first page failed");
+    expect(first.page).toHaveLength(2);
+    expect(first.isDone).toBe(false);
+    // An endCursor range replays exactly the rows it bounds, even with
+    // an oversized page size alongside it.
+    const ranged = await asOwner.query(listOrderHistoryPageRef, {
+      ...base,
+      paginationOpts: { numItems: 10000, cursor: null, endCursor: first.continueCursor },
+    });
+    if (!ranged.ok) throw new Error(`ranged page failed: ${JSON.stringify(ranged)}`);
+    // The range holds despite the oversized page size: exactly the two
+    // bounded rows come back instead of all five.
+    expect(ranged.page).toHaveLength(2);
+    expect(ranged.page.map((row) => row.id)).toEqual(first.page.map((row) => row.id));
+    // Oversized caller budgets cannot broaden the read: the page still
+    // returns every row exactly as the defaults would.
+    const oversizedBudgets = await asOwner.query(listOrderHistoryPageRef, {
+      ...base,
+      paginationOpts: { numItems: 10000, cursor: null, maximumRowsRead: 1000000000, maximumBytesRead: 1000000000000 },
+    });
+    if (!oversizedBudgets.ok) throw new Error("oversized-budget page failed");
+    expect(oversizedBudgets.page).toHaveLength(5);
+    expect(oversizedBudgets.isDone).toBe(true);
+    // Non-positive budgets normalize to the server caps: the read
+    // behaves like the defaults instead of erroring or emptying.
+    const nonPositiveBudgets = await asOwner.query(listOrderHistoryPageRef, {
+      ...base,
+      paginationOpts: { numItems: 10000, cursor: null, maximumRowsRead: 0, maximumBytesRead: -3 },
+    });
+    if (!nonPositiveBudgets.ok) throw new Error("non-positive-budget page failed");
+    expect(nonPositiveBudgets.page).toHaveLength(5);
+    expect(nonPositiveBudgets.isDone).toBe(true);
+    // A tighter caller budget is preserved: fewer rows with more to come.
+    const tight = await asOwner.query(listOrderHistoryPageRef, {
+      ...base,
+      paginationOpts: { numItems: 10000, cursor: null, maximumRowsRead: 2 },
+    });
+    if (!tight.ok) throw new Error("tight-budget page failed");
+    expect(tight.page.length).toBeLessThanOrEqual(2);
+    expect(tight.isDone).toBe(false);
+  });
+
   test("201 entries page through with links and evidence intact", async () => {
     const t = convexTest(schema, modules);
     const project = await setupProject(t, "pages-entries");
