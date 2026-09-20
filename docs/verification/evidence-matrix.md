@@ -37,7 +37,7 @@ Passing controlled evidence never counts as a live provider, deployed applicatio
 | P-18 | partial-controlled | The bounded authorized backend projection now reads stored assets, safe document metadata and service cases with cross-project isolation and truncation tests; commissioning, UI consumption and service/replacement mutations remain open. |
 | P-19 | not-started | Second-location reuse with fresh-fact checks needs E1. |
 | P-20 | partial-controlled | F1 enforces contributor, approver and owner authority across project scopes; the due-decision workbench flow remains for U1/E1. |
-| P-21 | partial-controlled | Foundation UI has reviewed desktop/narrow and keyboard retry evidence; the complete selected workflow and all state variants remain. |
+| P-21 | partial-controlled | Foundation UI has reviewed desktop/narrow and keyboard retry evidence; U1 now preserves paginated activity and visibly fences server mutations during reconnect, while the complete selected workflow and final visual inspection remain. |
 | P-22 | not-started | Usage/outcome metric records and truthful reporting need F1 through V1. |
 | P-23 | not-started | Negotiation mandate, disclosure, rounds and non-commitment need C1/E1. |
 | P-24 | not-started | Document/CSV import, invalid input and review flow need R1/E1. |
@@ -103,7 +103,7 @@ Passing controlled evidence never counts as a live provider, deployed applicatio
 | S-17 | not-started | C1 ambiguous reconciliation remains unknown. |
 | S-18 | not-started | C1 component cleanup versus durable project evidence. |
 | S-19 | not-started | C1 malicious HTML/header/attachment boundary. |
-| S-20 | partial-controlled | Foundation UI has truthful configured/unconfigured/retry states and reviewed responsive behavior; full server-state vocabulary/reconnect remains. |
+| S-20 | partial-controlled | Foundation UI has truthful configured/unconfigured/retry states and reviewed responsive behavior; U1 renders last-known state during reconnect, blocks every server mutation until a fresh connected snapshot and preserves truthful activity cursors, while hosted reconnect behavior remains unverified. |
 | S-21 | live-unverified | Full published Firecrawl/Jev/OpenAI/AgentMail/Convex path has not run. |
 | S-22 | partial-controlled | F1 and browser tests enforce owner-only recipient versions and block alternate channels across API, model, retry and browser boundaries; C1 still owns the real transport integration. |
 | S-23 | live-unverified | Requires the owner mailbox, hosted route, provider credentials and an unscripted real reply. |
