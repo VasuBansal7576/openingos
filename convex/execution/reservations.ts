@@ -72,22 +72,31 @@ export const reserve = f1Mutation({
       return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
     }
     // The reservation binds to the grant cost ceiling as well as the
-    // shared budget: neither the single amount nor the job's running
-    // total may exceed what the grant authorizes.
+    // shared budget: neither the single amount nor the grant-wide running
+    // total may exceed what the grant authorizes. F1R-01: exposure spans
+    // every job bound to this grant (reserved + spent + unresolved),
+    // summed atomically inside this mutation so two jobs cannot each
+    // spend the same approval.
     if (args.amountMicroUsd > grant.costCeilingMicroUsd) {
       return { ok: false as const, code: "grant-ceiling-exceeded", message: "reservation exceeds the grant cost ceiling" };
     }
-    const jobReservations = await ctx.db
-      .query("reservations")
-      .withIndex("by_job", (q) => q.eq("jobId", args.jobId))
+    const grantJobs = await ctx.db
+      .query("jobs")
+      .withIndex("by_grant", (q) => q.eq("grantId", grant._id))
       .collect();
-    const jobCommitted = jobReservations.reduce(
-      (sum, reservation) =>
-        sum + reservation.reservedMicroUsd + reservation.spentMicroUsd + reservation.unresolvedMicroUsd,
-      0,
-    );
-    if (jobCommitted + args.amountMicroUsd > grant.costCeilingMicroUsd) {
-      return { ok: false as const, code: "grant-ceiling-exceeded", message: "job reservations exceed the grant cost ceiling" };
+    let grantCommitted = 0;
+    for (const grantJob of grantJobs) {
+      const grantJobReservations = await ctx.db
+        .query("reservations")
+        .withIndex("by_job", (q) => q.eq("jobId", grantJob._id))
+        .collect();
+      for (const reservation of grantJobReservations) {
+        grantCommitted +=
+          reservation.reservedMicroUsd + reservation.spentMicroUsd + reservation.unresolvedMicroUsd;
+      }
+    }
+    if (grantCommitted + args.amountMicroUsd > grant.costCeilingMicroUsd) {
+      return { ok: false as const, code: "grant-ceiling-exceeded", message: "grant-wide reservations exceed the grant cost ceiling" };
     }
     const budget = await ctx.db
       .query("providerBudgets")

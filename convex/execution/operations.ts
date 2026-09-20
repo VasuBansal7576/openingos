@@ -332,19 +332,26 @@ export const claim = f1InternalMutation({
     ) {
       return { ok: false as const, code: "stale-input-version", message: "prepared inputs no longer match the current grant" };
     }
-    // The grant cost ceiling binds the claim: the job's running
-    // reservation total must still fit inside what the grant authorizes.
-    const jobReservations = await ctx.db
-      .query("reservations")
-      .withIndex("by_job", (q) => q.eq("jobId", operation.jobId))
+    // The grant cost ceiling binds the claim grant-wide (F1R-01): the
+    // running reservation total across every job bound to this grant
+    // must still fit inside what the grant authorizes.
+    const grantJobs = await ctx.db
+      .query("jobs")
+      .withIndex("by_grant", (q) => q.eq("grantId", grant._id))
       .collect();
-    const jobCommitted = jobReservations.reduce(
-      (sum, reservation) =>
-        sum + reservation.reservedMicroUsd + reservation.spentMicroUsd + reservation.unresolvedMicroUsd,
-      0,
-    );
-    if (jobCommitted > grant.costCeilingMicroUsd) {
-      return { ok: false as const, code: "grant-ceiling-exceeded", message: "job reservations exceed the grant cost ceiling" };
+    let grantCommitted = 0;
+    for (const grantJob of grantJobs) {
+      const grantJobReservations = await ctx.db
+        .query("reservations")
+        .withIndex("by_job", (q) => q.eq("jobId", grantJob._id))
+        .collect();
+      for (const reservation of grantJobReservations) {
+        grantCommitted +=
+          reservation.reservedMicroUsd + reservation.spentMicroUsd + reservation.unresolvedMicroUsd;
+      }
+    }
+    if (grantCommitted > grant.costCeilingMicroUsd) {
+      return { ok: false as const, code: "grant-ceiling-exceeded", message: "grant-wide reservations exceed the grant cost ceiling" };
     }
 
     const storedPayload = operation.normalizedPayload;

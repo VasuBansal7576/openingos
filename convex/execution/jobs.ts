@@ -225,6 +225,48 @@ export const cancel = f1Mutation({
         unresolved.push(operation._id);
       }
     }
+    // F1R-02: release orphan reservations created before operation
+    // creation (or stranded by a failed create). Reservations bound to
+    // in-flight/outcomeUnknown work, or carrying spent/unresolved
+    // exposure, remain held.
+    const inFlightReservationIds = new Set(
+      operations
+        .filter(
+          (operation) =>
+            (operation.state === "dispatching" || operation.state === "outcomeUnknown") &&
+            operation.reservationId !== undefined,
+        )
+        .map((operation) => operation.reservationId as Id<"reservations">),
+    );
+    const jobReservations = await ctx.db
+      .query("reservations")
+      .withIndex("by_job", (q) => q.eq("jobId", args.jobId))
+      .collect();
+    for (const reservation of jobReservations) {
+      if (reservation.state !== "open" || reservation.reservedMicroUsd <= 0) continue;
+      if (reservation.spentMicroUsd > 0 || reservation.unresolvedMicroUsd > 0) continue;
+      if (inFlightReservationIds.has(reservation._id)) continue;
+      const boundLive = operations.some(
+        (operation) =>
+          operation.reservationId === reservation._id &&
+          operation.state !== "cancelled" &&
+          operation.state !== "denied",
+      );
+      if (boundLive) continue;
+      const released = reservation.reservedMicroUsd;
+      await ctx.db.patch(reservation._id, {
+        reservedMicroUsd: 0,
+        state: "closed",
+        updatedAt: now,
+      });
+      const budget = await ctx.db.get(reservation.budgetId);
+      if (budget !== null) {
+        await ctx.db.patch(reservation.budgetId, {
+          reservedMicroUsd: Math.max(0, budget.reservedMicroUsd - released),
+          updatedAt: now,
+        });
+      }
+    }
     await ctx.db.patch(args.jobId, {
       state: "cancelled",
       cancelledAt: now,
