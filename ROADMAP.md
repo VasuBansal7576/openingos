@@ -17,7 +17,7 @@ This file supplies order, not duplicate contracts or a running automation.
    Establish app CI, hosted Convex access, identity isolation, the Jev adapter and isolated remote browser execution.
    Resolve ordinary technical choices with test evidence and amend the relevant ADR before dependent implementation.
    The controlled application, Jev and browser foundations are accepted at `6432e98`; hosted Convex, live credentials, identity isolation on the published origin and D-04 remain open.
-3. [ ] **F1, shared contracts.** Prove schemas, money, authority, owner-only recipients, deduplication and shared provider budgets.
+3. [x] **F1, shared contracts.** Prove schemas, money, authority, owner-only recipients, deduplication and shared provider budgets.
    Independent controlled contract tests may run alongside F0; freeze affected interfaces only after their prerequisites pass.
    Assign one owner to schema, dependency and lockfile changes.
 4. [ ] **R1 / C1 / U1, parallel features.** After accepted F1 contracts land, dispatch research, communication and workbench packages with exclusive file ownership.
@@ -79,7 +79,8 @@ This file supplies order, not duplicate contracts or a running automation.
 - [x] Have the separate Astra reviewer reject exact PR head `e9068fc` after proving that a temporary approver plus a permanent lower role could delegate that lower role permanently, temporary organization ownership could become permanent project ownership, and 25 earlier membership rows could hide valid organization authority.
 - [x] Integrate the Luna-owned authority repair as `52df491`: delegation horizons now use only rows that independently satisfy both delegation and target-role authority, project-owner grants inherit temporary organization-owner expiry, and organization guards use bounded exact authority ranges.
 - [x] Pass the full local matrix at `52df491`: both TypeScript checks, production build, 23 repository tests, 77 money/Jev proofs, 244 F1 tests, 180 direct Convex tests, 155 browser tests, 2 application tests, 19 provider-contract tests and 5 user-path tests.
-- [ ] Confirm the latest PR head has no new actionable Greptile findings, obtain a fresh ACCEPT verdict from the separate Astra reviewer on that same fixed commit, and verify GitHub reports no conflicts before checking F1 or dispatching R1/C1/U1.
+- [x] Confirm exact PR head `92a49cd` has no new actionable Greptile findings, obtain a fresh ACCEPT verdict from the separate Astra reviewer on that same fixed commit, and verify GitHub reports no conflicts.
+- [x] Merge ready PR #1 as `96f0f1f` after all exact-head gates pass, then verify the merged `main` tree is identical to the tested and reviewed `92a49cd` tree.
 - [x] Shut down settled worker/reviewer sessions and remove both completed worker worktrees through Orca after verifying clean status and remote preservation.
 
 The completed money and Jev proof wave contains controlled proofs only, reviewed at `595d30c` with no actionable findings remaining.

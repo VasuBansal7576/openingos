@@ -306,3 +306,13 @@ The implementation worker ran as GPT-5.6 Luna with max reasoning on the Vasu-own
 All evidence is controlled local execution only.
 No live provider, hosted identity, deployment, vendor outreach or external effect was claimed.
 F1 and PR merge remain open until this replacement exact head passes GitHub Actions and Greptile, GitHub reports no conflict and a fresh separate Astra reviewer accepts the same revision.
+
+### 2026-09-21 - 96f0f1f merged F1 checkpoint
+
+Exact PR head `92a49cd` passed every required GitHub Actions job and Greptile in 2 minutes 32 seconds, with all 13 historical review threads resolved and no new actionable finding.
+A separate GPT-6 Astra reviewer accepted that exact SHA after the full matrix and 22 fresh public-handler probes covering all six recent membership defects and adjacent authority edges.
+The reviewer also reproduced the expected failures on older baselines, exercised 400 to 450 history rows under a 64-document limit, and left the checkout clean at the unchanged SHA.
+PR #1 merged to `main` as `96f0f1f`, and the merged tree is identical to the tested and reviewed `92a49cd` tree.
+F1 shared contracts are complete for controlled implementation, which unblocks parallel R1 research, C1 communication and U1 workbench packages.
+Hosted Convex, provider credentials and allowances, the private owner mailbox, live provider calls and publication remain unverified and block only their live evidence paths.
+No controlled result is presented as live integration success.
