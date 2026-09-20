@@ -64,9 +64,12 @@ export const ingestEvent = f1InternalMutation({
  * Internal: record a confirmed late delivery after cancellation. The job
  * keeps its cancelled state; the delivery is a separate recorded fact.
  *
- * Unknown allowance moves exactly once from unresolved to spent. Token and
- * event binding hold even from outcomeUnknown, the provider event persists
- * with global dedupe, and the attempt updates to the confirmed outcome.
+ * The late delivery updates only the receipt (persisted provider event),
+ * the operation state, and the attempt. An undetermined charge stays
+ * reserved until the separate authoritative `reconcileActualCost`
+ * transition settles it. Token and event binding hold even from
+ * outcomeUnknown, the provider event persists with global dedupe, and
+ * the attempt updates to the confirmed outcome.
  */
 export const recordLateDelivery = f1InternalMutation({
   args: {
@@ -127,28 +130,8 @@ export const recordLateDelivery = f1InternalMutation({
       createdAt: now,
     });
     await ctx.db.patch(args.operationId, { state: "observedSuccess", updatedAt: now });
-    if (operation.reservationId !== undefined) {
-      const reservation = await ctx.db.get(operation.reservationId);
-      if (reservation !== null) {
-        const amount = reservation.unresolvedMicroUsd + reservation.reservedMicroUsd;
-        const budget = await ctx.db.get(reservation.budgetId);
-        if (budget !== null && amount > 0) {
-          await ctx.db.patch(reservation.budgetId, {
-            reservedMicroUsd: Math.max(0, budget.reservedMicroUsd - reservation.reservedMicroUsd),
-            unresolvedMicroUsd: Math.max(0, budget.unresolvedMicroUsd - reservation.unresolvedMicroUsd),
-            spentMicroUsd: budget.spentMicroUsd + amount,
-            updatedAt: now,
-          });
-        }
-        await ctx.db.patch(operation.reservationId, {
-          reservedMicroUsd: 0,
-          unresolvedMicroUsd: 0,
-          spentMicroUsd: reservation.spentMicroUsd + amount,
-          state: "closed",
-          updatedAt: now,
-        });
-      }
-    }
+    // No fund movement here: unresolved allowance remains reserved until
+    // `reconcileActualCost` authoritatively settles the real charge.
     const attempts = await ctx.db
       .query("attempts")
       .withIndex("by_token", (q) => q.eq("token", args.token))
@@ -170,5 +153,76 @@ export const recordLateDelivery = f1InternalMutation({
       delivery: "observedSuccess",
       deduplicated: false,
     };
+  },
+});
+
+/**
+ * Internal: authoritatively reconcile the actual provider cost for an
+ * operation whose charge stayed undetermined. Moves exactly `actualSpentMicroUsd`
+ * from the reservation's held allowance (reserved + unresolved) to spent
+ * and releases the remainder back to the organization ledger. The
+ * reservation closes exactly once; a repeat with the same settled state
+ * is denied so allowance never moves twice.
+ *
+ * Reachable only from server-side reconciliation — browser callers can
+ * never settle spend directly.
+ */
+export const reconcileActualCost = f1InternalMutation({
+  args: {
+    operationId: v.id("operations"),
+    actualSpentMicroUsd: v.number(),
+  },
+  returns: v.union(
+    v.object({
+      ok: v.literal(true),
+      spentMicroUsd: v.number(),
+      releasedMicroUsd: v.number(),
+    }),
+    denialValidator,
+  ),
+  handler: async (ctx, args) => {
+    const now = Date.now();
+    const operation = await ctx.db.get(args.operationId);
+    if (operation === null) {
+      return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
+    }
+    if (operation.reservationId === undefined) {
+      return { ok: false as const, code: "allowance-exhausted", message: "operation carries no reservation to reconcile" };
+    }
+    if (!Number.isSafeInteger(args.actualSpentMicroUsd) || args.actualSpentMicroUsd < 0) {
+      return { ok: false as const, code: "invalid-payload", message: "actual spend must be a non-negative safe integer" };
+    }
+    const reservation = await ctx.db.get(operation.reservationId);
+    if (reservation === null) {
+      return { ok: false as const, code: "allowance-exhausted", message: "reservation is not available" };
+    }
+    if (reservation.jobId !== operation.jobId || reservation.organizationId !== operation.organizationId) {
+      return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
+    }
+    const held = reservation.reservedMicroUsd + reservation.unresolvedMicroUsd;
+    if (reservation.state === "closed" || held <= 0) {
+      return { ok: false as const, code: "already-claimed", message: "reservation already reconciled" };
+    }
+    if (args.actualSpentMicroUsd > held) {
+      return { ok: false as const, code: "invalid-payload", message: "actual spend exceeds the held allowance" };
+    }
+    const released = held - args.actualSpentMicroUsd;
+    const budget = await ctx.db.get(reservation.budgetId);
+    if (budget !== null) {
+      await ctx.db.patch(reservation.budgetId, {
+        reservedMicroUsd: Math.max(0, budget.reservedMicroUsd - reservation.reservedMicroUsd),
+        unresolvedMicroUsd: Math.max(0, budget.unresolvedMicroUsd - reservation.unresolvedMicroUsd),
+        spentMicroUsd: budget.spentMicroUsd + args.actualSpentMicroUsd,
+        updatedAt: now,
+      });
+    }
+    await ctx.db.patch(operation.reservationId, {
+      reservedMicroUsd: 0,
+      unresolvedMicroUsd: 0,
+      spentMicroUsd: reservation.spentMicroUsd + args.actualSpentMicroUsd,
+      state: "closed",
+      updatedAt: now,
+    });
+    return { ok: true as const, spentMicroUsd: args.actualSpentMicroUsd, releasedMicroUsd: released };
   },
 });

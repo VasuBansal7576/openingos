@@ -597,6 +597,11 @@ export class ControlledBackend {
     if (!row || row.organizationId !== organizationId) {
       return denial("denied-membership", "not authorized for this project");
     }
+    // Role-capped revocation: the revoker cannot remove a membership
+    // above their own role in the stated project.
+    if (!roleSatisfies(access.value, row.role)) {
+      return denial("denied-capability", "cannot revoke a membership above your own role");
+    }
     if (row.projectId !== projectId) {
       if (row.projectId !== null) {
         return denial("denied-project", "membership is not in this project");
@@ -659,14 +664,23 @@ export class ControlledBackend {
     let grantId = input.grantId ?? null;
     let grantVersion = 0;
     let inputVersions: Record<string, string> = {};
-    if (kind === "communication") {
-      if (grantId === null) return denial("denied-capability", "communication requires a grant");
+    if (grantId !== null) {
+      // Every explicit job grant is fully validated: same
+      // organization/project, active, unexpired, and authorizing the
+      // classified operation.
       const grant = this.grants.get(grantId);
-      if (!grant) return denial("denied-membership", "not authorized for this project");
+      if (!grant || grant.organizationId !== input.organizationId || grant.projectId !== input.projectId) {
+        return denial("denied-membership", "not authorized for this project");
+      }
       if (grant.status !== "active") return denial("revoked-grant", "grant is not active");
       if (isExpired(now, grant.expiresAt)) return denial("expired-grant", "grant expired");
+      if (!grant.operations.includes(operationId)) {
+        return denial("denied-capability", `grant does not authorize ${operationId}`);
+      }
       grantVersion = grant.revocationVersion;
       inputVersions = { ...grant.inputVersions };
+    } else if (kind === "communication") {
+      return denial("denied-capability", "communication requires a grant");
     }
     if (grantId === null) {
       const fallback = [...this.grants.values()].find(
@@ -692,8 +706,11 @@ export class ControlledBackend {
           canonicalPayload: canonicalJson({}),
           payloadHash: payloadHash({}),
           payloadSha256: null,
+          // No-spend research authority with valid positive semantics:
+          // positive round limit, zero cost ceiling (no reservation fits,
+          // so bounded real research needs an owner-funded allowance).
           costCeilingMicroUsd: 0,
-          roundLimit: 0,
+          roundLimit: 3,
           expiresAt: now + 900_000,
           revocationVersion: 1,
           status: "active",
@@ -774,20 +791,14 @@ export class ControlledBackend {
     if (input.grantId !== job.grantId) {
       return denial("denied-capability", "operation grant must match the job grant");
     }
-    let roundsUsed = 0;
-    for (const operation of this.operations.values()) {
-      if (operation.grantId !== grant.id) continue;
-      if (operation.state === "cancelled" || operation.state === "denied") continue;
-      roundsUsed += 1;
-    }
-    if (roundsUsed >= grant.roundLimit) {
-      return denial("round-limit-exceeded", "grant round limit exhausted");
-    }
 
     const key = requestKey(job.organizationId, input.kind, input.requestId);
     const canonical = canonicalJson(input.payload);
     const hash = payloadHash(input.payload);
 
+    // Same-request dedupe precedes round-limit rejection: an identical
+    // retry returns the one existing operation without consuming another
+    // round, while a changed payload conflicts regardless of rounds.
     const existingId = this.operationsByKey.get(key);
     if (existingId !== undefined) {
       const existing = this.operations.get(existingId);
@@ -801,6 +812,16 @@ export class ControlledBackend {
         }
         return denial("duplicate-conflict", "requestId reused with a different payload");
       }
+    }
+
+    let roundsUsed = 0;
+    for (const operation of this.operations.values()) {
+      if (operation.grantId !== grant.id) continue;
+      if (operation.state === "cancelled" || operation.state === "denied") continue;
+      roundsUsed += 1;
+    }
+    if (roundsUsed >= grant.roundLimit) {
+      return denial("round-limit-exceeded", "grant round limit exhausted");
     }
 
     let conversationVersion: number | null = null;
@@ -819,6 +840,20 @@ export class ControlledBackend {
       const reservation = this.reservations.get(input.reservationId);
       if (!reservation || reservation.jobId !== job.id) {
         return denial("allowance-exhausted", "reservation does not belong to this job");
+      }
+      if (reservation.organizationId !== job.organizationId) {
+        return denial("denied-membership", "not authorized for this project");
+      }
+      // One-to-one binding: a reservation funds at most one live
+      // operation.
+      for (const sibling of this.operations.values()) {
+        if (
+          sibling.reservationId === reservation.id &&
+          sibling.state !== "cancelled" &&
+          sibling.state !== "denied"
+        ) {
+          return denial("allowance-exhausted", "reservation is already bound to another operation");
+        }
       }
       reservationId = reservation.id;
     }
@@ -963,7 +998,19 @@ export class ControlledBackend {
       }
     }
 
-    if (operation.reservationId !== null) {
+    // Reservation is mandatory for every paid/effectful claim and fully
+    // bound to operation, job, organization, budget, and grant — and
+    // one-to-one across live operations. Pure reads and local record
+    // changes claim without one.
+    if (operation.reservationId === null) {
+      if (
+        operation.kind === "research.collect" ||
+        operation.kind === "communication.send" ||
+        operation.kind === "communication.clarify"
+      ) {
+        return denial("allowance-exhausted", "operation requires a reservation before claim");
+      }
+    } else {
       const reservation = this.reservations.get(operation.reservationId);
       if (!reservation || reservation.state !== "open") {
         return denial("allowance-exhausted", "reservation is not available");
@@ -977,6 +1024,20 @@ export class ControlledBackend {
       const budget = this.budgets.get(reservation.budgetId);
       if (!budget || budget.organizationId !== operation.organizationId) {
         return denial("denied-membership", "not authorized for this project");
+      }
+      const reservationJob = this.jobs.get(reservation.jobId);
+      if (!reservationJob || reservationJob.grantId !== operation.grantId) {
+        return denial("allowance-exhausted", "reservation grant does not match the operation grant");
+      }
+      for (const sibling of this.operations.values()) {
+        if (
+          sibling.id !== operation.id &&
+          sibling.reservationId === reservation.id &&
+          sibling.state !== "cancelled" &&
+          sibling.state !== "denied"
+        ) {
+          return denial("allowance-exhausted", "reservation is already bound to another operation");
+        }
       }
     }
 
@@ -1147,29 +1208,36 @@ export class ControlledBackend {
         return denial("round-limit-exceeded", "grant round limit exhausted");
       }
     }
-    // The resend never inherits the old reservation. While prior unknown
-    // exposure remains, a fresh open reservation for the same job is
-    // required; otherwise the resend is denied and the exposure stays
-    // locked.
-    let resendReservationId: string | null = null;
-    if (operation.reservationId !== null) {
-      const prior = this.reservations.get(operation.reservationId);
-      if (prior && prior.unresolvedMicroUsd > 0) {
-        if (newReservationId === undefined) {
-          return denial("unknown-charges-reserved", "prior unknown exposure remains; supply a fresh reservation");
-        }
-        const fresh = this.reservations.get(newReservationId);
-        if (
-          !fresh ||
-          fresh.state !== "open" ||
-          fresh.jobId !== operation.jobId ||
-          fresh.organizationId !== operation.organizationId
-        ) {
-          return denial("allowance-exhausted", "fresh reservation is not available for this job");
-        }
-        resendReservationId = fresh.id;
+    // A reviewed resend always carries its own fresh reservation: the
+    // resend never inherits the old reservation, and while prior unknown
+    // exposure remains the old allowance stays locked.
+    if (newReservationId === undefined) {
+      return denial("unknown-charges-reserved", "resend requires its own fresh reservation");
+    }
+    const fresh = this.reservations.get(newReservationId);
+    if (!fresh || fresh.state !== "open") {
+      return denial("allowance-exhausted", "fresh reservation is not available for this job");
+    }
+    if (fresh.jobId !== operation.jobId) {
+      return denial("allowance-exhausted", "fresh reservation does not belong to this job");
+    }
+    if (fresh.organizationId !== operation.organizationId) {
+      return denial("denied-membership", "not authorized for this project");
+    }
+    const freshBudget = this.budgets.get(fresh.budgetId);
+    if (!freshBudget || freshBudget.organizationId !== operation.organizationId) {
+      return denial("denied-membership", "not authorized for this project");
+    }
+    for (const sibling of this.operations.values()) {
+      if (
+        sibling.reservationId === fresh.id &&
+        sibling.state !== "cancelled" &&
+        sibling.state !== "denied"
+      ) {
+        return denial("allowance-exhausted", "fresh reservation is already bound to another operation");
       }
     }
+    const resendReservationId: string | null = fresh.id;
     const resent: Operation = {
       ...operation,
       id: this.next("op"),
@@ -1210,6 +1278,28 @@ export class ControlledBackend {
     for (const operation of this.operations.values()) {
       if (operation.jobId !== jobId) continue;
       if (operation.state === "prepared") {
+        // Cancellation releases the unclaimed prepared operation's
+        // reservation back to the organization ledger.
+        if (operation.reservationId !== null) {
+          const reservation = this.reservations.get(operation.reservationId);
+          if (reservation && reservation.state === "open" && reservation.reservedMicroUsd > 0) {
+            const released = reservation.reservedMicroUsd;
+            this.reservations.set(reservation.id, {
+              ...reservation,
+              reservedMicroUsd: 0,
+              state: "closed",
+              updatedAt: now,
+            });
+            const budget = this.budgets.get(reservation.budgetId);
+            if (budget) {
+              this.budgets.set(budget.id, {
+                ...budget,
+                reservedMicroUsd: Math.max(0, budget.reservedMicroUsd - released),
+                updatedAt: now,
+              });
+            }
+          }
+        }
         this.operations.set(operation.id, { ...operation, state: "cancelled", updatedAt: now });
       } else if (operation.state === "dispatching" || operation.state === "outcomeUnknown") {
         unresolved.push(operation.id);
@@ -1255,30 +1345,8 @@ export class ControlledBackend {
     this.processedEvents.set(eventKey, { outcome: "success", processingVersion: 1 });
     const updated: Operation = { ...operation, state: "observedSuccess", updatedAt: now };
     this.operations.set(operationId, updated);
-    if (operation.reservationId !== null) {
-      const reservation = this.reservations.get(operation.reservationId);
-      const budget = reservation ? this.budgets.get(reservation.budgetId) : undefined;
-      if (reservation) {
-        const amount = reservation.unresolvedMicroUsd + reservation.reservedMicroUsd;
-        if (budget && amount > 0) {
-          this.budgets.set(budget.id, {
-            ...budget,
-            reservedMicroUsd: Math.max(0, budget.reservedMicroUsd - reservation.reservedMicroUsd),
-            unresolvedMicroUsd: Math.max(0, budget.unresolvedMicroUsd - reservation.unresolvedMicroUsd),
-            spentMicroUsd: budget.spentMicroUsd + amount,
-            updatedAt: now,
-          });
-        }
-        this.reservations.set(reservation.id, {
-          ...reservation,
-          reservedMicroUsd: 0,
-          unresolvedMicroUsd: 0,
-          spentMicroUsd: reservation.spentMicroUsd + amount,
-          state: "closed",
-          updatedAt: now,
-        });
-      }
-    }
+    // No fund movement here: unresolved allowance stays reserved until
+    // the separate authoritative `reconcileActualCost` settles it.
     for (const attempt of this.attempts.values()) {
       if (attempt.operationId === operationId && attempt.token === token) {
         this.attempts.set(attempt.id, {
@@ -1293,6 +1361,59 @@ export class ControlledBackend {
     // Cancellation and confirmed late delivery remain separate facts: the
     // job keeps its cancelled state while the delivery is recorded.
     return approved({ jobState: job.state, delivery: "observedSuccess", deduplicated: false });
+  }
+
+  /**
+   * Authoritatively reconcile the actual provider cost for an operation
+   * whose charge stayed undetermined. Moves exactly `actualSpentMicroUsd` from the
+   * reservation's held allowance (reserved + unresolved) to spent and
+   * releases the remainder. The reservation closes exactly once.
+   */
+  reconcileActualCost(
+    operationId: string,
+    actualSpentMicroUsd: number,
+    now: number,
+  ): AuthorityResult<{ spentMicroUsd: number; releasedMicroUsd: number }> {
+    const operation = this.operations.get(operationId);
+    if (!operation) return denial("denied-membership", "not authorized for this project");
+    if (operation.reservationId === null) {
+      return denial("allowance-exhausted", "operation carries no reservation to reconcile");
+    }
+    if (!Number.isSafeInteger(actualSpentMicroUsd) || actualSpentMicroUsd < 0) {
+      return denial("invalid-payload", "actual spend must be a non-negative safe integer");
+    }
+    const reservation = this.reservations.get(operation.reservationId);
+    if (!reservation) return denial("allowance-exhausted", "reservation is not available");
+    if (reservation.jobId !== operation.jobId || reservation.organizationId !== operation.organizationId) {
+      return denial("denied-membership", "not authorized for this project");
+    }
+    const held = reservation.reservedMicroUsd + reservation.unresolvedMicroUsd;
+    if (reservation.state === "closed" || held <= 0) {
+      return denial("already-claimed", "reservation already reconciled");
+    }
+    if (actualSpentMicroUsd > held) {
+      return denial("invalid-payload", "actual spend exceeds the held allowance");
+    }
+    const released = held - actualSpentMicroUsd;
+    const budget = this.budgets.get(reservation.budgetId);
+    if (budget) {
+      this.budgets.set(budget.id, {
+        ...budget,
+        reservedMicroUsd: Math.max(0, budget.reservedMicroUsd - reservation.reservedMicroUsd),
+        unresolvedMicroUsd: Math.max(0, budget.unresolvedMicroUsd - reservation.unresolvedMicroUsd),
+        spentMicroUsd: budget.spentMicroUsd + actualSpentMicroUsd,
+        updatedAt: now,
+      });
+    }
+    this.reservations.set(reservation.id, {
+      ...reservation,
+      reservedMicroUsd: 0,
+      unresolvedMicroUsd: 0,
+      spentMicroUsd: reservation.spentMicroUsd + actualSpentMicroUsd,
+      state: "closed",
+      updatedAt: now,
+    });
+    return approved({ spentMicroUsd: actualSpentMicroUsd, releasedMicroUsd: released });
   }
 
   // -- Shared budgets -----------------------------------------------------

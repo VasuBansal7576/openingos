@@ -33,9 +33,11 @@ describe("S-05 idempotent operations, one send", () => {
     const { store, now } = fixture;
     const job = startCommsJob(fixture);
     const payload = commsPayload(CONTROLLED_OWNER_MAILBOX);
+    const reservation = store.reserve(job.id, 50_000, "controlled-fixture", now);
+    if (!reservation.ok) throw new Error("reserve failed");
 
     const first = store.createOperation(
-      { identity: fixture.ownerA, jobId: job.id, kind: "communication.send", requestId: "req-dup", payload, grantId: fixture.grantCommsA },
+      { identity: fixture.ownerA, jobId: job.id, kind: "communication.send", requestId: "req-dup", payload, grantId: fixture.grantCommsA, reservationId: reservation.value.id },
       now,
     );
     expect(first.ok).toBe(true);
@@ -91,8 +93,10 @@ describe("S-05 idempotent operations, one send", () => {
     const fixture = buildControlledFixture();
     const { store, now } = fixture;
     const job = startCommsJob(fixture);
+    const reservation = store.reserve(job.id, 50_000, "controlled-fixture", now);
+    if (!reservation.ok) throw new Error("reserve failed");
     const created = store.createOperation(
-      { identity: fixture.ownerA, jobId: job.id, kind: "communication.send", requestId: "req-once", payload: commsPayload(CONTROLLED_OWNER_MAILBOX), grantId: fixture.grantCommsA },
+      { identity: fixture.ownerA, jobId: job.id, kind: "communication.send", requestId: "req-once", payload: commsPayload(CONTROLLED_OWNER_MAILBOX), grantId: fixture.grantCommsA, reservationId: reservation.value.id },
       now,
     );
     if (!created.ok) throw new Error("create failed");
@@ -209,8 +213,10 @@ describe("S-07 cancellation and late delivery stay separate", () => {
     const fixture = buildControlledFixture();
     const { store, now } = fixture;
     const job = startCommsJob(fixture);
+    const reservation = store.reserve(job.id, 50_000, "controlled-fixture", now);
+    if (!reservation.ok) throw new Error("reserve failed");
     const created = store.createOperation(
-      { identity: fixture.ownerA, jobId: job.id, kind: "communication.send", requestId: "req-late", payload: commsPayload(CONTROLLED_OWNER_MAILBOX), grantId: fixture.grantCommsA },
+      { identity: fixture.ownerA, jobId: job.id, kind: "communication.send", requestId: "req-late", payload: commsPayload(CONTROLLED_OWNER_MAILBOX), grantId: fixture.grantCommsA, reservationId: reservation.value.id },
       now,
     );
     if (!created.ok) throw new Error("create failed");

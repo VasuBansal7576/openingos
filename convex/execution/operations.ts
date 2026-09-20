@@ -41,6 +41,22 @@ function isCommunicationKind(kind: string): boolean {
   return kind === "communication.send" || kind === "communication.clarify";
 }
 
+/**
+ * Provider-effectful operations that must carry a reservation into the
+ * claim: bounded collection and outbound communication consume shared
+ * provider allowance. Pure reads and local record changes carry no
+ * provider cost and claim without one.
+ */
+const REQUIRES_RESERVATION: ReadonlySet<string> = new Set([
+  "research.collect",
+  "communication.send",
+  "communication.clarify",
+]);
+
+export function requiresReservation(kind: string): boolean {
+  return REQUIRES_RESERVATION.has(kind);
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -132,25 +148,15 @@ export const create = f1Mutation({
     if (args.grantId !== job.grantId) {
       return { ok: false as const, code: "denied-capability", message: "operation grant must match the job grant" };
     }
-    // Round accounting for dependent C1 follow-ups: each prepared or
-    // in-flight operation consumes one round of its grant. Cancelled
-    // operations free their round; terminal and ambiguous ones keep it.
-    const grantOperations = await ctx.db
-      .query("operations")
-      .withIndex("by_grant", (q) => q.eq("grantId", args.grantId))
-      .collect();
-    const roundsUsed = grantOperations.filter(
-      (operation) => operation.state !== "cancelled" && operation.state !== "denied",
-    ).length;
-    if (roundsUsed >= grant.roundLimit) {
-      return { ok: false as const, code: "round-limit-exceeded", message: "grant round limit exhausted" };
-    }
 
     const parsed = parseBoundedPayloadJson(args.payloadJson);
     if (!parsed.ok) return { ok: false as const, code: parsed.code, message: parsed.message };
     const canonical = parsed.payload.canonical;
     const hash = parsed.payload.hash;
     const key = requestKey(args.organizationId, args.kind, args.requestId);
+    // Same-request dedupe precedes round-limit rejection: an identical
+    // retry returns the one existing operation without consuming another
+    // round, while a changed payload conflicts regardless of rounds.
     const existing = await ctx.db
       .query("operations")
       .withIndex("by_requestKey", (q) => q.eq("requestKey", key))
@@ -163,6 +169,20 @@ export const create = f1Mutation({
         return { ok: true as const, operationId: existing._id, deduped: true };
       }
       return { ok: false as const, code: "duplicate-conflict", message: "requestId reused with a different payload" };
+    }
+
+    // Round accounting for dependent C1 follow-ups: each prepared or
+    // in-flight operation consumes one round of its grant. Cancelled
+    // operations free their round; terminal and ambiguous ones keep it.
+    const grantOperations = await ctx.db
+      .query("operations")
+      .withIndex("by_grant", (q) => q.eq("grantId", args.grantId))
+      .collect();
+    const roundsUsed = grantOperations.filter(
+      (operation) => operation.state !== "cancelled" && operation.state !== "denied",
+    ).length;
+    if (roundsUsed >= grant.roundLimit) {
+      return { ok: false as const, code: "round-limit-exceeded", message: "grant round limit exhausted" };
     }
 
     let conversationVersion: number | undefined;
@@ -181,6 +201,25 @@ export const create = f1Mutation({
       const reservation = await ctx.db.get(args.reservationId);
       if (reservation === null || reservation.jobId !== args.jobId) {
         return { ok: false as const, code: "allowance-exhausted", message: "reservation does not belong to this job" };
+      }
+      if (reservation.organizationId !== args.organizationId) {
+        return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
+      }
+      // One-to-one binding: a reservation funds at most one live
+      // operation. A second operation cannot attach to an already bound
+      // reservation; it must reserve its own allowance.
+      const siblings = await ctx.db
+        .query("operations")
+        .withIndex("by_job", (q) => q.eq("jobId", args.jobId))
+        .collect();
+      const alreadyBound = siblings.some(
+        (sibling) =>
+          sibling.reservationId === args.reservationId &&
+          sibling.state !== "cancelled" &&
+          sibling.state !== "denied",
+      );
+      if (alreadyBound) {
+        return { ok: false as const, code: "allowance-exhausted", message: "reservation is already bound to another operation" };
       }
       reservationRef = args.reservationId;
     }
@@ -374,9 +413,17 @@ export const claim = f1InternalMutation({
     }
 
     // F1-24: recheck the full reservation relationship, not just its
-    // open state. A reservation from another job, organization, or budget
-    // cannot fund this claim.
-    if (operation.reservationId !== undefined) {
+    // open state. A reservation from another job, organization, budget,
+    // or grant cannot fund this claim, and one reservation never funds
+    // two live operations.
+    if (operation.reservationId === undefined) {
+      // Reservation is mandatory for every paid/effectful claim: a
+      // provider-effectful operation reaches dispatch only with bound
+      // allowance. Pure reads and local record changes claim without one.
+      if (REQUIRES_RESERVATION.has(operation.kind)) {
+        return { ok: false as const, code: "allowance-exhausted", message: "operation requires a reservation before claim" };
+      }
+    } else {
       const reservation = await ctx.db.get(operation.reservationId);
       if (reservation === null || reservation.state !== "open") {
         return { ok: false as const, code: "allowance-exhausted", message: "reservation is not available" };
@@ -390,6 +437,24 @@ export const claim = f1InternalMutation({
       const budget = await ctx.db.get(reservation.budgetId);
       if (budget === null || budget.organizationId !== operation.organizationId) {
         return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
+      }
+      const reservationJob = await ctx.db.get(reservation.jobId);
+      if (reservationJob === null || reservationJob.grantId !== operation.grantId) {
+        return { ok: false as const, code: "allowance-exhausted", message: "reservation grant does not match the operation grant" };
+      }
+      const jobOperations = await ctx.db
+        .query("operations")
+        .withIndex("by_job", (q) => q.eq("jobId", operation.jobId))
+        .collect();
+      const doubleBound = jobOperations.some(
+        (sibling) =>
+          sibling._id !== operation._id &&
+          sibling.reservationId === operation.reservationId &&
+          sibling.state !== "cancelled" &&
+          sibling.state !== "denied",
+      );
+      if (doubleBound) {
+        return { ok: false as const, code: "allowance-exhausted", message: "reservation is already bound to another operation" };
       }
     }
 
