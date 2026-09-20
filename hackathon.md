@@ -387,3 +387,13 @@ The default matrix includes 23 repository checks, 77 money and Jev boundary proo
 All evidence in this checkpoint is controlled local execution only.
 No hosted Convex run, live OpenAI, Jev, Firecrawl or AgentMail call, owner-mailbox exchange, genuine vendor result, public deployment or realized savings was observed.
 PR #2 remains open until this documented head is pushed, exact-head GitHub Actions and direct review-thread audit pass, a separate GPT-6 Astra session accepts the same revision, GitHub reports no conflict, and the selected desktop and narrow user flow is inspected.
+
+### 2026-09-21 - C1 create-time draft-binding repair checkpoint
+
+Greptile's exact-head rescan identified one additional P1: a changed fully supported supplier draft could consume an operation row and request key before claim-time validation rejected it.
+The Luna-owned repair is integrated through `c13f1b8` and binds the submitted fully supported envelope to the approved grant during operation creation.
+The regression proves the rejected draft leaves row counts and the request key unchanged, then permits the corrected approved draft to reuse that same key and reach claim.
+Mixed supported communication still persists only its approved segment, and the existing exact unrelated short-body, unavailable-capability, injection and tamper cases remain green.
+The worker's exact repair tree passed 782 controlled tests across the full repository matrix, strict TypeScript and the production build; the integration head independently passed the focused regression, strict TypeScript, production build and tree-equivalence check.
+No hosted Convex run, provider call, owner-mailbox exchange or external effect was performed.
+PR #2 still requires exact-head CI, direct Greptile thread closure, separate Astra acceptance and desktop/narrow browser inspection before merge.

@@ -104,6 +104,7 @@ This file supplies order, not duplicate contracts or a running automation.
 - [x] Repair Greptile P1 discussions `4058238262` and `4058238267` through integrated commit `de46ec6`: every post-fetch non-success retains unresolved exposure, and a digest of the complete parsed workload is bound through the grant, job and operation input-version snapshots before claim and fetch.
 - [x] Repair Greptile E1 P1 discussion `4058268105` through integrated commit `3a73e65`: backend-valid empty optional equipment strings become absent display metadata without dropping the authorized projection, while defined non-string values still fail closed.
 - [x] Repair Greptile W1 P2 discussion `4058268108` through integrated commit `3a73e65`: temporary membership creation schedules an idempotent membership-scoped expiry mutation whose database write invalidates reactive project and workbench queries.
+- [x] Repair Greptile C1 P1 discussion `4058329243` through integrated commit `c13f1b8`: a changed fully supported supplier draft is rejected before an operation row, request key or grant allowance is consumed, while corrected same-key retries and D-17 mixed-segment canonicalization remain valid.
 - [ ] Finish the U1 backend-shape adapter, connect the UI to Convex, inspect the selected flow at desktop and narrow widths, then obtain exact-head CI, Greptile and separate Astra review.
 
 The completed money and Jev proof wave contains controlled proofs only, reviewed at `595d30c` with no actionable findings remaining.
