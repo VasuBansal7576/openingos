@@ -225,6 +225,7 @@ async function setupOrderChain(
     quoteVersion: `v-${suffix}`,
     quantity: "1",
     requirementVersion: 1,
+    idempotencyKey: `selection-${suffix}`,
   });
   if (!selection.ok) throw new Error(`selection setup failed: ${JSON.stringify(selection)}`);
   const order = await asOwner.mutation(recordOrderRef, {

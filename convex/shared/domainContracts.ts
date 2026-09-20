@@ -446,6 +446,9 @@ export type NegotiationInput = Infer<typeof negotiationInputValidator>;
 export const selectionInputValidator = v.object({
   organizationId: v.id("organizations"),
   projectId: v.id("projects"),
+  // Optional for compatibility with pre-F1R-11 callers; durable rows always
+  // receive an explicit or server-derived stable replay key.
+  idempotencyKey: v.optional(v.string()),
   requirementId: v.id("requirements"),
   candidateId: v.id("candidates"),
   quoteId: v.id("quotes"),

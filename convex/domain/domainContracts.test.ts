@@ -154,6 +154,7 @@ describe("immutable version and idempotency keys", () => {
   });
 
   test("selections pin the exact quote version and requirement version", () => {
+    expect(selectionInputValidator.fields.idempotencyKey).toBeDefined();
     expect(selectionInputValidator.fields.quoteVersion).toBeDefined();
     expect(selectionInputValidator.fields.requirementVersion).toBeDefined();
   });

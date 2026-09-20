@@ -14,7 +14,13 @@ import type { Id } from "../_generated/dataModel.js";
 import { f1Mutation, f1Query } from "../server.js";
 import { denialValidator } from "../access/checks.js";
 import { sha256HexOfCanonical } from "../shared/sha256.js";
-import { decimalCompare, decimalZero, quantity } from "../../proofs/money/decimal.js";
+import {
+  decimalCompare,
+  decimalToString,
+  decimalZero,
+  quantity,
+} from "../../proofs/money/decimal.js";
+import { canonicalJson } from "../shared/hashing.js";
 import {
   approvalInputValidator,
   selectionInputValidator,
@@ -22,9 +28,60 @@ import {
 import { requireDomainAccess, requireOwnedRef } from "./guards.js";
 
 const selectionResultValidator = v.union(
-  v.object({ ok: v.literal(true), selectionId: v.id("selections") }),
+  v.object({ ok: v.literal(true), selectionId: v.id("selections"), deduplicated: v.boolean() }),
   denialValidator,
 );
+
+type SelectionReplayFields = {
+  readonly organizationId: Id<"organizations">;
+  readonly projectId: Id<"projects">;
+  readonly requirementId: Id<"requirements">;
+  readonly candidateId: Id<"candidates">;
+  readonly quoteId: Id<"quotes">;
+  readonly quoteVersion: string;
+  readonly quantity: string;
+  readonly requirementVersion: number;
+  readonly actor: string;
+};
+
+function legacySelectionKey(
+  args: SelectionReplayFields,
+): string {
+  return `legacy:${canonicalJson({
+    organizationId: args.organizationId,
+    projectId: args.projectId,
+    requirementId: args.requirementId,
+    candidateId: args.candidateId,
+    quoteId: args.quoteId,
+    quoteVersion: args.quoteVersion,
+    quantity: args.quantity,
+    requirementVersion: args.requirementVersion,
+    actor: args.actor,
+  })}`;
+}
+
+function sameSelectionReplay(
+  existing: SelectionReplayFields,
+  wanted: SelectionReplayFields,
+): boolean {
+  let existingQuantity: string;
+  try {
+    existingQuantity = decimalToString(quantity(existing.quantity));
+  } catch {
+    return false;
+  }
+  return (
+    existing.organizationId === wanted.organizationId &&
+    existing.projectId === wanted.projectId &&
+    existing.requirementId === wanted.requirementId &&
+    existing.candidateId === wanted.candidateId &&
+    existing.quoteId === wanted.quoteId &&
+    existing.quoteVersion === wanted.quoteVersion &&
+    existingQuantity === wanted.quantity &&
+    existing.requirementVersion === wanted.requirementVersion &&
+    existing.actor === wanted.actor
+  );
+}
 
 /**
  * Record a selection. Requirement, candidate, and quote must all live in
@@ -46,6 +103,48 @@ export const recordSelection = f1Mutation({
     );
     if (!access.ok) {
       return { ok: false as const, code: access.code, message: access.message };
+    }
+    if (args.idempotencyKey !== undefined && args.idempotencyKey.trim().length === 0) {
+      return { ok: false as const, code: "invalid-payload", message: "idempotency key required" };
+    }
+    let normalizedQuantity: string;
+    try {
+      const selected = quantity(args.quantity);
+      if (decimalCompare(selected, decimalZero()) <= 0) {
+        return { ok: false as const, code: "invalid-payload", message: "selected quantity must be positive" };
+      }
+      normalizedQuantity = decimalToString(selected);
+    } catch {
+      return { ok: false as const, code: "invalid-payload", message: "selected quantity is not a valid decimal" };
+    }
+    const replayFields = {
+      organizationId: args.organizationId,
+      projectId: args.projectId,
+      requirementId: args.requirementId,
+      candidateId: args.candidateId,
+      quoteId: args.quoteId,
+      quoteVersion: args.quoteVersion,
+      quantity: normalizedQuantity,
+      requirementVersion: args.requirementVersion,
+      actor: access.value.identity,
+    } satisfies SelectionReplayFields;
+    const idempotencyKey = args.idempotencyKey?.trim() ?? legacySelectionKey(replayFields);
+    // Replay lookup follows project authorization but precedes all current
+    // basis checks. An exact historical selection remains replayable after
+    // its quote is superseded; any changed field or actor conflicts without
+    // writing a second row. The project-local index scopes a key to the
+    // authorized project, so the same key remains independent elsewhere.
+    const existingInProject = await ctx.db
+      .query("selections")
+      .withIndex("by_project_and_key", (q) =>
+        q.eq("projectId", args.projectId).eq("idempotencyKey", idempotencyKey),
+      )
+      .unique();
+    if (existingInProject !== null) {
+      if (!sameSelectionReplay(existingInProject, replayFields)) {
+        return { ok: false as const, code: "duplicate-conflict", message: "idempotency key already used with different fields" };
+      }
+      return { ok: true as const, selectionId: existingInProject._id, deduplicated: true };
     }
     const requirement = await requireOwnedRef(
       await ctx.db.get(args.requirementId),
@@ -124,27 +223,20 @@ export const recordSelection = f1Mutation({
     ) {
       return { ok: false as const, code: "invalid-payload", message: "mixed-currency-requires-accepted-conversion-basis" };
     }
-    try {
-      const selected = quantity(args.quantity);
-      if (decimalCompare(selected, decimalZero()) <= 0) {
-        return { ok: false as const, code: "invalid-payload", message: "selected quantity must be positive" };
-      }
-    } catch {
-      return { ok: false as const, code: "invalid-payload", message: "selected quantity is not a valid decimal" };
-    }
     const selectionId = await ctx.db.insert("selections", {
       organizationId: args.organizationId,
       projectId: args.projectId,
+      idempotencyKey,
       requirementId: args.requirementId,
       candidateId: args.candidateId,
       quoteId: args.quoteId,
       quoteVersion: args.quoteVersion,
-      quantity: args.quantity,
+      quantity: normalizedQuantity,
       requirementVersion: args.requirementVersion,
       actor: access.value.identity,
       createdAt: Date.now(),
     });
-    return { ok: true as const, selectionId };
+    return { ok: true as const, selectionId, deduplicated: false };
   },
 });
 

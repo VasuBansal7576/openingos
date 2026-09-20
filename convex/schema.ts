@@ -308,6 +308,7 @@ export default defineSchema({
   selections: defineTable({
     organizationId: v.id("organizations"),
     projectId: v.id("projects"),
+    idempotencyKey: v.string(),
     requirementId: v.id("requirements"),
     candidateId: v.id("candidates"),
     quoteId: v.id("quotes"),
@@ -318,7 +319,8 @@ export default defineSchema({
     createdAt: v.number(),
   })
     .index("by_project", ["projectId"])
-    .index("by_requirement", ["requirementId"]),
+    .index("by_requirement", ["requirementId"])
+    .index("by_project_and_key", ["projectId", "idempotencyKey"]),
 
   approvals: defineTable({
     organizationId: v.id("organizations"),
