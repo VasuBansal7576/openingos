@@ -318,10 +318,117 @@ function RecoveryView({ snapshot, onAction, onMessage }: { readonly snapshot: Wo
   return <div className="wb-page"><PageHeading eyebrow="BOUNDED RECOVERY" title="A setback. Not a restart." description="Keep the context, preserve completed evidence, and expose the next authorized move." />{recoverable.length === 0 ? <div className="wb-recovery-empty"><EmptyState icon="sync" title="No recovery is waiting" message="The current server projection has no unknown, partial, paused or failed provider job." /><div className="wb-honesty-card"><Icon name="shield" size={20} /><div><strong>Recovery stays bounded</strong><p>OpeningOS will not resend an ambiguous external action or erase the original outcome. It waits for reconciliation or an explicit authorized review.</p></div></div></div> : <div className="wb-recovery-list">{recoverable.map((job) => <JobRow key={job.id} job={job} snapshot={snapshot} onAction={onAction} onMessage={onMessage} />)}</div>}<div className="wb-recovery-story"><span className="wb-eyebrow">THE STORY, NOT JUST THE STATUS</span>{snapshot.activity.items.slice(0, 5).map((item) => <div key={item.id}><span className="wb-story-mark"><Icon name={item.state === "failed" ? "warning" : "check"} size={13} /></span><div><strong>{item.summary ?? "Activity detail unavailable"}</strong><p>{formatDate(item.occurredAt)} · {item.actorLabel ?? "Actor unavailable"}</p></div></div>)}</div></div>;
 }
 
-function EquipmentView({ snapshot, onAction, onMessage }: { readonly snapshot: WorkbenchSnapshot; readonly onAction?: WorkbenchViewProps["onAction"]; readonly onMessage: (message: string) => void }) {
-  const fulfilled = snapshot.requirements.filter((requirement) => ["installed", "commissioned"].includes(requirement.fulfillment));
-  const createCase = () => onMessage(onAction ? "A service-case action requires an asset reference from the server projection." : "No service-case action is attached. Nothing was sent externally.");
-  return <div className="wb-page"><PageHeading eyebrow="EQUIPMENT & FOLLOW-THROUGH" title="Good equipment. A longer story." description="Purchase evidence, warranty records and service cases stay connected without turning a selection into an installed asset." />{fulfilled.length === 0 ? <div className="wb-equipment-empty"><EmptyState icon="wrench" title="No installed equipment in this project" message="A selected or ordered offer is not an installed asset. Commissioning must be recorded by an authorized user before it appears here." /><div className="wb-honesty-card"><Icon name="lock" size={20} /><div><strong>Asset creation is explicit</strong><p>There is no seeded equipment record in this projection, and no service appointment can be booked from this empty state.</p><ActionButton kind="secondary" onClick={createCase} disabled={!onAction}>Open service case</ActionButton></div></div></div> : fulfilled.map((requirement) => <article className="wb-panel wb-equipment-card" key={requirement.id}><div className="wb-equipment-icon"><Icon name="wrench" size={26} /></div><Pill tone="success">{formatStateLabel(requirement.fulfillment)}</Pill><h2>{requirement.title}</h2><p>{requirement.quantity} {requirement.unit} · project record</p><div className="wb-requirement-facts"><div><span>Need by</span><strong>{formatDate(requirement.needByAt)}</strong></div><div><span>Evidence</span><strong>Server record required</strong></div></div><ActionButton kind="secondary" onClick={createCase} disabled={!onAction}>Open service case</ActionButton></article>)}</div>;
+function AssetServiceCase({ serviceCase }: { readonly serviceCase: WorkbenchSnapshot["equipment"]["assets"][number]["serviceCases"][number] }) {
+  return (
+    <li className="wb-case-row">
+      <div className="wb-case-head">
+        <strong>{serviceCase.summary}</strong>
+        <Pill tone={serviceCase.state === "resolved" || serviceCase.state === "closed" ? "success" : serviceCase.state === "open" ? "warning" : "neutral"}>{formatStateLabel(serviceCase.state)}</Pill>
+      </div>
+      <div className="wb-case-facts">
+        <span>Urgency <strong>{formatStateLabel(serviceCase.urgency)}</strong></span>
+        <span>Opened <strong>{formatDate(serviceCase.createdAt)}</strong></span>
+        <span>Updated <strong>{formatDate(serviceCase.updatedAt)}</strong></span>
+      </div>
+      <p className="wb-case-outcome">{serviceCase.outcome === null ? "Outcome pending — no recorded result in this projection." : serviceCase.outcome}</p>
+    </li>
+  );
+}
+
+function AssetCard({ asset }: { readonly asset: WorkbenchSnapshot["equipment"]["assets"][number] }) {
+  const headingId = `asset-${asset.id}-heading`;
+  return (
+    <article className="wb-panel wb-equipment-card" aria-labelledby={headingId}>
+      <div className="wb-equipment-top">
+        <span className="wb-equipment-icon"><Icon name="wrench" size={26} /></span>
+        <Pill tone="success">Installed asset record</Pill>
+      </div>
+      <h2 id={headingId}>{asset.label}</h2>
+      <p className="wb-asset-meta">Recorded {formatDate(asset.createdAt)}</p>
+      <dl className="wb-asset-facts">
+        <div><dt>Serial</dt><dd>{asset.serial ?? "Not recorded"}</dd></div>
+        <div><dt>Constraints</dt><dd>{asset.constraints ?? "None recorded"}</dd></div>
+        <div><dt>Purchase provenance</dt><dd>{asset.purchaseProvenance ?? "Not recorded"}</dd></div>
+      </dl>
+      <section className="wb-asset-section" aria-label={`Documents for ${asset.label}`}>
+        <span className="wb-eyebrow">PURCHASE & WARRANTY DOCUMENTS</span>
+        {asset.documents.length === 0 ? (
+          <p className="wb-asset-note">No documents are attached to this asset in the current projection.</p>
+        ) : (
+          <ul className="wb-document-list">
+            {asset.documents.map((document, index) => (
+              <li key={`${document.kind}-${document.createdAt}-${index}`}>
+                <Icon name="file" size={14} />
+                <span>{formatStateLabel(document.kind)}</span>
+                <span>{formatDate(document.createdAt)}</span>
+              </li>
+            ))}
+          </ul>
+        )}
+        {asset.documentsTruncated ? <p className="wb-card-footnote" role="status"><Icon name="warning" size={13} /> More documents exist than this projection shows. The list is truncated.</p> : null}
+      </section>
+      <section className="wb-asset-section" aria-label={`Service cases for ${asset.label}`}>
+        <span className="wb-eyebrow">SERVICE CASES</span>
+        {asset.serviceCases.length === 0 ? (
+          <p className="wb-asset-note">No service case is recorded for this asset in the current projection.</p>
+        ) : (
+          <ul className="wb-case-list">
+            {asset.serviceCases.map((serviceCase) => <AssetServiceCase key={serviceCase.id} serviceCase={serviceCase} />)}
+          </ul>
+        )}
+        {asset.serviceCasesTruncated ? <p className="wb-card-footnote" role="status"><Icon name="warning" size={13} /> More service cases exist than this projection shows. The list is truncated.</p> : null}
+      </section>
+      <div className="wb-asset-foot">
+        <ActionButton
+          kind="secondary"
+          disabled
+          title="Service-case creation is unavailable: no backend command route exists for service cases. Nothing was sent."
+        >
+          Open service case
+        </ActionButton>
+        <p className="wb-micro"><Icon name="lock" size={12} /> Service-case creation is unavailable in this workbench. No backend command route exists, so this action stays disabled and sends nothing.</p>
+      </div>
+    </article>
+  );
+}
+
+function EquipmentView({ snapshot }: { readonly snapshot: WorkbenchSnapshot }) {
+  const { assets, assetsTruncated } = snapshot.equipment;
+  return (
+    <div className="wb-page">
+      <PageHeading
+        eyebrow="EQUIPMENT & FOLLOW-THROUGH"
+        title="Good equipment. A longer story."
+        description="Installed assets with their purchase and warranty documents and service cases, read from the server projection. A selected, ordered, or fulfilled requirement never appears here on its own."
+      />
+      {assets.length === 0 ? (
+        <div className="wb-equipment-empty">
+          <EmptyState
+            icon="wrench"
+            title="No installed equipment in this project"
+            message="This projection contains no installed-asset records. A selected, ordered, installed, or fulfilled requirement is not an asset until commissioning is recorded by an authorized user."
+          />
+          <div className="wb-honesty-card">
+            <Icon name="lock" size={20} />
+            <div>
+              <strong>Asset creation is explicit</strong>
+              <p>There is no seeded equipment record in this projection. Service-case creation is unavailable because no backend command route exists, so the action below stays disabled and sends nothing.</p>
+              <ActionButton kind="secondary" disabled title="Service-case creation is unavailable: no backend command route exists for service cases. Nothing was sent.">
+                Open service case
+              </ActionButton>
+            </div>
+          </div>
+        </div>
+      ) : (
+        <>
+          {assetsTruncated ? <div className="wb-inline-warning" role="status"><Icon name="warning" size={16} /> More installed assets exist than this projection shows. Showing the first {assets.length}.</div> : null}
+          <div className="wb-equipment-list">
+            {assets.map((asset) => <AssetCard key={asset.id} asset={asset} />)}
+          </div>
+        </>
+      )}
+    </div>
+  );
 }
 
 export default function WorkbenchView({ loadState, onRetry, onAction, onLoadMore }: WorkbenchViewProps) {
@@ -335,6 +442,6 @@ export default function WorkbenchView({ loadState, onRetry, onAction, onLoadMore
   if (!snapshot) {
     return <main className="wb-connected-empty"><div className="wb-empty-hero"><span className="wb-brand-mark">O<span>.</span></span><span className="wb-eyebrow">OPENINGOS / PURCHASING WORKBENCH</span><h1>Waiting for an authorized project.</h1><p>{loadState.state === "empty" ? `${loadState.message} No vendors, quotes or provider outcomes are shown until server state is available.` : "The backend is connected, but no project-scoped projection has arrived yet. No vendors, quotes or provider outcomes are shown until server state is available."}</p><div className="wb-honesty-card"><Icon name="lock" size={18} /><div><strong>Private by default</strong><p>Project IDs, recipient details and raw provider headers stay out of the public projection. Ask the coordinator to wire the authorized project adapter before using this view.</p></div></div>{loadState.state !== "loading" && onRetry ? <ActionButton onClick={onRetry} kind="secondary"><Icon name="refresh" size={15} /> Retry project state</ActionButton> : null}</div></main>;
   }
-  const tabContent = activeTab === "project" ? <ProjectView snapshot={snapshot} onReview={setSelectedOffer} onAction={connectedAction} onLoadMore={onLoadMore} onTabChange={setActiveTab} onMessage={setMessage} /> : activeTab === "suppliers" ? <SuppliersView snapshot={snapshot} onReview={setSelectedOffer} onOpenEvidence={setEvidence} /> : activeTab === "inbox" ? <InboxView snapshot={snapshot} onAction={connectedAction} onMessage={setMessage} /> : activeTab === "recovery" ? <RecoveryView snapshot={snapshot} onAction={connectedAction} onMessage={setMessage} /> : <EquipmentView snapshot={snapshot} onAction={connectedAction} onMessage={setMessage} />;
+  const tabContent = activeTab === "project" ? <ProjectView snapshot={snapshot} onReview={setSelectedOffer} onAction={connectedAction} onLoadMore={onLoadMore} onTabChange={setActiveTab} onMessage={setMessage} /> : activeTab === "suppliers" ? <SuppliersView snapshot={snapshot} onReview={setSelectedOffer} onOpenEvidence={setEvidence} /> : activeTab === "inbox" ? <InboxView snapshot={snapshot} onAction={connectedAction} onMessage={setMessage} /> : activeTab === "recovery" ? <RecoveryView snapshot={snapshot} onAction={connectedAction} onMessage={setMessage} /> : <EquipmentView snapshot={snapshot} />;
   return <div className="wb-app"><Header activeTab={activeTab} project={snapshot.project} onTabChange={setActiveTab} onOpenAssistant={() => setAssistantOpen(true)} /><LoadNotice loadState={loadState} onRetry={onRetry} /><OverviewStrip snapshot={snapshot} /><main id="workbench-main" tabIndex={-1}>{tabContent}</main>{message ? <div className="wb-toast" role="status" aria-live="polite"><span>{message}</span><button type="button" onClick={() => setMessage(null)} aria-label="Dismiss message"><Icon name="close" size={14} /></button></div> : null}{assistantOpen ? <AssistantRail snapshot={snapshot} onClose={() => setAssistantOpen(false)} /> : null}{evidence ? <EvidencePanel evidence={evidence} onClose={() => setEvidence(null)} /> : null}{selectedOffer ? <SelectionPanel offer={selectedOffer} snapshot={snapshot} onClose={() => setSelectedOffer(null)} onAction={connectedAction} onMessage={setMessage} /> : null}</div>;
 }

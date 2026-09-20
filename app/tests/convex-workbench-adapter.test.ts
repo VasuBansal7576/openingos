@@ -37,6 +37,7 @@ function projection(projectId = "project-1"): Record<string, unknown> {
     jobsTruncated: false,
     decisions: [],
     decisionsTruncated: false,
+    equipment: { assets: [], assetsTruncated: false },
     activity: { page: [], continueCursor: null, isDone: true },
     provenance: { mode: "unknown", label: "No supplier terms", ownerAuthoredTerms: false },
   };
