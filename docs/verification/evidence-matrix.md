@@ -34,7 +34,7 @@ Passing controlled evidence never counts as a live provider, deployed applicatio
 | P-15 | controlled-verified | F1 direct-handler tests deny cross-organization, forged-ID and restricted-project reads and writes. |
 | P-16 | controlled-verified | F1 direct-handler tests keep private quotes and financial limits inaccessible from isolated guest sessions. |
 | P-17 | partial-controlled | Controlled browser execution exposes bounded failure, cancellation and recovery states; provider outages/reconnect remain. |
-| P-18 | not-started | Commissioned equipment and service/replacement outcome path needs E1. |
+| P-18 | partial-controlled | The bounded authorized backend projection now reads stored assets, safe document metadata and service cases with cross-project isolation and truncation tests; commissioning, UI consumption and service/replacement mutations remain open. |
 | P-19 | not-started | Second-location reuse with fresh-fact checks needs E1. |
 | P-20 | partial-controlled | F1 enforces contributor, approver and owner authority across project scopes; the due-decision workbench flow remains for U1/E1. |
 | P-21 | partial-controlled | Foundation UI has reviewed desktop/narrow and keyboard retry evidence; the complete selected workflow and all state variants remain. |

@@ -340,7 +340,9 @@ R1 and C1 are complete for controlled implementation; the latest Greptile pass o
 The real Convex UI adapter, D-17 mixed-scope partitioning and the repaired J-03 actual-action allowance fence are integrated locally through `c6c60fb`.
 The J-03 action now fails closed on missing, invalid, overflowing or stale server-configured pricing, reserves the full bounded three-attempt exposure and does not encode an invented live price.
 Its 15 focused controlled tests, TypeScript and production build pass on the combined checkout.
-The two U1 Greptile P1 repairs remain active, and E1 equipment projection is under coordinator redaction repair before integration.
+The two U1 Greptile P1 repairs remain active.
+The repaired E1 backend projection is integrated locally through `436dc61` and reads real authorized asset, safe document and service-case records with bounded results.
+Its 10 focused controlled tests, strict TypeScript and production build pass; equipment UI consumption, commissioning and service mutations remain open.
 Official OpenAI documentation resolved the pending controlled model contract to dated snapshot `gpt-5.4-mini-2026-03-17`; no live OpenAI account access or request was claimed.
 All evidence in this checkpoint is controlled local execution only.
 No live provider call, hosted deployment, owner-mailbox exchange or external effect was observed.

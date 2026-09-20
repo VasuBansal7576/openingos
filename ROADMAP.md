@@ -26,6 +26,7 @@ This file supplies order, not duplicate contracts or a running automation.
    - [x] C1 owner-only transport, callbacks, reconciliation and quote ingestion use indexed provider binding lookup at exact PR head `099d016`.
    - [ ] U1 production-state adapter, live Convex wiring and desktop/narrow browser proof remain open.
 5. [ ] **E1, integrated behavior.** Build recovery, change impact and equipment/service flows against the integrated research and communication modules.
+   - [x] Project-authorized, bounded equipment projection reads real asset, safe document and service-case records at local integration commit `436dc61`; UI consumption, mutations, recovery and change-impact flows remain open.
 6. [ ] **V1, proof and review.** A separate Astra session reviews a fixed combined commit; implementation owners repair its findings.
    Prove all 52 P/H/D requirements, 24 S-cases and 7 J-cases, recording live versus controlled evidence and any unmet case.
    Exercise the real owner-email negotiation, Jev decisions, browser recovery, guest isolation and responsive UI; an early working path is not completion.
@@ -89,6 +90,7 @@ This file supplies order, not duplicate contracts or a running automation.
 - [x] Repair Greptile's PR #2 unbounded S1 negative controls with explicit 65-row reads in `1db56b5`, while retaining the production identity-first and quote-tuple index assertions.
 - [x] Close Greptile P1 discussions `4058028201` and `4058028206` with indexed C1 binding lookup and independently paginated R1 evidence, claims and candidate streams; exact PR head `099d016` passes every expected GitHub check and Greptile.
 - [x] Integrate D-17 mixed-scope admission, the real Convex U1 adapter and the J-03 actual-action allowance fence through local commit `c6c60fb`; focused controlled tests, TypeScript and production build pass.
+- [x] Integrate the repaired E1 equipment backend projection through local commit `436dc61`; 10 focused projection tests, strict TypeScript and the production build pass, with asset documents restricted to exactly `kind` and `createdAt`.
 - [ ] Close U1 Greptile P1 discussions `4058112415` and `4058112420` with append-only activity pagination and connected-only mutation controls on the next exact PR head.
 - [ ] Finish the U1 backend-shape adapter, connect the UI to Convex, inspect the selected flow at desktop and narrow widths, then obtain exact-head CI, Greptile and separate Astra review.
 
