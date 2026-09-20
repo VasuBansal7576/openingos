@@ -9,7 +9,8 @@
  */
 
 import { v } from "convex/values";
-import { f1Mutation, f1Query, type F1MutationCtx } from "../server.js";
+import { makeFunctionReference } from "convex/server";
+import { f1InternalMutation, f1Mutation, f1Query, type F1MutationCtx } from "../server.js";
 import type { Id } from "../_generated/dataModel.js";
 import {
   checkProjectAccess,
@@ -32,6 +33,28 @@ const roleResultValidator = v.union(
   v.object({ ok: v.literal(true), role: v.string() }),
   denialValidator,
 );
+
+/**
+ * Typed scheduler reference to the internal expiry transition below. The
+ * generated API proxy stays untouched (no-codegen constraint), so the
+ * reference is built by path with exact argument/result types instead.
+ */
+const expireMembershipRef = makeFunctionReference<
+  "mutation",
+  { membershipId: Id<"memberships"> },
+  { ok: true; expired: boolean }
+>("access/memberships:expireMembership");
+
+async function scheduleTemporaryExpiry(
+  ctx: F1MutationCtx,
+  membershipId: Id<"memberships">,
+  expiresAt: number,
+  now: number,
+): Promise<void> {
+  await ctx.scheduler.runAfter(Math.max(0, expiresAt - now), expireMembershipRef, {
+    membershipId,
+  });
+}
 
 async function recordCurrentAuthority(
   ctx: F1MutationCtx,
@@ -242,6 +265,9 @@ export const createProject = f1Mutation({
       ownerExpiresAt,
       now2,
     );
+    if (ownerExpiresAt !== undefined) {
+      await scheduleTemporaryExpiry(ctx, membershipId, ownerExpiresAt, now2);
+    }
     return { ok: true as const, projectId };
   },
 });
@@ -338,6 +364,9 @@ export const grantProjectAccess = f1Mutation({
       args.expiresAt,
       now,
     );
+    if (args.expiresAt !== undefined) {
+      await scheduleTemporaryExpiry(ctx, membershipId, args.expiresAt, now);
+    }
     return { ok: true as const, membershipId };
   },
 });
@@ -400,5 +429,41 @@ export const revokeProjectAccess = f1Mutation({
     if (authority !== null) await ctx.db.delete(authority._id);
     await ctx.db.patch(args.membershipId, { status: "revoked", revokedAt: now, updatedAt: now });
     return { ok: true as const, revoked: true };
+  },
+});
+
+/**
+ * Membership expiry transition (internal, scheduler-owned).
+ *
+ * Every temporary grant from grantProjectAccess and every temporary
+ * project-owner grant derived in createProject schedules exactly one call to
+ * this mutation in the same transaction as the grant. The scheduled write is
+ * the reactive invalidation source: at or after the stored expiry it deletes
+ * only this membership's authority projection and marks the row revoked, so
+ * the membership/authority rows watched by listAccessibleProjects and
+ * getProjection change and subscribers recompute. Queries keep their own
+ * server-clock fence for rows whose scheduled transition has not committed.
+ * Repeated, early, missing, permanent, or already-revoked executions are
+ * safe no-ops that never touch unrelated authority.
+ */
+export const expireMembership = f1InternalMutation({
+  args: { membershipId: v.id("memberships") },
+  returns: v.object({ ok: v.literal(true), expired: v.boolean() }),
+  handler: async (ctx, args) => {
+    const row = await ctx.db.get(args.membershipId);
+    if (row === null || row.status !== "active" || row.expiresAt === undefined) {
+      return { ok: true as const, expired: false };
+    }
+    const now = Date.now();
+    if (row.expiresAt > now) {
+      return { ok: true as const, expired: false };
+    }
+    const authority = await ctx.db
+      .query("membershipAuthorities")
+      .withIndex("by_membership", (q) => q.eq("membershipId", args.membershipId))
+      .unique();
+    if (authority !== null) await ctx.db.delete(authority._id);
+    await ctx.db.patch(args.membershipId, { status: "revoked", revokedAt: now, updatedAt: now });
+    return { ok: true as const, expired: true };
   },
 });

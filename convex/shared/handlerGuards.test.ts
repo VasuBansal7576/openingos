@@ -65,6 +65,7 @@ const ALLOWLIST: Record<string, Record<string, Visibility>> = {
     createProject: "mutation",
     grantProjectAccess: "mutation",
     revokeProjectAccess: "mutation",
+    expireMembership: "internalMutation",
   },
   "access/grants.ts": { get: "query", issue: "mutation", revoke: "mutation" },
   "access/recipients.ts": { describe: "query", configure: "internalMutation" },
