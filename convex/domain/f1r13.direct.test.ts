@@ -2344,6 +2344,68 @@ describe("Greptile r4056517360: bounded commitment scans", () => {
     expect(replay.deduplicated).toBe(true);
     expect(replay.orderId).toBe(fitting.orderId);
   });
+
+  test("an order past the 1000-event acceptance scan bound denies explicitly", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, "event-scan-bound");
+    const graph = await setupTwoLineGraph(t, project, "event-scan-bound");
+    const asOwner = t.withIdentity(OWNER);
+    const selection = await asOwner.mutation(recordSelectionRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      requirementId: graph.requirementId,
+      candidateId: graph.candidateId,
+      quoteId: graph.quoteId,
+      quoteVersion: "v-event-scan-bound",
+      selectionLines: [
+        { quoteLineId: "machine", quantity: "2", unit: "piece" },
+        { quoteLineId: "chair", quantity: "10", unit: "piece" },
+      ],
+      requirementVersion: 1,
+      idempotencyKey: "sel-event-scan-bound",
+    });
+    if (!selection.ok) throw new Error("selection setup failed");
+    const order = await asOwner.mutation(recordOrderRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      selectionId: selection.selectionId,
+      idempotencyKey: "ord-event-scan-bound",
+      orderLines: [
+        { quoteLineId: "machine", quantity: "2", unit: "piece" },
+        { quoteLineId: "chair", quantity: "8", unit: "piece" },
+      ],
+    });
+    if (!order.ok) throw new Error("order setup failed");
+    // 1001 acceptance-free shipment events: the accumulation scan would
+    // have to read past its bound to prove any new acceptance fits, so
+    // the new acceptance is denied as incomplete rather than verified
+    // against a truncated history.
+    for (let i = 0; i < 1001; i += 1) {
+      await t.run((ctx) =>
+        ctx.db.insert("orderEvents", {
+          organizationId: project.orgId,
+          projectId: project.projectId,
+          orderId: order.orderId,
+          kind: "shipment" as const,
+          recordedBy: OWNER.tokenIdentifier,
+          idempotencyKey: `seed-shipment-${i}`,
+          createdAt: Date.now(),
+        }),
+      );
+    }
+    const before = await tableCounts(t, project);
+    expect(before.events).toBe(1001);
+    const denied = await asOwner.mutation(appendOrderEventRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      orderId: order.orderId,
+      kind: "acceptance",
+      acceptanceLines: [{ quoteLineId: "chair", acceptedQuantity: "1", unit: "piece" }],
+      idempotencyKey: "evt-past-scan-bound",
+    });
+    expect(denied).toMatchObject({ ok: false, code: "incomplete-history" });
+    expect(await tableCounts(t, project)).toEqual(before);
+  });
 });
 
 describe("Greptile r4056517362: paginated history stays reloadable", () => {
