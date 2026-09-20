@@ -236,6 +236,45 @@ async function select(
   });
 }
 
+describe("project membership expiry validation", () => {
+  test("rejects expired, fractional, and unsafe expiries without writing", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, "membership-expiry");
+    const asOwner = t.withIdentity(OWNER);
+    const before = await t.run((ctx) => ctx.db.query("memberships").collect());
+    const invalidExpiries = [
+      Date.now() - 1,
+      Date.now() + 0.5,
+      Number.MAX_SAFE_INTEGER + 1,
+    ];
+    for (const expiresAt of invalidExpiries) {
+      const granted = await asOwner.mutation(grantProjectAccessRef, {
+        organizationId: project.orgId,
+        projectId: project.projectId,
+        targetIdentity: `expired-member-${String(expiresAt)}`,
+        role: "viewer",
+        expiresAt,
+      });
+      expect(granted).toMatchObject({ ok: false, code: "invalid-payload" });
+    }
+    const after = await t.run((ctx) => ctx.db.query("memberships").collect());
+    expect(after).toHaveLength(before.length);
+  });
+
+  test("accepts a finite safe-integer expiry in the future", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, "membership-expiry-valid");
+    const granted = await t.withIdentity(OWNER).mutation(grantProjectAccessRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      targetIdentity: "future-member",
+      role: "viewer",
+      expiresAt: Date.now() + 3_600_000,
+    });
+    expect(granted.ok).toBe(true);
+  });
+});
+
 describe("F1R-03 same-project graph contradictions are rejected", () => {
   test("selection rejects a quote bound to another requirement and vendor", async () => {
     const t = convexTest(schema, modules);
@@ -544,6 +583,31 @@ describe("F1R-04 superseded terms authorize nothing new", () => {
 });
 
 describe("F1R-05 approval replay identity covers every material field", () => {
+  test("selection and quote links must refer to the same quote", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, "approval-cross-quote");
+    const asOwner = t.withIdentity(OWNER);
+    const graph = await setupGraph(t, project, "main");
+    const quoteA = await asOwner.mutation(recordQuoteRef, quoteArgs(project, "v1"));
+    const quoteB = await asOwner.mutation(recordQuoteRef, quoteArgs(project, "v2"));
+    if (!quoteA.ok || !quoteB.ok) throw new Error("quote setup failed");
+    const selection = await select(t, project, graph, quoteA, "v1");
+    if (!selection.ok) throw new Error("selection setup failed");
+    const snapshotCanonical = "{\"decision\":\"cross-quote\"}";
+    const approval = await asOwner.mutation(recordApprovalRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      scope: "selection",
+      selectionId: selection.selectionId,
+      quoteId: quoteB.quoteId,
+      snapshotCanonical,
+      snapshotHash: await sha256Hex(snapshotCanonical),
+    });
+    expect(approval).toMatchObject({ ok: false, code: "denied-project" });
+    const approvals = await t.run((ctx) => ctx.db.query("approvals").collect());
+    expect(approvals).toHaveLength(0);
+  });
+
   test("changed scope conflicts even with an identical client snapshot", async () => {
     const t = convexTest(schema, modules);
     const project = await setupProject(t, "replay-scope");

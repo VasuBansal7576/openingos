@@ -179,6 +179,18 @@ export const grantProjectAccess = f1Mutation({
     if (args.targetIdentity.trim().length === 0) {
       return { ok: false as const, code: "forged-identity", message: "target identity required" };
     }
+    if (
+      args.expiresAt !== undefined &&
+      (!Number.isFinite(args.expiresAt) ||
+        !Number.isSafeInteger(args.expiresAt) ||
+        args.expiresAt <= now)
+    ) {
+      return {
+        ok: false as const,
+        code: "invalid-payload",
+        message: "membership expiry must be a finite future safe-integer timestamp",
+      };
+    }
     // No escalation or lateral grants: the granted role cannot exceed the
     // granter's own role in the stated project.
     if (!roleSatisfies(access.value, args.role)) {
