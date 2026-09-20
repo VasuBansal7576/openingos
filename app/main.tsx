@@ -42,6 +42,61 @@ export function appendWorkbenchActivity(current: WorkbenchSnapshot, next: Workbe
   };
 }
 
+/**
+ * Monotonic fence for concurrent "Load older activity" pages racing each other
+ * and racing live projection updates.
+ *
+ * Every load-more dispatch takes the next request generation; the applied
+ * generation only moves forward. A response whose generation is older than the
+ * applied generation still contributes its unseen items (so no page is
+ * skipped) but never moves continueCursor/isDone backwards (so an older
+ * response cannot regress, repeat, or re-open pagination).
+ */
+export function mergeFencedActivityPage(
+  current: WorkbenchSnapshot,
+  next: WorkbenchSnapshot,
+  requestGeneration: number,
+  appliedGeneration: number,
+): { readonly snapshot: WorkbenchSnapshot; readonly appliedGeneration: number } {
+  const merged = appendWorkbenchActivity(current, next);
+  if (requestGeneration < appliedGeneration) {
+    return {
+      snapshot: {
+        ...merged,
+        activity: {
+          items: merged.activity.items,
+          continueCursor: current.activity.continueCursor,
+          isDone: current.activity.isDone,
+        },
+      },
+      appliedGeneration,
+    };
+  }
+  return { snapshot: merged, appliedGeneration: requestGeneration };
+}
+
+/**
+ * Apply a live (head) projection refresh without dropping activity pages the
+ * user already paged through. Head fields come from the live snapshot; tail
+ * items already appended stay appended with dedupe. The deeper pagination
+ * cursor is kept while a tail exists so the live refresh cannot regress
+ * continueCursor or re-open a finished list.
+ */
+export function applyLiveWorkbenchSnapshot(current: WorkbenchSnapshot, live: WorkbenchSnapshot): WorkbenchSnapshot {
+  const liveIds = new Set(live.activity.items.map((item) => item.id));
+  const tail = current.activity.items.filter((item) => !liveIds.has(item.id));
+  const items = [...live.activity.items, ...tail];
+  const hasTail = tail.length > 0;
+  return {
+    ...live,
+    activity: {
+      items,
+      continueCursor: hasTail ? current.activity.continueCursor : live.activity.continueCursor,
+      isDone: hasTail ? current.activity.isDone : live.activity.isDone,
+    },
+  };
+}
+
 function ConnectionAwareApp({ onRetry, projectId, workbenchAdapter }: { readonly onRetry: () => void; readonly projectId?: string | undefined; readonly workbenchAdapter?: RuntimeWorkbenchAdapter | undefined }) {
   const connection = useConvexConnectionState();
   const auth = useConvexAuth();
@@ -55,7 +110,7 @@ function ConnectionAwareApp({ onRetry, projectId, workbenchAdapter }: { readonly
   return <AdapterAwareApp backendStatus={backendStatus} onRetry={onRetry} projectId={projectId} workbenchAdapter={workbenchAdapter} />;
 }
 
-function AdapterAwareApp({
+export function AdapterAwareApp({
   backendStatus,
   onRetry,
   projectId,
@@ -72,6 +127,11 @@ function AdapterAwareApp({
   const previousContext = useRef<{ readonly projectId: string | undefined; readonly adapter: RuntimeWorkbenchAdapter | undefined }>({ projectId: undefined, adapter: undefined });
   const backendStatusRef = useRef(backendStatus);
   backendStatusRef.current = backendStatus;
+  // Monotonic fence: every head load, load-more page, and live update takes a
+  // request generation at dispatch/event time; appliedGeneration only moves
+  // forward so an older response can add unseen items but never regress
+  // continueCursor/isDone.
+  const activityFence = useRef({ requested: 0, applied: 0 });
 
   useEffect(() => {
     let disposed = false;
@@ -111,11 +171,24 @@ function AdapterAwareApp({
           ? { state: "reconnecting", lastKnown: current.snapshot }
           : { state: "loading", ...(current?.state === "ready" ? { lastKnown: current.snapshot } : {}) });
       }
+      activityFence.current.requested += 1;
+      const loadGeneration = activityFence.current.requested;
       try {
         const response = await workbenchAdapter.load(resolvedProjectId, cursor);
         if (disposed || backendStatusRef.current !== "connected") return;
         const snapshot = response === null ? null : parseWorkbenchSnapshot(response, resolvedProjectId);
-        setWorkbench(snapshot === null ? { state: "empty", message: "No authorized project projection is available yet." } : { state: "ready", snapshot });
+        if (snapshot === null) {
+          if (loadGeneration >= activityFence.current.applied) {
+            activityFence.current.applied = loadGeneration;
+            setWorkbench({ state: "empty", message: "No authorized project projection is available yet." });
+          }
+          return;
+        }
+        if (loadGeneration >= activityFence.current.applied) activityFence.current.applied = loadGeneration;
+        setWorkbench((current) => {
+          if (current?.state !== "ready" || current.snapshot.project.id !== resolvedProjectId) return { state: "ready", snapshot };
+          return { state: "ready", snapshot: applyLiveWorkbenchSnapshot(current.snapshot, snapshot) };
+        });
       } catch (error) {
         if (disposed || backendStatusRef.current !== "connected") return;
         setWorkbench({ state: "error", message: error instanceof Error ? error.message : "The project projection could not be read." });
@@ -127,7 +200,13 @@ function AdapterAwareApp({
       (response) => {
         if (disposed || backendStatusRef.current !== "connected") return;
         const snapshot = response === null ? null : parseWorkbenchSnapshot(response, resolvedProjectId);
-        setWorkbench(snapshot === null ? { state: "empty", message: "No authorized project projection is available yet." } : { state: "ready", snapshot });
+        activityFence.current.requested += 1;
+        activityFence.current.applied = activityFence.current.requested;
+        setWorkbench((current) => {
+          if (snapshot === null) return { state: "empty", message: "No authorized project projection is available yet." };
+          if (current?.state !== "ready" || current.snapshot.project.id !== resolvedProjectId) return { state: "ready", snapshot };
+          return { state: "ready", snapshot: applyLiveWorkbenchSnapshot(current.snapshot, snapshot) };
+        });
       },
       (error: unknown) => {
         if (disposed || backendStatusRef.current !== "connected") return;
@@ -158,6 +237,8 @@ function AdapterAwareApp({
     if (backendStatusRef.current !== "connected") return;
     const cursor = workbench?.state === "ready" ? workbench.snapshot.activity.continueCursor : null;
     if (cursor === null || cursor === undefined || workbenchAdapter === undefined || resolvedProjectId === undefined) return;
+    activityFence.current.requested += 1;
+    const requestGeneration = activityFence.current.requested;
     void workbenchAdapter.load(resolvedProjectId, cursor).then((response) => {
       if (response === null || backendStatusRef.current !== "connected") return;
       const snapshot = parseWorkbenchSnapshot(response, resolvedProjectId);
@@ -165,7 +246,9 @@ function AdapterAwareApp({
       setWorkbench((current) => {
         if (backendStatusRef.current !== "connected") return current;
         if (current?.state !== "ready" || current.snapshot.project.id !== resolvedProjectId) return { state: "ready", snapshot };
-        return { state: "ready", snapshot: appendWorkbenchActivity(current.snapshot, snapshot) };
+        const merged = mergeFencedActivityPage(current.snapshot, snapshot, requestGeneration, activityFence.current.applied);
+        activityFence.current.applied = merged.appliedGeneration;
+        return { state: "ready", snapshot: merged.snapshot };
       });
     }).catch((error: unknown) => {
       if (backendStatusRef.current !== "connected") return;
