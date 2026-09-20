@@ -78,18 +78,28 @@ async function settleReservation(
   }
 }
 
-/** Internal: record a validated provider outcome for a claimed token. */
+/**
+ * Internal: record a validated provider outcome for a claimed token.
+ *
+ * F1-20: provider events dedupe GLOBALLY by provider, environment, and
+ * event ID. A duplicate event returns the recorded outcome with zero new
+ * effect — it never settles a second outcome, spends budget, or touches
+ * another operation. The response carries only the coarse outcome, so a
+ * duplicate from another tenant leaks nothing.
+ */
 export const recordOutcome = f1InternalMutation({
   args: {
     operationId: v.id("operations"),
     token: v.string(),
     outcome: outcomeValidator,
+    provider: v.optional(v.string()),
+    environment: v.optional(v.string()),
     providerEventId: v.optional(v.string()),
     unknownCharges: v.optional(v.boolean()),
     detail: v.optional(v.string()),
   },
   returns: v.union(
-    v.object({ ok: v.literal(true), state: v.string(), deduplicated: v.boolean() }),
+    v.object({ ok: v.literal(true), state: v.string(), deduplicated: v.boolean(), outcome: v.string() }),
     denialValidator,
   ),
   handler: async (ctx, args) => {
@@ -101,26 +111,30 @@ export const recordOutcome = f1InternalMutation({
     if (operation.state !== "dispatching" || operation.attemptToken !== args.token) {
       return { ok: false as const, code: "already-claimed", message: "attempt token is not valid for this operation" };
     }
-    let deduplicated = false;
+    const provider = args.provider ?? "controlled";
+    const environment = args.environment ?? "controlled";
     if (args.providerEventId !== undefined) {
       const seen = await ctx.db
         .query("processedEvents")
-        .withIndex("by_provider_and_event", (q) =>
-          q.eq("provider", "controlled").eq("eventId", args.providerEventId ?? ""),
+        .withIndex("by_provider_environment_and_event", (q) =>
+          q
+            .eq("provider", provider)
+            .eq("environment", environment)
+            .eq("eventId", args.providerEventId ?? ""),
         )
         .unique();
       if (seen !== null) {
-        deduplicated = true;
-      } else {
-        await ctx.db.insert("processedEvents", {
-          provider: "controlled",
-          environment: "controlled",
-          eventId: args.providerEventId,
-          processingVersion: 1,
-          outcome: args.outcome,
-          createdAt: now,
-        });
+        return { ok: true as const, state: operation.state, deduplicated: true, outcome: seen.outcome };
       }
+      await ctx.db.insert("processedEvents", {
+        provider,
+        environment,
+        eventId: args.providerEventId,
+        processingVersion: 1,
+        outcome: args.outcome,
+        operationId: args.operationId,
+        createdAt: now,
+      });
     }
     let state: "observedSuccess" | "observedFailure" | "outcomeUnknown" = "observedSuccess";
     if (args.outcome === "unknown" || (args.outcome === "failure" && args.unknownCharges === true)) {
@@ -151,7 +165,7 @@ export const recordOutcome = f1InternalMutation({
         });
       }
     }
-    return { ok: true as const, state, deduplicated };
+    return { ok: true as const, state, deduplicated: false, outcome: args.outcome };
   },
 });
 
@@ -194,14 +208,17 @@ export const reconcileAfterCrash = f1InternalMutation({
 
 /**
  * Internal: explicit reviewed resend. Creates a linked new operation with a
- * fresh requestId and warns that the prior attempt may still complete.
- * Reachable by approvers only through the public resend action.
+ * fresh requestId and warns that the prior attempt may still complete. The
+ * resend never inherits the old reservation: while prior unknown exposure
+ * remains, a fresh open reservation for the same job is required, otherwise
+ * the resend is denied and the exposure stays locked.
  */
 export const reviewedResend = f1InternalMutation({
   args: {
     operationId: v.id("operations"),
     identity: v.string(),
     newRequestId: v.string(),
+    newReservationId: v.optional(v.id("reservations")),
   },
   returns: v.union(
     v.object({ ok: v.literal(true), operationId: v.id("operations"), warning: v.string() }),
@@ -236,6 +253,38 @@ export const reviewedResend = f1InternalMutation({
     if (clash !== null) {
       return { ok: false as const, code: "duplicate-conflict", message: "resend requestId is already in use" };
     }
+    const grant = await ctx.db.get(operation.grantId);
+    if (grant !== null) {
+      const grantOperations = await ctx.db
+        .query("operations")
+        .withIndex("by_grant", (q) => q.eq("grantId", operation.grantId))
+        .collect();
+      const roundsUsed = grantOperations.filter(
+        (entry) => entry.state !== "cancelled" && entry.state !== "denied",
+      ).length;
+      if (roundsUsed >= grant.roundLimit) {
+        return { ok: false as const, code: "round-limit-exceeded", message: "grant round limit exhausted" };
+      }
+    }
+    let resendReservationId: typeof operation.reservationId | undefined;
+    if (operation.reservationId !== undefined) {
+      const prior = await ctx.db.get(operation.reservationId);
+      if (prior !== null && prior.unresolvedMicroUsd > 0) {
+        if (args.newReservationId === undefined) {
+          return { ok: false as const, code: "unknown-charges-reserved", message: "prior unknown exposure remains; supply a fresh reservation" };
+        }
+        const fresh = await ctx.db.get(args.newReservationId);
+        if (
+          fresh === null ||
+          fresh.state !== "open" ||
+          fresh.jobId !== operation.jobId ||
+          fresh.organizationId !== operation.organizationId
+        ) {
+          return { ok: false as const, code: "allowance-exhausted", message: "fresh reservation is not available for this job" };
+        }
+        resendReservationId = args.newReservationId;
+      }
+    }
     const freshId = await ctx.db.insert("operations", {
       organizationId: operation.organizationId,
       projectId: operation.projectId,
@@ -256,7 +305,7 @@ export const reviewedResend = f1InternalMutation({
         ? {}
         : { conversationVersion: operation.conversationVersion }),
       state: "prepared",
-      ...(operation.reservationId === undefined ? {} : { reservationId: operation.reservationId }),
+      ...(resendReservationId === undefined ? {} : { reservationId: resendReservationId }),
       linkedResendOf: args.operationId,
       createdAt: now,
       updatedAt: now,

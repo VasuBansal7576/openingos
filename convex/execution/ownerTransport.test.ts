@@ -32,13 +32,16 @@ function commsOp(
 }
 
 describe("S-22 owner-only transport", () => {
-  test("missing recipient configuration blocks new claims", () => {
+  test("missing recipient configuration blocks comms grants at issuance", () => {
     const store = new ControlledBackend();
     const now = 1_700_000_000_000;
     const org = store.createOrganization("Solo", "private", now).id;
     const proj = store.createProject(org, "P", "open", now).id;
     store.addMembership(org, null, "owner", "owner", now);
     store.ensureBudget(org, 1_000_000, "controlled", now);
+    const before = store.snapshotCounts();
+    // No active recipient: a communication grant cannot even be issued,
+    // so no downstream claim can exist.
     const grant = store.issueGrant(
       {
         issuerIdentity: "owner",
@@ -55,20 +58,9 @@ describe("S-22 owner-only transport", () => {
       },
       now,
     );
-    if (!grant.ok) throw new Error("grant failed");
-    const job = store.requestWork(
-      { identity: "owner", organizationId: org, projectId: proj, text: "Send the RFQ.", kind: "communication", grantId: grant.value.id },
-      now,
-    );
-    if (!job.ok) throw new Error("job failed");
-    const created = store.createOperation(
-      { identity: "owner", jobId: job.value.id, kind: "communication.send", requestId: "r1", payload: commsPayload("owner-supplier@example.test"), grantId: grant.value.id },
-      now,
-    );
-    if (!created.ok) throw new Error("create failed");
-    const claim = store.claimOperation({ identity: "owner", operationId: created.value.operation.id }, now);
-    expect(claim.ok).toBe(false);
-    if (!claim.ok) expect(claim.code).toBe("missing-recipient-config");
+    expect(grant.ok).toBe(false);
+    if (!grant.ok) expect(grant.code).toBe("invalid-payload");
+    expect(store.snapshotCounts()).toEqual(before);
     expect(store.sentMessages).toHaveLength(0);
   });
 
