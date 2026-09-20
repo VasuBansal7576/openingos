@@ -186,6 +186,37 @@ async function insertOwnerQuote(
   );
 }
 
+async function insertUnrelatedQuotes(
+  t: ReturnType<typeof convexTest>,
+  project: { organizationId: Id<"organizations">; projectId: Id<"projects"> },
+): Promise<void> {
+  await t.run(async (ctx) => {
+    const now = Date.now();
+    for (let index = 0; index < 300; index += 1) {
+      await ctx.db.insert("quotes", {
+        organizationId: project.organizationId,
+        projectId: project.projectId,
+        version: `unrelated-${index}`,
+        contentHash: `unrelated-content-${index}`,
+        currency: "EUR",
+        lines: [{
+          lineId: "unrelated-line",
+          description: "Unrelated offer",
+          quantity: "1",
+          unitPrice: { currency: "EUR", minorUnits: 1 },
+          evidenceRefs: [],
+        }],
+        charges: [],
+        taxBasis: { kind: "inclusive", basisId: "NL-EUR-INCLUSIVE", evidenceRefs: [] },
+        evidenceRefs: [],
+        counterpartyRole: "userImport",
+        executionMode: "recorded",
+        createdAt: now + index,
+      });
+    }
+  });
+}
+
 async function seedJobState(
   t: ReturnType<typeof convexTest>,
   project: { organizationId: Id<"organizations">; projectId: Id<"projects"> },
@@ -278,6 +309,7 @@ describe("U1 workbench projection", () => {
     expect(listed.ok).toBe(true);
     if (!listed.ok) throw new Error("guest list denied");
     expect(listed.projects.map((item) => item.id)).toEqual([guestProject.projectId]);
+    expect(listed.projects[0]?.access.role).toBe("owner");
 
     const denied = await guest.query(getProjectionRef, { projectId: privateProject.projectId, limit: 1 });
     expect(denied).toEqual({ ok: false, code: "denied-membership", message: "not authorized for this project" });
@@ -380,10 +412,12 @@ describe("U1 workbench projection", () => {
     });
     await insertOwnerQuote(t, project, graph, "v1", "hash-v1", undefined, 100, snapshotId);
     await insertOwnerQuote(t, project, graph, "v2", "hash-v2", "hash-v1", 200, snapshotId);
+    await insertUnrelatedQuotes(t, project);
 
     const result = await t.withIdentity(OWNER).query(getProjectionRef, { projectId: project.projectId, limit: 4 });
     expect(result.ok).toBe(true);
     if (!result.ok) throw new Error("projection denied");
+    expect(result.access.role).toBe("owner");
     const candidate = result.candidates[0];
     expect(candidate?.latestValidQuote?.version).toBe("v2");
     expect(candidate?.latestValidQuote?.lines[0]?.unitPrice.minorUnits).toBe(750000);

@@ -20,6 +20,7 @@ import type {
 } from "../shared/quoteSemantics.js";
 
 export const MAX_PROJECT_PAGE = 12;
+const MAX_AUTHORITY_ROWS_READ = MAX_PROJECT_PAGE * 4;
 export const MAX_REQUIREMENTS = 12;
 export const MAX_CANDIDATES = 12;
 export const MAX_CANDIDATE_EVIDENCE = 2;
@@ -88,6 +89,11 @@ const capabilityFlagsValidator = v.object({
   canCompare: v.boolean(),
   canCommunicate: v.boolean(),
   canClarify: v.boolean(),
+});
+
+const accessValidator = v.object({
+  role: roleValidator,
+  capabilities: capabilityFlagsValidator,
 });
 
 const requirementValidator = v.object({
@@ -243,7 +249,7 @@ const activityValidator = v.object({
 });
 
 const projectListItemValidator = projectValidator.extend({
-  effectiveRole: roleValidator,
+  access: accessValidator,
 });
 
 const accessibleProjectsValidator = v.object({
@@ -256,8 +262,7 @@ const accessibleProjectsValidator = v.object({
 const projectionValidator = v.object({
   ok: v.literal(true),
   project: projectValidator,
-  effectiveRole: roleValidator,
-  capabilities: capabilityFlagsValidator,
+  access: accessValidator,
   requirements: v.array(requirementValidator),
   requirementsTruncated: v.boolean(),
   candidates: v.array(candidateValidator),
@@ -294,6 +299,16 @@ type ProjectRow = {
   readonly budgetMinorUnits?: number;
   readonly needByAt?: number;
   readonly createdAt: number;
+};
+
+type AuthorityRow = {
+  readonly _id: Id<"membershipAuthorities">;
+  readonly organizationId: Id<"organizations">;
+  readonly projectId?: Id<"projects">;
+  readonly identity: string;
+  readonly role: DbRole;
+  readonly authorityUntil: number;
+  readonly expiresAt?: number;
 };
 
 type QuoteProjection = {
@@ -347,6 +362,10 @@ function capabilityFlags(role: DbRole) {
     canCommunicate: requireCapability("communication.send", role).ok,
     canClarify: requireCapability("communication.clarify", role).ok,
   };
+}
+
+function accessView(role: DbRole) {
+  return { role, capabilities: capabilityFlags(role) };
 }
 
 function executionMode(value: string): ExecutionMode | null {
@@ -623,35 +642,42 @@ async function latestQuotesForCandidates(
   organizationId: Id<"organizations">,
   candidates: readonly { readonly requirementId: Id<"requirements">; readonly vendorId: Id<"vendors"> }[],
 ): Promise<Map<CandidateQuoteKey, QuoteSelection | null>> {
-  // The frozen schema has no requirement/vendor quote index. Scan only a
-  // bounded newest slice and use the indexed successor probe to reject stale
-  // revisions. If the current match is outside this slice, null is safer than
-  // presenting an older or guessed quote as current.
+  // Each candidate has a dedicated tuple index range. Read only a bounded
+  // newest slice and use the indexed successor probe to reject stale revisions.
+  // If the range is truncated or contains multiple current roots, null is
+  // safer than presenting an older or guessed quote as current.
   const result = new Map<CandidateQuoteKey, QuoteSelection | null>();
   if (candidates.length === 0) return result;
-  const rows = await ctx.db
-    .query("quotes")
-    .withIndex("by_project", (q) => q.eq("projectId", projectId))
-    .order("desc")
-    .take(MAX_QUOTE_SCAN);
-  const wanted = new Set(candidates.map((candidate) => candidateQuoteKey(candidate.requirementId, candidate.vendorId)));
-  const resolved = new Set<CandidateQuoteKey>();
-  for (const row of rows) {
-    if (
-      row.organizationId !== organizationId ||
-      row.projectId !== projectId ||
-      row.requirementId === undefined ||
-      row.vendorId === undefined
-    ) continue;
-    const key = candidateQuoteKey(row.requirementId, row.vendorId);
-    if (!wanted.has(key) || resolved.has(key)) continue;
-    if (await hasQuoteSuccessor(ctx, projectId, row.contentHash)) continue;
-    const rendered = renderQuote(row);
-    result.set(key, rendered);
-    resolved.add(key);
-  }
-  for (const key of wanted) {
-    if (!result.has(key)) result.set(key, null);
+  for (const candidate of candidates) {
+    const key = candidateQuoteKey(candidate.requirementId, candidate.vendorId);
+    const rows = await ctx.db
+      .query("quotes")
+      .withIndex("by_project_and_requirement_and_vendor_and_created_at", (q) =>
+        q
+          .eq("projectId", projectId)
+          .eq("requirementId", candidate.requirementId)
+          .eq("vendorId", candidate.vendorId),
+      )
+      .order("desc")
+      .take(MAX_QUOTE_SCAN + 1);
+    if (rows.length > MAX_QUOTE_SCAN) {
+      result.set(key, null);
+      continue;
+    }
+    const current: QuoteSelection[] = [];
+    for (const row of rows) {
+      if (
+        row.organizationId !== organizationId ||
+        row.projectId !== projectId ||
+        row.requirementId !== candidate.requirementId ||
+        row.vendorId !== candidate.vendorId
+      ) continue;
+      if (await hasQuoteSuccessor(ctx, projectId, row.contentHash)) continue;
+      const rendered = renderQuote(row);
+      if (rendered !== null) current.push(rendered);
+      if (current.length > 1) break;
+    }
+    result.set(key, current.length === 1 ? current[0] ?? null : null);
   }
   return result;
 }
@@ -682,7 +708,7 @@ function uniqueModes(views: readonly ProvenanceView[]): ProvenanceView {
   return combineProvenance(views);
 }
 
-/** List projects visible to the authenticated identity through bounded scans. */
+/** List projects visible to the authenticated identity through authority pages. */
 export const listAccessibleProjects = f1Query({
   args: {
     cursor: v.optional(v.string()),
@@ -695,42 +721,48 @@ export const listAccessibleProjects = f1Query({
     const pageSize = boundedLimit(args.limit, MAX_PROJECT_PAGE);
     if (pageSize === null) return { ok: false as const, code: "invalid-payload", message: "limit must be a positive safe integer" };
     let page: {
-      readonly page: readonly ProjectRow[];
+      readonly page: readonly AuthorityRow[];
       readonly isDone: boolean;
       readonly continueCursor: string;
     };
     try {
       page = await ctx.db
-        .query("projects")
-        .order("asc")
-        .paginate({ numItems: pageSize, cursor: args.cursor ?? null });
+        .query("membershipAuthorities")
+        .withIndex("by_identity_and_authority_until_and_organization_and_project", (q) =>
+          q.eq("identity", identity),
+        )
+        .order("desc")
+        .paginate({
+          numItems: pageSize,
+          cursor: args.cursor ?? null,
+          maximumRowsRead: Math.max(pageSize, Math.min(MAX_AUTHORITY_ROWS_READ, pageSize * 4)),
+        });
     } catch {
-      return { ok: false as const, code: "invalid-payload", message: "invalid project cursor" };
+      return { ok: false as const, code: "invalid-payload", message: "invalid authority cursor" };
     }
     const now = Date.now();
-    const projects = [] as Array<{
-      readonly id: Id<"projects">;
-      readonly organizationId: Id<"organizations">;
-      readonly name: string;
-      readonly visibility: "open" | "restricted";
-      readonly location?: {
-        readonly id: Id<"locations">;
-        readonly name: string;
-        readonly region: string;
-        readonly reportingCurrency: string;
-        readonly operatingStatus: string;
-      };
-      readonly currency?: string;
-      readonly budgetMinorUnits?: number;
-      readonly needByAt?: number;
-      readonly createdAt: number;
-      readonly effectiveRole: DbRole;
-    }>;
-    for (const project of page.page) {
-      const access = await checkProjectAccess(ctx, identity, project.organizationId, project._id, "viewer", now);
+    const projects: Array<ReturnType<typeof readProjectSummary> extends Promise<infer Summary>
+      ? Summary & { readonly access: ReturnType<typeof accessView> }
+      : never> = [];
+    const seenProjects = new Set<Id<"projects">>();
+    for (const authority of page.page) {
+      if (
+        authority.projectId === undefined ||
+        authority.authorityUntil <= now ||
+        (authority.expiresAt !== undefined && authority.expiresAt <= now) ||
+        seenProjects.has(authority.projectId)
+      ) continue;
+      const project = await ctx.db.get(authority.projectId);
+      if (
+        project === null ||
+        project.organizationId !== authority.organizationId ||
+        project._id !== authority.projectId
+      ) continue;
+      const access = await checkProjectAccess(ctx, identity, authority.organizationId, authority.projectId, "viewer", now);
       if (!access.ok) continue;
       const summary = await readProjectSummary(ctx, project);
-      projects.push({ ...summary, effectiveRole: access.value });
+      seenProjects.add(project._id);
+      projects.push({ ...summary, access: accessView(access.value) });
     }
     return {
       ok: true as const,
@@ -1019,8 +1051,7 @@ export const getProjection = f1Query({
     return {
       ok: true as const,
       project: summary,
-      effectiveRole: access.value,
-      capabilities: capabilityFlags(access.value),
+      access: accessView(access.value),
       requirements,
       requirementsTruncated: requirementsPage.length > Math.min(pageSize, MAX_REQUIREMENTS),
       candidates,
