@@ -73,7 +73,7 @@ Passing controlled evidence never counts as a live provider, deployed applicatio
 | D-09 | partial-controlled | Controlled executor sessions bind organization/project/job and reject stale/wrong context; full app guest/private evidence isolation remains. |
 | D-10 | partial-controlled | Controlled tests record deterministic execution outcomes; representative end-to-end timing/cost/intervention evidence remains. |
 | D-11 | not-started | Jev research prioritization and deferred-supplier resumption need R1. |
-| D-12 | not-started | Jev choice, OpenAI draft and owner-only AgentMail negotiation need C1/E1. |
+| D-12 | partial-controlled | The server-only OpenAI boundary now validates source-backed extraction and supplier drafts through a dated Responses snapshot, shared allowance fence and one-attempt accounting; live OpenAI access, downstream approval UI and owner-only AgentMail negotiation remain. |
 | D-13 | not-started | Supplier-resolvable uncertainty and focused review routing need R1/C1/E1. |
 | D-14 | controlled-verified | Reviewed F1 and browser tests enforce backend capability, grant, expiry, revocation, recipient and unknown-operation denial, including covered-action continuity. |
 | D-15 | not-started | Changed-term re-evaluation without history overwrite needs E1/U1. |

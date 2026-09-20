@@ -13,7 +13,7 @@
     "typecheck": "tsc --noEmit",
     "build": "vite build",
     "test": "bun run test:repository && bun run test:proofs && bun run test:evals && bun run test:f1 && bun run test:browser && bun test app/tests/application.test.ts convex/communication/contracts.test.ts && bun run test:direct",
-    "test:direct": "bunx vitest run convex/handlers.direct.test.ts convex/domain/domainGraph.direct.test.ts convex/domain/waveB1.direct.test.ts convex/domain/waveB2.direct.test.ts convex/domain/f1r09.direct.test.ts convex/domain/f1r06r21.direct.test.ts convex/domain/f1r13.direct.test.ts convex/domain/quoteSuccessorBounded.direct.test.ts convex/workbenchIndexes.direct.test.ts convex/workbench/projection.test.ts convex/research/collection.test.ts convex/communication/handlers.direct.test.ts --environment edge-runtime",
+    "test:direct": "bunx vitest run convex/handlers.direct.test.ts convex/domain/domainGraph.direct.test.ts convex/domain/waveB1.direct.test.ts convex/domain/waveB2.direct.test.ts convex/domain/f1r09.direct.test.ts convex/domain/f1r06r21.direct.test.ts convex/domain/f1r13.direct.test.ts convex/domain/quoteSuccessorBounded.direct.test.ts convex/workbenchIndexes.direct.test.ts convex/workbench/projection.test.ts convex/research/collection.test.ts convex/communication/handlers.direct.test.ts convex/models/openai.test.ts --environment edge-runtime",
     "test:f1": "bun test convex/access convex/execution convex/purchasing convex/shared convex/domain/domainContracts.test.ts",
     "test:provider-contracts": "bun test app/tests/provider-contracts.test.ts",
     "test:user-path": "bun test app/tests/user-path.test.ts"

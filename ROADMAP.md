@@ -94,6 +94,7 @@ This file supplies order, not duplicate contracts or a running automation.
 - [x] Integrate the U1 activity-pagination and reconnect-action repairs through local commit `6c63609`; the full local test matrix, strict TypeScript and production build pass.
 - [x] Close U1 Greptile P1 discussions `4058112415` and `4058112420` at exact PR head `df30e5f` with append-only activity pagination and connected-only mutation controls; factual test evidence is posted to both discussions.
 - [x] Integrate the controlled J-06 versioned Jev evaluation corpus and runner through local commit `1f98a60`; 12 focused tests and strict TypeScript pass, and the suite is now part of `bun run test`.
+- [x] Integrate the controlled server-only OpenAI Responses boundary through local commit `a0ec63f`; the dated model, strict extraction/draft schemas, source and token bounds, shared reservation fence, one-attempt transport and ambiguous accounting pass 17 focused tests and the combined full matrix.
 - [ ] Repair Greptile P1 discussion `4058171616`, which found that short exact-grant communication drafts can be refused before communication-envelope validation.
 - [ ] Finish the U1 backend-shape adapter, connect the UI to Convex, inspect the selected flow at desktop and narrow widths, then obtain exact-head CI, Greptile and separate Astra review.
 

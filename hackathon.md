@@ -355,4 +355,7 @@ The full local test matrix, strict TypeScript and production build pass for that
 The controlled J-06 evaluation package is integrated locally through `1f98a60` and is now included in the default test command.
 Its versioned corpus covers incomplete offers, legitimate short follow-ups, unrelated requests, adversarial text and changed owner replies, with per-decision candidate error rates, intervention counts and separate model-versus-total latency.
 The 12 focused tests and strict TypeScript pass, but no live `jev-1.13.0` evaluation ran and no production threshold has been chosen.
+The controlled server-only OpenAI Responses boundary is integrated locally through `a0ec63f` and included in the default direct test suite.
+It uses dated snapshot `gpt-5.4-mini-2026-03-17`, strict source-backed extraction and supplier-draft schemas, bounded token and byte policies, a shared reservation fence, exactly one transport attempt and durable ambiguous-exposure accounting.
+The integrated 17 focused tests and full local matrix pass; no OpenAI credential or live request was used, and downstream approval and communication consumption remain open.
 Greptile subsequently identified one new P1 in production communication scope admission; a focused Luna repair is active and PR #2 will not merge until that exact-head finding and independent Astra review are complete.
