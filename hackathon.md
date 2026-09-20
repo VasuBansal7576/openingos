@@ -263,3 +263,14 @@ The completed reconciliation and direct-fixture worker worktrees were removed th
 PR #1 still requires exact-latest-head Actions and Greptile closure plus one separate Astra ACCEPT verdict before F1 can be checked complete or merged.
 All results are controlled evidence only.
 No hosted Convex state, live provider call, owner-mailbox exchange, public site or commercial outcome was observed.
+
+### 2026-09-20 - e21950e integrated Astra-repair checkpoint
+
+Integrated the two repairs required by the separate Astra rejection of the prior exact PR head.
+Both `research.read` and `comparison.read` now refuse unrelated explanations and generic-commercial requests before durable job rows or operation binding, while preserving server-owned contextual purchasing reads and automatic supplier collection.
+Cancellation reconciliation now uses bounded indexed current-state snapshots to correct a stale unsampled count after late delivery; the exact 49-operation regression keeps the returned, stored and paginated unresolved inventory at 32.
+The exact integrated head passes TypeScript, production build, 23 repository tests, 77 money and Jev proofs, 234 F1 tests, 174 direct Convex tests, 155 browser-executor tests, 2 application tests, 19 provider-contract tests and 5 mounted user-path tests.
+The completed Devin attempts were stopped without approving opaque native requests; their useful partial patch was preserved for the Luna repair owner, and the completed Luna terminals were released after both repair commits were verified on Vasu-owned remote branches.
+PR #1 has not yet been pushed to this local checkpoint, so exact-head GitHub Actions, Greptile closure, conflict status and a fresh separate Astra verdict remain pending.
+All results are controlled local evidence only.
+No hosted Convex state, live provider call, owner-mailbox exchange, public site or commercial outcome was observed.
