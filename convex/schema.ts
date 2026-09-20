@@ -249,6 +249,10 @@ export default defineSchema({
     ),
     origin: v.union(v.literal("internal"), v.literal("ownerImport")),
     conflictEvidenceIds: v.array(v.id("productEvidence")),
+    // C1 inbound source link: an agentmail message marker records the exact
+    // evidence row it was extracted from, so replay and quote extraction use
+    // a durable link instead of scanning a project evidence prefix.
+    sourceEvidenceId: v.optional(v.id("evidence")),
     idempotencyKey: v.string(),
     // F1R-07: the normalized ingestion identity is immutable. Verification,
     // freshness, and status projections may change without changing replay
@@ -896,7 +900,12 @@ export default defineSchema({
       v.literal("fixture"),
     ),
     locator: v.optional(v.string()),
-  }).index("by_project", ["projectId"]),
+  })
+    .index("by_project", ["projectId"])
+    // Exact replay lookup for an inbound source snapshot by its content hash
+    // inside one project. Legacy markers without `sourceEvidenceId` use this
+    // instead of collecting an arbitrary project evidence prefix.
+    .index("by_project_and_contentHash", ["projectId", "contentHash"]),
 
   files: defineTable({
     organizationId: v.id("organizations"),
