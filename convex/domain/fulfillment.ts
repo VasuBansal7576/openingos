@@ -1283,6 +1283,14 @@ const orderHistoryEntriesPageValidator = paginationResultValidator(orderHistoryE
   kind: v.literal("entries"),
 });
 
+const selectionLineAllocationValidator = v.union(
+  v.object({ status: v.literal("resolved") }),
+  v.object({
+    status: v.literal("unresolved"),
+    reason: v.string(),
+  }),
+);
+
 const orderLineageValidator = v.object({
   ok: v.literal(true),
   order: v.object({
@@ -1297,7 +1305,12 @@ const orderLineageValidator = v.object({
   }),
   selection: v.object({
     id: v.id("selections"),
+    // Preserve the scalar quantity from pre-F1R-13 rows. A scalar behind a
+    // multi-line quote cannot be assigned to a line from current quote data,
+    // so it is returned beside an explicit unresolved allocation status.
+    quantity: v.optional(v.string()),
     selectionLines: v.array(storedOrderLineValidator),
+    lineAllocation: selectionLineAllocationValidator,
   }),
   quote: v.object({
     id: v.id("quotes"),
@@ -1403,6 +1416,14 @@ export const getOrderLineage = f1Query({
         message: "order carries no resolvable lines or preserved quantity; reload is unavailable until history is reconciled",
       };
     }
+    const lineAllocation = selectionLines.length > 0
+      ? { status: "resolved" as const }
+      : {
+          status: "unresolved" as const,
+          reason: selection.value.quantity === undefined
+            ? "missing-selection-lines"
+            : "historical-scalar-multiline",
+        };
     const events = await ctx.db
       .query("orderEvents")
       .withIndex("by_order", (q) => q.eq("orderId", args.orderId))
@@ -1453,7 +1474,14 @@ export const getOrderLineage = f1Query({
           ? {}
           : { orderedQuantity: order.value.orderedQuantity }),
       },
-      selection: { id: selection.value._id, selectionLines: sortLinesById(selectionLines) },
+      selection: {
+        id: selection.value._id,
+        ...(selection.value.quantity === undefined
+          ? {}
+          : { quantity: selection.value.quantity }),
+        selectionLines: sortLinesById(selectionLines),
+        lineAllocation,
+      },
       quote: {
         id: quote._id,
         version: quote.version,

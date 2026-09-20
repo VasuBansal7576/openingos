@@ -2352,6 +2352,81 @@ describe("F1R-17 historical pre-F1R13 commands replay before new-write validatio
     expect(lineage.events[0]?.acceptanceLines).toEqual([]);
     expect(lineage.acceptedByLine).toEqual([]);
   });
+
+  test("historical scalar selection quantity survives exact replay with unresolved allocation", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, "scalar-selection-quantity");
+    const graph = await setupTwoLineGraph(t, project, "scalar-selection-quantity");
+    const asOwner = t.withIdentity(OWNER);
+
+    // This is the scalar-only shape written by the pre-F1R-13 handlers:
+    // quantity 2 is the selected amount, while the quote has two lines and
+    // therefore cannot safely receive an invented per-line allocation.
+    const historicSelection = {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      requirementId: graph.requirementId,
+      candidateId: graph.candidateId,
+      quoteId: graph.quoteId,
+      quoteVersion: "v-scalar-selection-quantity",
+      quantity: "2",
+      requirementVersion: 1,
+      idempotencyKey: "old-scalar-selection-quantity",
+    };
+    const selectionId = await t.run((ctx) =>
+      ctx.db.insert("selections", {
+        ...historicSelection,
+        actor: OWNER.tokenIdentifier,
+        createdAt: Date.now(),
+      }),
+    );
+    const historicOrder = {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      selectionId,
+      orderedQuantity: "1",
+      idempotencyKey: "old-scalar-order-quantity",
+    };
+    const orderId = await t.run((ctx) =>
+      ctx.db.insert("orders", {
+        ...historicOrder,
+        requirementId: graph.requirementId,
+        quoteId: graph.quoteId,
+        quoteVersion: "v-scalar-selection-quantity",
+        requirementVersion: 1,
+        state: "recorded" as const,
+        amendmentCount: 0,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      }),
+    );
+
+    const beforeReplay = await tableCounts(t, project);
+    const replayedSelection = await asOwner.mutation(recordSelectionRef, historicSelection);
+    expect(replayedSelection).toMatchObject({
+      ok: true,
+      selectionId,
+      deduplicated: true,
+    });
+    const replayedOrder = await asOwner.mutation(recordOrderRef, historicOrder);
+    expect(replayedOrder).toMatchObject({ ok: true, orderId, deduplicated: true });
+    expect(await tableCounts(t, project)).toEqual(beforeReplay);
+
+    const lineage = await asOwner.query(getOrderLineageRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      orderId,
+    });
+    if (!lineage.ok) throw new Error(`scalar selection lineage failed: ${JSON.stringify(lineage)}`);
+    expect(lineage.selection.quantity).toBe("2");
+    expect(lineage.selection.selectionLines).toEqual([]);
+    expect(lineage.selection.lineAllocation).toEqual({
+      status: "unresolved",
+      reason: "historical-scalar-multiline",
+    });
+    expect(lineage.order.orderedQuantity).toBe("1");
+    expect(lineage.orderLines).toEqual([]);
+  });
 });
 
 describe("Greptile r4056517360: bounded commitment scans", () => {
