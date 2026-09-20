@@ -411,9 +411,210 @@ describe("F1R-06 compatibility binds resolving versioned evidence", () => {
     expect(rebased.ok).toBe(false);
     if (!rebased.ok) expect(rebased.code).toBe("conflicted-evidence");
   });
+
+  test.each([49, 50, 51, 125])("conflict invalidates every dependent candidate at %i rows and preserves unrelated findings", async (count) => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, `compat-many-${count}`);
+    const asOwner = t.withIdentity(OWNER);
+    const graph = await setupGraph(t, project, `many-${count}`);
+    const shared = await recordFieldEvidence(t, project, { requirementId: graph.requirementId }, `compat-many-evidence-${count}`);
+    if (!shared.ok) throw new Error("shared evidence setup failed");
+    const version = await resolveVerified(t, project, shared.evidenceId);
+    const addCandidate = async (index: number) => {
+      const created = await asOwner.mutation(recordCandidateRef, {
+        organizationId: project.orgId,
+        projectId: project.projectId,
+        requirementId: graph.requirementId,
+        vendorId: graph.vendorId,
+        productModel: `Model many-${count}-${index}`,
+        variant: "220V",
+        conversationState: "draft",
+      });
+      if (!created.ok) throw new Error("candidate setup failed");
+      return created.candidateId;
+    };
+    const candidateIds: Id<"candidates">[] = [graph.candidateId];
+    for (let index = 1; index < count; index += 1) candidateIds.push(await addCandidate(index));
+    for (const candidateId of candidateIds) {
+      const verified = await verify(t, project, candidateId, [{ sourceId: shared.evidenceId, version }]);
+      expect(verified.ok).toBe(true);
+    }
+
+    const unrelatedGraph = await setupGraph(t, project, `many-unrelated-${count}`);
+    const unrelatedEvidence = await recordFieldEvidence(
+      t,
+      project,
+      { requirementId: unrelatedGraph.requirementId },
+      `compat-many-unrelated-${count}`,
+    );
+    if (!unrelatedEvidence.ok) throw new Error("unrelated evidence setup failed");
+    const unrelatedVersion = await resolveVerified(t, project, unrelatedEvidence.evidenceId);
+    const unrelatedVerified = await verify(t, project, unrelatedGraph.candidateId, [
+      { sourceId: unrelatedEvidence.evidenceId, version: unrelatedVersion },
+    ]);
+    expect(unrelatedVerified.ok).toBe(true);
+
+    const conflicting = await recordFieldEvidence(t, project, { requirementId: graph.requirementId }, `compat-many-conflict-${count}`);
+    if (!conflicting.ok) throw new Error("conflicting evidence setup failed");
+    const disputed = await asOwner.mutation(linkEvidenceConflictRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      evidenceId: shared.evidenceId,
+      conflictingIds: [conflicting.evidenceId],
+    });
+    expect(disputed.ok).toBe(true);
+
+    const affected = await t.run((ctx) =>
+      ctx.db
+        .query("candidates")
+        .withIndex("by_requirement", (q) => q.eq("requirementId", graph.requirementId))
+        .collect(),
+    );
+    expect(affected.filter((row) => row.compatibility === "pass")).toHaveLength(0);
+    const unrelated = await t.run((ctx) => ctx.db.get(unrelatedGraph.candidateId));
+    expect(unrelated?.compatibility).toBe("pass");
+  });
+
+  test("fanout above the integrity bound is denied before evidence or pass rows change", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, "compat-fanout-boundary");
+    const asOwner = t.withIdentity(OWNER);
+    const graph = await setupGraph(t, project, "fanout-boundary");
+    const shared = await recordFieldEvidence(t, project, { requirementId: graph.requirementId }, "compat-fanout-boundary-evidence");
+    if (!shared.ok) throw new Error("shared evidence setup failed");
+    const version = await resolveVerified(t, project, shared.evidenceId);
+    const count = sourcing.MAX_COMPATIBILITY_FANOUT + 1;
+    for (let index = 1; index < count; index += 1) {
+      const created = await asOwner.mutation(recordCandidateRef, {
+        organizationId: project.orgId,
+        projectId: project.projectId,
+        requirementId: graph.requirementId,
+        vendorId: graph.vendorId,
+        productModel: `Model fanout-boundary-${index}`,
+        variant: "220V",
+        conversationState: "draft",
+      });
+      if (!created.ok) throw new Error("candidate setup failed");
+    }
+    await t.run(async (ctx) => {
+      const candidates = await ctx.db
+        .query("candidates")
+        .withIndex("by_requirement", (q) => q.eq("requirementId", graph.requirementId))
+        .take(count);
+      expect(candidates).toHaveLength(count);
+      for (const candidate of candidates) {
+        await ctx.db.patch(candidate._id, {
+          compatibility: "pass",
+          compatibilityEvidenceRefs: [{ sourceId: shared.evidenceId, version }],
+        });
+      }
+    });
+    const beforeEvidence = await t.run((ctx) => ctx.db.get(shared.evidenceId));
+    const conflicting = await recordFieldEvidence(t, project, { requirementId: graph.requirementId }, "compat-fanout-boundary-conflict");
+    if (!conflicting.ok) throw new Error("conflicting evidence setup failed");
+    const denied = await asOwner.mutation(linkEvidenceConflictRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      evidenceId: shared.evidenceId,
+      conflictingIds: [conflicting.evidenceId],
+    });
+    expect(denied.ok).toBe(false);
+    if (!denied.ok) expect(denied.code).toBe("invalid-payload");
+    const afterEvidence = await t.run((ctx) => ctx.db.get(shared.evidenceId));
+    expect(afterEvidence).toEqual(beforeEvidence);
+    const rows = await t.run((ctx) =>
+      ctx.db
+        .query("candidates")
+        .withIndex("by_requirement", (q) => q.eq("requirementId", graph.requirementId))
+        .take(count),
+    );
+    expect(rows.every((row) => row.compatibility === "pass")).toBe(true);
+  });
 });
 
 describe("F1R-07 replays compare the full material snapshot", () => {
+  test("public and internal exact replay deduplicates after verification and conflict without resetting state", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, "replay-after-resolution");
+    const args = {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      field: "power",
+      sourceKind: "manual",
+      capturedAt: 1,
+      originalValue: "220V",
+      normalizedValue: "220V",
+      freshness: "fresh" as const,
+      counterpartyRole: "vendor" as const,
+      idempotencyKey: "replay-after-resolution-public",
+    };
+    const first = await t.withIdentity(OWNER).mutation(recordProductEvidenceRef, args);
+    expect(first.ok).toBe(true);
+    if (!first.ok) throw new Error("public evidence setup failed");
+    const resolved = await resolveVerified(t, project, first.evidenceId);
+    const replay = await t.withIdentity(OWNER).mutation(recordProductEvidenceRef, args);
+    expect(replay).toEqual({ ok: true, evidenceId: first.evidenceId, deduplicated: true });
+    const conflict = await t.withIdentity(OWNER).mutation(recordProductEvidenceRef, {
+      ...args,
+      normalizedValue: "110V",
+    });
+    expect(conflict.ok).toBe(false);
+    if (!conflict.ok) expect(conflict.code).toBe("duplicate-conflict");
+
+    const internalArgs = {
+      ...args,
+      executionMode: "recorded" as const,
+      idempotencyKey: "replay-after-resolution-internal",
+    };
+    const internal = await t.mutation(ingestProductEvidenceRef, internalArgs);
+    expect(internal.ok).toBe(true);
+    if (!internal.ok) throw new Error("internal evidence setup failed");
+    await t.withIdentity(OWNER).mutation(linkEvidenceConflictRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      evidenceId: first.evidenceId,
+      conflictingIds: [internal.evidenceId],
+    });
+    const internalReplay = await t.mutation(ingestProductEvidenceRef, internalArgs);
+    expect(internalReplay).toEqual({ ok: true, evidenceId: internal.evidenceId, deduplicated: true });
+    const publicRow = await t.run((ctx) => ctx.db.get(first.evidenceId));
+    const internalRow = await t.run((ctx) => ctx.db.get(internal.evidenceId));
+    expect(publicRow?.verification).toBe("conflicted");
+    expect(publicRow?.version).not.toBe(resolved);
+    expect(internalRow?.verification).toBe("unverified");
+  });
+
+  test("legacy evidence without an ingestion identity replays after verification without rewriting state", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, "replay-legacy-identity");
+    const args = {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      field: "power",
+      sourceKind: "manual",
+      capturedAt: 1,
+      originalValue: "220V",
+      normalizedValue: "220V",
+      freshness: "fresh" as const,
+      counterpartyRole: "vendor" as const,
+      idempotencyKey: "replay-legacy-identity",
+    };
+    const first = await t.withIdentity(OWNER).mutation(recordProductEvidenceRef, args);
+    expect(first.ok).toBe(true);
+    if (!first.ok) throw new Error("legacy evidence setup failed");
+    await t.run(async (ctx) => {
+      await ctx.db.patch(first.evidenceId, { ingestionIdentity: undefined });
+    });
+    const resolved = await resolveVerified(t, project, first.evidenceId);
+    const beforeReplay = await t.run((ctx) => ctx.db.get(first.evidenceId));
+    const replay = await t.withIdentity(OWNER).mutation(recordProductEvidenceRef, args);
+    expect(replay).toEqual({ ok: true, evidenceId: first.evidenceId, deduplicated: true });
+    const afterReplay = await t.run((ctx) => ctx.db.get(first.evidenceId));
+    expect(afterReplay?.verification).toBe(beforeReplay?.verification);
+    expect(afterReplay?.version).toBe(resolved);
+    expect(afterReplay?.lastCheckedAt).toBe(beforeReplay?.lastCheckedAt);
+  });
+
   test("each omitted evidence field conflicts on the public path", async () => {
     const t = convexTest(schema, modules);
     const project = await setupProject(t, "replay-public");

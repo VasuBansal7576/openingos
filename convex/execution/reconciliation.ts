@@ -15,6 +15,17 @@
 import { v } from "convex/values";
 import { f1InternalMutation } from "../server.js";
 import { denialValidator } from "../access/checks.js";
+import type { Id } from "../_generated/dataModel.js";
+
+function receiptScopeMatches(
+  receipt: { readonly organizationId?: Id<"organizations">; readonly projectId?: Id<"projects"> },
+  operation: {
+    readonly organizationId: Id<"organizations">;
+    readonly projectId: Id<"projects">;
+  },
+): boolean {
+  return receipt.organizationId === operation.organizationId && receipt.projectId === operation.projectId;
+}
 
 /** Internal: ingest one provider event idempotently. */
 export const ingestEvent = f1InternalMutation({
@@ -46,6 +57,13 @@ export const ingestEvent = f1InternalMutation({
       )
       .unique();
     if (seen !== null) {
+      if (
+        !receiptScopeMatches(seen, { organizationId: args.organizationId, projectId: args.projectId }) ||
+        seen.processingVersion !== args.processingVersion ||
+        seen.outcome !== args.outcome
+      ) {
+        return { ok: false as const, code: "duplicate-conflict", message: "event receipt facts conflict" };
+      }
       return { ok: true as const, deduplicated: true, outcome: seen.outcome };
     }
     await ctx.db.insert("processedEvents", {
@@ -54,6 +72,8 @@ export const ingestEvent = f1InternalMutation({
       eventId: args.eventId,
       processingVersion: args.processingVersion,
       outcome: args.outcome,
+      organizationId: args.organizationId,
+      projectId: args.projectId,
       createdAt: Date.now(),
     });
     return { ok: true as const, deduplicated: false, outcome: args.outcome };
@@ -111,30 +131,26 @@ export const recordLateDelivery = f1InternalMutation({
         q.eq("provider", provider).eq("environment", environment).eq("eventId", args.providerEventId),
       )
       .unique();
-    // F1R-12: receipt and application are separate. An unbound early
-    // receipt binds to this operation exactly once; an event already
-    // applied to this operation dedupes; an event bound elsewhere stays
-    // fenced with zero new effect.
+    const job = await ctx.db.get(operation.jobId);
     if (seen !== null) {
-      if (seen.operationId === args.operationId) {
-        const job = await ctx.db.get(operation.jobId);
-        return {
-          ok: true as const,
-          jobState: job?.state ?? "unknown",
-          delivery: "observedSuccess",
-          deduplicated: true,
-        };
+      if (!receiptScopeMatches(seen, operation)) {
+        return { ok: false as const, code: "duplicate-conflict", message: "event receipt belongs to another project" };
       }
-      if (seen.operationId !== undefined) {
-        const job = await ctx.db.get(operation.jobId);
-        return {
-          ok: true as const,
-          jobState: job?.state ?? "unknown",
-          delivery: operation.state,
-          deduplicated: true,
-        };
+      if (seen.operationId !== undefined && seen.operationId !== args.operationId) {
+        return { ok: false as const, code: "duplicate-conflict", message: "event receipt is bound to another operation" };
       }
-      await ctx.db.patch(seen._id, { operationId: args.operationId });
+      // A failure receipt is final. An unknown receipt can later gain an
+      // authoritative success application, but the immutable receipt fact
+      // itself is never rewritten.
+      if (seen.outcome === "failure") {
+        return { ok: false as const, code: "duplicate-conflict", message: "event receipt records failure" };
+      }
+      await ctx.db.patch(seen._id, {
+        operationId: args.operationId,
+        applicationOutcome: "success",
+        applicationState: "observedSuccess",
+        appliedAt: now,
+      });
     } else {
       await ctx.db.insert("processedEvents", {
         provider,
@@ -142,7 +158,12 @@ export const recordLateDelivery = f1InternalMutation({
         eventId: args.providerEventId,
         processingVersion: 1,
         outcome: "success",
+        organizationId: operation.organizationId,
+        projectId: operation.projectId,
         operationId: args.operationId,
+        applicationOutcome: "success",
+        applicationState: "observedSuccess",
+        appliedAt: now,
         createdAt: now,
       });
     }
@@ -163,7 +184,6 @@ export const recordLateDelivery = f1InternalMutation({
         });
       }
     }
-    const job = await ctx.db.get(operation.jobId);
     return {
       ok: true as const,
       jobState: job?.state ?? "unknown",
