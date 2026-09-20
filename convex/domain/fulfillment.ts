@@ -1479,6 +1479,23 @@ export const getOrderLineage = f1Query({
  */
 const ORDER_HISTORY_PAGE_MAX = 200;
 
+/**
+ * Greptile pagination budget hardening: the caller-controlled read
+ * budgets are normalized alongside the page size so total server work
+ * stays deterministically bounded even when an `endCursor` range is
+ * supplied or the maximum limits are oversized or non-positive.
+ * Tighter caller budgets are preserved (the minimum wins); absent,
+ * non-finite, or non-positive budgets fall back to these server caps,
+ * so every call carries an explicit bound into `paginate`.
+ */
+const ORDER_HISTORY_SCAN_ROW_CAP = 1000;
+const ORDER_HISTORY_SCAN_BYTE_CAP = 2 * 1024 * 1024;
+
+function normalizeHistoryBudget(value: number | undefined, cap: number): number {
+  if (value === undefined || !Number.isFinite(value) || value < 1) return cap;
+  return Math.min(Math.floor(value), cap);
+}
+
 function clampHistoryPageOpts(paginationOpts: {
   readonly numItems: number;
   readonly cursor: string | null;
@@ -1498,7 +1515,12 @@ function clampHistoryPageOpts(paginationOpts: {
   const numItems = Number.isFinite(floored)
     ? Math.min(Math.max(floored, 1), ORDER_HISTORY_PAGE_MAX)
     : ORDER_HISTORY_PAGE_MAX;
-  return { ...paginationOpts, numItems };
+  return {
+    ...paginationOpts,
+    numItems,
+    maximumRowsRead: normalizeHistoryBudget(paginationOpts.maximumRowsRead, ORDER_HISTORY_SCAN_ROW_CAP),
+    maximumBytesRead: normalizeHistoryBudget(paginationOpts.maximumBytesRead, ORDER_HISTORY_SCAN_BYTE_CAP),
+  };
 }
 
 /**
