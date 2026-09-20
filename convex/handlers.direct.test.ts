@@ -193,6 +193,21 @@ const OWNER_B = { tokenIdentifier: "direct-owner-b" };
 const ATTACKER = { tokenIdentifier: "direct-attacker" };
 const OWNER_MAILBOX = "owner-supplier@example.test";
 
+// Strict RFQ authority (ADR-0007 / D-17): every communication grant and
+// operation payload must carry an anchored purchasing-communication body on
+// its own — validateWorkflowPayload rejects the shared helper's generic
+// fixture body. Key shape, owner-roleplay profile, owner recipient, and
+// empty CC/BCC come from the shared helper unchanged; only the body carries
+// the RFQ anchor (same precedent as f1r20r22.test.ts). The body avoids the
+// word "reply" so it never reads as a thread reply requiring a conversation.
+function directCommsPayload(to: string): Record<string, unknown> {
+  return {
+    ...commsPayload(to),
+    subject: "Controlled RFQ fixture",
+    body: "Send the controlled RFQ to the owner playing supplier.",
+  };
+}
+
 async function setupCommsProject(
   t: ReturnType<typeof convexTest>,
   owner: { tokenIdentifier: string },
@@ -247,10 +262,13 @@ async function setupCommsProject(
     communicationProfile: COMMUNICATION_PROFILE_OWNER_ROLEPLAY,
     recipientConfigVersion: recipient.version,
     inputVersions: { brief: "v1" },
-    payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
+    payloadJson: JSON.stringify(directCommsPayload(OWNER_MAILBOX)),
     costCeilingMicroUsd: 100_000,
     roundLimit: 2,
     expiresAt: Date.now() + 3_600_000,
+    // Exact current authority: one project-scoped communication.send entry
+    // bound to this project. No conversation ref exists yet at grant time.
+    workflowAuthorities: [{ operationId: "communication.send", projectId: proj.projectId }],
   });
   if (!grant.ok) throw new Error("grant setup failed");
   return { orgId: org.organizationId, projectId: proj.projectId, grantId: grant.grantId };
@@ -294,7 +312,7 @@ describe("direct cross-org and restricted denials before dedupe", () => {
       grantId: victim.grantId,
     });
     if (!job.ok) throw new Error("job setup failed");
-    const payloadJson = JSON.stringify(commsPayload(OWNER_MAILBOX));
+    const payloadJson = JSON.stringify(directCommsPayload(OWNER_MAILBOX));
     const created = await asVictim.mutation(createOperationRef, {
       jobId: job.jobId,
       organizationId: victim.orgId,
@@ -325,7 +343,7 @@ describe("direct cross-org and restricted denials before dedupe", () => {
       projectId: victim.projectId,
       kind: "communication.send",
       requestId: "req-direct-victim",
-      payloadJson: JSON.stringify(commsPayload("other@example.test")),
+      payloadJson: JSON.stringify(directCommsPayload("other@example.test")),
       grantId: victim.grantId,
     });
     expect(changed.ok).toBe(false);
@@ -376,7 +394,7 @@ describe("direct cross-org and restricted denials before dedupe", () => {
       grantId: setup.grantId,
     });
     if (!job.ok) throw new Error("restricted job failed");
-    const payloadJson = JSON.stringify(commsPayload(OWNER_MAILBOX));
+    const payloadJson = JSON.stringify(directCommsPayload(OWNER_MAILBOX));
     const created = await asApprover.mutation(createOperationRef, {
       jobId: job.jobId,
       organizationId: setup.orgId,
@@ -419,7 +437,7 @@ describe("direct cross-org and restricted denials before dedupe", () => {
       projectId: victim.projectId,
       kind: "communication.send",
       requestId: "req-direct-oracle",
-      payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
+      payloadJson: JSON.stringify(directCommsPayload(OWNER_MAILBOX)),
       grantId: victim.grantId,
     });
     if (!created.ok) throw new Error("operation setup failed");
@@ -953,7 +971,7 @@ describe("direct checkpoint-2 money, budgets, and reconciliation", () => {
       communicationProfile: COMMUNICATION_PROFILE_OWNER_ROLEPLAY,
       recipientConfigVersion: 1,
       inputVersions: { brief: "v1" },
-      payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
+      payloadJson: JSON.stringify(directCommsPayload(OWNER_MAILBOX)),
       costCeilingMicroUsd: 100_000,
       expiresAt: Date.now() + 3_600_000,
     };
@@ -1020,7 +1038,7 @@ describe("direct checkpoint-2 money, budgets, and reconciliation", () => {
       communicationProfile: COMMUNICATION_PROFILE_OWNER_ROLEPLAY,
       recipientConfigVersion: 1,
       inputVersions: { brief: "rounds" },
-      payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
+      payloadJson: JSON.stringify(directCommsPayload(OWNER_MAILBOX)),
       costCeilingMicroUsd: 500_000,
       roundLimit: 1,
       expiresAt: Date.now() + 3_600_000,
@@ -1040,7 +1058,7 @@ describe("direct checkpoint-2 money, budgets, and reconciliation", () => {
       projectId: setup.projectId,
       kind: "communication.send",
       requestId: "req-round-1",
-      payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
+      payloadJson: JSON.stringify(directCommsPayload(OWNER_MAILBOX)),
       grantId: limited.grantId,
     });
     expect(first.ok).toBe(true);
@@ -1050,7 +1068,7 @@ describe("direct checkpoint-2 money, budgets, and reconciliation", () => {
       projectId: setup.projectId,
       kind: "communication.send",
       requestId: "req-round-2",
-      payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
+      payloadJson: JSON.stringify(directCommsPayload(OWNER_MAILBOX)),
       grantId: limited.grantId,
     });
     expect(second.ok).toBe(false);
@@ -1068,7 +1086,7 @@ describe("direct checkpoint-2 money, budgets, and reconciliation", () => {
       communicationProfile: COMMUNICATION_PROFILE_OWNER_ROLEPLAY,
       recipientConfigVersion: 1,
       inputVersions: { brief: "v1" },
-      payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
+      payloadJson: JSON.stringify(directCommsPayload(OWNER_MAILBOX)),
       costCeilingMicroUsd: 100_000,
       roundLimit: 3,
       expiresAt: Date.now() + 3_600_000,
@@ -1088,7 +1106,7 @@ describe("direct checkpoint-2 money, budgets, and reconciliation", () => {
       projectId: setup.projectId,
       kind: "communication.send",
       requestId: "req-alt-grant",
-      payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
+      payloadJson: JSON.stringify(directCommsPayload(OWNER_MAILBOX)),
       grantId: grant2.grantId,
     });
     expect(created.ok).toBe(false);
@@ -1113,7 +1131,7 @@ describe("direct checkpoint-2 money, budgets, and reconciliation", () => {
       projectId: setup.projectId,
       kind: "communication.send",
       requestId: "req-versions",
-      payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
+      payloadJson: JSON.stringify(directCommsPayload(OWNER_MAILBOX)),
       grantId: setup.grantId,
     });
     if (!created.ok) throw new Error("operation setup failed");
@@ -1158,7 +1176,7 @@ describe("direct checkpoint-2 money, budgets, and reconciliation", () => {
       projectId: setup.projectId,
       kind: "communication.send",
       requestId: "req-resrel",
-      payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
+      payloadJson: JSON.stringify(directCommsPayload(OWNER_MAILBOX)),
       grantId: setup.grantId,
       reservationId: reservation.reservationId,
     });
@@ -1212,7 +1230,7 @@ describe("direct checkpoint-2 money, budgets, and reconciliation", () => {
       projectId: setup.projectId,
       kind: "communication.send",
       requestId: "req-late-direct",
-      payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
+      payloadJson: JSON.stringify(directCommsPayload(OWNER_MAILBOX)),
       grantId: setup.grantId,
       reservationId: reservation.reservationId,
     });
@@ -1322,7 +1340,7 @@ describe("direct checkpoint-2 money, budgets, and reconciliation", () => {
       projectId: setup.projectId,
       kind: "communication.send",
       requestId: "req-resend-direct",
-      payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
+      payloadJson: JSON.stringify(directCommsPayload(OWNER_MAILBOX)),
       grantId: setup.grantId,
       reservationId: reservation.reservationId,
     });
@@ -1392,7 +1410,7 @@ describe("direct checkpoint-2 money, budgets, and reconciliation", () => {
       projectId: setup.projectId,
       kind: "communication.send",
       requestId: "req-direct-receipt-application",
-      payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
+      payloadJson: JSON.stringify(directCommsPayload(OWNER_MAILBOX)),
       grantId: setup.grantId,
       reservationId: reservation.reservationId,
     });
@@ -1470,7 +1488,7 @@ describe("direct checkpoint-2 money, budgets, and reconciliation", () => {
         projectId: setup.projectId,
         kind: "communication.send",
         requestId,
-        payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
+        payloadJson: JSON.stringify(directCommsPayload(OWNER_MAILBOX)),
         grantId: setup.grantId,
         reservationId: reservation.reservationId,
       });
@@ -1654,7 +1672,7 @@ describe("direct checkpoint-A authority hardening", () => {
       communicationProfile: COMMUNICATION_PROFILE_OWNER_ROLEPLAY,
       recipientConfigVersion: 1,
       inputVersions: { brief: "v1" },
-      payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
+      payloadJson: JSON.stringify(directCommsPayload(OWNER_MAILBOX)),
       costCeilingMicroUsd: 100_000,
       roundLimit: 2,
       expiresAt: Date.now() + 3_600_000,
@@ -1709,7 +1727,7 @@ describe("direct checkpoint-A authority hardening", () => {
       projectId: setup.projectId,
       kind: "communication.send",
       requestId: "req-cancel-release",
-      payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
+      payloadJson: JSON.stringify(directCommsPayload(OWNER_MAILBOX)),
       grantId: setup.grantId,
       reservationId: reservation.reservationId,
     });
@@ -1748,7 +1766,7 @@ describe("direct checkpoint-A authority hardening", () => {
       projectId: setup.projectId,
       kind: "communication.send",
       requestId: "req-bare-claim",
-      payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
+      payloadJson: JSON.stringify(directCommsPayload(OWNER_MAILBOX)),
       grantId: setup.grantId,
     });
     if (!bare.ok) throw new Error("bare create failed");
@@ -1767,7 +1785,7 @@ describe("direct checkpoint-A authority hardening", () => {
       communicationProfile: COMMUNICATION_PROFILE_OWNER_ROLEPLAY,
       recipientConfigVersion: 1,
       inputVersions: { brief: "v1" },
-      payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
+      payloadJson: JSON.stringify(directCommsPayload(OWNER_MAILBOX)),
       costCeilingMicroUsd: 100_000,
       roundLimit: 5,
       expiresAt: Date.now() + 3_600_000,
@@ -1794,7 +1812,7 @@ describe("direct checkpoint-A authority hardening", () => {
       organizationId: setup.orgId,
       projectId: setup.projectId,
       kind: "communication.send",
-      payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
+      payloadJson: JSON.stringify(directCommsPayload(OWNER_MAILBOX)),
       grantId: roomy.grantId,
       reservationId: reservation.reservationId,
     };
@@ -1813,7 +1831,7 @@ describe("direct checkpoint-A authority hardening", () => {
       communicationProfile: COMMUNICATION_PROFILE_OWNER_ROLEPLAY,
       recipientConfigVersion: 1,
       inputVersions: { brief: "v1" },
-      payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
+      payloadJson: JSON.stringify(directCommsPayload(OWNER_MAILBOX)),
       costCeilingMicroUsd: 100_000,
       roundLimit: 3,
       expiresAt: Date.now() + 3_600_000,
@@ -1842,7 +1860,7 @@ describe("direct checkpoint-A authority hardening", () => {
       communicationProfile: COMMUNICATION_PROFILE_OWNER_ROLEPLAY,
       recipientConfigVersion: 1,
       inputVersions: { brief: "single-round" },
-      payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
+      payloadJson: JSON.stringify(directCommsPayload(OWNER_MAILBOX)),
       costCeilingMicroUsd: 100_000,
       roundLimit: 1,
       expiresAt: Date.now() + 3_600_000,
@@ -1856,7 +1874,7 @@ describe("direct checkpoint-A authority hardening", () => {
       grantId: limited.grantId,
     });
     if (!job.ok) throw new Error("job setup failed");
-    const payloadJson = JSON.stringify(commsPayload(OWNER_MAILBOX));
+    const payloadJson = JSON.stringify(directCommsPayload(OWNER_MAILBOX));
     const base = {
       jobId: job.jobId,
       organizationId: setup.orgId,
