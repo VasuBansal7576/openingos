@@ -57,7 +57,9 @@ This file supplies order, not duplicate contracts or a running automation.
 - [x] Resolve ADR-0003 through ADR-0008 for controlled implementation and record every P/H/D, S and J case in the [evidence matrix](docs/verification/evidence-matrix.md).
 - [x] Integrate F1R-01 through F1R-12 repairs at `8abd7c1`, including grant-wide exposure, orphan-reservation cleanup, early/late event application, graph and revision lineage, resolvable evidence, numeric validation, watch-target isolation and project-scoped selection idempotency.
 - [x] Pass the full local matrix at `8abd7c1`: both typechecks, production build, 23 repository tests, 77 money/Jev proofs, 186 F1 tests, 117 direct Convex tests, 155 browser tests, 2 application tests, 19 provider-contract tests and 5 user-path tests.
-- [ ] Complete F1R-13 durable line and adjustment lineage, integrate it, and obtain a fresh ACCEPT verdict from the separate Astra reviewer before checking F1 or dispatching R1/C1/U1.
+- [x] Complete and integrate F1R-13 durable line and adjustment lineage at `02209d6`, including multi-line selection, order and acceptance state, typed immutable financial evidence, linked credit/refund isolation, bounded authorized reload state, exact pre-upgrade replay compatibility and quote-quantity caps.
+- [x] Pass the full local matrix at `02209d6`: both TypeScript checks, production build, 23 repository tests, 77 money/Jev proofs, 190 F1 tests, 125 direct Convex tests, 155 browser tests, 2 application tests, 19 provider-contract tests and 5 user-path tests.
+- [ ] Obtain a fresh ACCEPT verdict from the separate Astra reviewer on the fixed integrated F1 commit, and close actionable Greptile findings on the latest PR head, before checking F1 or dispatching R1/C1/U1.
 - [x] Shut down settled worker/reviewer sessions and remove both completed worker worktrees through Orca after verifying clean status and remote preservation.
 
 The completed money and Jev proof wave contains controlled proofs only, reviewed at `595d30c` with no actionable findings remaining.

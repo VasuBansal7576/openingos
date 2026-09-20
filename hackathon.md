@@ -12,7 +12,7 @@
 - **Auth:** Convex Auth foundation only; no hosted guest/private isolation proof
 - **AI models:** controlled Jev `jev-1.13.0` adapter tests only; no live application inference
 - **Started:** 2026-09-19T09:46:19Z
-- **Last updated:** 2026-09-20T07:04:00Z
+- **Last updated:** 2026-09-20T07:30:00Z
 
 ## Log
 
@@ -195,5 +195,14 @@ The unchanged independent probe artifact passes 18 of 19 checks.
 Its remaining old F1R-07 setup expects a watch with nonexistent evidence to be accepted, which conflicts with the later F1R-10 requirement that missing evidence must block the write.
 The stronger F1R-10 contract remains in place, and a fresh Astra review will use resolvable evidence when checking replay behavior.
 F1R-13 durable multi-line order, acceptance and financial-adjustment lineage remains in implementation, so F1 and all dependent R1/C1/U1 roadmap gates remain open.
+
+### 2026-09-20 - 02209d6 local checkpoint
+
+Integrated F1R-13 durable line lineage for multi-item selection, partial ordering, per-line acceptance, typed immutable adjustment evidence and isolated linked credits/refunds.
+Coordinator review rejected the first implementation until the exact pre-F1R-13 no-key scalar selection identity was preserved and new quote-quantity caps ran after historical replay.
+The fixed checkpoint passes both TypeScript checks, production build, 23 repository tests, 77 money and Jev proofs, 190 F1 tests, 125 direct Convex tests, 155 browser-executor tests, 2 application tests, 19 provider-contract tests and 5 user-path tests.
+Opened ready-for-review PR #1 at `35abe0e`; all application and repository jobs passed and Greptile started its first real PR review.
+The PR has not yet been updated to this local checkpoint, and the fresh separate Astra review plus Greptile follow-through remain pending.
+All results are controlled local evidence only; no hosted deployment, provider call, supplier contact, genuine quote or realized saving is claimed.
 This checkpoint contains controlled local evidence only.
 No hosted Convex state, live provider call, owner-mailbox exchange, public site or commercial outcome was observed.
