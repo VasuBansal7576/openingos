@@ -2533,3 +2533,90 @@ describe("admission deadline fencing (FR03)", () => {
     expect(driver.trackedLease(jobB)).toBe(handleB);
   });
 });
+
+describe("explicit expire derives the tracked acquired lease (FR03)", () => {
+  const FAR = NOW + 5_000_000;
+  const T = NOW + 2_000;
+
+  function setupShortLease(): { readonly driver: ControlledDriver; readonly jobId: string; readonly handle: string } {
+    const driver = new ControlledDriver(SECRET);
+    const req = parseJobRequest(requestFixture({
+      expiresAt: FAR,
+      sessionLease: { leaseId: "lease-1", expiresAtMs: FAR },
+    }));
+    const jobId = driver.registerJob(req, NOW) as string;
+    const lease = driver.acquireLease(jobId, {
+      organizationId: req.organizationId,
+      projectId: req.projectId,
+      leaseId: "lease-1",
+      expiresAtMs: T,
+      guest: false,
+    }, NOW);
+    if (isDenial(lease)) {
+      throw new Error(`acquire failed: ${lease.detail}`);
+    }
+    return { driver, jobId, handle: (lease as SessionLease).handle };
+  }
+
+  const CTX_SHORT = { organizationId: "org-a", projectId: "proj-a", jobId: "job-a" };
+
+  it("leaves the job tracked and resolvable at exact-1", () => {
+    const setup = setupShortLease();
+    const job = setup.driver.expire(setup.jobId, T - 1);
+    expect(job.state).toBe("queued");
+    expect(setup.driver.trackedLease(setup.jobId)).toBe(setup.handle);
+    expect(isDenial(setup.driver.sessionsForTests().resolve(setup.handle, CTX_SHORT, T - 1))).toBe(false);
+  });
+
+  it("fences and releases at exact acquired expiry with only expire(jobId, nowMs)", () => {
+    const setup = setupShortLease();
+    const job = setup.driver.expire(setup.jobId, T);
+    expect(job.state).toBe("cancelled");
+    expect(setup.driver.trackedLease(setup.jobId)).toBeUndefined();
+    const detail = mustDenialReason(setup.driver.sessionsForTests().resolve(setup.handle, CTX_SHORT, T), "lease-invalid");
+    expect(detail).toContain("released");
+    expect(job.attempts.length).toBe(0);
+  });
+
+  it("fences and releases at exact+1 with only expire(jobId, nowMs)", () => {
+    const setup = setupShortLease();
+    const job = setup.driver.expire(setup.jobId, T + 1);
+    expect(job.state).toBe("cancelled");
+    expect(setup.driver.trackedLease(setup.jobId)).toBeUndefined();
+  });
+
+  it("fences a running job at exact acquired expiry, preserving its attempt", async () => {
+    const setup = setupShortLease();
+    const claim = setup.driver.authorize({
+      jobId: setup.jobId, nowMs: NOW, operationId: "readVisibleText", viaRecovery: false, sessionHandle: setup.handle,
+    });
+    if (isDenial(claim)) {
+      throw new Error("seed claim failed");
+    }
+    const stub = driverStub(setup.driver);
+    const settled = await setup.driver.dispatch(setup.jobId, (claim as IssuedClaim).claimId, stub.transport, { nowMs: NOW });
+    expect(settled.receipt.outcome).toBe("observed-success");
+    const job = setup.driver.expire(setup.jobId, T);
+    expect(job.state).toBe("cancelled");
+    expect(setup.driver.trackedLease(setup.jobId)).toBeUndefined();
+    expect(job.attempts.length).toBe(1);
+    expect(job.attempts[0]?.state).toBe("observedSuccess");
+  });
+
+  it("ignores untracked handles and keeps waiting work without deadlines", async () => {
+    const setup = setupShortLease();
+    const claim = setup.driver.authorize({
+      jobId: setup.jobId, nowMs: NOW, operationId: "readVisibleText", viaRecovery: false, sessionHandle: setup.handle,
+    });
+    if (isDenial(claim)) {
+      throw new Error("seed claim failed");
+    }
+    const stub = driverStub(setup.driver, [{ outcome: "waiting" }]);
+    const out = await setup.driver.dispatch(setup.jobId, (claim as IssuedClaim).claimId, stub.transport, { nowMs: NOW });
+    expect(out.job.state).toBe("waitingForSupplier");
+    // Waiting released its session; expire derives no acquired deadline and
+    // no other deadline is reached, so the job is untouched.
+    const job = setup.driver.expire(setup.jobId, NOW + 1);
+    expect(job.state).toBe("waitingForSupplier");
+  });
+});

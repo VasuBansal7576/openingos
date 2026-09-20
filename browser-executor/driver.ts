@@ -134,6 +134,15 @@ export interface ControlledDriverOptions {
   readonly stepTimeoutMs?: number;
 }
 
+/**
+ * Typed internal options for the fence transition. Only narrows authority:
+ * an explicit claim expiry adds one more deadline to the derived set (job,
+ * signed-request lease, tracked acquired lease, ceiling).
+ */
+export interface ExpireOptions {
+  readonly claimExpiryMs?: number;
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "transport failed";
 }
@@ -406,7 +415,9 @@ export class ControlledDriver {
         !inspected.released &&
         input.nowMs >= inspected.expiresAtMs
       ) {
-        this.expire(input.jobId, input.nowMs, undefined, inspected.expiresAtMs);
+        // The tracked handle is the presented one, so plain expire derives
+        // the same acquired deadline internally.
+        this.expire(input.jobId, input.nowMs);
         return denied(
           "lease-invalid",
           `session lease "${inspected.leaseId}" reached its expiry; fenced with session release`,
@@ -562,7 +573,7 @@ export class ControlledDriver {
       options.nowMs >= record.request.sessionLease.expiresAtMs ||
       options.nowMs >= activeCeilingAt(job)
     ) {
-      this.expire(jobId, options.nowMs, entry.claim.expiresAtMs);
+      this.expire(jobId, options.nowMs, { claimExpiryMs: entry.claim.expiresAtMs });
       return refused("job reached its expiry; fenced with zero transport calls");
     }
     const context = this.leaseContext(jobId) as LeaseContext;
@@ -696,7 +707,7 @@ export class ControlledDriver {
       }
       const atMs = effectiveNow();
       if (isExpiredAt(atMs)) {
-        this.expire(jobId, atMs, entry.claim.expiresAtMs);
+        this.expire(jobId, atMs, { claimExpiryMs: entry.claim.expiresAtMs });
         const fenced = this.jobs.get(jobId) as BrowserJob;
         // Preserve the claimed attempt as unknown on the fenced job.
         const stranded = fenced.attempts.find((item) => item.attemptId === attemptId);
@@ -741,7 +752,7 @@ export class ControlledDriver {
       if (isExpiredAt(atMs)) {
         // Reached job/lease/claim/ceiling expiry: fence, release the session,
         // and retain any late outcome on the fenced job.
-        this.expire(jobId, atMs, entry.claim.expiresAtMs);
+        this.expire(jobId, atMs, { claimExpiryMs: entry.claim.expiresAtMs });
         const fencedAt = effectiveNow();
         void transportPromise.then(
           (late) => settleLateResult(late, Math.max(atMs, fencedAt)),
@@ -761,7 +772,7 @@ export class ControlledDriver {
     if ("transportError" in raced) {
       const atMs = effectiveNow();
       if (isExpiredAt(atMs)) {
-        this.expire(jobId, atMs, entry.claim.expiresAtMs);
+        this.expire(jobId, atMs, { claimExpiryMs: entry.claim.expiresAtMs });
         const fenced = this.jobs.get(jobId) as BrowserJob;
         const stranded = fenced.attempts.find((item) => item.attemptId === attemptId);
         if (stranded !== undefined && (stranded.state === "dispatching" || stranded.state === "outcomeUnknown")) {
@@ -817,11 +828,11 @@ export class ControlledDriver {
         nowMs >= activeCeilingAt(latest) ||
         (claimExpiryMs !== undefined && nowMs >= claimExpiryMs)
       ) {
-        this.expire(jobId, nowMs, claimExpiryMs);
+        this.expire(jobId, nowMs, claimExpiryMs === undefined ? undefined : { claimExpiryMs });
         latest = this.jobs.get(jobId) as BrowserJob;
       }
     } else if (nowMs >= latest.request.expiresAt) {
-      this.expire(jobId, nowMs, claimExpiryMs);
+      this.expire(jobId, nowMs, claimExpiryMs === undefined ? undefined : { claimExpiryMs });
       latest = this.jobs.get(jobId) as BrowserJob;
     }
     if (latest.state === "cancelled") {
@@ -898,16 +909,22 @@ export class ControlledDriver {
    * session; unresolved in-flight attempts keep their dispatching state for
    * truthful reconciliation.
    */
-  expire(jobId: string, nowMs: number, claimExpiryMs?: number, acquiredExpiryMs?: number): BrowserJob {
+  expire(jobId: string, nowMs: number, options?: ExpireOptions): BrowserJob {
     const job = this.jobs.get(jobId);
     if (job === undefined) {
       throw new Error(`job "${jobId}" is not registered`);
     }
     const record = this.requests.get(jobId);
+    // The acquired lease deadline is derived from the currently tracked
+    // handle itself, so a plain expire(jobId, nowMs) fences a reached
+    // acquired expiry. Stale or untracked handles can never widen or narrow
+    // this: only the tracked record participates.
+    const trackedHandle = this.leases.get(jobId);
+    const trackedLease = trackedHandle === undefined ? undefined : this.sessions.inspect(trackedHandle);
     const fenced = fenceExpired(job, nowMs, {
       ...(record === undefined ? {} : { leaseExpiryMs: record.request.sessionLease.expiresAtMs }),
-      ...(acquiredExpiryMs === undefined ? {} : { acquiredExpiryMs }),
-      ...(claimExpiryMs === undefined ? {} : { claimExpiryMs }),
+      ...(trackedLease?.expiresAtMs === undefined ? {} : { acquiredExpiryMs: trackedLease.expiresAtMs }),
+      ...(options?.claimExpiryMs === undefined ? {} : { claimExpiryMs: options.claimExpiryMs }),
       ceilingAtMs: activeCeilingAt(job),
     });
     this.jobs.set(jobId, fenced);
