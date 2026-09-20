@@ -14,6 +14,7 @@ import { v } from "convex/values";
 import type { Id } from "../_generated/dataModel.js";
 import { f1Mutation, f1Query } from "../server.js";
 import { canonicalJson, payloadHash } from "../shared/hashing.js";
+import { sha256HexOfCanonical } from "../shared/sha256.js";
 import { isExpired } from "../shared/time.js";
 import { classifyScope, containsInstructionOverride } from "../shared/scope.js";
 import { checkProjectAccess, denialValidator, identityOf, requireCapability } from "../access/checks.js";
@@ -124,6 +125,7 @@ export const start = f1Mutation({
         .withIndex("by_active", (q) => q.eq("active", true))
         .unique();
       const autoPayload = { research: "bounded-server-grant" };
+      const autoCanonical = canonicalJson(autoPayload);
       grantId = await ctx.db.insert("grants", {
         organizationId: args.organizationId,
         projectId: args.projectId,
@@ -131,8 +133,9 @@ export const start = f1Mutation({
         communicationProfile: "ownerRoleplay",
         recipientConfigVersion: recipient?.version ?? 0,
         inputVersions: {},
-        canonicalPayload: canonicalJson(autoPayload),
+        canonicalPayload: autoCanonical,
         payloadHash: payloadHash(autoPayload),
+        payloadSha256: await sha256HexOfCanonical(autoCanonical),
         costCeilingMicroUsd: 0,
         roundLimit: 0,
         expiresAt: now + 900_000,

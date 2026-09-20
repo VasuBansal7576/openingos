@@ -18,8 +18,8 @@
 import { v } from "convex/values";
 import type { Id } from "../_generated/dataModel.js";
 import { f1InternalMutation, f1Mutation, f1Query } from "../server.js";
-import { canonicalJson, normalizeMailbox, payloadHash, requestKey } from "../shared/hashing.js";
-import { sameCanonicalPayload, sha256BindingOk } from "../shared/sha256.js";
+import { canonicalJson, normalizeMailbox, parseBoundedPayloadJson, requestKey } from "../shared/hashing.js";
+import { sameCanonicalPayload, sha256BindingOk, sha256HexOfCanonical } from "../shared/sha256.js";
 import { isExpired } from "../shared/time.js";
 import { lookupCapability } from "../shared/scope.js";
 import { COMMUNICATION_PROFILE_OWNER_ROLEPLAY } from "../shared/provenance.js";
@@ -69,8 +69,7 @@ export const create = f1Mutation({
     projectId: v.id("projects"),
     kind: v.string(),
     requestId: v.string(),
-    payload: v.any(),
-    payloadSha256: v.optional(v.string()),
+    payloadJson: v.string(),
     grantId: v.id("grants"),
     reservationId: v.optional(v.id("reservations")),
   },
@@ -129,9 +128,11 @@ export const create = f1Mutation({
       return { ok: false as const, code: "expired-grant", message: "grant expired" };
     }
 
+    const parsed = parseBoundedPayloadJson(args.payloadJson);
+    if (!parsed.ok) return { ok: false as const, code: parsed.code, message: parsed.message };
+    const canonical = parsed.payload.canonical;
+    const hash = parsed.payload.hash;
     const key = requestKey(args.organizationId, args.kind, args.requestId);
-    const canonical = canonicalJson(args.payload);
-    const hash = payloadHash(args.payload);
     const existing = await ctx.db
       .query("operations")
       .withIndex("by_requestKey", (q) => q.eq("requestKey", key))
@@ -139,8 +140,7 @@ export const create = f1Mutation({
     if (existing !== null) {
       if (
         existing.jobId === args.jobId &&
-        sameCanonicalPayload(existing.normalizedPayload, canonical) &&
-        sha256BindingOk(existing.payloadSha256, args.payloadSha256)
+        sameCanonicalPayload(existing.normalizedPayload, canonical)
       ) {
         return { ok: true as const, operationId: existing._id, deduped: true };
       }
@@ -167,6 +167,7 @@ export const create = f1Mutation({
       reservationRef = args.reservationId;
     }
 
+    const payloadSha256 = await sha256HexOfCanonical(canonical);
     const operationId = await ctx.db.insert("operations", {
       organizationId: args.organizationId,
       projectId: args.projectId,
@@ -176,7 +177,7 @@ export const create = f1Mutation({
       requestKey: key,
       normalizedPayload: canonical,
       normalizedPayloadHash: hash,
-      ...(args.payloadSha256 === undefined ? {} : { payloadSha256: args.payloadSha256 }),
+      payloadSha256,
       inputVersions: { ...grant.inputVersions },
       grantId: args.grantId,
       grantVersion: grant.revocationVersion,
