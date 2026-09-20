@@ -111,10 +111,10 @@ async function uniqueRequirementForPayload(
     return undefined;
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
-  const record = parsed as Record<string, unknown>;
-  const keys = Object.keys(record).sort();
-  if (keys.length !== 1 || keys[0] !== "query" || typeof record.query !== "string") return undefined;
-  const tokens = [...new Set(record.query.match(/[A-Za-z0-9]+/g) ?? [])].slice(0, 24);
+  if (!("query" in parsed) || typeof parsed.query !== "string") return undefined;
+  const keys = Object.keys(parsed).sort();
+  if (keys.length !== 1 || keys[0] !== "query") return undefined;
+  const tokens = [...new Set(parsed.query.match(/[A-Za-z0-9]+/g) ?? [])].slice(0, 24);
   const matches = new Set<Id<"requirements">>();
   for (const token of tokens) {
     const variants = [...new Set([

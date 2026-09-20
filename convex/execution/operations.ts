@@ -134,7 +134,10 @@ export async function projectWorkflowContext(
     }
     terms.push(requirement.key, requirement.title, requirement.category);
   }
-  if (text !== undefined) {
+  // Once the grant/job chain carries an exact requirement ref, request text
+  // is payload data only. It must not pivot the bound context to another
+  // requirement or add terms that broaden the authority.
+  if (text !== undefined && matchedRequirementId === undefined) {
     const textTokens = [...new Set(text.match(/[A-Za-z0-9]+/g) ?? [])].slice(0, 24);
     const matches = new Map<Id<"requirements">, (typeof requirementPresence)[number]>();
     for (const token of textTokens) {
