@@ -98,14 +98,17 @@ export async function checkProjectAccess(
   if (project === null || project.organizationId !== organizationId) {
     return denial("denied-membership", "not authorized for this project");
   }
-  let role = bestRole(current.map((row) => row.role));
-  if (project.visibility === "restricted") {
-    const scoped = current.filter((row) => row.projectId === projectId);
-    if (scoped.length === 0) {
-      return denial("denied-membership", "not authorized for this project");
-    }
-    role = bestRole(scoped.map((row) => row.role));
+  // A membership scoped to one project never leaks authority into another
+  // project. Open projects honor org-scoped rows plus rows scoped to this
+  // project; restricted projects honor only rows scoped to this project.
+  const eligible =
+    project.visibility === "restricted"
+      ? current.filter((row) => row.projectId === projectId)
+      : current.filter((row) => row.projectId === undefined || row.projectId === projectId);
+  if (eligible.length === 0) {
+    return denial("denied-membership", "not authorized for this project");
   }
+  const role = bestRole(eligible.map((row) => row.role));
   if (!roleSatisfies(role, minRole)) {
     return denial("denied-capability", `role ${role} cannot perform ${minRole}-level work`);
   }

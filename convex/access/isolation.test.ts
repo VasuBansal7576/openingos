@@ -27,8 +27,6 @@ describe("S-04 cross-tenant isolation", () => {
         sourceKind: "supplier-page",
         contentHash: "hash-1",
         completeness: "complete",
-        counterpartyRole: "vendor",
-        executionMode: "fixture",
       },
       now,
     );
@@ -51,8 +49,6 @@ describe("S-04 cross-tenant isolation", () => {
       charges: [],
       taxBasis: "NL-EUR-INCLUSIVE",
       evidenceRefs: [],
-      counterpartyRole: "vendor",
-      executionMode: "fixture",
     }, now);
     expect(quote.ok).toBe(false);
     expect(store.snapshotCounts()).toEqual(before);
@@ -96,8 +92,6 @@ describe("S-04 cross-tenant isolation", () => {
       charges: [],
       taxBasis: "NL-EUR-INCLUSIVE",
       evidenceRefs: [],
-      counterpartyRole: "vendor",
-      executionMode: "fixture",
     }, now);
     expect(quote.ok).toBe(false);
 
@@ -221,5 +215,153 @@ describe("S-04 cross-tenant isolation", () => {
     const fixture = buildControlledFixture();
     const { store, now } = fixture;
     expect(commsPayload(CONTROLLED_OWNER_MAILBOX).to).toBe("owner-supplier@example.test");
+  });
+});
+
+describe("checkpoint-1 membership and provenance boundaries", () => {
+  test("approvers cannot grant owner or roles above themselves", () => {
+    const fixture = buildControlledFixture();
+    const { store, now } = fixture;
+    const sameLevel = store.grantMembership(
+      fixture.approverA,
+      fixture.orgPrivateA,
+      fixture.projAOpen,
+      "id-new-approver",
+      "approver",
+      now,
+    );
+    expect(sameLevel.ok).toBe(true);
+    const escalate = store.grantMembership(
+      fixture.approverA,
+      fixture.orgPrivateA,
+      fixture.projAOpen,
+      "id-new-owner",
+      "owner",
+      now,
+    );
+    expect(escalate.ok).toBe(false);
+    if (!escalate.ok) expect(escalate.code).toBe("denied-capability");
+    const ownerGrant = store.grantMembership(
+      fixture.ownerA,
+      fixture.orgPrivateA,
+      fixture.projAOpen,
+      "id-new-owner-2",
+      "owner",
+      now,
+    );
+    expect(ownerGrant.ok).toBe(true);
+  });
+
+  test("revoke binds the target membership to the stated project", () => {
+    const fixture = buildControlledFixture();
+    const { store, now } = fixture;
+    const member = store.grantMembership(
+      fixture.ownerA,
+      fixture.orgPrivateA,
+      fixture.projAOpen,
+      "id-revoke-me",
+      "viewer",
+      now,
+    );
+    if (!member.ok) throw new Error("grant failed");
+    const cross = store.revokeMembershipBound(
+      fixture.approverA,
+      fixture.orgPrivateA,
+      fixture.projARestricted,
+      member.value.id,
+      now,
+    );
+    expect(cross.ok).toBe(false);
+    const bound = store.revokeMembershipBound(
+      fixture.approverA,
+      fixture.orgPrivateA,
+      fixture.projAOpen,
+      member.value.id,
+      now,
+    );
+    expect(bound.ok).toBe(true);
+  });
+
+  test("organization administration requires org-scoped owner authority", () => {
+    const fixture = buildControlledFixture();
+    const { store, now } = fixture;
+    expect(store.authorizeOrgAdmin(fixture.ownerA, fixture.orgPrivateA, now).ok).toBe(true);
+    expect(store.authorizeOrgAdmin(fixture.approverA, fixture.orgPrivateA, now).ok).toBe(false);
+    const scoped = store.addMembership(fixture.orgPrivateA, fixture.projAOpen, "id-scoped-owner", "owner", now);
+    expect(scoped.role).toBe("owner");
+    const attempt = store.authorizeOrgAdmin("id-scoped-owner", fixture.orgPrivateA, now);
+    expect(attempt.ok).toBe(false);
+    if (!attempt.ok) expect(attempt.code).toBe("denied-capability");
+  });
+
+  test("project-scoped-only roles access their restricted project and nothing else", () => {
+    const fixture = buildControlledFixture();
+    const { store, now } = fixture;
+    store.addMembership(fixture.orgPrivateA, fixture.projARestricted, "id-lone-wolf", "contributor", now);
+    const home = store.checkProjectAccess(
+      "id-lone-wolf",
+      fixture.orgPrivateA,
+      fixture.projARestricted,
+      "viewer",
+      now,
+    );
+    expect(home.ok).toBe(true);
+    const away = store.checkProjectAccess(
+      "id-lone-wolf",
+      fixture.orgPrivateA,
+      fixture.projAOpen,
+      "viewer",
+      now,
+    );
+    expect(away.ok).toBe(false);
+    if (!away.ok) expect(away.code).toBe("denied-membership");
+  });
+
+  test("comma-containing mailboxes fail single-mailbox validation (F1-21)", () => {
+    const fixture = buildControlledFixture();
+    const { store, now } = fixture;
+    expect(() =>
+      store.configureRecipient("owner-supplier@example.test,other@example.test", "deployment", now),
+    ).toThrow();
+    expect(() =>
+      store.configureRecipient("Demo Supplier <owner-supplier@example.test>", "deployment", now),
+    ).toThrow();
+    expect(() =>
+      store.configureRecipient("owner-supplier@example.test;other@example.test", "deployment", now),
+    ).toThrow();
+    const valid = store.configureRecipient("owner-supplier@example.test", "deployment", now);
+    expect(valid.active).toBe(true);
+  });
+
+  test("provider ingest carries explicit provenance; public imports cannot", () => {
+    const fixture = buildControlledFixture();
+    const { store, now } = fixture;
+    const ingested = store.ingestProviderEvidence(
+      fixture.orgPrivateA,
+      fixture.projAOpen,
+      {
+        sourceKind: "supplier-reply",
+        contentHash: "hash-owner-reply",
+        completeness: "complete",
+        counterpartyRole: "ownerStandIn",
+        executionMode: "live",
+      },
+      now,
+    );
+    expect(ingested.ok).toBe(true);
+    if (!ingested.ok) throw new Error("ingest failed");
+    expect(ingested.value.counterpartyRole).toBe("ownerStandIn");
+    const recorded = store.recordEvidence(
+      fixture.ownerA,
+      fixture.orgPrivateA,
+      fixture.projAOpen,
+      { sourceKind: "user-document", contentHash: "hash-user", completeness: "complete" },
+      now,
+    );
+    expect(recorded.ok).toBe(true);
+    if (!recorded.ok) throw new Error("record failed");
+    expect(recorded.value.counterpartyRole).toBe("userImport");
+    expect(recorded.value.executionMode).toBe("recorded");
+    expect(recorded.value.providerIds).toBeNull();
   });
 });

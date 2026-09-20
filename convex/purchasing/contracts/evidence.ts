@@ -26,13 +26,25 @@ const completenessValidator = v.union(
   v.literal("unavailable"),
 );
 
-const executionModeValidator = v.union(
-  v.literal("live"),
-  v.literal("recorded"),
-  v.literal("fixture"),
-);
+/**
+ * Public user-import fields. Provenance is NOT caller-supplied: the
+ * handler derives `counterpartyRole: userImport`, `executionMode:
+ * recorded`, and empty provider IDs server-side, so imports can never
+ * self-assert live transport, vendor authorship, or provider correlation.
+ * Passing those fields is a validator rejection, not a silent override.
+ */
+const userEvidenceFieldsValidator = v.object({
+  organizationId: v.id("organizations"),
+  projectId: v.id("projects"),
+  sourceKind: v.string(),
+  sourceUrl: v.optional(v.string()),
+  contentHash: v.string(),
+  completeness: completenessValidator,
+  locator: v.optional(v.string()),
+});
 
-const evidenceFieldsValidator = v.object({
+/** Provider-ingest fields: provenance travels with the verified pipeline. */
+const providerEvidenceFieldsValidator = v.object({
   organizationId: v.id("organizations"),
   projectId: v.id("projects"),
   sourceKind: v.string(),
@@ -40,8 +52,8 @@ const evidenceFieldsValidator = v.object({
   providerIds: v.optional(v.string()),
   contentHash: v.string(),
   completeness: completenessValidator,
-  counterpartyRole: v.string(),
-  executionMode: executionModeValidator,
+  counterpartyRole: v.union(v.literal("vendor"), v.literal("ownerStandIn")),
+  executionMode: v.union(v.literal("live"), v.literal("recorded")),
   locator: v.optional(v.string()),
 });
 
@@ -95,7 +107,7 @@ const recordResultValidator = v.union(
 
 /** Public user import: record an evidence snapshot under project authority. */
 export const record = f1Mutation({
-  args: evidenceFieldsValidator,
+  args: userEvidenceFieldsValidator,
   returns: recordResultValidator,
   handler: async (ctx, args) => {
     const identity = await identityOf(ctx);
@@ -116,16 +128,24 @@ export const record = f1Mutation({
     if (!capability.ok) {
       return { ok: false as const, code: capability.code, message: capability.message };
     }
-    const valid = validateEvidenceFields(args);
+    const valid = validateEvidenceFields({
+      ...args,
+      counterpartyRole: "userImport",
+      executionMode: "recorded",
+    });
     if (!valid.ok) return { ok: false as const, code: valid.code, message: valid.message };
     const evidenceId = await insertEvidenceRecord(ctx, valid.value, now);
     return { ok: true as const, evidenceId };
   },
 });
 
-/** Internal provider write: verified ingestion pipeline only. */
+/**
+ * Internal provider write: verified ingestion pipeline only. Fixture
+ * execution mode is unavailable here and in public runtime; controlled
+ * fixtures live in test code, never in production records.
+ */
 export const ingestProviderEvidence = f1InternalMutation({
-  args: evidenceFieldsValidator,
+  args: providerEvidenceFieldsValidator,
   returns: recordResultValidator,
   handler: async (ctx, args) => {
     const project = await ctx.db.get(args.projectId);
