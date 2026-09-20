@@ -9,11 +9,15 @@ import { convexTest } from "convex-test";
 import { makeFunctionReference, type RegisteredMutation } from "convex/server";
 import { expect, test } from "bun:test";
 import schema from "../schema.js";
-import type { Id } from "../_generated/dataModel.js";
-import { workflowContextKey } from "../shared/scope.js";
+import {
+  validateWorkflowPayload,
+  workflowContextKey,
+  type WorkflowAuthority,
+} from "../shared/scope.js";
 import * as grants from "../access/grants.js";
 import * as memberships from "../access/memberships.js";
 import * as jobs from "./jobs.js";
+import { projectWorkflowContext } from "./operations.js";
 import * as operations from "./operations.js";
 import * as reservations from "./reservations.js";
 
@@ -128,8 +132,14 @@ async function requirement(
   );
 }
 
-async function issueResearchGrant(fixture: Awaited<ReturnType<typeof setup>>) {
-  const payloadJson = JSON.stringify({ query: "Research suppliers for Quasar" });
+async function issueResearchGrant(
+  fixture: Awaited<ReturnType<typeof setup>>,
+  options: {
+    readonly query?: string;
+    readonly workflowAuthorities?: WorkflowAuthority[];
+  } = {},
+) {
+  const payloadJson = JSON.stringify({ query: options.query ?? "Research suppliers for Quasar" });
   const grant = await fixture.asOwner.mutation(issueGrantRef, {
     organizationId: fixture.organizationId,
     projectId: fixture.projectId,
@@ -141,6 +151,9 @@ async function issueResearchGrant(fixture: Awaited<ReturnType<typeof setup>>) {
     costCeilingMicroUsd: 100,
     roundLimit: 10,
     expiresAt: Date.now() + 600_000,
+    ...(options.workflowAuthorities === undefined
+      ? {}
+      : { workflowAuthorities: options.workflowAuthorities }),
   });
   expect(grant.ok).toBe(true);
   if (!grant.ok) throw new Error("grant setup failed");
@@ -182,8 +195,8 @@ test("grant authority is copied as an exact server-owned requirement ref", async
   });
   expect(operation.ok).toBe(true);
   if (!operation.ok) throw new Error("operation setup failed");
-  const grantId = grant.grantId as Id<"grants">;
-  const operationId = operation.operationId as Id<"operations">;
+  const grantId = grant.grantId;
+  const operationId = operation.operationId;
   const rows = await fixture.t.run(async (ctx) => ({
     grant: await ctx.db.get(grantId),
     operation: await ctx.db.get(operationId),
@@ -192,6 +205,135 @@ test("grant authority is copied as an exact server-owned requirement ref", async
     { operationId: "research.collect", projectId: fixture.projectId, requirementId },
   ]);
   expect(rows.operation?.workflowAuthority).toEqual(rows.grant?.workflowAuthorities?.[0]);
+});
+
+test("an exact requirement authority resists a different textual requirement", async () => {
+  const fixture = await setup();
+  const boundRequirementId = await requirement(fixture, "Quasar");
+  await requirement(fixture, "Espresso");
+  const authority: WorkflowAuthority = {
+    operationId: "research.collect",
+    projectId: fixture.projectId,
+    requirementId: boundRequirementId,
+  };
+  const context = await fixture.t.run((ctx) =>
+    projectWorkflowContext(
+      ctx,
+      fixture.organizationId,
+      fixture.projectId,
+      "Research suppliers for Espresso",
+      undefined,
+      authority,
+    ),
+  );
+  expect(context?.matchedRequirementId).toBe(boundRequirementId);
+  expect(context?.terms).toContain("Quasar");
+  expect(context?.terms).not.toContain("Espresso");
+});
+
+test("foreign and cancelled exact requirement refs are denied", async () => {
+  const fixture = await setup();
+  const cancelledRequirementId = await requirement(fixture, "Cancelled");
+  await fixture.t.run((ctx) => ctx.db.patch(cancelledRequirementId, { state: "cancelled" }));
+  const cancelledGrant = await fixture.asOwner.mutation(issueGrantRef, {
+    organizationId: fixture.organizationId,
+    projectId: fixture.projectId,
+    operations: ["research.collect"],
+    communicationProfile: "ownerRoleplay",
+    recipientConfigVersion: 0,
+    inputVersions: { brief: "v1" },
+    payloadJson: JSON.stringify({ query: "Research suppliers for Cancelled" }),
+    costCeilingMicroUsd: 100,
+    roundLimit: 10,
+    expiresAt: Date.now() + 600_000,
+    workflowAuthorities: [
+      {
+        operationId: "research.collect",
+        projectId: fixture.projectId,
+        requirementId: cancelledRequirementId,
+      },
+    ],
+  });
+  expect(cancelledGrant.ok).toBe(false);
+  if (cancelledGrant.ok) throw new Error("cancelled requirement ref unexpectedly authorized");
+  expect(cancelledGrant.code).toBe("denied-project");
+
+  const foreignProject = await fixture.asOwner.mutation(createProjectRef, {
+    organizationId: fixture.organizationId,
+    name: "Foreign authority project",
+    visibility: "open",
+  });
+  expect(foreignProject.ok).toBe(true);
+  if (!foreignProject.ok) throw new Error("foreign project setup failed");
+  const foreignRequirementId = await fixture.t.run((ctx) =>
+    ctx.db.insert("requirements", {
+      organizationId: fixture.organizationId,
+      projectId: foreignProject.projectId,
+      key: "foreign-requirement",
+      title: "Foreign",
+      category: "equipment",
+      quantity: "1",
+      unit: "piece",
+      priority: "P0",
+      state: "draft",
+      fulfillment: "notOrdered",
+      version: 1,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    }),
+  );
+  const foreignGrant = await fixture.asOwner.mutation(issueGrantRef, {
+    organizationId: fixture.organizationId,
+    projectId: fixture.projectId,
+    operations: ["research.collect"],
+    communicationProfile: "ownerRoleplay",
+    recipientConfigVersion: 0,
+    inputVersions: { brief: "v1" },
+    payloadJson: JSON.stringify({ query: "Research suppliers for Foreign" }),
+    costCeilingMicroUsd: 100,
+    roundLimit: 10,
+    expiresAt: Date.now() + 600_000,
+    workflowAuthorities: [
+      {
+        operationId: "research.collect",
+        projectId: fixture.projectId,
+        requirementId: foreignRequirementId,
+      },
+    ],
+  });
+  expect(foreignGrant.ok).toBe(false);
+  if (foreignGrant.ok) throw new Error("foreign requirement ref unexpectedly authorized");
+  expect(foreignGrant.code).toBe("denied-project");
+});
+
+test("ambiguous server-owned fallback stays unbound and rejects anaphoric payloads", async () => {
+  const fixture = await setup();
+  await requirement(fixture, "Quasar");
+  await requirement(fixture, "Espresso");
+  const grant = await issueResearchGrant(fixture, { query: "Research suppliers" });
+  const authority: WorkflowAuthority = {
+    operationId: "research.collect",
+    projectId: fixture.projectId,
+  };
+  const context = await fixture.t.run((ctx) =>
+    projectWorkflowContext(
+      ctx,
+      fixture.organizationId,
+      fixture.projectId,
+      "What changes if they choose another option?",
+      grant.grantId,
+      authority,
+    ),
+  );
+  expect(context?.matchedRequirementId).toBeUndefined();
+  expect(context?.terms).toEqual([]);
+  const verdict = validateWorkflowPayload({
+    operationId: "research.collect",
+    purpose: "purchasingResearch",
+    payload: { query: "What changes if they choose another option?" },
+    ...(context === null ? {} : { context }),
+  });
+  expect(verdict.ok).toBe(false);
 });
 
 test("unknown semantic payload fields cannot create an operation", async () => {
