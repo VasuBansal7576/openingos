@@ -25,7 +25,7 @@ import * as jobs from "../execution/jobs.js";
 import * as reservations from "../execution/reservations.js";
 import * as operations from "../execution/operations.js";
 import * as research from "./collection.js";
-import { normalizeProviderResponse } from "./contracts.js";
+import { isSafePublicSourceUrl, normalizeProviderResponse } from "./contracts.js";
 import { canonicalJson } from "../shared/hashing.js";
 import type { Id } from "../_generated/dataModel.js";
 
@@ -628,6 +628,42 @@ describe("R1 project research pagination", () => {
     expect(lastPage?.ok && lastPage.pagination.candidates.isDone).toBe(true);
   });
 
+  test("F17 blocks non-public literal source addresses", async () => {
+    // Controlled regression for the public-source guard: literal loopback,
+    // mapped loopback, ULA, unspecified, CGNAT, and related non-public ranges
+    // are rejected while public DNS names and public literals still pass.
+    const blocked = [
+      "http://[::1]/",
+      "http://[::ffff:127.0.0.1]/",
+      "http://[fc00::1]/",
+      "http://[fd12:3456::1]/product",
+      "http://[fe80::1]/",
+      "http://[ff02::1]/",
+      "http://[::]/",
+      "http://0.0.0.0/",
+      "http://100.64.0.1/",
+      "http://10.0.0.2/",
+      "http://127.0.0.1/",
+      "http://192.168.0.10/",
+      "http://172.20.0.10/",
+      "http://169.254.10.20/",
+      "http://localhost/",
+      "http://service.localhost/",
+    ];
+    for (const url of blocked) {
+      expect(isSafePublicSourceUrl(url)).toBe(false);
+    }
+    const allowed = [
+      "https://supplier.example.test/product",
+      "http://example.nl/catalog",
+      "https://8.8.8.8/",
+      "http://[2001:4860:4860::8888]/",
+    ];
+    for (const url of allowed) {
+      expect(isSafePublicSourceUrl(url)).toBe(true);
+    }
+  });
+
   test("rejects invalid stream cursors and denies a foreign project", async () => {
     const t = init();
     const fixture = await createFixture(t, "r1-pagination-denial");
@@ -656,5 +692,185 @@ describe("R1 project research pagination", () => {
       paginationOpts: { numItems: 16, cursor: null },
     });
     expect(denied).toMatchObject({ ok: false, code: "denied-membership" });
+  });
+});
+
+describe("R1 collection-target binding (F03)", () => {
+  const INTENT = "Research suppliers for the espresso machine";
+
+  test("F03 rejects a private IPv6 source URL before any dispatch or accounting", async () => {
+    const t = init();
+    const fixture = await createFixture(t, "f03-ipv6-fixture");
+    const asOwner = t.withIdentity(OWNER);
+    const before = await t.run(async (ctx) => ({
+      jobs: (
+        await ctx.db.query("jobs").withIndex("by_project", (q) => q.eq("projectId", fixture.projectId)).take(16)
+      ).length,
+      operations: (await ctx.db.query("operations").withIndex("by_grant", (q) => q.eq("grantId", fixture.grantId)).take(65)).length,
+      reservations: (await ctx.db.query("reservations").withIndex("by_job", (q) => q.eq("jobId", fixture.jobId)).take(8)).length,
+    }));
+    const ula = await asOwner.mutation(requestGrantedResearchRef, {
+      projectId: fixture.projectId,
+      researchIntent: INTENT,
+      requestId: "f03-private-ipv6",
+      grantId: fixture.grantId,
+      mode: "scrape",
+      sourceUrl: "http://[fc00::1]/product",
+    });
+    expect(ula).toMatchObject({ ok: false, code: "invalid-payload" });
+    const loopback = await asOwner.mutation(requestGrantedResearchRef, {
+      projectId: fixture.projectId,
+      researchIntent: INTENT,
+      requestId: "f03-loopback-ipv6",
+      grantId: fixture.grantId,
+      mode: "map",
+      sourceUrl: "http://[::1]/sitemap.xml",
+    });
+    expect(loopback).toMatchObject({ ok: false, code: "invalid-payload" });
+    const after = await t.run(async (ctx) => ({
+      jobs: (
+        await ctx.db.query("jobs").withIndex("by_project", (q) => q.eq("projectId", fixture.projectId)).take(16)
+      ).length,
+      operations: (await ctx.db.query("operations").withIndex("by_grant", (q) => q.eq("grantId", fixture.grantId)).take(65)).length,
+      reservations: (await ctx.db.query("reservations").withIndex("by_job", (q) => q.eq("jobId", fixture.jobId)).take(8)).length,
+    }));
+    expect(after).toEqual(before);
+  });
+
+  test("F03 same-requestId changed mode/sourceUrl conflicts while an identical retry succeeds", async () => {
+    const t = init();
+    const fixture = await createFixture(t, "f03-retry-fixture");
+    const asOwner = t.withIdentity(OWNER);
+    const first = await asOwner.mutation(requestGrantedResearchRef, {
+      projectId: fixture.projectId,
+      researchIntent: INTENT,
+      requestId: "f03-retry",
+      grantId: fixture.grantId,
+      mode: "search",
+    });
+    expect(first.ok).toBe(true);
+    if (!first.ok || first.operationId === null) throw new Error("bound search request failed");
+    const changed = await asOwner.mutation(requestGrantedResearchRef, {
+      projectId: fixture.projectId,
+      researchIntent: INTENT,
+      requestId: "f03-retry",
+      grantId: fixture.grantId,
+      mode: "scrape",
+      sourceUrl: "https://supplier.example.test/other",
+    });
+    expect(changed).toMatchObject({ ok: false, code: "duplicate-conflict" });
+    const identical = await asOwner.mutation(requestGrantedResearchRef, {
+      projectId: fixture.projectId,
+      researchIntent: INTENT,
+      requestId: "f03-retry",
+      grantId: fixture.grantId,
+      mode: "search",
+    });
+    expect(identical.ok).toBe(true);
+    if (identical.ok && identical.operationId !== null) {
+      expect(identical.operationId).toBe(first.operationId);
+    } else {
+      throw new Error("identical retry did not return the existing operation");
+    }
+    const rows = await t.run(async (ctx) => ({
+      jobs: (await ctx.db.query("jobs").withIndex("by_project", (q) => q.eq("projectId", fixture.projectId)).take(16)).length,
+      operations: (await ctx.db.query("operations").withIndex("by_grant", (q) => q.eq("grantId", fixture.grantId)).take(65)).length,
+    }));
+    // Fixture operation plus the one bound search operation; the changed
+    // retry created no job, reservation, or operation.
+    expect(rows).toEqual({ jobs: 2, operations: 2 });
+  });
+
+  test("F03 recovery and transport bind the original collection target", async () => {
+    const t = init();
+    const fixture = await createFixture(t, "f03-recovery-fixture");
+    const asOwner = t.withIdentity(OWNER);
+    const sourceUrl = "https://supplier.example.test/product";
+    const requested = await asOwner.mutation(requestGrantedResearchRef, {
+      projectId: fixture.projectId,
+      researchIntent: INTENT,
+      requestId: "f03-bound",
+      grantId: fixture.grantId,
+      mode: "scrape",
+      sourceUrl,
+    });
+    expect(requested.ok).toBe(true);
+    if (!requested.ok || requested.operationId === null) throw new Error("bound scrape request failed");
+    const operationId = requested.operationId;
+    const jobId = requested.jobId;
+    const partial = await t.action(executeRef, {
+      operationId,
+      identity: fixture.identity,
+      mode: "scrape",
+      sourceUrl,
+      controlled: true,
+      controlledResponseJson: JSON.stringify({
+        url: sourceUrl,
+        title: "Two group espresso machine",
+        markdown: "A truncated source",
+        truncated: true,
+      }),
+    });
+    expect(partial.ok).toBe(true);
+    const changedRecovery = await asOwner.mutation(recoverResearchRef, {
+      jobId,
+      operationId,
+      requestId: "f03-recovery-changed",
+      mode: "search",
+    });
+    expect(changedRecovery).toMatchObject({ ok: false, code: "duplicate-conflict" });
+    const changedSourceRecovery = await asOwner.mutation(recoverResearchRef, {
+      jobId,
+      operationId,
+      requestId: "f03-recovery-changed-source",
+      mode: "scrape",
+      sourceUrl: "https://supplier.example.test/other",
+    });
+    expect(changedSourceRecovery).toMatchObject({ ok: false, code: "duplicate-conflict" });
+    const opsBefore = await t.run(async (ctx) =>
+      (await ctx.db.query("operations").withIndex("by_job", (q) => q.eq("jobId", jobId)).take(65)).length,
+    );
+    expect(opsBefore).toBe(1);
+    const recovered = await asOwner.mutation(recoverResearchRef, {
+      jobId,
+      operationId,
+      requestId: "f03-recovery-same",
+      mode: "scrape",
+      sourceUrl,
+    });
+    expect(recovered.ok).toBe(true);
+    if (!recovered.ok) throw new Error("same-target recovery failed");
+    expect(recovered.operationId).not.toBe(operationId);
+    // The transport rejects scheduler arguments that disagree with the
+    // stored binding before claiming, leaving the operation prepared.
+    const calls: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL) => {
+      calls.push(String(url));
+      return new Response(JSON.stringify({ success: true, data: { web: [] } }), { status: 200 });
+    }));
+    const mismatched = await t.action(executeRef, {
+      operationId: recovered.operationId,
+      identity: fixture.identity,
+      mode: "search",
+      controlled: true,
+    });
+    expect(mismatched).toMatchObject({ ok: false, code: "duplicate-conflict" });
+    expect(calls).toHaveLength(0);
+    const stored = await t.run(async (ctx) => await ctx.db.get(recovered.operationId));
+    expect(stored?.state).toBe("prepared");
+    // The bound target still executes honestly through the controlled path.
+    const matched = await t.action(executeRef, {
+      operationId: recovered.operationId,
+      identity: fixture.identity,
+      mode: "scrape",
+      sourceUrl,
+      controlled: true,
+      controlledResponseJson: JSON.stringify({
+        url: sourceUrl,
+        title: "Two group espresso machine",
+        markdown: "Recovered source",
+      }),
+    });
+    expect(matched.ok).toBe(true);
   });
 });

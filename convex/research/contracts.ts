@@ -555,19 +555,179 @@ export function normalizeProviderResponse(input: NormalizeProviderInput): Provid
   };
 }
 
-/** A bounded public URL guard used immediately before map/scrape dispatch. */
+/**
+ * Bounded public-source URL guard, enforced immediately before map/scrape
+ * dispatch (request validation and the pre-claim execute check in
+ * `collection.ts`).
+ *
+ * Literal-address policy: every IPv4/IPv6 literal host is classified below.
+ * Only globally routable unicast literals pass. Loopback, unspecified,
+ * private, link-local, multicast, reserved, documentation, benchmark, TEST-NET
+ * and CGNAT ranges are rejected, including when reached through an IPv6
+ * transition form (IPv4-mapped, 6to4, NAT64 well-known prefix) whose embedded
+ * IPv4 address falls in one of those ranges.
+ *
+ * DNS policy (honest limitation, not a guarantee): DNS names are allowed
+ * without resolution. This guard performs no DNS lookup, offers no
+ * DNS-rebinding protection, and maintains no allowlist. A name that resolves
+ * to a blocked literal at fetch time is not stopped here.
+ *
+ * Redirect policy (honest limitation, not a guarantee): the Firecrawl
+ * provider transport may follow HTTP redirects inside its own bounded attempt
+ * budget. Redirect targets are provider-observed and recorded on the evidence
+ * rows, but they are not re-validated by this guard.
+ */
 export function isSafePublicSourceUrl(value: string): boolean {
+  let parsed: URL;
   try {
-    const parsed = new URL(value);
-    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return false;
-    const host = parsed.hostname.toLocaleLowerCase();
-    if (host === "localhost" || host.endsWith(".localhost") || host === "127.0.0.1" || host === "::1") return false;
-    if (/^(10|127)\./.test(host) || /^192\.168\./.test(host) || /^169\.254\./.test(host)) return false;
-    if (/^172\.(1[6-9]|2\d|3[0-1])\./.test(host)) return false;
-    return parsed.username.length === 0 && parsed.password.length === 0;
+    parsed = new URL(value);
   } catch {
     return false;
   }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return false;
+  if (parsed.username.length > 0 || parsed.password.length > 0) return false;
+  return isPublicSourceHost(parsed.hostname);
+}
+
+function isPublicSourceHost(hostname: string): boolean {
+  let host = hostname.toLocaleLowerCase();
+  // WHATWG URL keeps brackets on `hostname` for IPv6 literals (`[::1]`).
+  // Strip one bracket pair so the literal classifier below sees the address.
+  if (host.startsWith("[") && host.endsWith("]") && host.length >= 2) {
+    host = host.slice(1, -1);
+  }
+  if (host.length === 0) return false;
+  if (host.includes(":")) return isPublicIpv6Literal(host);
+  if (isDecimalDottedQuad(host)) return isPublicIpv4(host.split(".").map(Number));
+  // A DNS name. `localhost` and its subdomains never leave the device.
+  // Anything else is allowed here without resolution; see the DNS policy above.
+  if (host === "localhost" || host.endsWith(".localhost")) return false;
+  return true;
+}
+
+/**
+ * WHATWG URL normalizes non-standard IPv4 spellings (hex/octal parts and
+ * single-number forms such as `http://2130706433/`) to decimal dotted quads
+ * in `hostname`, so classifying the normalized quad also covers those forms.
+ */
+function isDecimalDottedQuad(host: string): boolean {
+  return /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
+}
+
+function isPublicIpv4(octets: number[]): boolean {
+  if (octets.length !== 4 || octets.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) {
+    return false;
+  }
+  const [a, b, c] = octets as [number, number, number, number];
+  if (a === 0) return false; // 0.0.0.0/8: unspecified and "this host".
+  if (a === 10) return false; // RFC 1918 private.
+  if (a === 127) return false; // Loopback.
+  if (a === 169 && b === 254) return false; // Link-local.
+  if (a === 172 && b >= 16 && b <= 31) return false; // RFC 1918 private.
+  if (a === 192 && b === 168) return false; // RFC 1918 private.
+  if (a === 100 && (b & 0xc0) === 0x40) return false; // CGNAT 100.64.0.0/10.
+  if (a === 192 && b === 0 && c === 2) return false; // TEST-NET-1.
+  if (a === 198 && b === 51 && c === 100) return false; // TEST-NET-2.
+  if (a === 203 && b === 0 && c === 113) return false; // TEST-NET-3.
+  if (a === 198 && (b === 18 || b === 19)) return false; // Benchmark 198.18.0.0/15.
+  if (a === 192 && b === 88 && c === 99) return false; // Deprecated 6to4 relay anycast.
+  if (a >= 224 && a <= 239) return false; // Multicast.
+  if (a >= 240) return false; // Reserved, including 255.255.255.255.
+  return true;
+}
+
+function parseIpv6Literal(text: string): Uint8Array | null {
+  // A zone id (`fe80::1%eth0`) never identifies a distinct public host; the
+  // scoped form is link-local by definition, so reject it outright.
+  if (text.includes("%")) return null;
+  const halves = text.split("::");
+  if (halves.length > 2) return null;
+  const head = halves[0] === "" || halves[0] === undefined ? [] : halves[0].split(":");
+  const tail = halves.length === 2 && halves[1] !== "" && halves[1] !== undefined ? halves[1].split(":") : [];
+  const expandTail = (parts: string[]): number[] | null => {
+    const out: number[] = [];
+    for (const part of parts) {
+      if (part.includes(".")) {
+        const bytes = parseDottedQuadBytes(part);
+        if (bytes === null) return null;
+        out.push((bytes[0] << 8) | bytes[1], (bytes[2] << 8) | bytes[3]);
+        continue;
+      }
+      if (!/^[0-9a-f]{1,4}$/.test(part)) return null;
+      out.push(parseInt(part, 16));
+    }
+    return out;
+  };
+  const headGroups = expandTail(head);
+  const tailGroups = expandTail(tail);
+  if (headGroups === null || tailGroups === null) return null;
+  // An embedded dotted quad must be the final 32 bits of the address.
+  const embeddedInHead = head.some((part) => part.includes("."));
+  if (embeddedInHead && halves.length === 2) return null;
+  if (halves.length === 1 && headGroups.length !== 8) return null;
+  if (halves.length === 2 && headGroups.length + tailGroups.length > 8) return null;
+  const groups = halves.length === 1
+    ? headGroups
+    : [...headGroups, ...new Array(8 - headGroups.length - tailGroups.length).fill(0), ...tailGroups];
+  if (groups.length !== 8) return null;
+  const bytes = new Uint8Array(16);
+  groups.forEach((group, index) => {
+    bytes[index * 2] = (group >> 8) & 0xff;
+    bytes[index * 2 + 1] = group & 0xff;
+  });
+  return bytes;
+}
+
+function parseDottedQuadBytes(text: string): [number, number, number, number] | null {
+  const parts = text.split(".");
+  if (parts.length !== 4) return null;
+  const octets: number[] = [];
+  for (const part of parts) {
+    if (!/^\d{1,3}$/.test(part)) return null;
+    const value = Number(part);
+    if (!Number.isInteger(value) || value < 0 || value > 255) return null;
+    octets.push(value);
+  }
+  return octets as [number, number, number, number];
+}
+
+function isPublicIpv6Literal(host: string): boolean {
+  const parsed = parseIpv6Literal(host);
+  if (parsed === null) return false;
+  // The parser always returns exactly 16 bytes; an absent index fails closed
+  // to zero, which can only make the checks below more restrictive.
+  const at = (index: number): number => parsed[index] ?? 0;
+  const isZeroRange = (start: number, end: number): boolean => {
+    for (let index = start; index < end; index += 1) {
+      if (at(index) !== 0) return false;
+    }
+    return true;
+  };
+  // ::ffff:0:0/96 IPv4-mapped: classify the embedded IPv4 address, so mapped
+  // loopback/private/CGNAT forms are rejected with their IPv4 meaning.
+  const isMapped = isZeroRange(0, 10) && at(10) === 0xff && at(11) === 0xff;
+  if (isMapped) {
+    return isPublicIpv4([at(12), at(13), at(14), at(15)]);
+  }
+  // 2002::/16 6to4: bytes 2-5 carry the embedded IPv4 address.
+  if (at(0) === 0x20 && at(1) === 0x02) {
+    return isPublicIpv4([at(2), at(3), at(4), at(5)]);
+  }
+  // 64:ff9b::/96 well-known NAT64 prefix: last 32 bits carry the IPv4 address.
+  if (
+    at(0) === 0x00 && at(1) === 0x64 && at(2) === 0xff && at(3) === 0x9b &&
+    isZeroRange(4, 12)
+  ) {
+    return isPublicIpv4([at(12), at(13), at(14), at(15)]);
+  }
+  if (isZeroRange(0, 16)) return false; // :: unspecified.
+  if (isZeroRange(0, 15) && at(15) === 0x01) return false; // ::1 loopback.
+  if (at(0) === 0xff) return false; // ff00::/8 multicast.
+  if (at(0) === 0xfe && (at(1) & 0xc0) === 0x80) return false; // fe80::/10 link-local.
+  if ((at(0) & 0xfe) === 0xfc) return false; // fc00::/7 unique-local.
+  if (at(0) === 0x01 && at(1) === 0x00 && isZeroRange(2, 8)) return false; // 100::/64 discard.
+  if (at(0) === 0x20 && at(1) === 0x01 && at(2) === 0x0d && at(3) === 0xb8) return false; // 2001:db8::/32 documentation.
+  return true;
 }
 
 /** Provider errors are parsed from unknown without exposing response bodies. */
