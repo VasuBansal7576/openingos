@@ -303,13 +303,17 @@ export const vendorInputValidator = v.object({
 });
 export type VendorInput = Infer<typeof vendorInputValidator>;
 
+/**
+ * Vendor contacts are organization-owned (a supplier's channel does not
+ * change per project). Replay-safe through the idempotency key.
+ */
 export const vendorContactInputValidator = v.object({
   organizationId: v.id("organizations"),
-  projectId: v.id("projects"),
   vendorId: v.id("vendors"),
   channel: v.string(),
   detailHash: v.string(),
   preference: v.optional(v.string()),
+  idempotencyKey: v.string(),
 });
 export type VendorContactInput = Infer<typeof vendorContactInputValidator>;
 
@@ -343,6 +347,13 @@ export type CompatibilityVerificationInput = Infer<
   typeof compatibilityVerificationInputValidator
 >;
 
+/**
+ * Explicit owner-import product evidence (public path). The caller states
+ * whose counterparty terms these are from the closed ownerStandIn/vendor
+ * union — explicit and labeled `ownerImport`/`recorded`, never a
+ * self-asserted live vendor record. The idempotency key makes collection
+ * reruns replay-safe.
+ */
 export const productEvidenceInputValidator = v.object({
   organizationId: v.id("organizations"),
   projectId: v.id("projects"),
@@ -356,15 +367,57 @@ export const productEvidenceInputValidator = v.object({
   normalizedValue: v.string(),
   freshness: evidenceFreshnessValidator,
   lastCheckedAt: v.optional(v.number()),
+  counterpartyRole: v.union(v.literal("ownerStandIn"), v.literal("vendor")),
+  idempotencyKey: v.string(),
 });
 export type ProductEvidenceInput = Infer<typeof productEvidenceInputValidator>;
+
+/** Internal pipeline product evidence (R1/C1 ingestion only). */
+export const providerProductEvidenceInputValidator = v.object({
+  organizationId: v.id("organizations"),
+  projectId: v.id("projects"),
+  requirementId: v.optional(v.id("requirements")),
+  candidateId: v.optional(v.id("candidates")),
+  field: v.string(),
+  sourceKind: v.string(),
+  sourceUrl: v.optional(v.string()),
+  capturedAt: v.number(),
+  originalValue: v.string(),
+  normalizedValue: v.string(),
+  freshness: evidenceFreshnessValidator,
+  lastCheckedAt: v.optional(v.number()),
+  counterpartyRole: v.union(v.literal("ownerStandIn"), v.literal("vendor")),
+  executionMode: v.union(v.literal("live"), v.literal("recorded")),
+  idempotencyKey: v.string(),
+});
+export type ProviderProductEvidenceInput = Infer<
+  typeof providerProductEvidenceInputValidator
+>;
+
+/**
+ * RFQ input. `scenarioVendorIds` names researched vendors as scenario
+ * context only: the list can neither imply nor authorize direct vendor
+ * delivery. Owner-only transport stays governed by the communication
+ * grant and recipient configuration (ADR-0004/0007), never by this
+ * record. Line items state the requested scope; an optional
+ * conversation binding must resolve in-project.
+ */
+export const rfqLineItemValidator = v.object({
+  itemId: v.string(),
+  description: v.string(),
+  quantity: v.string(),
+  unit: v.string(),
+});
+export type RfqLineItem = Infer<typeof rfqLineItemValidator>;
 
 export const rfqInputValidator = v.object({
   organizationId: v.id("organizations"),
   projectId: v.id("projects"),
   requirementId: v.id("requirements"),
   idempotencyKey: v.string(),
-  recipientVendorIds: v.array(v.id("vendors")),
+  scenarioVendorIds: v.array(v.id("vendors")),
+  lineItems: v.array(rfqLineItemValidator),
+  conversationId: v.optional(v.id("conversations")),
   briefHash: v.string(),
   conversationState: domainConversationStateValidator,
 });
@@ -423,6 +476,7 @@ export const orderEventInputValidator = v.object({
   kind: orderEventKindValidator,
   acceptedQuantity: v.optional(v.string()),
   note: v.optional(v.string()),
+  idempotencyKey: v.string(),
 });
 export type OrderEventInput = Infer<typeof orderEventInputValidator>;
 
@@ -446,6 +500,7 @@ export const assetInputValidator = v.object({
   serial: v.optional(v.string()),
   constraints: v.optional(v.string()),
   purchaseProvenance: v.optional(v.string()),
+  idempotencyKey: v.string(),
 });
 export type AssetInput = Infer<typeof assetInputValidator>;
 
@@ -455,6 +510,7 @@ export const assetDocumentInputValidator = v.object({
   assetId: v.id("assets"),
   kind: v.string(),
   storageRef: v.optional(v.string()),
+  idempotencyKey: v.string(),
 });
 export type AssetDocumentInput = Infer<typeof assetDocumentInputValidator>;
 
@@ -464,15 +520,27 @@ export const serviceCaseInputValidator = v.object({
   assetId: v.id("assets"),
   urgency: serviceCaseUrgencyValidator,
   summary: v.string(),
+  idempotencyKey: v.string(),
 });
 export type ServiceCaseInput = Infer<typeof serviceCaseInputValidator>;
 
+/**
+ * Watch input (explicit owner-import path). The caller declares the
+ * watched counterparty and an optional job allowance linkage; the source
+ * is validator-fixed to `ownerImport` so a public caller can never claim
+ * internal pipeline verification. The next check time derives
+ * server-side from cadence.
+ */
 export const watchInputValidator = v.object({
   organizationId: v.id("organizations"),
   projectId: v.id("projects"),
+  jobId: v.optional(v.id("jobs")),
   targetKind: v.string(),
   targetId: v.string(),
   cadenceMs: v.number(),
+  counterpartyRole: v.union(v.literal("ownerStandIn"), v.literal("vendor")),
+  evidenceRefs: v.optional(v.array(domainEvidenceRefValidator)),
+  idempotencyKey: v.string(),
 });
 export type WatchInput = Infer<typeof watchInputValidator>;
 
@@ -491,6 +559,7 @@ export const riskInputValidator = v.object({
   severity: riskSeverityValidator,
   source: v.string(),
   owner: v.optional(v.string()),
+  dependencyIds: v.optional(v.array(v.id("dependencies"))),
 });
 export type RiskInput = Infer<typeof riskInputValidator>;
 
@@ -511,26 +580,43 @@ export type TemplateInput = Infer<typeof templateInputValidator>;
 
 // -- Typed handoffs ----------------------------------------------------------
 
-/** Research collection handoff: Firecrawl/page claims into evidence (R1). */
+/**
+ * Research collection handoff: Firecrawl/page claims into evidence (R1).
+ * Tenancy plus the job input version travel with the claims so a stale
+ * collection can never write into a newer job or another workspace.
+ */
 export const researchCollectionValidator = v.object({
+  organizationId: v.id("organizations"),
+  projectId: v.id("projects"),
   jobId: v.id("jobs"),
+  inputVersion: v.string(),
+  grantId: v.optional(v.id("grants")),
   sourceKind: v.string(),
   sourceUrl: v.optional(v.string()),
   collectedAt: v.number(),
+  completeness: v.union(v.literal("complete"), v.literal("partial"), v.literal("unavailable")),
   claims: v.array(
     v.object({
       field: v.string(),
       originalValue: v.string(),
       normalizedValue: v.string(),
       locator: v.optional(v.string()),
+      status: v.union(v.literal("proposed"), v.literal("verified"), v.literal("conflicted")),
     }),
   ),
 });
 export type ResearchCollection = Infer<typeof researchCollectionValidator>;
 
-/** Browser observation handoff: executor findings into records (ADR-0006). */
+/**
+ * Browser observation handoff: executor findings into records
+ * (ADR-0006). The observation version plus input version bind the
+ * finding to the exact DOM state and job inputs it was read from.
+ */
 export const browserObservationValidator = v.object({
+  organizationId: v.id("organizations"),
+  projectId: v.id("projects"),
   jobId: v.id("jobs"),
+  inputVersion: v.string(),
   attemptId: v.string(),
   observationVersion: v.number(),
   url: v.string(),
@@ -538,12 +624,16 @@ export const browserObservationValidator = v.object({
   visibleTextHash: v.string(),
   observedTargets: v.array(v.string()),
   claimedOutcome: v.string(),
+  status: v.union(v.literal("observed"), v.literal("stale"), v.literal("failed")),
+  evidenceRefs: v.array(domainEvidenceRefValidator),
   meteredUsageMicroUsd: v.number(),
 });
 export type BrowserObservation = Infer<typeof browserObservationValidator>;
 
 /** Jev decision handoff: bounded choice over observed options (ADR-0005). */
 export const jevDecisionValidator = v.object({
+  organizationId: v.id("organizations"),
+  projectId: v.id("projects"),
   decisionType: v.string(),
   questionVersion: v.string(),
   jobId: v.id("jobs"),
@@ -564,9 +654,13 @@ export type JevDecision = Infer<typeof jevDecisionValidator>;
 
 /** OpenAI handoff: extraction proposals and drafted text (ADR-0005). */
 export const openAIExtractionValidator = v.object({
+  organizationId: v.id("organizations"),
+  projectId: v.id("projects"),
   jobId: v.id("jobs"),
+  inputVersion: v.string(),
   modelVersion: v.string(),
   sourceRef: v.string(),
+  evidenceRefs: v.array(domainEvidenceRefValidator),
   fields: v.record(v.string(), v.string()),
   confidence: v.string(),
   status: v.union(v.literal("proposed"), v.literal("needsReview"), v.literal("rejected")),
@@ -574,17 +668,29 @@ export const openAIExtractionValidator = v.object({
 export type OpenAIExtraction = Infer<typeof openAIExtractionValidator>;
 
 export const openAIDraftValidator = v.object({
+  organizationId: v.id("organizations"),
+  projectId: v.id("projects"),
   jobId: v.id("jobs"),
+  inputVersion: v.string(),
   draftKind: v.string(),
   contentHash: v.string(),
   sourceLocators: v.array(v.string()),
+  status: v.union(v.literal("proposed"), v.literal("approved"), v.literal("superseded")),
 });
 export type OpenAIDraft = Infer<typeof openAIDraftValidator>;
 
-/** Outbound brief handoff: approved message into the send path (C1). */
+/**
+ * Outbound brief handoff: approved message into the send path (C1).
+ * `scenarioVendorIds` is scenario context only; the actual transport
+ * destination stays governed by the communication grant and recipient
+ * configuration, never by this record.
+ */
 export const outboundBriefValidator = v.object({
+  organizationId: v.id("organizations"),
+  projectId: v.id("projects"),
   grantId: v.id("grants"),
-  recipientVendorIds: v.array(v.id("vendors")),
+  inputVersion: v.string(),
+  scenarioVendorIds: v.array(v.id("vendors")),
   communicationProfile: v.string(),
   payloadHash: v.string(),
 });
@@ -592,7 +698,12 @@ export type OutboundBrief = Infer<typeof outboundBriefValidator>;
 
 /** Inbound classification handoff: reply into quote updates (C1). */
 export const inboundClassificationValidator = v.object({
+  organizationId: v.id("organizations"),
+  projectId: v.id("projects"),
+  conversationId: v.optional(v.id("conversations")),
   providerIds: v.string(),
+  counterpartyRole: v.union(v.literal("ownerStandIn"), v.literal("vendor")),
+  executionMode: v.union(v.literal("live"), v.literal("recorded")),
   classification: v.union(
     v.literal("quote"),
     v.literal("clarification"),
@@ -604,20 +715,31 @@ export const inboundClassificationValidator = v.object({
     v.literal("serviceResponse"),
     v.literal("attachment"),
   ),
+  evidenceRefs: v.array(domainEvidenceRefValidator),
+  status: v.union(v.literal("classified"), v.literal("needsReview"), v.literal("applied")),
   extractedVersion: v.optional(v.string()),
 });
 export type InboundClassification = Infer<typeof inboundClassificationValidator>;
 
-/** Quote update handoff: revision linkage for the quote pipeline. */
+/**
+ * Quote update handoff: revision linkage for the quote pipeline, bound
+ * to the exact content hash so a version label can never drift from its
+ * hashed terms.
+ */
 export const quoteUpdateValidator = v.object({
+  organizationId: v.id("organizations"),
+  projectId: v.id("projects"),
   quoteId: v.id("quotes"),
   version: v.string(),
+  contentHash: v.string(),
   supersedes: v.optional(v.string()),
 });
 export type QuoteUpdate = Infer<typeof quoteUpdateValidator>;
 
 /** UI projection handoff: cached answers keyed by exact versions (U1). */
 export const uiProjectionValidator = v.object({
+  organizationId: v.id("organizations"),
+  projectId: v.id("projects"),
   projectionKey: v.string(),
   inputVersions: v.record(v.string(), v.string()),
   computedAt: v.number(),
@@ -717,15 +839,9 @@ export function templateReuseExcludesHistoricFinancials(
 }
 
 /**
- * Owner-stand-in preservation: owner-authored counterparty terms keep
- * their label through reuse and projection. Returns the preserved role
- * unchanged; any other role passes through untouched.
+ * Controlled-demo labeling lives on the stored records themselves
+ * (`counterpartyRole` plus `executionMode`/`origin`): no helper
+ * re-labels roles in flight, so provenance cannot be laundered between
+ * the read and the write.
  */
-export function preserveCounterpartyRole<T extends string>(role: T): T {
-  return role;
-}
-
-/** Controlled-demo label for any owner-authored record (ADR-0003). */
-export function isControlledCounterparty(role: string): boolean {
-  return role === "ownerStandIn" || role === "userImport";
-}
+export const CONTROLLED_COUNTERPARTY_ROLES = ["ownerStandIn", "userImport"] as const;

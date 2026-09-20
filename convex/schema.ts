@@ -121,6 +121,8 @@ export default defineSchema({
     budgetMinorUnits: v.optional(v.number()),
     currency: v.optional(v.string()),
     needByAt: v.optional(v.number()),
+    templateId: v.optional(v.id("templates")),
+    templateVersion: v.optional(v.string()),
     createdAt: v.number(),
     updatedAt: v.number(),
   })
@@ -162,16 +164,16 @@ export default defineSchema({
 
   vendorContacts: defineTable({
     organizationId: v.id("organizations"),
-    projectId: v.id("projects"),
     vendorId: v.id("vendors"),
     channel: v.string(),
     detailHash: v.string(),
     preference: v.optional(v.string()),
+    idempotencyKey: v.string(),
     createdAt: v.number(),
   })
-    .index("by_project", ["projectId"])
+    .index("by_organization", ["organizationId"])
     .index("by_vendor", ["vendorId"])
-    .index("by_vendor_and_project", ["vendorId", "projectId"]),
+    .index("by_organization_and_key", ["organizationId", "idempotencyKey"]),
 
   candidates: defineTable({
     organizationId: v.id("organizations"),
@@ -221,24 +223,37 @@ export default defineSchema({
       v.literal("unknown"),
     ),
     lastCheckedAt: v.optional(v.number()),
-    counterpartyRole: v.string(),
+    counterpartyRole: v.union(v.literal("ownerStandIn"), v.literal("vendor")),
     executionMode: v.union(
       v.literal("live"),
       v.literal("recorded"),
       v.literal("fixture"),
     ),
+    origin: v.union(v.literal("internal"), v.literal("ownerImport")),
+    conflictEvidenceIds: v.array(v.id("productEvidence")),
+    idempotencyKey: v.string(),
     createdAt: v.number(),
   })
     .index("by_project", ["projectId"])
     .index("by_candidate", ["candidateId"])
-    .index("by_requirement", ["requirementId"]),
+    .index("by_requirement", ["requirementId"])
+    .index("by_project_and_key", ["projectId", "idempotencyKey"]),
 
   rfqs: defineTable({
     organizationId: v.id("organizations"),
     projectId: v.id("projects"),
     requirementId: v.id("requirements"),
     idempotencyKey: v.string(),
-    recipientVendorIds: v.array(v.id("vendors")),
+    scenarioVendorIds: v.array(v.id("vendors")),
+    lineItems: v.array(
+      v.object({
+        itemId: v.string(),
+        description: v.string(),
+        quantity: v.string(),
+        unit: v.string(),
+      }),
+    ),
+    conversationId: v.optional(v.id("conversations")),
     briefHash: v.string(),
     conversationState: v.union(
       v.literal("draft"),
@@ -258,6 +273,9 @@ export default defineSchema({
     organizationId: v.id("organizations"),
     projectId: v.id("projects"),
     quoteId: v.id("quotes"),
+    quoteVersion: v.string(),
+    currency: v.string(),
+    conversationId: v.optional(v.id("conversations")),
     mandateHash: v.string(),
     targetMinorUnits: v.optional(v.number()),
     roundLimit: v.number(),
@@ -275,6 +293,7 @@ export default defineSchema({
     updatedAt: v.number(),
   })
     .index("by_project", ["projectId"])
+    .index("by_project_and_state", ["projectId", "state"])
     .index("by_quote", ["quoteId"]),
 
   selections: defineTable({
@@ -349,8 +368,12 @@ export default defineSchema({
     acceptedQuantity: v.optional(v.string()),
     note: v.optional(v.string()),
     recordedBy: v.string(),
+    idempotencyKey: v.string(),
     createdAt: v.number(),
-  }).index("by_order", ["orderId"]),
+  })
+    .index("by_order", ["orderId"])
+    .index("by_project", ["projectId"])
+    .index("by_project_and_key", ["projectId", "idempotencyKey"]),
 
   costEntries: defineTable({
     organizationId: v.id("organizations"),
@@ -370,7 +393,8 @@ export default defineSchema({
   })
     .index("by_project", ["projectId"])
     .index("by_order", ["orderId"])
-    .index("by_project_and_key", ["projectId", "idempotencyKey"]),
+    .index("by_project_and_key", ["projectId", "idempotencyKey"])
+    .index("by_project_and_kind", ["projectId", "kind"]),
 
   assets: defineTable({
     organizationId: v.id("organizations"),
@@ -381,10 +405,12 @@ export default defineSchema({
     serial: v.optional(v.string()),
     constraints: v.optional(v.string()),
     purchaseProvenance: v.optional(v.string()),
+    idempotencyKey: v.string(),
     createdAt: v.number(),
   })
     .index("by_project", ["projectId"])
-    .index("by_location", ["locationId"]),
+    .index("by_location", ["locationId"])
+    .index("by_project_and_key", ["projectId", "idempotencyKey"]),
 
   assetDocuments: defineTable({
     organizationId: v.id("organizations"),
@@ -392,8 +418,11 @@ export default defineSchema({
     assetId: v.id("assets"),
     kind: v.string(),
     storageRef: v.optional(v.string()),
+    idempotencyKey: v.string(),
     createdAt: v.number(),
-  }).index("by_asset", ["assetId"]),
+  })
+    .index("by_asset", ["assetId"])
+    .index("by_project_and_key", ["projectId", "idempotencyKey"]),
 
   serviceCases: defineTable({
     organizationId: v.id("organizations"),
@@ -409,25 +438,35 @@ export default defineSchema({
       v.literal("closed"),
     ),
     outcome: v.optional(v.string()),
+    idempotencyKey: v.string(),
     createdAt: v.number(),
     updatedAt: v.number(),
   })
     .index("by_project", ["projectId"])
-    .index("by_asset", ["assetId"]),
+    .index("by_asset", ["assetId"])
+    .index("by_project_and_key", ["projectId", "idempotencyKey"]),
 
   watches: defineTable({
     organizationId: v.id("organizations"),
     projectId: v.id("projects"),
+    jobId: v.optional(v.id("jobs")),
     targetKind: v.string(),
     targetId: v.string(),
     cadenceMs: v.number(),
+    nextCheckAt: v.number(),
     state: v.union(v.literal("active"), v.literal("paused"), v.literal("stopped")),
     lastResult: v.union(v.literal("ok"), v.literal("stale"), v.literal("error"), v.literal("unknown")),
     lastCheckedAt: v.optional(v.number()),
+    source: v.union(v.literal("internal"), v.literal("ownerImport")),
+    counterpartyRole: v.union(v.literal("ownerStandIn"), v.literal("vendor")),
+    evidenceRefs: v.optional(v.array(domainEvidenceRefValidator)),
+    idempotencyKey: v.string(),
     createdAt: v.number(),
   })
     .index("by_project", ["projectId"])
-    .index("by_project_and_state", ["projectId", "state"]),
+    .index("by_project_and_state", ["projectId", "state"])
+    .index("by_project_and_nextCheck", ["projectId", "nextCheckAt"])
+    .index("by_project_and_key", ["projectId", "idempotencyKey"]),
 
   projectEvents: defineTable({
     organizationId: v.id("organizations"),
@@ -436,7 +475,9 @@ export default defineSchema({
     actor: v.string(),
     evidenceRefs: v.optional(v.array(domainEvidenceRefValidator)),
     createdAt: v.number(),
-  }).index("by_project", ["projectId"]),
+  })
+    .index("by_project", ["projectId"])
+    .index("by_project_and_kind", ["projectId", "kind"]),
 
   risks: defineTable({
     organizationId: v.id("organizations"),
@@ -451,11 +492,15 @@ export default defineSchema({
     ),
     source: v.string(),
     owner: v.optional(v.string()),
+    dependencyIds: v.array(v.id("dependencies")),
+    acceptedBy: v.optional(v.string()),
+    decidedAt: v.optional(v.number()),
     createdAt: v.number(),
     updatedAt: v.number(),
   })
     .index("by_project", ["projectId"])
-    .index("by_project_and_state", ["projectId", "state"]),
+    .index("by_project_and_state", ["projectId", "state"])
+    .index("by_project_and_severity", ["projectId", "severity"]),
 
   templates: defineTable({
     organizationId: v.id("organizations"),

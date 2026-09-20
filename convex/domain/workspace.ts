@@ -11,10 +11,11 @@
 
 import { v } from "convex/values";
 import type { Id } from "../_generated/dataModel.js";
-import { f1Mutation, f1Query } from "../server.js";
+import { f1InternalMutation, f1Mutation, f1Query } from "../server.js";
 import { denialValidator } from "../access/checks.js";
 import {
   TEMPLATE_REUSE_COLLECTIONS,
+  dependencyCreatesCycle,
   projectEventInputValidator,
   riskInputValidator,
   templateInputValidator,
@@ -23,11 +24,19 @@ import {
 } from "../shared/domainContracts.js";
 import { requireDomainAccess, requireOwnedRef } from "./guards.js";
 
-/** Create an evidence watch on a named target (bounded cadence). */
+/**
+ * Create an evidence watch on a named target (explicit owner-import
+ * path). The caller declares the watched counterparty from the closed
+ * union and an optional job allowance linkage; the source is fixed to
+ * `ownerImport` so a public caller can never claim internal pipeline
+ * verification. The next check time derives server-side from cadence.
+ * Replays through the idempotency key return the existing watch or
+ * conflict on divergence.
+ */
 export const createWatch = f1Mutation({
   args: watchInputValidator.fields,
   returns: v.union(
-    v.object({ ok: v.literal(true), watchId: v.id("watches") }),
+    v.object({ ok: v.literal(true), watchId: v.id("watches"), deduplicated: v.boolean() }),
     denialValidator,
   ),
   handler: async (ctx, args) => {
@@ -40,27 +49,72 @@ export const createWatch = f1Mutation({
     if (!access.ok) {
       return { ok: false as const, code: access.code, message: access.message };
     }
+    if (args.idempotencyKey.trim().length === 0) {
+      return { ok: false as const, code: "invalid-payload", message: "idempotency key required" };
+    }
     if (args.targetKind.trim().length === 0 || args.targetId.trim().length === 0) {
       return { ok: false as const, code: "invalid-payload", message: "watch target required" };
     }
     if (!Number.isInteger(args.cadenceMs) || args.cadenceMs <= 0) {
       return { ok: false as const, code: "invalid-payload", message: "cadence must be positive" };
     }
+    const existing = await ctx.db
+      .query("watches")
+      .withIndex("by_project_and_key", (q) =>
+        q.eq("projectId", args.projectId).eq("idempotencyKey", args.idempotencyKey),
+      )
+      .unique();
+    if (existing !== null) {
+      if (existing.organizationId !== args.organizationId) {
+        return { ok: false as const, code: "denied-project", message: "reference is not in this project" };
+      }
+      const sameJob = (existing.jobId ?? undefined) === args.jobId;
+      if (
+        !sameJob ||
+        existing.targetKind !== args.targetKind ||
+        existing.targetId !== args.targetId ||
+        existing.cadenceMs !== args.cadenceMs ||
+        existing.counterpartyRole !== args.counterpartyRole
+      ) {
+        return { ok: false as const, code: "duplicate-conflict", message: "idempotency key already used with different fields" };
+      }
+      return { ok: true as const, watchId: existing._id, deduplicated: true };
+    }
+    if (args.jobId !== undefined) {
+      const job = await ctx.db.get(args.jobId);
+      if (
+        job === null ||
+        job.organizationId !== args.organizationId ||
+        job.projectId !== args.projectId
+      ) {
+        return { ok: false as const, code: "denied-project", message: "job is not in this project" };
+      }
+    }
+    const now = Date.now();
     const watchId = await ctx.db.insert("watches", {
       organizationId: args.organizationId,
       projectId: args.projectId,
+      ...(args.jobId === undefined ? {} : { jobId: args.jobId }),
       targetKind: args.targetKind,
       targetId: args.targetId,
       cadenceMs: args.cadenceMs,
+      nextCheckAt: now + args.cadenceMs,
       state: "active",
       lastResult: "unknown",
-      createdAt: Date.now(),
+      source: "ownerImport",
+      counterpartyRole: args.counterpartyRole,
+      ...(args.evidenceRefs === undefined ? {} : { evidenceRefs: [...args.evidenceRefs] }),
+      idempotencyKey: args.idempotencyKey,
+      createdAt: now,
     });
-    return { ok: true as const, watchId };
+    return { ok: true as const, watchId, deduplicated: false };
   },
 });
 
-/** Record a watch check result; the watch must be in-project. */
+/**
+ * Record an explicit owner-import watch check result; the watch must be
+ * in-project. The next check time advances server-side from cadence.
+ */
 export const checkWatch = f1Mutation({
   args: {
     organizationId: v.id("organizations"),
@@ -87,9 +141,41 @@ export const checkWatch = f1Mutation({
     if (!watch.ok) {
       return { ok: false as const, code: watch.code, message: watch.message };
     }
+    if (watch.value.source !== "ownerImport") {
+      return { ok: false as const, code: "invalid-payload", message: "internal watches check through the pipeline" };
+    }
+    const now = Date.now();
     await ctx.db.patch(args.watchId, {
       lastResult: args.result,
-      lastCheckedAt: Date.now(),
+      lastCheckedAt: now,
+      nextCheckAt: now + watch.value.cadenceMs,
+    });
+    return { ok: true as const };
+  },
+});
+
+/**
+ * Internal pipeline watch check (R1/C1 ingestion only): stamps an
+ * internal verification result and advances the next check time. No
+ * client can reach this path.
+ */
+export const ingestWatchCheck = f1InternalMutation({
+  args: {
+    watchId: v.id("watches"),
+    result: v.union(v.literal("ok"), v.literal("stale"), v.literal("error"), v.literal("unknown")),
+  },
+  returns: v.union(v.object({ ok: v.literal(true) }), denialValidator),
+  handler: async (ctx, args) => {
+    const watch = await ctx.db.get(args.watchId);
+    if (watch === null) {
+      return { ok: false as const, code: "denied-membership", message: "unknown watch" };
+    }
+    const now = Date.now();
+    await ctx.db.patch(args.watchId, {
+      lastResult: args.result,
+      lastCheckedAt: now,
+      nextCheckAt: now + watch.cadenceMs,
+      source: "internal",
     });
     return { ok: true as const };
   },
@@ -127,7 +213,7 @@ export const appendProjectEvent = f1Mutation({
   },
 });
 
-/** List project events (bounded through the project index). */
+/** List project events, newest first (bounded timeline read). */
 export const listProjectEvents = f1Query({
   args: {
     organizationId: v.id("organizations"),
@@ -154,6 +240,7 @@ export const listProjectEvents = f1Query({
     const rows = await ctx.db
       .query("projectEvents")
       .withIndex("by_project", (q) => q.eq("projectId", args.projectId))
+      .order("desc")
       .take(Math.max(1, Math.min(50, Math.floor(args.limit))));
     return {
       ok: true as const,
@@ -164,7 +251,11 @@ export const listProjectEvents = f1Query({
   },
 });
 
-/** Raise a risk with severity, source, and owner. */
+/**
+ * Raise a risk with severity, source, owner, and optional dependency
+ * references. Every referenced dependency must resolve in-project, so a
+ * risk can never point at another workspace's graph.
+ */
 export const raiseRisk = f1Mutation({
   args: riskInputValidator.fields,
   returns: v.union(
@@ -184,6 +275,16 @@ export const raiseRisk = f1Mutation({
     if (args.scope.trim().length === 0 || args.source.trim().length === 0) {
       return { ok: false as const, code: "invalid-payload", message: "scope and source required" };
     }
+    for (const dependencyId of args.dependencyIds ?? []) {
+      const dependency = await ctx.db.get(dependencyId);
+      if (
+        dependency === null ||
+        dependency.organizationId !== args.organizationId ||
+        dependency.projectId !== args.projectId
+      ) {
+        return { ok: false as const, code: "denied-project", message: "dependency is not in this project" };
+      }
+    }
     const now = Date.now();
     const riskId = await ctx.db.insert("risks", {
       organizationId: args.organizationId,
@@ -193,6 +294,7 @@ export const raiseRisk = f1Mutation({
       state: "open",
       source: args.source,
       ...(args.owner === undefined ? {} : { owner: args.owner }),
+      dependencyIds: [...(args.dependencyIds ?? [])],
       createdAt: now,
       updatedAt: now,
     });
@@ -200,7 +302,12 @@ export const raiseRisk = f1Mutation({
   },
 });
 
-/** Move a risk through its resolution lifecycle (forward only). */
+/**
+ * Move a risk through its resolution lifecycle (forward only).
+ * Terminally accepting a risk requires approver authority or above and
+ * records the accepting identity with its timestamp: a contributor
+ * alone can mitigate or resolve, but never accept, a risk.
+ */
 export const resolveRisk = f1Mutation({
   args: {
     organizationId: v.id("organizations"),
@@ -215,11 +322,12 @@ export const resolveRisk = f1Mutation({
   },
   returns: v.union(v.object({ ok: v.literal(true) }), denialValidator),
   handler: async (ctx, args) => {
+    const minRole = args.state === "accepted" ? "approver" : "contributor";
     const access = await requireDomainAccess(
       ctx,
       args.organizationId,
       args.projectId,
-      "contributor",
+      minRole,
     );
     if (!access.ok) {
       return { ok: false as const, code: access.code, message: access.message };
@@ -238,7 +346,14 @@ export const resolveRisk = f1Mutation({
     if (toIndex < fromIndex) {
       return { ok: false as const, code: "invalid-payload", message: "risks move forward only" };
     }
-    await ctx.db.patch(args.riskId, { state: args.state, updatedAt: Date.now() });
+    const now = Date.now();
+    await ctx.db.patch(args.riskId, {
+      state: args.state,
+      updatedAt: now,
+      ...(args.state === "accepted"
+        ? { acceptedBy: access.value.identity, decidedAt: now }
+        : {}),
+    });
     return { ok: true as const };
   },
 });
@@ -253,7 +368,7 @@ export const resolveRisk = f1Mutation({
 export const saveTemplate = f1Mutation({
   args: templateInputValidator.fields,
   returns: v.union(
-    v.object({ ok: v.literal(true), templateId: v.id("templates") }),
+    v.object({ ok: v.literal(true), templateId: v.id("templates"), deduplicated: v.boolean() }),
     denialValidator,
   ),
   handler: async (ctx, args) => {
@@ -269,6 +384,14 @@ export const saveTemplate = f1Mutation({
     if (args.name.trim().length === 0 || args.version.trim().length === 0) {
       return { ok: false as const, code: "invalid-payload", message: "name and version required" };
     }
+    // Snapshots must parse before the version is claimed, so a broken
+    // template can never occupy its version slot.
+    if (
+      parseSnapshotRequirements(args.requirementSnapshot) === null ||
+      parseSnapshotConstraints(args.constraintSnapshot) === null
+    ) {
+      return { ok: false as const, code: "invalid-payload", message: "template snapshot is invalid" };
+    }
     const duplicate = await ctx.db
       .query("templates")
       .withIndex("by_organization_and_version", (q) =>
@@ -276,7 +399,17 @@ export const saveTemplate = f1Mutation({
       )
       .unique();
     if (duplicate !== null) {
-      return { ok: false as const, code: "duplicate-conflict", message: "template version exists" };
+      // Exact replay returns the stored row; any divergent field is a
+      // version collision, never a silent overwrite.
+      if (
+        duplicate.sourceProjectId !== args.sourceProjectId ||
+        duplicate.name !== args.name ||
+        duplicate.requirementSnapshot !== args.requirementSnapshot ||
+        duplicate.constraintSnapshot !== args.constraintSnapshot
+      ) {
+        return { ok: false as const, code: "duplicate-conflict", message: "template version already used with different fields" };
+      }
+      return { ok: true as const, templateId: duplicate._id, deduplicated: true };
     }
     const templateId = await ctx.db.insert("templates", {
       organizationId: args.organizationId,
@@ -287,7 +420,7 @@ export const saveTemplate = f1Mutation({
       constraintSnapshot: args.constraintSnapshot,
       createdAt: Date.now(),
     });
-    return { ok: true as const, templateId };
+    return { ok: true as const, templateId, deduplicated: false };
   },
 });
 
@@ -312,7 +445,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function parseSnapshotRequirements(snapshot: string): SnapshotRequirement[] | null {
   let parsed: unknown;
   try {
-    parsed = JSON.parse(snapshot) as unknown;
+    parsed = JSON.parse(snapshot);
   } catch {
     return null;
   }
@@ -338,7 +471,7 @@ function parseSnapshotRequirements(snapshot: string): SnapshotRequirement[] | nu
 function parseSnapshotConstraints(snapshot: string): SnapshotConstraint[] | null {
   let parsed: unknown;
   try {
-    parsed = JSON.parse(snapshot) as unknown;
+    parsed = JSON.parse(snapshot);
   } catch {
     return null;
   }
@@ -360,6 +493,12 @@ function parseSnapshotConstraints(snapshot: string): SnapshotConstraint[] | null
  * holds no reference to orders, order events, or cost entries, so
  * historical commitments and cash provably stay behind. The template
  * must belong to the caller's organization.
+ *
+ * Every structural check runs before the first write: duplicate
+ * snapshot keys, unknown edge endpoints, self edges, dependency cycles,
+ * and bound overruns are all denied whole, so a failed instantiation
+ * leaves zero partial rows. Replaying an already-instantiated template
+ * returns the stored requirement rows instead of duplicating them.
  */
 export const instantiateTemplate = f1Mutation({
   args: {
@@ -372,6 +511,7 @@ export const instantiateTemplate = f1Mutation({
       ok: v.literal(true),
       requirementIds: v.array(v.id("requirements")),
       collections: v.array(v.string()),
+      deduplicated: v.boolean(),
     }),
     denialValidator,
   ),
@@ -405,9 +545,31 @@ export const instantiateTemplate = f1Mutation({
     if (!templateReuseExcludesHistoricFinancials([...TEMPLATE_REUSE_COLLECTIONS])) {
       return { ok: false as const, code: "invalid-payload", message: "reuse scope includes financials" };
     }
-    const now = Date.now();
+    // Snapshot-internal validation before any write: unique keys, known
+    // endpoints, no self edges, no cycles.
+    const seenKeys = new Set<string>();
+    for (const item of wanted) {
+      if (seenKeys.has(item.key)) {
+        return { ok: false as const, code: "invalid-payload", message: `duplicate requirement key ${item.key}` };
+      }
+      seenKeys.add(item.key);
+    }
+    const edgeShapes: { from: string; to: string }[] = [];
+    for (const edge of edges) {
+      if (!seenKeys.has(edge.fromKey) || !seenKeys.has(edge.toKey)) {
+        return { ok: false as const, code: "invalid-payload", message: "dependency endpoint is not in the snapshot" };
+      }
+      if (edge.fromKey === edge.toKey) {
+        return { ok: false as const, code: "invalid-payload", message: "dependency self edge is not allowed" };
+      }
+      if (dependencyCreatesCycle(edgeShapes, edge.fromKey, edge.toKey)) {
+        return { ok: false as const, code: "invalid-payload", message: "dependency would create a cycle" };
+      }
+      edgeShapes.push({ from: edge.fromKey, to: edge.toKey });
+    }
+    // Target-side pre-check before any write: exact replay returns the
+    // stored rows, any foreign key occupancy conflicts whole.
     const idsByKey = new Map<string, Id<"requirements">>();
-    const requirementIds: Id<"requirements">[] = [];
     for (const item of wanted) {
       const duplicate = await ctx.db
         .query("requirements")
@@ -415,7 +577,42 @@ export const instantiateTemplate = f1Mutation({
           q.eq("projectId", args.targetProjectId).eq("key", item.key),
         )
         .unique();
-      if (duplicate !== null) continue;
+      if (duplicate === null) continue;
+      if (duplicate.organizationId !== args.organizationId) {
+        return { ok: false as const, code: "denied-project", message: "reference is not in this project" };
+      }
+      idsByKey.set(item.key, duplicate._id);
+    }
+    if (idsByKey.size === wanted.length) {
+      const replayed = wanted.map((item) => idsByKey.get(item.key));
+      if (replayed.every((id): id is Id<"requirements"> => id !== undefined)) {
+        const replayMatches = await Promise.all(
+          replayed.map(async (id) => {
+            const row = await ctx.db.get(id);
+            return (
+              row !== null &&
+              row.templateId === args.templateId &&
+              row.templateVersion === template.version
+            );
+          }),
+        );
+        if (replayMatches.every(Boolean)) {
+          return {
+            ok: true as const,
+            requirementIds: replayed,
+            collections: [...TEMPLATE_REUSE_COLLECTIONS],
+            deduplicated: true,
+          };
+        }
+      }
+      return { ok: false as const, code: "duplicate-conflict", message: "target project already holds these requirement keys" };
+    }
+    if (idsByKey.size > 0) {
+      return { ok: false as const, code: "duplicate-conflict", message: "target project already holds some requirement keys" };
+    }
+    const now = Date.now();
+    const requirementIds: Id<"requirements">[] = [];
+    for (const item of wanted) {
       const requirementId = await ctx.db.insert("requirements", {
         organizationId: args.organizationId,
         projectId: args.targetProjectId,
@@ -428,6 +625,8 @@ export const instantiateTemplate = f1Mutation({
         state: "draft",
         fulfillment: "notOrdered",
         version: 1,
+        templateId: args.templateId,
+        templateVersion: template.version,
         createdAt: now,
         updatedAt: now,
       });
@@ -437,7 +636,9 @@ export const instantiateTemplate = f1Mutation({
     for (const edge of edges) {
       const from = idsByKey.get(edge.fromKey);
       const to = idsByKey.get(edge.toKey);
-      if (from === undefined || to === undefined || from === to) continue;
+      if (from === undefined || to === undefined) {
+        throw new Error("instantiation invariant violated: validated endpoint missing");
+      }
       await ctx.db.insert("dependencies", {
         organizationId: args.organizationId,
         projectId: args.targetProjectId,
@@ -452,6 +653,7 @@ export const instantiateTemplate = f1Mutation({
       ok: true as const,
       requirementIds,
       collections: [...TEMPLATE_REUSE_COLLECTIONS],
+      deduplicated: false,
     };
   },
 });

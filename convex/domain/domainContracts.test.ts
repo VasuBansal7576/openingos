@@ -10,6 +10,7 @@
 
 import { describe, expect, test } from "bun:test";
 import {
+  CONTROLLED_COUNTERPARTY_ROLES,
   TEMPLATE_REUSE_COLLECTIONS,
   approvalInputValidator,
   assetDocumentInputValidator,
@@ -23,7 +24,6 @@ import {
   dependencyInputValidator,
   inboundClassificationValidator,
   isActionableApproval,
-  isControlledCounterparty,
   isReusableFreshness,
   isTerminalFulfillmentState,
   isTerminalRequirementState,
@@ -35,9 +35,9 @@ import {
   orderEventInputValidator,
   orderInputValidator,
   outboundBriefValidator,
-  preserveCounterpartyRole,
   productEvidenceInputValidator,
   projectEventInputValidator,
+  providerProductEvidenceInputValidator,
   quoteUpdateValidator,
   requirementInputValidator,
   researchCollectionValidator,
@@ -131,6 +131,22 @@ describe("immutable version and idempotency keys", () => {
     expect(costEntryInputValidator.fields.idempotencyKey).toBeDefined();
   });
 
+  test("externally repeatable recorders carry idempotency keys", () => {
+    expect(orderEventInputValidator.fields.idempotencyKey).toBeDefined();
+    expect(assetInputValidator.fields.idempotencyKey).toBeDefined();
+    expect(assetDocumentInputValidator.fields.idempotencyKey).toBeDefined();
+    expect(serviceCaseInputValidator.fields.idempotencyKey).toBeDefined();
+    expect(vendorContactInputValidator.fields.idempotencyKey).toBeDefined();
+    expect(watchInputValidator.fields.idempotencyKey).toBeDefined();
+    expect(productEvidenceInputValidator.fields.idempotencyKey).toBeDefined();
+  });
+
+  test("watches and risks carry allowance, schedule, and provenance links", () => {
+    expect("jobId" in watchInputValidator.fields).toBe(true);
+    expect("counterpartyRole" in watchInputValidator.fields).toBe(true);
+    expect("dependencyIds" in riskInputValidator.fields).toBe(true);
+  });
+
   test("approvals and templates bind immutable snapshot/version identity", () => {
     expect(approvalInputValidator.fields.snapshotHash).toBeDefined();
     expect(approvalInputValidator.fields.snapshotCanonical).toBeDefined();
@@ -143,23 +159,19 @@ describe("immutable version and idempotency keys", () => {
   });
 });
 
-describe("ownerStandIn provenance preservation", () => {
-  test("owner-authored roles pass through unchanged", () => {
-    expect(preserveCounterpartyRole("ownerStandIn")).toBe("ownerStandIn");
-    expect(preserveCounterpartyRole("vendor")).toBe("vendor");
+describe("closed counterparty provenance", () => {
+  test("the controlled label set is fixed and explicit", () => {
+    expect([...CONTROLLED_COUNTERPARTY_ROLES]).toEqual(["ownerStandIn", "userImport"]);
   });
 
-  test("controlled counterparties stay labeled", () => {
-    expect(isControlledCounterparty("ownerStandIn")).toBe(true);
-    expect(isControlledCounterparty("userImport")).toBe(true);
-    expect(isControlledCounterparty("vendor")).toBe(false);
-  });
-
-  test("product evidence input carries no client provenance field", () => {
+  test("product evidence input declares the closed union explicitly", () => {
     const fields = Object.keys(productEvidenceInputValidator.fields);
-    expect(fields).not.toContain("counterpartyRole");
+    expect(fields).toContain("counterpartyRole");
+    expect(fields).toContain("idempotencyKey");
     expect(fields).not.toContain("executionMode");
+    expect(fields).not.toContain("origin");
     expect(fields).not.toContain("providerIds");
+    expect(providerProductEvidenceInputValidator.fields.executionMode).toBeDefined();
   });
 });
 
@@ -245,20 +257,23 @@ describe("every named core record has a creation contract", () => {
       expect(validator.fields.organizationId).toBeDefined();
     }
     // Organization-scoped records carry no project: locations bind
-    // projects through attachProject, and vendors serve every project in
-    // the organization. Templates are organization-owned with the source
-    // project kept as a derivable parent reference.
+    // projects through attachProject, vendors serve every project, and
+    // vendor contacts describe a vendor's channels org-wide. Templates
+    // are organization-owned with the source project kept as a
+    // derivable parent reference.
     expect("projectId" in locationInputValidator.fields).toBe(false);
     expect("projectId" in vendorInputValidator.fields).toBe(false);
+    expect("projectId" in vendorContactInputValidator.fields).toBe(false);
     expect("projectId" in templateInputValidator.fields).toBe(false);
     expect("sourceProjectId" in templateInputValidator.fields).toBe(true);
     const projectScoped = validators.filter(
       (validator) =>
         validator !== locationInputValidator &&
         validator !== vendorInputValidator &&
+        validator !== vendorContactInputValidator &&
         validator !== templateInputValidator,
     );
-    expect(projectScoped).toHaveLength(18);
+    expect(projectScoped).toHaveLength(17);
     for (const validator of projectScoped) {
       expect("projectId" in validator.fields).toBe(true);
     }
@@ -280,5 +295,47 @@ describe("every named core record has a creation contract", () => {
     for (const handoff of handoffs) {
       expect(handoff.fields).toBeDefined();
     }
+  });
+
+  test("handoffs carry tenancy so R1/C1/U1 cannot float workspaces", () => {
+    const handoffs = [
+      researchCollectionValidator,
+      browserObservationValidator,
+      jevDecisionValidator,
+      openAIExtractionValidator,
+      openAIDraftValidator,
+      outboundBriefValidator,
+      inboundClassificationValidator,
+      quoteUpdateValidator,
+      uiProjectionValidator,
+    ];
+    for (const handoff of handoffs) {
+      expect("organizationId" in handoff.fields).toBe(true);
+      expect("projectId" in handoff.fields).toBe(true);
+    }
+  });
+
+  test("handoffs bind versions, status, provenance, and exact terms", () => {
+    expect("inputVersion" in researchCollectionValidator.fields).toBe(true);
+    expect("completeness" in researchCollectionValidator.fields).toBe(true);
+    expect("status" in browserObservationValidator.fields).toBe(true);
+    expect("evidenceRefs" in browserObservationValidator.fields).toBe(true);
+    expect("inputVersion" in openAIExtractionValidator.fields).toBe(true);
+    expect("evidenceRefs" in openAIExtractionValidator.fields).toBe(true);
+    expect("status" in openAIDraftValidator.fields).toBe(true);
+    // Scenario vendors are context, never transport authority.
+    expect("scenarioVendorIds" in outboundBriefValidator.fields).toBe(true);
+    expect("recipientVendorIds" in outboundBriefValidator.fields).toBe(false);
+    expect("counterpartyRole" in inboundClassificationValidator.fields).toBe(true);
+    expect("status" in inboundClassificationValidator.fields).toBe(true);
+    expect("contentHash" in quoteUpdateValidator.fields).toBe(true);
+    expect("status" in uiProjectionValidator.fields).toBe(true);
+  });
+
+  test("rfq vendors are scenario context with line items and binding", () => {
+    expect("scenarioVendorIds" in rfqInputValidator.fields).toBe(true);
+    expect("recipientVendorIds" in rfqInputValidator.fields).toBe(false);
+    expect("lineItems" in rfqInputValidator.fields).toBe(true);
+    expect("conversationId" in rfqInputValidator.fields).toBe(true);
   });
 });

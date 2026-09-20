@@ -167,6 +167,21 @@ const recordProductEvidenceRef = makeFunctionReference<
   MutationArgs<typeof sourcing.recordProductEvidence>,
   MutationReturn<typeof sourcing.recordProductEvidence>
 >("domain/sourcing:recordProductEvidence");
+const ingestProductEvidenceRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof sourcing.ingestProductEvidence>,
+  MutationReturn<typeof sourcing.ingestProductEvidence>
+>("domain/sourcing:ingestProductEvidence");
+const linkEvidenceConflictRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof sourcing.linkEvidenceConflict>,
+  MutationReturn<typeof sourcing.linkEvidenceConflict>
+>("domain/sourcing:linkEvidenceConflict");
+const verifyProductEvidenceRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof sourcing.verifyProductEvidence>,
+  MutationReturn<typeof sourcing.verifyProductEvidence>
+>("domain/sourcing:verifyProductEvidence");
 const createRfqRef = makeFunctionReference<
   "mutation",
   MutationArgs<typeof sourcing.createRfq>,
@@ -252,6 +267,11 @@ const checkWatchRef = makeFunctionReference<
   MutationArgs<typeof workspace.checkWatch>,
   MutationReturn<typeof workspace.checkWatch>
 >("domain/workspace:checkWatch");
+const ingestWatchCheckRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof workspace.ingestWatchCheck>,
+  MutationReturn<typeof workspace.ingestWatchCheck>
+>("domain/workspace:ingestWatchCheck");
 const appendProjectEventRef = makeFunctionReference<
   "mutation",
   MutationArgs<typeof workspace.appendProjectEvent>,
@@ -322,6 +342,7 @@ function quoteArgs(
     requirementId?: Id<"requirements">;
     vendorId?: Id<"vendors">;
     rfqId?: Id<"rfqs">;
+    conversationId?: Id<"conversations">;
   } = {},
 ) {
   return {
@@ -381,15 +402,14 @@ async function setupSourcingGraph(
     conversationState: "draft",
   });
   if (!candidate.ok) throw new Error("candidate setup failed");
-  // Every graph vendor holds an authorized contact channel in its
-  // project, so RFQ tests start from the authorized state and the
-  // recipient-mismatch path is proven by vendors without one.
+  // Every graph vendor holds an organization-owned contact channel, so
+  // scenario references resolve without implying delivery authority.
   const contact = await asOwner.mutation(recordVendorContactRef, {
     organizationId: project.orgId,
-    projectId: project.projectId,
     vendorId: vendor.vendorId,
     channel: "email",
     detailHash: "hash-graph-contact",
+    idempotencyKey: "contact-graph-1",
   });
   if (!contact.ok) throw new Error("contact setup failed");
   return { requirementId: requirement.requirementId, vendorId: vendor.vendorId, candidateId: candidate.candidateId };
@@ -459,12 +479,24 @@ describe("direct full graph journey through required indexes", () => {
 
     const contact = await asOwner.mutation(recordVendorContactRef, {
       organizationId: project.orgId,
-      projectId: project.projectId,
       vendorId: graph.vendorId,
-      channel: "email",
+      channel: "phone",
       detailHash: "hash-contact-1",
+      idempotencyKey: "contact-journey-1",
     });
     expect(contact.ok).toBe(true);
+    if (!contact.ok) throw new Error("contact failed");
+    expect(contact.deduplicated).toBe(false);
+    const contactReplay = await asOwner.mutation(recordVendorContactRef, {
+      organizationId: project.orgId,
+      vendorId: graph.vendorId,
+      channel: "phone",
+      detailHash: "hash-contact-1",
+      idempotencyKey: "contact-journey-1",
+    });
+    if (!contactReplay.ok) throw new Error("contact replay failed");
+    expect(contactReplay.deduplicated).toBe(true);
+    expect(contactReplay.contactId).toBe(contact.contactId);
 
     const got = await asOwner.query(getRequirementRef, {
       organizationId: project.orgId,
@@ -510,15 +542,23 @@ describe("direct full graph journey through required indexes", () => {
       originalValue: "1600 W",
       normalizedValue: "1600",
       freshness: "fresh",
+      counterpartyRole: "vendor",
+      idempotencyKey: "pev-journey-1",
     });
-    expect(evidence.ok).toBe(true);
+    if (!evidence.ok) throw new Error("evidence failed");
+    expect(evidence.deduplicated).toBe(false);
+    const storedEvidence = await t.run(async (ctx) => ctx.db.get(evidence.evidenceId));
+    expect(storedEvidence?.counterpartyRole).toBe("vendor");
+    expect(storedEvidence?.origin).toBe("ownerImport");
+    expect(storedEvidence?.executionMode).toBe("recorded");
 
     const rfq = await asOwner.mutation(createRfqRef, {
       organizationId: project.orgId,
       projectId: project.projectId,
       requirementId: graph.requirementId,
       idempotencyKey: "rfq-journey-1",
-      recipientVendorIds: [graph.vendorId],
+      scenarioVendorIds: [graph.vendorId],
+      lineItems: [{ itemId: "machine", description: "Espresso machine", quantity: "1", unit: "piece" }],
       briefHash: "brief-1",
       conversationState: "draft",
     });
@@ -601,8 +641,10 @@ describe("direct full graph journey through required indexes", () => {
       projectId: project.projectId,
       orderId: order.orderId,
       kind: "confirmation",
+      idempotencyKey: "evt-journey-1",
     });
-    expect(event.ok).toBe(true);
+    if (!event.ok) throw new Error("event failed");
+    expect(event.deduplicated).toBe(false);
     const payment = await asOwner.mutation(recordCostEntryRef, {
       organizationId: project.orgId,
       projectId: project.projectId,
@@ -619,23 +661,29 @@ describe("direct full graph journey through required indexes", () => {
       locationId: location.locationId,
       orderId: order.orderId,
       label: "Linea Mini #1",
+      idempotencyKey: "asset-journey-1",
     });
     if (!asset.ok) throw new Error("asset failed");
+    expect(asset.deduplicated).toBe(false);
     const document = await asOwner.mutation(recordAssetDocumentRef, {
       organizationId: project.orgId,
       projectId: project.projectId,
       assetId: asset.assetId,
       kind: "manual",
+      idempotencyKey: "doc-journey-1",
     });
-    expect(document.ok).toBe(true);
+    if (!document.ok) throw new Error("document failed");
+    expect(document.deduplicated).toBe(false);
     const serviceCase = await asOwner.mutation(openServiceCaseRef, {
       organizationId: project.orgId,
       projectId: project.projectId,
       assetId: asset.assetId,
       urgency: "normal",
       summary: "Annual descale",
+      idempotencyKey: "case-journey-1",
     });
     if (!serviceCase.ok) throw new Error("service case failed");
+    expect(serviceCase.deduplicated).toBe(false);
     const advanced = await asOwner.mutation(updateServiceCaseRef, {
       organizationId: project.orgId,
       projectId: project.projectId,
@@ -650,8 +698,15 @@ describe("direct full graph journey through required indexes", () => {
       targetKind: "vendor-price",
       targetId: "vendor-1:linea-mini",
       cadenceMs: 86_400_000,
+      counterpartyRole: "vendor",
+      idempotencyKey: "watch-journey-1",
     });
     if (!watch.ok) throw new Error("watch failed");
+    expect(watch.deduplicated).toBe(false);
+    const storedWatch = await t.run(async (ctx) => ctx.db.get(watch.watchId));
+    expect(storedWatch?.source).toBe("ownerImport");
+    expect(storedWatch?.counterpartyRole).toBe("vendor");
+    expect(storedWatch?.nextCheckAt).toBeGreaterThan(0);
     const checked = await asOwner.mutation(checkWatchRef, {
       organizationId: project.orgId,
       projectId: project.projectId,
@@ -769,32 +824,34 @@ describe("direct cross-project reference rejection", () => {
       projectId: projectB.projectId,
       requirementId: graphB.requirementId,
       idempotencyKey: "rfq-foreign-1",
-      recipientVendorIds: [graphA.vendorId],
+      scenarioVendorIds: [graphA.vendorId],
+      lineItems: [{ itemId: "machine", description: "Espresso machine", quantity: "1", unit: "piece" }],
       briefHash: "brief-x",
       conversationState: "draft",
     });
     expect(foreignRfq.ok).toBe(false);
     if (!foreignRfq.ok) expect(foreignRfq.code).toBe("denied-project");
 
-    // A known in-organization vendor without an authorized contact
-    // channel for the project is a recipient mismatch, not a send.
+    // Scenario vendors are context, not authority: an in-organization
+    // vendor without any contact channel is a valid scenario reference,
+    // and the record authorizes no delivery on its own.
     const contactless = await asB.mutation(recordVendorRef, {
       organizationId: projectB.orgId,
       name: "Contactless Supplier",
       regions: ["NL"],
     });
     if (!contactless.ok) throw new Error("contactless vendor failed");
-    const mismatchedRfq = await asB.mutation(createRfqRef, {
+    const scenarioRfq = await asB.mutation(createRfqRef, {
       organizationId: projectB.orgId,
       projectId: projectB.projectId,
       requirementId: graphB.requirementId,
       idempotencyKey: "rfq-foreign-2",
-      recipientVendorIds: [contactless.vendorId],
+      scenarioVendorIds: [contactless.vendorId],
+      lineItems: [{ itemId: "machine", description: "Espresso machine", quantity: "1", unit: "piece" }],
       briefHash: "brief-x",
       conversationState: "draft",
     });
-    expect(mismatchedRfq.ok).toBe(false);
-    if (!mismatchedRfq.ok) expect(mismatchedRfq.code).toBe("recipient-mismatch");
+    expect(scenarioRfq.ok).toBe(true);
 
     const foreignQuote = await asB.mutation(recordQuoteRef, quoteArgs(
       projectB.orgId,
@@ -871,6 +928,7 @@ describe("direct cross-project reference rejection", () => {
       projectId: projectA.projectId,
       orderId: orderB.orderId,
       kind: "shipment",
+      idempotencyKey: "evt-cross-1",
     });
     expect(foreignEvent.ok).toBe(false);
     if (!foreignEvent.ok) expect(foreignEvent.code).toBe("denied-project");
@@ -891,6 +949,7 @@ describe("direct cross-project reference rejection", () => {
       projectId: projectB.projectId,
       orderId: orderB.orderId,
       label: "Machine B",
+      idempotencyKey: "asset-b-1",
     });
     if (!assetB.ok) throw new Error("asset B failed");
     const foreignCase = await asA.mutation(openServiceCaseRef, {
@@ -899,6 +958,7 @@ describe("direct cross-project reference rejection", () => {
       assetId: assetB.assetId,
       urgency: "high",
       summary: "Cross-project probe",
+      idempotencyKey: "case-cross-1",
     });
     expect(foreignCase.ok).toBe(false);
     if (!foreignCase.ok) expect(foreignCase.code).toBe("denied-project");
@@ -909,6 +969,8 @@ describe("direct cross-project reference rejection", () => {
       targetKind: "vendor-price",
       targetId: "vendor-b:linea-mini",
       cadenceMs: 86_400_000,
+      counterpartyRole: "vendor",
+      idempotencyKey: "watch-foreign-b",
     });
     if (!watchB.ok) throw new Error("watch B failed");
     const foreignWatchRead = await asA.mutation(checkWatchRef, {
@@ -1098,7 +1160,8 @@ describe("direct dependency cycles, variant identity, and version keys", () => {
       projectId: project.projectId,
       requirementId: graph.requirementId,
       idempotencyKey: "rfq-replay-1",
-      recipientVendorIds: [graph.vendorId],
+      scenarioVendorIds: [graph.vendorId],
+      lineItems: [{ itemId: "machine", description: "Espresso machine", quantity: "1", unit: "piece" }],
       briefHash: "brief-r",
       conversationState: "draft" as const,
     };
@@ -1179,7 +1242,7 @@ describe("direct dependency cycles, variant identity, and version keys", () => {
 });
 
 describe("direct provenance and reuse boundaries", () => {
-  test("public evidence imports cannot self-assert provenance", async () => {
+  test("public evidence imports cannot self-assert transport", async () => {
     const t = convexTest(schema, modules);
     const project = await setupProject(t, OWNER_A, "provenance");
     const asOwner = t.withIdentity(OWNER_A);
@@ -1198,6 +1261,7 @@ describe("direct provenance and reuse boundaries", () => {
         counterpartyRole: "vendor",
         executionMode: "live",
         providerIds: "inbox-1/message-1",
+        idempotencyKey: "pev-prov-0",
       }),
     ).rejects.toThrow(/Unexpected field/);
   });
@@ -1225,7 +1289,7 @@ describe("direct provenance and reuse boundaries", () => {
     expect(row?.compatibility).toBe("unknown");
   });
 
-  test("recorded evidence carries server-derived user provenance", async () => {
+  test("explicit owner-import evidence carries the closed union and origin", async () => {
     const t = convexTest(schema, modules);
     const project = await setupProject(t, OWNER_A, "provenance-rows");
     const asOwner = t.withIdentity(OWNER_A);
@@ -1238,12 +1302,116 @@ describe("direct provenance and reuse boundaries", () => {
       originalValue: "1600 W",
       normalizedValue: "1600",
       freshness: "fresh",
+      counterpartyRole: "ownerStandIn",
+      idempotencyKey: "pev-prov-1",
     });
     if (!recorded.ok) throw new Error("evidence record failed");
+    expect(recorded.deduplicated).toBe(false);
     const row = await t.run(async (ctx) => ctx.db.get(recorded.evidenceId));
-    expect(row?.counterpartyRole).toBe("userImport");
+    expect(row?.counterpartyRole).toBe("ownerStandIn");
     expect(row?.executionMode).toBe("recorded");
+    expect(row?.origin).toBe("ownerImport");
     expect(row?.verification).toBe("unverified");
+    // Closed union: userImport, live, and fixture labels are rejected
+    // by the validator, never stored.
+    const loose: FunctionReference<"mutation", "public", Record<string, unknown>, unknown> =
+      makeFunctionReference("domain/sourcing:recordProductEvidence");
+    await expect(
+      asOwner.mutation(loose, {
+        organizationId: project.orgId,
+        projectId: project.projectId,
+        field: "power.watts",
+        sourceKind: "user-document",
+        capturedAt: Date.now(),
+        originalValue: "1600 W",
+        normalizedValue: "1600",
+        freshness: "fresh",
+        counterpartyRole: "userImport",
+        executionMode: "live",
+        providerIds: "inbox-1/message-1",
+        idempotencyKey: "pev-prov-2",
+      }),
+    ).rejects.toThrow(/Validator error/);
+  });
+
+  test("evidence conflicts link and resolve through authority", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, OWNER_A, "evidence-links");
+    const asOwner = t.withIdentity(OWNER_A);
+    const graph = await setupSourcingGraph(t, OWNER_A, project);
+    const base = {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      requirementId: graph.requirementId,
+      field: "power.watts",
+      sourceKind: "supplier-page",
+      capturedAt: Date.now(),
+      freshness: "fresh" as const,
+      counterpartyRole: "vendor" as const,
+    };
+    const first = await asOwner.mutation(recordProductEvidenceRef, {
+      ...base,
+      originalValue: "1600 W",
+      normalizedValue: "1600",
+      idempotencyKey: "pev-link-1",
+    });
+    if (!first.ok) throw new Error("first evidence failed");
+    const second = await asOwner.mutation(recordProductEvidenceRef, {
+      ...base,
+      originalValue: "2200 W",
+      normalizedValue: "2200",
+      idempotencyKey: "pev-link-2",
+    });
+    if (!second.ok) throw new Error("second evidence failed");
+    // Identical replay deduplicates; divergent replay conflicts.
+    const replay = await asOwner.mutation(recordProductEvidenceRef, {
+      ...base,
+      originalValue: "1600 W",
+      normalizedValue: "1600",
+      idempotencyKey: "pev-link-1",
+    });
+    if (!replay.ok) throw new Error("evidence replay failed");
+    expect(replay.deduplicated).toBe(true);
+    expect(replay.evidenceId).toBe(first.evidenceId);
+    const collision = await asOwner.mutation(recordProductEvidenceRef, {
+      ...base,
+      originalValue: "9999 W",
+      normalizedValue: "9999",
+      idempotencyKey: "pev-link-1",
+    });
+    expect(collision.ok).toBe(false);
+    if (!collision.ok) expect(collision.code).toBe("duplicate-conflict");
+    const linked = await asOwner.mutation(linkEvidenceConflictRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      evidenceId: first.evidenceId,
+      conflictingIds: [second.evidenceId],
+    });
+    expect(linked.ok).toBe(true);
+    const conflicted = await t.run(async (ctx) => ctx.db.get(first.evidenceId));
+    expect(conflicted?.verification).toBe("conflicted");
+    expect(conflicted?.conflictEvidenceIds).toEqual([second.evidenceId]);
+    const selfLink = await asOwner.mutation(linkEvidenceConflictRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      evidenceId: first.evidenceId,
+      conflictingIds: [first.evidenceId],
+    });
+    expect(selfLink.ok).toBe(false);
+    const resolved = await asOwner.mutation(verifyProductEvidenceRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      evidenceId: first.evidenceId,
+      verdict: "verified",
+    });
+    expect(resolved.ok).toBe(true);
+    const twice = await asOwner.mutation(verifyProductEvidenceRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      evidenceId: first.evidenceId,
+      verdict: "superseded",
+    });
+    expect(twice.ok).toBe(false);
   });
 
   test("template reuse copies requirements without orders or payments", async () => {
@@ -1380,14 +1548,33 @@ describe("direct provenance and reuse boundaries", () => {
       organizationId: project.orgId,
       projectId: project.projectId,
       label: "Spare grinder",
+      idempotencyKey: "asset-ver-1",
     });
     if (!asset.ok) throw new Error("asset failed");
+    const assetReplay = await asOwner.mutation(recordAssetRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      label: "Spare grinder",
+      idempotencyKey: "asset-ver-1",
+    });
+    if (!assetReplay.ok) throw new Error("asset replay failed");
+    expect(assetReplay.deduplicated).toBe(true);
+    expect(assetReplay.assetId).toBe(asset.assetId);
+    const assetCollision = await asOwner.mutation(recordAssetRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      label: "Different grinder",
+      idempotencyKey: "asset-ver-1",
+    });
+    expect(assetCollision.ok).toBe(false);
+    if (!assetCollision.ok) expect(assetCollision.code).toBe("duplicate-conflict");
     const serviceCase = await asOwner.mutation(openServiceCaseRef, {
       organizationId: project.orgId,
       projectId: project.projectId,
       assetId: asset.assetId,
       urgency: "low",
       summary: "Check burrs",
+      idempotencyKey: "case-ver-1",
     });
     if (!serviceCase.ok) throw new Error("case failed");
     const closed = await asOwner.mutation(updateServiceCaseRef, {
@@ -1574,14 +1761,28 @@ describe("direct audit repairs: authority, hashes, bounds, lineage", () => {
       orderId: order.orderId,
       kind: "partialDelivery",
       acceptedQuantity: "1.5",
+      idempotencyKey: "evt-acc-1",
     });
-    expect(first.ok).toBe(true);
+    if (!first.ok) throw new Error("first event failed");
+    expect(first.deduplicated).toBe(false);
+    const firstReplay = await asOwner.mutation(appendOrderEventRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      orderId: order.orderId,
+      kind: "partialDelivery",
+      acceptedQuantity: "1.5",
+      idempotencyKey: "evt-acc-1",
+    });
+    if (!firstReplay.ok) throw new Error("event replay failed");
+    expect(firstReplay.deduplicated).toBe(true);
+    expect(firstReplay.eventId).toBe(first.eventId);
     const overCumulative = await asOwner.mutation(appendOrderEventRef, {
       organizationId: project.orgId,
       projectId: project.projectId,
       orderId: order.orderId,
       kind: "partialDelivery",
       acceptedQuantity: "1",
+      idempotencyKey: "evt-acc-2",
     });
     expect(overCumulative.ok).toBe(false);
     if (!overCumulative.ok) expect(overCumulative.code).toBe("invalid-payload");
@@ -1591,6 +1792,7 @@ describe("direct audit repairs: authority, hashes, bounds, lineage", () => {
       orderId: order.orderId,
       kind: "acceptance",
       acceptedQuantity: "3",
+      idempotencyKey: "evt-acc-3",
     });
     expect(overSingle.ok).toBe(false);
     const malformed = await asOwner.mutation(appendOrderEventRef, {
@@ -1599,6 +1801,7 @@ describe("direct audit repairs: authority, hashes, bounds, lineage", () => {
       orderId: order.orderId,
       kind: "acceptance",
       acceptedQuantity: "many",
+      idempotencyKey: "evt-acc-4",
     });
     expect(malformed.ok).toBe(false);
     const exact = await asOwner.mutation(appendOrderEventRef, {
@@ -1607,6 +1810,7 @@ describe("direct audit repairs: authority, hashes, bounds, lineage", () => {
       orderId: order.orderId,
       kind: "acceptance",
       acceptedQuantity: "0.5",
+      idempotencyKey: "evt-acc-5",
     });
     expect(exact.ok).toBe(true);
   });
@@ -1717,7 +1921,8 @@ describe("direct audit repairs: authority, hashes, bounds, lineage", () => {
       organizationId: project.orgId,
       projectId: project.projectId,
       requirementId: graph.requirementId,
-      recipientVendorIds: [graph.vendorId],
+      scenarioVendorIds: [graph.vendorId],
+      lineItems: [{ itemId: "machine", description: "Espresso machine", quantity: "1", unit: "piece" }],
       briefHash: "brief-h",
       conversationState: "draft" as const,
     };
@@ -1744,6 +1949,32 @@ describe("direct audit repairs: authority, hashes, bounds, lineage", () => {
     if (!second.ok) throw new Error("second quote failed");
     // Identical commercial terms bound to different RFQs hash apart.
     expect(first.contentHash).not.toBe(second.contentHash);
+  });
+
+  test("internal pipeline evidence writes carry internal origin", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, OWNER_A, "pipeline-prov");
+    const asOwner = t.withIdentity(OWNER_A);
+    const graph = await setupSourcingGraph(t, OWNER_A, project);
+    const ingested = await t.mutation(ingestProductEvidenceRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      requirementId: graph.requirementId,
+      field: "power.watts",
+      sourceKind: "collector",
+      capturedAt: Date.now(),
+      originalValue: "1600 W",
+      normalizedValue: "1600",
+      freshness: "fresh",
+      counterpartyRole: "vendor",
+      executionMode: "live",
+      idempotencyKey: "pev-pipe-1",
+    });
+    if (!ingested.ok) throw new Error("ingest failed");
+    const row = await t.run(async (ctx) => ctx.db.get(ingested.evidenceId));
+    expect(row?.origin).toBe("internal");
+    expect(row?.executionMode).toBe("live");
+    expect(row?.verification).toBe("unverified");
   });
 
   test("compatibility verification needs evidence and approver authority", async () => {
@@ -1778,5 +2009,522 @@ describe("direct audit repairs: authority, hashes, bounds, lineage", () => {
     });
     expect(noEvidence.ok).toBe(false);
     if (!noEvidence.ok) expect(noEvidence.code).toBe("invalid-payload");
+  });
+});
+
+describe("direct second-round repairs: bindings, pins, replay, lineage", () => {
+  async function setupGrantAndConversation(
+    t: ReturnType<typeof convexTest>,
+    orgId: Id<"organizations">,
+    projectId: Id<"projects">,
+  ) {
+    return await t.run(async (ctx) => {
+      const now = Date.now();
+      const grantId = await ctx.db.insert("grants", {
+        organizationId: orgId,
+        projectId,
+        operations: ["communication.send"],
+        communicationProfile: "ownerRoleplay",
+        recipientConfigVersion: 1,
+        inputVersions: {},
+        canonicalPayload: "{}",
+        payloadHash: "hash-conv",
+        costCeilingMicroUsd: 100_000,
+        roundLimit: 2,
+        expiresAt: now + 3_600_000,
+        revocationVersion: 1,
+        status: "active",
+        createdAt: now,
+      });
+      const conversationId = await ctx.db.insert("conversations", {
+        organizationId: orgId,
+        projectId,
+        grantId,
+        version: 1,
+        state: "draft",
+        recipientConfigVersion: 1,
+        updatedAt: now,
+      });
+      return { grantId, conversationId };
+    });
+  }
+
+  function rfqLine(id: string) {
+    return { itemId: id, description: `Item ${id}`, quantity: "1", unit: "piece" };
+  }
+
+  test("rfqs carry line items and an in-project conversation binding", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, OWNER_A, "rfq-bind");
+    const asOwner = t.withIdentity(OWNER_A);
+    const graph = await setupSourcingGraph(t, OWNER_A, project);
+    const base = {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      requirementId: graph.requirementId,
+      idempotencyKey: "rfq-bind-1",
+      scenarioVendorIds: [graph.vendorId],
+      briefHash: "brief-bind",
+      conversationState: "draft" as const,
+    };
+    const emptyLines = await asOwner.mutation(createRfqRef, {
+      ...base,
+      lineItems: [],
+    });
+    expect(emptyLines.ok).toBe(false);
+    const badQuantity = await asOwner.mutation(createRfqRef, {
+      ...base,
+      lineItems: [{ itemId: "m", description: "Machine", quantity: "lots", unit: "piece" }],
+    });
+    expect(badQuantity.ok).toBe(false);
+    const { conversationId } = await setupGrantAndConversation(t, project.orgId, project.projectId);
+    const bound = await asOwner.mutation(createRfqRef, {
+      ...base,
+      lineItems: [rfqLine("machine")],
+      conversationId,
+    });
+    if (!bound.ok) throw new Error("bound rfq failed");
+    const stored = await t.run(async (ctx) => ctx.db.get(bound.rfqId));
+    expect(stored?.conversationId).toBe(conversationId);
+    expect(stored?.lineItems).toHaveLength(1);
+    // A conversation from another project never binds.
+    const projectB = await setupProject(t, OWNER_B, "rfq-bind-b");
+    const foreign = await setupGrantAndConversation(t, projectB.orgId, projectB.projectId);
+    const crossBound = await asOwner.mutation(createRfqRef, {
+      ...base,
+      idempotencyKey: "rfq-bind-2",
+      lineItems: [rfqLine("machine")],
+      conversationId: foreign.conversationId,
+    });
+    expect(crossBound.ok).toBe(false);
+    if (!crossBound.ok) expect(crossBound.code).toBe("denied-project");
+    // Divergent line items under one key collide instead of merging.
+    const collision = await asOwner.mutation(createRfqRef, {
+      ...base,
+      lineItems: [rfqLine("machine"), rfqLine("grinder")],
+    });
+    expect(collision.ok).toBe(false);
+    if (!collision.ok) expect(collision.code).toBe("duplicate-conflict");
+  });
+
+  test("negotiations pin exact quote version, currency, and conversation", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, OWNER_A, "neg-pin");
+    const asOwner = t.withIdentity(OWNER_A);
+    const graph = await setupSourcingGraph(t, OWNER_A, project);
+    const { conversationId } = await setupGrantAndConversation(t, project.orgId, project.projectId);
+    const quote = await asOwner.mutation(recordQuoteRef, quoteArgs(
+      project.orgId,
+      project.projectId,
+      "q-pin-1",
+      { requirementId: graph.requirementId, vendorId: graph.vendorId, conversationId },
+    ));
+    if (!quote.ok) throw new Error("quote failed");
+    const negotiation = await asOwner.mutation(openNegotiationRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      quoteId: quote.quoteId,
+      mandateHash: "mandate-pin",
+      roundLimit: 3,
+      expiresAt: Date.now() + 3_600_000,
+    });
+    if (!negotiation.ok) throw new Error("negotiation failed");
+    const stored = await t.run(async (ctx) => ctx.db.get(negotiation.negotiationId));
+    expect(stored?.quoteVersion).toBe("q-pin-1");
+    expect(stored?.currency).toBe("EUR");
+    expect(stored?.conversationId).toBe(conversationId);
+  });
+
+  test("watches link allowance, advance next checks, and separate sources", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, OWNER_A, "watch-src");
+    const asOwner = t.withIdentity(OWNER_A);
+    const { grantId } = await setupGrantAndConversation(t, project.orgId, project.projectId);
+    const jobId = await t.run(async (ctx) => {
+      const now = Date.now();
+      return await ctx.db.insert("jobs", {
+        organizationId: project.orgId,
+        projectId: project.projectId,
+        grantId,
+        grantVersion: 1,
+        kind: "research",
+        state: "running",
+        inputVersions: {},
+        createdAt: now,
+        updatedAt: now,
+      });
+    });
+    const watch = await asOwner.mutation(createWatchRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      jobId,
+      targetKind: "vendor-price",
+      targetId: "v:1",
+      cadenceMs: 3_600_000,
+      counterpartyRole: "ownerStandIn",
+      idempotencyKey: "watch-src-1",
+    });
+    if (!watch.ok) throw new Error("watch failed");
+    const created = await t.run(async (ctx) => ctx.db.get(watch.watchId));
+    expect(created?.jobId).toBe(jobId);
+    expect(created?.source).toBe("ownerImport");
+    const firstCheck = created?.nextCheckAt ?? 0;
+    const checked = await asOwner.mutation(checkWatchRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      watchId: watch.watchId,
+      result: "stale",
+    });
+    expect(checked.ok).toBe(true);
+    const after = await t.run(async (ctx) => ctx.db.get(watch.watchId));
+    expect((after?.nextCheckAt ?? 0) >= firstCheck).toBe(true);
+    // A job from another project never links.
+    const projectB = await setupProject(t, OWNER_B, "watch-src-b");
+    const foreign = await setupGrantAndConversation(t, projectB.orgId, projectB.projectId);
+    const foreignJob = await t.run(async (ctx) => {
+      const now = Date.now();
+      return await ctx.db.insert("jobs", {
+        organizationId: projectB.orgId,
+        projectId: projectB.projectId,
+        grantId: foreign.grantId,
+        grantVersion: 1,
+        kind: "research",
+        state: "running",
+        inputVersions: {},
+        createdAt: now,
+        updatedAt: now,
+      });
+    });
+    const crossLinked = await asOwner.mutation(createWatchRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      jobId: foreignJob,
+      targetKind: "vendor-price",
+      targetId: "v:2",
+      cadenceMs: 3_600_000,
+      counterpartyRole: "vendor",
+      idempotencyKey: "watch-src-2",
+    });
+    expect(crossLinked.ok).toBe(false);
+    if (!crossLinked.ok) expect(crossLinked.code).toBe("denied-project");
+    // The internal pipeline stamps internal source; owner checks on an
+    // internal watch are refused.
+    const ingested = await t.mutation(ingestWatchCheckRef, {
+      watchId: watch.watchId,
+      result: "ok",
+    });
+    expect(ingested.ok).toBe(true);
+    const internal = await t.run(async (ctx) => ctx.db.get(watch.watchId));
+    expect(internal?.source).toBe("internal");
+    const ownerRecheck = await asOwner.mutation(checkWatchRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      watchId: watch.watchId,
+      result: "ok",
+    });
+    expect(ownerRecheck.ok).toBe(false);
+  });
+
+  test("risks reference dependencies and only approvers accept", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, OWNER_A, "risk-gate");
+    const asOwner = t.withIdentity(OWNER_A);
+    const first = await asOwner.mutation(createRequirementRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      key: "req-r1",
+      title: "R1",
+      category: "cat",
+      quantity: "1",
+      unit: "piece",
+      priority: "P1",
+    });
+    if (!first.ok) throw new Error("req failed");
+    const second = await asOwner.mutation(createRequirementRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      key: "req-r2",
+      title: "R2",
+      category: "cat",
+      quantity: "1",
+      unit: "piece",
+      priority: "P1",
+    });
+    if (!second.ok) throw new Error("req failed");
+    const edge = await asOwner.mutation(addDependencyRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      fromRequirementId: first.requirementId,
+      toRequirementId: second.requirementId,
+      kind: "scheduling",
+    });
+    if (!edge.ok) throw new Error("edge failed");
+    const risk = await asOwner.mutation(raiseRiskRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      scope: "req-r1",
+      severity: "critical",
+      source: "dependency",
+      dependencyIds: [edge.dependencyId],
+    });
+    if (!risk.ok) throw new Error("risk failed");
+    const stored = await t.run(async (ctx) => ctx.db.get(risk.riskId));
+    expect(stored?.dependencyIds).toEqual([edge.dependencyId]);
+    // A dependency from another project never attaches.
+    const projectB = await setupProject(t, OWNER_B, "risk-gate-b");
+    const foreignDep = await t.run(async (ctx) =>
+      ctx.db.insert("dependencies", {
+        organizationId: projectB.orgId,
+        projectId: projectB.projectId,
+        fromRequirementId: first.requirementId,
+        toRequirementId: second.requirementId,
+        kind: "technical",
+        verification: "pending",
+        createdAt: Date.now(),
+      }),
+    );
+    const crossRisk = await asOwner.mutation(raiseRiskRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      scope: "cross",
+      severity: "high",
+      source: "dependency",
+      dependencyIds: [foreignDep],
+    });
+    expect(crossRisk.ok).toBe(false);
+    if (!crossRisk.ok) expect(crossRisk.code).toBe("denied-project");
+    // Contributors mitigate but never terminally accept.
+    const CONTRIB = { tokenIdentifier: "domain-contrib-risk" };
+    const granted = await asOwner.mutation(grantProjectAccessRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      targetIdentity: CONTRIB.tokenIdentifier,
+      role: "contributor",
+    });
+    expect(granted.ok).toBe(true);
+    const asContrib = t.withIdentity(CONTRIB);
+    const mitigating = await asContrib.mutation(resolveRiskRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      riskId: risk.riskId,
+      state: "mitigating",
+    });
+    expect(mitigating.ok).toBe(true);
+    const accepted = await asContrib.mutation(resolveRiskRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      riskId: risk.riskId,
+      state: "accepted",
+    });
+    expect(accepted.ok).toBe(false);
+    if (!accepted.ok) expect(accepted.code).toBe("denied-capability");
+    const approved = await asOwner.mutation(resolveRiskRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      riskId: risk.riskId,
+      state: "accepted",
+    });
+    expect(approved.ok).toBe(true);
+    const settled = await t.run(async (ctx) => ctx.db.get(risk.riskId));
+    expect(settled?.acceptedBy).toBe(OWNER_A.tokenIdentifier);
+    expect(settled?.decidedAt).toBeGreaterThan(0);
+  });
+
+  test("templates replay exactly and reject bad graphs before writes", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, OWNER_A, "template-exact");
+    const asOwner = t.withIdentity(OWNER_A);
+    const item = (key: string) => ({
+      key,
+      title: `Item ${key}`,
+      category: "cat",
+      quantity: "1",
+      unit: "piece",
+    });
+    const save = await asOwner.mutation(saveTemplateRef, {
+      organizationId: project.orgId,
+      sourceProjectId: project.projectId,
+      name: "exact",
+      version: "v1",
+      requirementSnapshot: JSON.stringify([item("a"), item("b")]),
+      constraintSnapshot: JSON.stringify([{ fromKey: "a", toKey: "b", kind: "technical" }]),
+    });
+    if (!save.ok || save.deduplicated) throw new Error("save failed");
+    const saveReplay = await asOwner.mutation(saveTemplateRef, {
+      organizationId: project.orgId,
+      sourceProjectId: project.projectId,
+      name: "exact",
+      version: "v1",
+      requirementSnapshot: JSON.stringify([item("a"), item("b")]),
+      constraintSnapshot: JSON.stringify([{ fromKey: "a", toKey: "b", kind: "technical" }]),
+    });
+    if (!saveReplay.ok) throw new Error("save replay failed");
+    expect(saveReplay.deduplicated).toBe(true);
+    expect(saveReplay.templateId).toBe(save.templateId);
+    const saveCollision = await asOwner.mutation(saveTemplateRef, {
+      organizationId: project.orgId,
+      sourceProjectId: project.projectId,
+      name: "renamed",
+      version: "v1",
+      requirementSnapshot: JSON.stringify([item("a")]),
+      constraintSnapshot: JSON.stringify([]),
+    });
+    expect(saveCollision.ok).toBe(false);
+    if (!saveCollision.ok) expect(saveCollision.code).toBe("duplicate-conflict");
+    const target = await asOwner.mutation(createProjectRef, {
+      organizationId: project.orgId,
+      name: "exact target",
+      visibility: "open",
+    });
+    if (!target.ok) throw new Error("target failed");
+    const first = await asOwner.mutation(instantiateTemplateRef, {
+      organizationId: project.orgId,
+      targetProjectId: target.projectId,
+      templateId: save.templateId,
+    });
+    if (!first.ok || first.deduplicated) throw new Error("instantiate failed");
+    expect(first.requirementIds).toHaveLength(2);
+    const replay = await asOwner.mutation(instantiateTemplateRef, {
+      organizationId: project.orgId,
+      targetProjectId: target.projectId,
+      templateId: save.templateId,
+    });
+    if (!replay.ok) throw new Error("instantiate replay failed");
+    expect(replay.deduplicated).toBe(true);
+    expect(replay.requirementIds).toEqual(first.requirementIds);
+    // Bad graphs deny whole with zero writes: duplicate keys, unknown
+    // endpoints, self edges, and cycles.
+    const badGraphs: [string, unknown[], unknown[]][] = [
+      ["dup-keys", [item("x"), item("x")], []],
+      ["unknown-endpoint", [item("x")], [{ fromKey: "x", toKey: "ghost", kind: "technical" }]],
+      ["self-edge", [item("x")], [{ fromKey: "x", toKey: "x", kind: "scheduling" }]],
+      ["cycle", [item("x"), item("y")], [
+        { fromKey: "x", toKey: "y", kind: "technical" },
+        { fromKey: "y", toKey: "x", kind: "technical" },
+      ]],
+    ];
+    for (const [name, reqs, cons] of badGraphs) {
+      const bad = await asOwner.mutation(saveTemplateRef, {
+        organizationId: project.orgId,
+        sourceProjectId: project.projectId,
+        name: `bad-${name}`,
+        version: `bad-${name}`,
+        requirementSnapshot: JSON.stringify(reqs),
+        constraintSnapshot: JSON.stringify(cons),
+      });
+      if (!bad.ok) throw new Error(`bad template ${name} failed to save`);
+      const fresh = await asOwner.mutation(createProjectRef, {
+        organizationId: project.orgId,
+        name: `bad target ${name}`,
+        visibility: "open",
+      });
+      if (!fresh.ok) throw new Error("fresh target failed");
+      const denied = await asOwner.mutation(instantiateTemplateRef, {
+        organizationId: project.orgId,
+        targetProjectId: fresh.projectId,
+        templateId: bad.templateId,
+      });
+      expect(denied.ok).toBe(false);
+      if (!denied.ok) expect(denied.code).toBe("invalid-payload");
+      const rows = await t.run(async (ctx) =>
+        ctx.db
+          .query("requirements")
+          .withIndex("by_project", (q) => q.eq("projectId", fresh.projectId))
+          .take(100),
+      );
+      expect(rows).toHaveLength(0);
+    }
+  });
+
+  test("selection and cost lineage refuse mixed currency and zero cash", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, OWNER_A, "money-line");
+    const asOwner = t.withIdentity(OWNER_A);
+    const graph = await setupSourcingGraph(t, OWNER_A, project);
+    const usd = await asOwner.mutation(createRequirementRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      key: "req-usd",
+      title: "USD scope",
+      category: "cat",
+      quantity: "1",
+      unit: "piece",
+      priority: "P1",
+      currency: "USD",
+    });
+    if (!usd.ok) throw new Error("usd requirement failed");
+    const usdCandidate = await asOwner.mutation(recordCandidateRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      requirementId: usd.requirementId,
+      vendorId: graph.vendorId,
+      productModel: "Linea Mini",
+      variant: "Black 220V",
+      conversationState: "draft",
+    });
+    if (!usdCandidate.ok) throw new Error("usd candidate failed");
+    const quote = await asOwner.mutation(recordQuoteRef, quoteArgs(project.orgId, project.projectId, "q-ml-1"));
+    if (!quote.ok) throw new Error("quote failed");
+    const mixed = await asOwner.mutation(recordSelectionRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      requirementId: usd.requirementId,
+      candidateId: usdCandidate.candidateId,
+      quoteId: quote.quoteId,
+      quoteVersion: "q-ml-1",
+      quantity: "1",
+      requirementVersion: 1,
+    });
+    expect(mixed.ok).toBe(false);
+    if (!mixed.ok) expect(mixed.code).toBe("invalid-payload");
+    const zeroQuantity = await asOwner.mutation(recordSelectionRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      requirementId: graph.requirementId,
+      candidateId: graph.candidateId,
+      quoteId: quote.quoteId,
+      quoteVersion: "q-ml-1",
+      quantity: "0",
+      requirementVersion: 1,
+    });
+    expect(zeroQuantity.ok).toBe(false);
+    const selection = await asOwner.mutation(recordSelectionRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      requirementId: graph.requirementId,
+      candidateId: graph.candidateId,
+      quoteId: quote.quoteId,
+      quoteVersion: "q-ml-1",
+      quantity: "1",
+      requirementVersion: 1,
+    });
+    if (!selection.ok) throw new Error("selection failed");
+    const order = await asOwner.mutation(recordOrderRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      selectionId: selection.selectionId,
+      idempotencyKey: "ord-ml-1",
+      orderedQuantity: "1",
+    });
+    if (!order.ok) throw new Error("order failed");
+    const foreignCash = await asOwner.mutation(recordCostEntryRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      orderId: order.orderId,
+      kind: "payment",
+      amount: { currency: "USD", minorUnits: 100 },
+      idempotencyKey: "pay-ml-1",
+    });
+    expect(foreignCash.ok).toBe(false);
+    if (!foreignCash.ok) expect(foreignCash.code).toBe("invalid-payload");
+    const zeroCash = await asOwner.mutation(recordCostEntryRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      orderId: order.orderId,
+      kind: "payment",
+      amount: { currency: "EUR", minorUnits: 0 },
+      idempotencyKey: "pay-ml-2",
+    });
+    expect(zeroCash.ok).toBe(false);
   });
 });

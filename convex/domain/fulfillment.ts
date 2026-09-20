@@ -175,7 +175,7 @@ export const listOrders = f1Query({
 export const appendOrderEvent = f1Mutation({
   args: orderEventInputValidator.fields,
   returns: v.union(
-    v.object({ ok: v.literal(true), eventId: v.id("orderEvents") }),
+    v.object({ ok: v.literal(true), eventId: v.id("orderEvents"), deduplicated: v.boolean() }),
     denialValidator,
   ),
   handler: async (ctx, args) => {
@@ -188,6 +188,44 @@ export const appendOrderEvent = f1Mutation({
     if (!access.ok) {
       return { ok: false as const, code: access.code, message: access.message };
     }
+    if (args.idempotencyKey.trim().length === 0) {
+      return { ok: false as const, code: "invalid-payload", message: "idempotency key required" };
+    }
+    // Accepted quantities compare normalized so `1` and `1.0` replay
+    // as the same event instead of conflicting.
+    let normalizedAccepted: string | undefined;
+    if (args.acceptedQuantity !== undefined) {
+      try {
+        normalizedAccepted = decimalToString(
+          parseDecimalString(args.acceptedQuantity, "accepted quantity"),
+        );
+      } catch {
+        return { ok: false as const, code: "invalid-payload", message: "accepted quantity is not a valid decimal" };
+      }
+    }
+    const existing = await ctx.db
+      .query("orderEvents")
+      .withIndex("by_project_and_key", (q) =>
+        q.eq("projectId", args.projectId).eq("idempotencyKey", args.idempotencyKey),
+      )
+      .unique();
+    if (existing !== null) {
+      if (existing.organizationId !== args.organizationId) {
+        return { ok: false as const, code: "denied-project", message: "reference is not in this project" };
+      }
+      const sameAccepted =
+        (existing.acceptedQuantity ?? undefined) === normalizedAccepted;
+      const sameNote = (existing.note ?? undefined) === args.note;
+      if (
+        existing.orderId !== args.orderId ||
+        existing.kind !== args.kind ||
+        !sameAccepted ||
+        !sameNote
+      ) {
+        return { ok: false as const, code: "duplicate-conflict", message: "idempotency key already used with different fields" };
+      }
+      return { ok: true as const, eventId: existing._id, deduplicated: true };
+    }
     const order = await requireOwnedRef(
       await ctx.db.get(args.orderId),
       args.organizationId,
@@ -197,9 +235,9 @@ export const appendOrderEvent = f1Mutation({
       return { ok: false as const, code: order.code, message: order.message };
     }
     let accepted: Decimal | null = null;
-    if (args.acceptedQuantity !== undefined) {
+    if (normalizedAccepted !== undefined) {
       try {
-        accepted = parseDecimalString(args.acceptedQuantity, "accepted quantity");
+        accepted = parseDecimalString(normalizedAccepted, "accepted quantity");
       } catch {
         return { ok: false as const, code: "invalid-payload", message: "accepted quantity is not a valid decimal" };
       }
@@ -238,9 +276,10 @@ export const appendOrderEvent = f1Mutation({
       ...(accepted === null ? {} : { acceptedQuantity: decimalToString(accepted) }),
       ...(args.note === undefined ? {} : { note: args.note }),
       recordedBy: access.value.identity,
+      idempotencyKey: args.idempotencyKey,
       createdAt: Date.now(),
     });
-    return { ok: true as const, eventId };
+    return { ok: true as const, eventId, deduplicated: false };
   },
 });
 
@@ -277,6 +316,12 @@ export const recordCostEntry = f1Mutation({
     if (!Number.isInteger(args.amount.minorUnits)) {
       return { ok: false as const, code: "invalid-payload", message: "minor units must be an integer" };
     }
+    if (args.amount.minorUnits <= 0) {
+      return { ok: false as const, code: "invalid-payload", message: "entry amount must be positive" };
+    }
+    if (args.amount.currency.trim().length === 0) {
+      return { ok: false as const, code: "invalid-payload", message: "currency required" };
+    }
     const existing = await ctx.db
       .query("costEntries")
       .withIndex("by_project_and_key", (q) =>
@@ -308,6 +353,28 @@ export const recordCostEntry = f1Mutation({
     if (!order.ok) {
       return { ok: false as const, code: order.code, message: order.message };
     }
+    // Currency lineage: the entry currency must match the quote currency
+    // pinned on the order, so mixed-currency cash can never slip in
+    // without an accepted conversion basis.
+    const selection = await requireOwnedRef(
+      await ctx.db.get(order.value.selectionId),
+      args.organizationId,
+      args.projectId,
+    );
+    if (!selection.ok) {
+      return { ok: false as const, code: selection.code, message: selection.message };
+    }
+    const quote = await ctx.db.get(selection.value.quoteId);
+    if (
+      quote === null ||
+      quote.organizationId !== args.organizationId ||
+      quote.projectId !== args.projectId
+    ) {
+      return { ok: false as const, code: "denied-project", message: "quote is not in this project" };
+    }
+    if (args.amount.currency !== quote.currency) {
+      return { ok: false as const, code: "invalid-payload", message: "mixed-currency-requires-accepted-conversion-basis" };
+    }
     if (args.linkedEntryId !== undefined) {
       const linked = await ctx.db.get(args.linkedEntryId);
       if (
@@ -336,13 +403,16 @@ export const recordCostEntry = f1Mutation({
 
 /**
  * Record installed equipment. Location and order provenance must resolve
- * inside the project when supplied; purchase provenance stays a label,
- * never a rewritten history.
+ * inside the project when supplied; the order's full decision lineage
+ * (selection, requirement, quote) is re-verified so an asset can never
+ * dangle off a foreign commitment. Purchase provenance stays a label,
+ * never a rewritten history. The idempotency key replays exactly or
+ * conflicts.
  */
 export const recordAsset = f1Mutation({
   args: assetInputValidator.fields,
   returns: v.union(
-    v.object({ ok: v.literal(true), assetId: v.id("assets") }),
+    v.object({ ok: v.literal(true), assetId: v.id("assets"), deduplicated: v.boolean() }),
     denialValidator,
   ),
   handler: async (ctx, args) => {
@@ -355,8 +425,39 @@ export const recordAsset = f1Mutation({
     if (!access.ok) {
       return { ok: false as const, code: access.code, message: access.message };
     }
+    if (args.idempotencyKey.trim().length === 0) {
+      return { ok: false as const, code: "invalid-payload", message: "idempotency key required" };
+    }
     if (args.label.trim().length === 0) {
       return { ok: false as const, code: "invalid-payload", message: "label required" };
+    }
+    const existing = await ctx.db
+      .query("assets")
+      .withIndex("by_project_and_key", (q) =>
+        q.eq("projectId", args.projectId).eq("idempotencyKey", args.idempotencyKey),
+      )
+      .unique();
+    if (existing !== null) {
+      if (existing.organizationId !== args.organizationId) {
+        return { ok: false as const, code: "denied-project", message: "reference is not in this project" };
+      }
+      const sameLocation = (existing.locationId ?? undefined) === args.locationId;
+      const sameOrder = (existing.orderId ?? undefined) === args.orderId;
+      const sameSerial = (existing.serial ?? undefined) === args.serial;
+      const sameConstraints = (existing.constraints ?? undefined) === args.constraints;
+      const sameProvenance =
+        (existing.purchaseProvenance ?? undefined) === args.purchaseProvenance;
+      if (
+        existing.label !== args.label ||
+        !sameLocation ||
+        !sameOrder ||
+        !sameSerial ||
+        !sameConstraints ||
+        !sameProvenance
+      ) {
+        return { ok: false as const, code: "duplicate-conflict", message: "idempotency key already used with different fields" };
+      }
+      return { ok: true as const, assetId: existing._id, deduplicated: true };
     }
     if (args.locationId !== undefined) {
       const location = await ctx.db.get(args.locationId);
@@ -373,6 +474,14 @@ export const recordAsset = f1Mutation({
       if (!order.ok) {
         return { ok: false as const, code: order.code, message: order.message };
       }
+      const selection = await requireOwnedRef(
+        await ctx.db.get(order.value.selectionId),
+        args.organizationId,
+        args.projectId,
+      );
+      if (!selection.ok) {
+        return { ok: false as const, code: selection.code, message: selection.message };
+      }
     }
     const assetId = await ctx.db.insert("assets", {
       organizationId: args.organizationId,
@@ -383,9 +492,10 @@ export const recordAsset = f1Mutation({
       ...(args.serial === undefined ? {} : { serial: args.serial }),
       ...(args.constraints === undefined ? {} : { constraints: args.constraints }),
       ...(args.purchaseProvenance === undefined ? {} : { purchaseProvenance: args.purchaseProvenance }),
+      idempotencyKey: args.idempotencyKey,
       createdAt: Date.now(),
     });
-    return { ok: true as const, assetId };
+    return { ok: true as const, assetId, deduplicated: false };
   },
 });
 
@@ -393,7 +503,7 @@ export const recordAsset = f1Mutation({
 export const recordAssetDocument = f1Mutation({
   args: assetDocumentInputValidator.fields,
   returns: v.union(
-    v.object({ ok: v.literal(true), documentId: v.id("assetDocuments") }),
+    v.object({ ok: v.literal(true), documentId: v.id("assetDocuments"), deduplicated: v.boolean() }),
     denialValidator,
   ),
   handler: async (ctx, args) => {
@@ -405,6 +515,28 @@ export const recordAssetDocument = f1Mutation({
     );
     if (!access.ok) {
       return { ok: false as const, code: access.code, message: access.message };
+    }
+    if (args.idempotencyKey.trim().length === 0) {
+      return { ok: false as const, code: "invalid-payload", message: "idempotency key required" };
+    }
+    if (args.kind.trim().length === 0) {
+      return { ok: false as const, code: "invalid-payload", message: "document kind required" };
+    }
+    const existing = await ctx.db
+      .query("assetDocuments")
+      .withIndex("by_project_and_key", (q) =>
+        q.eq("projectId", args.projectId).eq("idempotencyKey", args.idempotencyKey),
+      )
+      .unique();
+    if (existing !== null) {
+      if (existing.organizationId !== args.organizationId) {
+        return { ok: false as const, code: "denied-project", message: "reference is not in this project" };
+      }
+      const sameStorage = (existing.storageRef ?? undefined) === args.storageRef;
+      if (existing.assetId !== args.assetId || existing.kind !== args.kind || !sameStorage) {
+        return { ok: false as const, code: "duplicate-conflict", message: "idempotency key already used with different fields" };
+      }
+      return { ok: true as const, documentId: existing._id, deduplicated: true };
     }
     const asset = await requireOwnedRef(
       await ctx.db.get(args.assetId),
@@ -420,9 +552,10 @@ export const recordAssetDocument = f1Mutation({
       assetId: args.assetId,
       kind: args.kind,
       ...(args.storageRef === undefined ? {} : { storageRef: args.storageRef }),
+      idempotencyKey: args.idempotencyKey,
       createdAt: Date.now(),
     });
-    return { ok: true as const, documentId };
+    return { ok: true as const, documentId, deduplicated: false };
   },
 });
 
@@ -430,7 +563,7 @@ export const recordAssetDocument = f1Mutation({
 export const openServiceCase = f1Mutation({
   args: serviceCaseInputValidator.fields,
   returns: v.union(
-    v.object({ ok: v.literal(true), caseId: v.id("serviceCases") }),
+    v.object({ ok: v.literal(true), caseId: v.id("serviceCases"), deduplicated: v.boolean() }),
     denialValidator,
   ),
   handler: async (ctx, args) => {
@@ -443,6 +576,31 @@ export const openServiceCase = f1Mutation({
     if (!access.ok) {
       return { ok: false as const, code: access.code, message: access.message };
     }
+    if (args.idempotencyKey.trim().length === 0) {
+      return { ok: false as const, code: "invalid-payload", message: "idempotency key required" };
+    }
+    if (args.summary.trim().length === 0) {
+      return { ok: false as const, code: "invalid-payload", message: "summary required" };
+    }
+    const existing = await ctx.db
+      .query("serviceCases")
+      .withIndex("by_project_and_key", (q) =>
+        q.eq("projectId", args.projectId).eq("idempotencyKey", args.idempotencyKey),
+      )
+      .unique();
+    if (existing !== null) {
+      if (existing.organizationId !== args.organizationId) {
+        return { ok: false as const, code: "denied-project", message: "reference is not in this project" };
+      }
+      if (
+        existing.assetId !== args.assetId ||
+        existing.urgency !== args.urgency ||
+        existing.summary !== args.summary
+      ) {
+        return { ok: false as const, code: "duplicate-conflict", message: "idempotency key already used with different fields" };
+      }
+      return { ok: true as const, caseId: existing._id, deduplicated: true };
+    }
     const asset = await requireOwnedRef(
       await ctx.db.get(args.assetId),
       args.organizationId,
@@ -450,9 +608,6 @@ export const openServiceCase = f1Mutation({
     );
     if (!asset.ok) {
       return { ok: false as const, code: asset.code, message: asset.message };
-    }
-    if (args.summary.trim().length === 0) {
-      return { ok: false as const, code: "invalid-payload", message: "summary required" };
     }
     const now = Date.now();
     const caseId = await ctx.db.insert("serviceCases", {
@@ -462,10 +617,11 @@ export const openServiceCase = f1Mutation({
       urgency: args.urgency,
       summary: args.summary,
       state: "open",
+      idempotencyKey: args.idempotencyKey,
       createdAt: now,
       updatedAt: now,
     });
-    return { ok: true as const, caseId };
+    return { ok: true as const, caseId, deduplicated: false };
   },
 });
 
