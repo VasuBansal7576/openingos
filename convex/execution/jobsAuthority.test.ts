@@ -77,6 +77,9 @@ const claimOperationRef = makeFunctionReference<
 const identity = { tokenIdentifier: "jobs-authority-chain-owner" };
 
 const genericReadPrompts = [
+  "evidence",
+  "quotes",
+  "supplier",
   "Show the current stock",
   "Show the current budget",
   "Show the current order",
@@ -204,6 +207,7 @@ async function rowCounts(fixture: Awaited<ReturnType<typeof setup>>) {
     jobs: (await ctx.db.query("jobs").collect()).length,
     operations: (await ctx.db.query("operations").collect()).length,
     reservations: (await ctx.db.query("reservations").collect()).length,
+    attempts: (await ctx.db.query("attempts").collect()).length,
   }));
 }
 
@@ -433,6 +437,62 @@ test("generic commercial nouns cannot bind an existing read grant operation", as
 
     const operations = await fixture.t.run((ctx) => ctx.db.query("operations").collect());
     expect(operations, operationId).toHaveLength(0);
+  }
+});
+
+test("lone read-record nouns cannot reach claim or create an attempt", async () => {
+  for (const operationId of ["research.read", "comparison.read"] as const) {
+    const fixture = await setup();
+    const grantId = await issueReadGrant(fixture, operationId);
+    const started = await fixture.asOwner.mutation(startJobRef, {
+      organizationId: fixture.organizationId,
+      projectId: fixture.projectId,
+      text: "Show the current supplier quotes",
+      operationId,
+      kind: "research",
+      grantId,
+    });
+    expect(started.ok, operationId).toBe(true);
+    if (!started.ok) throw new Error(`${operationId} read job setup failed`);
+
+    for (const [index, query] of ["evidence", "quotes", "supplier"].entries()) {
+      const created = await fixture.asOwner.mutation(createOperationRef, {
+        organizationId: fixture.organizationId,
+        projectId: fixture.projectId,
+        jobId: started.jobId,
+        grantId,
+        kind: operationId,
+        requestId: `claim-lone-noun-${operationId}-${index}`,
+        payloadJson: JSON.stringify({ query: "Show the current supplier quotes" }),
+      });
+      expect(created.ok, `${operationId}: ${query}`).toBe(true);
+      if (!created.ok) throw new Error(`${operationId} operation setup failed`);
+
+      // Simulate a stale or tampered payload reaching the internal claim
+      // boundary after operation creation; claim must re-run the read grammar.
+      await fixture.t.run(async (ctx) => {
+        await ctx.db.patch(created.operationId, {
+          normalizedPayload: JSON.stringify({ query }),
+        });
+        await ctx.db.patch(grantId, {
+          canonicalPayload: JSON.stringify({ query }),
+        });
+      });
+      const beforeClaim = await rowCounts(fixture);
+      const claimed = await fixture.t.mutation(claimOperationRef, {
+        operationId: created.operationId,
+        identity: identity.tokenIdentifier,
+      });
+      expect(claimed.ok, `${operationId}: ${query}`).toBe(false);
+      expect(await rowCounts(fixture), `${operationId}: ${query}`).toEqual(beforeClaim);
+      const operation = await fixture.t.run((ctx) => ctx.db.get(created.operationId));
+      expect(operation?.state, `${operationId}: ${query}`).toBe("prepared");
+      await fixture.t.run((ctx) =>
+        ctx.db.patch(grantId, {
+          canonicalPayload: JSON.stringify({ query: "Show the current supplier quotes" }),
+        }),
+      );
+    }
   }
 });
 

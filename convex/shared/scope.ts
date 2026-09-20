@@ -758,8 +758,13 @@ function isResearchReadTokens(
   hasStructuredContext: boolean,
 ): boolean {
   if (hasContextualFollowUp(tokens, context, hasStructuredContext)) return true;
+  const hasReadStateCue = tokens.some((token) => PURCHASING_READ_STATE_CUES.has(token));
+  // A bare record noun such as "evidence", "quotes", or "supplier" is
+  // content, not a request to read the project's records. Require an
+  // explicit read/comparison cue before a record anchor can establish
+  // authority at admission, payload binding, or claim.
+  if (!hasReadStateCue) return false;
   if (tokens.some((token) => PURCHASING_READ_RECORD_ANCHORS.has(token))) return true;
-  if (!tokens.some((token) => PURCHASING_READ_STATE_CUES.has(token))) return false;
   return tokens.some((token) => context.has(token));
 }
 
