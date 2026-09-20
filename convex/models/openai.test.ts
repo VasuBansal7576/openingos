@@ -225,6 +225,7 @@ async function createFixture(
   t: TestConvex<typeof schema>,
   requestId: string,
   reservationAmount?: number,
+  workload: openai.CommercialExtractionWorkload = extractionWorkload(),
 ): Promise<Fixture> {
   const asOwner = t.withIdentity(OWNER);
   const pricing = controlledPricing();
@@ -239,7 +240,7 @@ async function createFixture(
     visibility: "open",
   });
   if (!project.ok) throw new Error(`project setup failed: ${project.message}`);
-  const workloadSha256 = await openai.openAIWorkloadSha256(extractionWorkload());
+  const workloadSha256 = await openai.openAIWorkloadSha256(workload);
   const payloadJson = canonicalJson({ query: "Research suppliers for the espresso machine" });
   const grant = await asOwner.mutation(issueGrantRef, {
     organizationId: organization.organizationId,
@@ -488,6 +489,141 @@ describe("OpenAI Responses transport boundary", () => {
     expect(typeof format["schema"]).toBe("object");
     expect(String(body["input"])).toContain("Commercial espresso machine");
     expect(JSON.stringify(result)).not.toContain("controlled-openai-key");
+  });
+
+  test("accounts for the 9,349-byte input and 1,430-byte schema boundary before dispatch", async () => {
+    const boundaryWorkload: openai.CommercialExtractionWorkload = {
+      ...extractionWorkload(),
+      source: { ...extractionWorkload().source, content: "x".repeat(8_948) },
+    };
+    const captured: { body?: Record<string, unknown> } = {};
+    const capture = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      captured.body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return providerResponse();
+    });
+    const broadPricing = { ...controlledPricing(), maxInputTokens: openai.OPENAI_MAX_TOKEN_CEILING };
+    const admitted = await openai.runOpenAIWorkload({
+      apiKey: "controlled-openai-key",
+      workload: boundaryWorkload,
+      inputVersion: "openai-v1",
+      pricing: broadPricing,
+      fetchImpl: capture,
+    });
+    expect(admitted).toMatchObject({ outcome: "completed" });
+    expect(captured.body).toBeDefined();
+    const body = captured.body as Record<string, unknown>;
+    const input = String(body["input"]);
+    const text = body["text"] as Record<string, unknown>;
+    const format = text["format"] as Record<string, unknown>;
+    const schema = format["schema"];
+    const encoder = new TextEncoder();
+    expect(encoder.encode(input).byteLength).toBe(9_349);
+    expect(encoder.encode(JSON.stringify(schema)).byteLength).toBe(1_430);
+    const billableInput = JSON.stringify({ input, text: { format } });
+    const upperBound = encoder.encode(billableInput).byteLength + openai.OPENAI_INPUT_TOKEN_FRAMING_OVERHEAD;
+    expect(upperBound).toBeGreaterThan(Math.ceil(9_349 / 4));
+
+    const rejectedFetch = vi.fn(async () => providerResponse());
+    const rejected = await openai.runOpenAIWorkload({
+      apiKey: "controlled-openai-key",
+      workload: boundaryWorkload,
+      inputVersion: "openai-v1",
+      pricing: { ...broadPricing, maxInputTokens: upperBound - 1 },
+      fetchImpl: rejectedFetch,
+    });
+    expect(rejected).toMatchObject({ outcome: "rejected", reason: "input-token-ceiling", attempts: 0 });
+    expect(rejectedFetch).not.toHaveBeenCalled();
+
+    const exactFetch = vi.fn(async () => providerResponse());
+    const exact = await openai.runOpenAIWorkload({
+      apiKey: "controlled-openai-key",
+      workload: boundaryWorkload,
+      inputVersion: "openai-v1",
+      pricing: { ...broadPricing, maxInputTokens: upperBound },
+      fetchImpl: exactFetch,
+    });
+    expect(exact).toMatchObject({ outcome: "completed" });
+    expect(exactFetch).toHaveBeenCalledTimes(1);
+
+    process.env[openai.OPENAI_PRICING_ENV_VARS.maxInputTokens] = String(upperBound - 1);
+    const underCap = init();
+    const underCapFixture = await createFixture(underCap, "openai-boundary-under-cap", undefined, boundaryWorkload);
+    const underCapFetch = vi.fn(async () => providerResponse());
+    vi.stubGlobal("fetch", underCapFetch);
+    const underCapResult = await underCap.withIdentity(OWNER).action(generateRef, {
+      operationId: underCapFixture.operationId,
+      identity: OWNER.tokenIdentifier,
+      inputVersion: "openai-v1",
+      payloadJson: underCapFixture.payloadJson,
+      workload: boundaryWorkload,
+    });
+    expect(underCapResult).toMatchObject({ ok: false, code: "invalid-payload" });
+    expect(underCapFetch).not.toHaveBeenCalled();
+    expect((await operationState(underCap, underCapFixture)).operation?.state).toBe("prepared");
+
+    process.env[openai.OPENAI_PRICING_ENV_VARS.maxInputTokens] = String(upperBound);
+    const exactCap = init();
+    const exactCapFixture = await createFixture(exactCap, "openai-boundary-exact-cap", undefined, boundaryWorkload);
+    const exactCapFetch = vi.fn(async () => providerResponse());
+    vi.stubGlobal("fetch", exactCapFetch);
+    const exactCapResult = await exactCap.withIdentity(OWNER).action(generateRef, {
+      operationId: exactCapFixture.operationId,
+      identity: OWNER.tokenIdentifier,
+      inputVersion: "openai-v1",
+      payloadJson: exactCapFixture.payloadJson,
+      workload: boundaryWorkload,
+    });
+    expect(exactCapResult).toMatchObject({ outcome: "completed" });
+    expect(exactCapFetch).toHaveBeenCalledTimes(1);
+    expect((await operationState(exactCap, exactCapFixture)).operation?.state).toBe("observedSuccess");
+  });
+
+  test("uses UTF-8 bytes for adversarial Unicode instead of a bytes-divided-by-four estimate", async () => {
+    const adversarialUnicode = Array.from({ length: 1_000 }, (_, index) => {
+      switch (index % 5) {
+        case 0: return "💥";
+        case 1: return "e\u0301";
+        case 2: return "漢";
+        case 3: return "\u200f";
+        default: return "{}[],:\\n";
+      }
+    }).join("");
+    const unicodeWorkload: openai.CommercialExtractionWorkload = {
+      ...extractionWorkload(),
+      source: { ...extractionWorkload().source, content: adversarialUnicode },
+    };
+    let capturedBody: Record<string, unknown> | undefined;
+    const broadPricing = { ...controlledPricing(), maxInputTokens: openai.OPENAI_MAX_TOKEN_CEILING };
+    const admitted = await openai.runOpenAIWorkload({
+      apiKey: "controlled-openai-key",
+      workload: unicodeWorkload,
+      inputVersion: "openai-v1",
+      pricing: broadPricing,
+      fetchImpl: async (_url, init) => {
+        capturedBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        return providerResponse();
+      },
+    });
+    expect(admitted).toMatchObject({ outcome: "completed" });
+    const body = capturedBody as Record<string, unknown>;
+    const input = String(body["input"]);
+    const text = body["text"] as Record<string, unknown>;
+    const format = text["format"] as Record<string, unknown>;
+    const encoder = new TextEncoder();
+    const billableInput = JSON.stringify({ input, text: { format } });
+    const upperBound = encoder.encode(billableInput).byteLength + openai.OPENAI_INPUT_TOKEN_FRAMING_OVERHEAD;
+    expect(upperBound).toBeGreaterThan(Math.ceil(encoder.encode(input).byteLength / 4));
+
+    const fetchImpl = vi.fn(async () => providerResponse());
+    const rejected = await openai.runOpenAIWorkload({
+      apiKey: "controlled-openai-key",
+      workload: unicodeWorkload,
+      inputVersion: "openai-v1",
+      pricing: { ...broadPricing, maxInputTokens: upperBound - 1 },
+      fetchImpl,
+    });
+    expect(rejected).toMatchObject({ outcome: "rejected", reason: "input-token-ceiling", attempts: 0 });
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 
   test("supports a supplier draft with source locator and version citations", async () => {
@@ -957,6 +1093,33 @@ describe("OpenAI pricing and shared execution boundary", () => {
     expect(state.operation?.state).toBe("outcomeUnknown");
     expect(state.reservation).toMatchObject({ state: "open", reservedMicroUsd: 0, spentMicroUsd: 0, unresolvedMicroUsd: fixture.pricing.maxReservationMicroUsd });
     expect(state.budget).toMatchObject({ reservedMicroUsd: 0, spentMicroUsd: 0, unresolvedMicroUsd: fixture.pricing.maxReservationMicroUsd });
+  });
+
+  test("same-request retry after an ambiguous attempt never dispatches a second request", async () => {
+    const t = init();
+    const fixture = await createFixture(t, "openai-same-request-retry");
+    const fetchImpl = vi.fn(async () => { throw new Error("controlled response loss"); });
+    vi.stubGlobal("fetch", fetchImpl);
+    const request = {
+      operationId: fixture.operationId,
+      identity: OWNER.tokenIdentifier,
+      inputVersion: "openai-v1",
+      payloadJson: fixture.payloadJson,
+      workload: extractionWorkload(),
+    };
+    const first = await t.withIdentity(OWNER).action(generateRef, request);
+    expect(first).toMatchObject({ outcome: "unavailable", reason: "transport-error", attempts: 1 });
+    const second = await t.withIdentity(OWNER).action(generateRef, request);
+    expect(second).toMatchObject({ ok: false, code: "already-claimed" });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    const state = await operationState(t, fixture);
+    expect(state.operation?.state).toBe("outcomeUnknown");
+    expect(state.reservation).toMatchObject({
+      state: "open",
+      reservedMicroUsd: 0,
+      spentMicroUsd: 0,
+      unresolvedMicroUsd: fixture.pricing.maxReservationMicroUsd,
+    });
   });
 
   test("OpenAI key is absent from frontend source", async () => {
