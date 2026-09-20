@@ -1046,8 +1046,15 @@ export const recordCostEntry = f1Mutation({
       // must equal the ordered unit (a quantity-changing amendment or an
       // explicit unit conversion needs its own validated basis), and the
       // affected quantity must fit inside the ordered line quantity.
-      // Order lines predating units carry an empty unit and accept any
-      // nonempty affected unit as valid legacy lineage.
+      // Historical bridge: a fresh scope-less scalar order stores an
+      // empty unit, which authorizes nothing new. A new quantity-bound
+      // credit or refund claiming any affected unit against that
+      // unresolved line is denied here instead of inventing a unit
+      // mapping; exact historical replays already returned above, and
+      // order-level payments without a triple are unaffected.
+      if (orderedLine.unit === "" && (args.kind === "credit" || args.kind === "refund")) {
+        return { ok: false as const, code: "invalid-payload", message: `order line ${normalizedLineId} unit is unresolved; new adjustments require a resolved order line unit` };
+      }
       if (orderedLine.unit !== "" && normalizedAffectedUnit !== orderedLine.unit) {
         return { ok: false as const, code: "invalid-payload", message: `order line ${normalizedLineId} unit does not match the ordered unit` };
       }
@@ -1245,6 +1252,11 @@ const orderHistoryEventValidator = v.object({
       unit: v.string(),
     }),
   ),
+  // Historical bridge: the legacy single-acceptance mirror is preserved
+  // explicitly whenever the stored row carries it, so a scalar
+  // acceptance behind a multi-line order reloads without inventing a
+  // line allocation.
+  acceptedQuantity: v.optional(v.string()),
   note: v.optional(v.string()),
 });
 
@@ -1267,6 +1279,11 @@ const orderLineageValidator = v.object({
     id: v.id("orders"),
     state: v.string(),
     supplierReference: v.optional(v.string()),
+    // Historical bridge: the legacy single-commitment mirror is
+    // preserved explicitly whenever the stored row carries it, so a
+    // scalar order behind a multi-line selection reloads without
+    // inventing a line allocation.
+    orderedQuantity: v.optional(v.string()),
   }),
   selection: v.object({
     id: v.id("selections"),
@@ -1365,6 +1382,17 @@ export const getOrderLineage = f1Query({
     }
     const selectionLines = effectiveSelectionLines(selection.value, quote);
     const orderLines = effectiveOrderLines(order.value, selectionLines);
+    // Historical bridge: an order with no resolvable lines and no
+    // preserved scalar mirror carries nothing truthful to report, so it
+    // is explicitly incomplete rather than successfully empty. Orders
+    // with a scalar mirror return below with that mirror preserved.
+    if (orderLines.length === 0 && order.value.orderedQuantity === undefined) {
+      return {
+        ok: false as const,
+        code: "incomplete-history",
+        message: "order carries no resolvable lines or preserved quantity; reload is unavailable until history is reconciled",
+      };
+    }
     const events = await ctx.db
       .query("orderEvents")
       .withIndex("by_order", (q) => q.eq("orderId", args.orderId))
@@ -1411,6 +1439,9 @@ export const getOrderLineage = f1Query({
         ...(order.value.supplierReference === undefined
           ? {}
           : { supplierReference: order.value.supplierReference }),
+        ...(order.value.orderedQuantity === undefined
+          ? {}
+          : { orderedQuantity: order.value.orderedQuantity }),
       },
       selection: { id: selection.value._id, selectionLines: sortLinesById(selectionLines) },
       quote: {
@@ -1448,6 +1479,7 @@ export const getOrderLineage = f1Query({
           id: event._id,
           kind: event.kind,
           acceptanceLines: [...effectiveEventAcceptances(event, orderLines)],
+          ...(event.acceptedQuantity === undefined ? {} : { acceptedQuantity: event.acceptedQuantity }),
           ...(event.note === undefined ? {} : { note: event.note }),
         })),
       costEntries: entries
@@ -1608,6 +1640,7 @@ export const listOrderHistoryPage = f1Query({
             id: event._id,
             kind: event.kind,
             acceptanceLines: [...effectiveEventAcceptances(event, orderLines)],
+            ...(event.acceptedQuantity === undefined ? {} : { acceptedQuantity: event.acceptedQuantity }),
             ...(event.note === undefined ? {} : { note: event.note }),
           })),
         isDone: result.isDone,
