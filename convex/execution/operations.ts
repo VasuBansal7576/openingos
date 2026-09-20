@@ -81,6 +81,7 @@ function inputVersionsEqual(
 }
 
 const PROJECT_CONTEXT_REQUIREMENT_LIMIT = 32;
+const PROJECT_CONTEXT_CONVERSATION_LIMIT = 32;
 
 async function projectWorkflowContext(
   ctx: F1MutationCtx,
@@ -98,12 +99,34 @@ async function projectWorkflowContext(
     requirement.title,
     requirement.category,
   ]);
+  const conversations = await ctx.db
+    .query("conversations")
+    .withIndex("by_project", (q) => q.eq("projectId", projectId))
+    .take(PROJECT_CONTEXT_CONVERSATION_LIMIT);
+  let hasPurchasingThread = false;
+  for (const conversation of conversations) {
+    if (conversation.state === "cancelled") continue;
+    const grant = await ctx.db.get(conversation.grantId);
+    if (
+      grant !== null &&
+      grant.organizationId === organizationId &&
+      grant.projectId === projectId &&
+      grant.operations.some(
+        (operationId) =>
+          operationId === "communication.send" || operationId === "communication.clarify",
+      )
+    ) {
+      hasPurchasingThread = true;
+      break;
+    }
+  }
   return {
     organizationId,
     projectId,
     projectName: project.name,
     terms,
     hasStructuredContext: requirements.length > 0,
+    hasPurchasingThread,
   };
 }
 
@@ -171,8 +194,8 @@ export const create = f1Mutation({
     ) {
       return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
     }
-    if (job.state === "cancelled") {
-      return { ok: false as const, code: "cancelled-before-claim", message: "job is cancelled" };
+    if (job.state === "cancelled" || job.state === "cancelling") {
+      return { ok: false as const, code: "cancelled-before-claim", message: "job is fenced for cancellation" };
     }
     const grant = await ctx.db.get(args.grantId);
     if (
@@ -375,8 +398,8 @@ export const claim = f1InternalMutation({
     if (job === null) {
       return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
     }
-    if (job.state === "cancelled") {
-      return { ok: false as const, code: "cancelled-before-claim", message: "job is cancelled" };
+    if (job.state === "cancelled" || job.state === "cancelling") {
+      return { ok: false as const, code: "cancelled-before-claim", message: "job is fenced for cancellation" };
     }
     if (BLOCKED_CHANNEL_KINDS.includes(operation.kind)) {
       return { ok: false as const, code: "alternate-channel-denied", message: `channel operation ${operation.kind} is never permitted` };

@@ -674,6 +674,10 @@ export default defineSchema({
       v.literal("completed"),
       v.literal("partial"),
       v.literal("failed"),
+      // Cancellation is a durable fence before cleanup finishes. Claims,
+      // operation creation, and new reservations reject both cancelling and
+      // cancelled jobs.
+      v.literal("cancelling"),
       v.literal("cancelled"),
     ),
     inputVersions: v.record(v.string(), v.string()),
@@ -681,6 +685,16 @@ export default defineSchema({
     updatedAt: v.number(),
     cancelledAt: v.optional(v.number()),
     cancelReason: v.optional(v.string()),
+    // Cleanup progresses through bounded operation and reservation pages.
+    // Null means that phase has not consumed a page yet; a string is the
+    // opaque Convex cursor for the next page.
+    cancellationPhase: v.optional(
+      v.union(v.literal("operations"), v.literal("reservations"), v.literal("complete")),
+    ),
+    cancellationOperationCursor: v.optional(v.union(v.string(), v.null())),
+    cancellationReservationCursor: v.optional(v.union(v.string(), v.null())),
+    cancellationOperationsProcessed: v.optional(v.number()),
+    cancellationReservationsProcessed: v.optional(v.number()),
   })
     .index("by_project", ["projectId"])
     .index("by_grant", ["grantId"]),
@@ -717,6 +731,7 @@ export default defineSchema({
   })
     .index("by_requestKey", ["requestKey"])
     .index("by_job", ["jobId"])
+    .index("by_reservation", ["reservationId"])
     .index("by_grant", ["grantId"]),
 
   attempts: defineTable({

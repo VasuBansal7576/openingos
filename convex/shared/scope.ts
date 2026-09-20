@@ -28,6 +28,8 @@ export interface ProjectWorkflowContext {
   readonly projectName: string;
   readonly terms?: readonly string[];
   readonly hasStructuredContext?: boolean;
+  /** A server-owned, non-cancelled purchasing conversation exists. */
+  readonly hasPurchasingThread?: boolean;
 }
 
 /**
@@ -188,150 +190,37 @@ export type ScopeVerdict =
   | { readonly verdict: "unrelatedRefused"; readonly reason: string }
   | { readonly verdict: "unavailableRefused"; readonly reason: string };
 
-/** Words that form the shipped purchasing workflow grammar. */
-const WORKFLOW_WORDS: ReadonlySet<string> = new Set([
-  "a",
-  "about",
-  "active",
-  "again",
-  "an",
-  "and",
-  "another",
-  "any",
-  "are",
-  "as",
-  "at",
-  "available",
-  "back",
-  "be",
-  "between",
-  "branch",
+/**
+ * Stable purchasing-intent anchors.  This is deliberately not a vocabulary
+ * of every word that appeared in a fixture.  Unknown product names can be
+ * carried by a request that already has one of these structural anchors, but
+ * unknown wording cannot establish authority on its own.
+ */
+const PURCHASING_INTENT_ANCHORS: ReadonlySet<string> = new Set([
   "budget",
-  "by",
-  "can",
-  "category",
-  "check",
-  "change",
-  "changes",
-  "clarification",
-  "clarify",
-  "choose",
-  "coffee",
-  "commercial",
   "compare",
   "comparison",
-  "complete",
-  "consider",
-  "counter",
-  "create",
-  "current",
   "cost",
-  "costs",
-  "date",
   "delivery",
-  "demo",
-  "due",
   "equipment",
-  "excluded",
-  "espresso",
-  "evidence",
-  "failed",
-  "find",
-  "for",
   "freight",
-  "from",
-  "future",
-  "grinder",
-  "how",
-  "if",
-  "in",
   "install",
   "installation",
-  "is",
-  "it",
   "item",
   "items",
-  "latest",
-  "lead",
-  "location",
-  "machine",
-  "more",
-  "new",
-  "next",
-  "of",
-  "on",
-  "or",
-  "order",
-  "other",
-  "option",
-  "options",
-  "please",
-  "price",
-  "pricing",
-  "progress",
-  "project",
-  "quote",
-  "quotes",
-  "read",
-  "ready",
-  "record",
-  "replacement",
-  "reply",
-  "research",
-  "rfq",
-  "round",
-  "service",
-  "services",
-  "send",
-  "seating",
-  "source",
-  "status",
-  "still",
-  "supplier",
-  "suppliers",
-  "support",
-  "that",
-  "the",
-  "these",
-  "this",
-  "they",
-  "to",
-  "two",
-  "utilities",
-  "utility",
-  "vendor",
-  "vendors",
-  "warranty",
-  "water",
-  "wave",
-  "what",
-  "when",
-  "which",
-  "with",
-  "we",
-  "why",
-  "who",
-  "would",
-]);
-
-const RESEARCH_ANCHORS: ReadonlySet<string> = new Set([
-  "budget",
-  "comparison",
-  "delivery",
-  "equipment",
-  "evidence",
-  "freight",
-  "install",
-  "installation",
-  "lead",
   "machine",
   "order",
   "price",
   "pricing",
+  "product",
+  "products",
+  "procure",
+  "procurement",
+  "purchase",
+  "purchasing",
   "quote",
   "quotes",
   "replacement",
-  "service",
   "supplier",
   "suppliers",
   "utilities",
@@ -339,18 +228,24 @@ const RESEARCH_ANCHORS: ReadonlySet<string> = new Set([
   "vendor",
   "vendors",
   "warranty",
-  "water",
 ]);
 
 const COMMUNICATION_ANCHORS: ReadonlySet<string> = new Set([
   "clarification",
   "clarify",
-  "demo",
-  "reply",
+  "counter",
+  "counteroffer",
+  "negotiate",
+  "negotiation",
   "rfq",
 ]);
 
-const CONTEXTUAL_WORDS: ReadonlySet<string> = new Set([
+/**
+ * Cues for a follow-up to an already structured project.  Question words by
+ * themselves are intentionally absent: "what is the weather" must not gain
+ * authority merely because a project exists.
+ */
+const CONTEXTUAL_FOLLOW_UP_CUES: ReadonlySet<string> = new Set([
   "again",
   "back",
   "change",
@@ -365,14 +260,42 @@ const CONTEXTUAL_WORDS: ReadonlySet<string> = new Set([
   "progress",
   "status",
   "still",
-  "that",
-  "this",
-  "what",
-  "when",
-  "which",
-  "why",
-  "who",
 ]);
+
+/**
+ * A cue that changes or asks for project progress, paired with an anaphoric
+ * reference, can establish a short follow-up without repeating the product
+ * name.  One generic cue alone is never enough: a structured project must
+ * either be named by a server-owned term or be referenced coherently.
+ */
+const CONTEXTUAL_REFERENCE_CUES: ReadonlySet<string> = new Set([
+  "another",
+  "choose",
+  "chosen",
+  "it",
+  "same",
+  "that",
+  "them",
+  "they",
+]);
+
+const CONTEXTUAL_PROGRESS_CUES: ReadonlySet<string> = new Set([
+  "again",
+  "back",
+  "change",
+  "changes",
+  "current",
+  "latest",
+  "more",
+  "next",
+  "progress",
+  "status",
+  "still",
+]);
+
+const CONTEXTUAL_OPTION_CUES: ReadonlySet<string> = new Set(["option", "options"]);
+
+const RESEARCH_ANCHORS = PURCHASING_INTENT_ANCHORS;
 
 const STOP_WORDS: ReadonlySet<string> = new Set([
   "a",
@@ -426,15 +349,23 @@ function meaningfulTokens(tokens: readonly string[]): string[] {
   return tokens.filter((token) => !STOP_WORDS.has(token));
 }
 
-function hasResearchAnchor(tokens: readonly string[], context: ReadonlySet<string>): boolean {
-  return tokens.some((token) => RESEARCH_ANCHORS.has(token) || context.has(token));
+function hasResearchAnchor(tokens: readonly string[]): boolean {
+  return tokens.some((token) => RESEARCH_ANCHORS.has(token));
 }
 
-function hasCommunicationAnchor(tokens: readonly string[], context: ReadonlySet<string>): boolean {
-  if (tokens.some((token) => COMMUNICATION_ANCHORS.has(token) || context.has(token))) return true;
+function hasCommunicationAnchor(
+  tokens: readonly string[],
+  context?: ProjectWorkflowContext,
+): boolean {
+  // A reply is meaningful only inside a server-owned purchasing thread. A
+  // caller cannot turn the generic word "reply" into outbound authority.
+  if (tokens.includes("reply")) return context?.hasPurchasingThread === true;
+  if (tokens.some((token) => COMMUNICATION_ANCHORS.has(token))) return true;
   return (
     tokens.includes("send") &&
     tokens.some((token) =>
+      token === "quote" ||
+      token === "rfq" ||
       token === "supplier" ||
       token === "suppliers" ||
       token === "vendor" ||
@@ -444,7 +375,26 @@ function hasCommunicationAnchor(tokens: readonly string[], context: ReadonlySet<
 }
 
 function hasContextualCue(tokens: readonly string[]): boolean {
-  return tokens.some((token) => CONTEXTUAL_WORDS.has(token));
+  return tokens.some((token) => CONTEXTUAL_FOLLOW_UP_CUES.has(token));
+}
+
+function hasContextualFollowUp(
+  tokens: readonly string[],
+  context: ReadonlySet<string>,
+  hasStructuredContext: boolean,
+): boolean {
+  if (!hasStructuredContext || context.size === 0) return false;
+  const hasServerOwnedTerm = tokens.some((token) => context.has(token));
+  if (hasServerOwnedTerm && hasContextualCue(tokens)) return true;
+
+  // Preserve concise anaphoric follow-ups such as "What changes if they
+  // choose another option?" while rejecting a generic "what is the latest"
+  // or an unrelated topic that happens to contain "changes".
+  return (
+    tokens.some((token) => CONTEXTUAL_PROGRESS_CUES.has(token)) &&
+    tokens.some((token) => CONTEXTUAL_REFERENCE_CUES.has(token)) &&
+    tokens.some((token) => CONTEXTUAL_OPTION_CUES.has(token))
+  );
 }
 
 function hasMixedUnsupportedClause(input: {
@@ -462,12 +412,12 @@ function hasMixedUnsupportedClause(input: {
   return clauses.some((clause) => {
     const hasPurposeAnchor =
       input.purpose === "purchasingCommunication"
-        ? hasCommunicationAnchor(clause, input.context)
-        : hasResearchAnchor(clause, input.context);
+        ? hasCommunicationAnchor(clause)
+        : hasResearchAnchor(clause);
     const hasContextualReference =
       input.hasStructuredContext &&
       input.context.size > 0 &&
-      hasContextualCue(clause);
+      hasContextualFollowUp(clause, input.context, input.hasStructuredContext);
     return !hasPurposeAnchor && !hasContextualReference;
   });
 }
@@ -494,27 +444,25 @@ function allowedWorkflowText(input: {
 
   const anchor =
     input.purpose === "purchasingCommunication"
-      ? hasCommunicationAnchor(meaningful, context)
-      : hasResearchAnchor(meaningful, context);
-  const contextual =
-    input.context?.hasStructuredContext === true &&
-    hasContextualCue(meaningful) &&
-    (input.context?.terms?.length ?? 0) > 0;
+      ? hasCommunicationAnchor(meaningful, input.context)
+      : hasResearchAnchor(meaningful);
+  const contextual = hasContextualFollowUp(
+    meaningful,
+    context,
+    input.context?.hasStructuredContext === true,
+  );
   if (!anchor && !contextual) return false;
 
-  const unknown = meaningful.filter(
-    (token) => !WORKFLOW_WORDS.has(token) && !context.has(token),
-  );
-  // Project-specific names are accepted as opaque labels only alongside an
-  // explicit workflow anchor. A request without a domain anchor is still
-  // refused regardless of these labels, and mixed clauses are rejected above.
-  if (unknown.length > 2) return false;
+  // There is intentionally no unknown-token allowlist or vocabulary budget.
+  // The positive anchor or the server-owned contextual follow-up is the
+  // authority boundary; opaque product names are data carried by that
+  // already-authorized structure, never a source of authority themselves.
   return true;
 }
 
 function isCommunicationSendText(text: string): boolean {
   const tokens = meaningfulTokens(tokenize(text));
-  return hasCommunicationAnchor(tokens, new Set());
+  return hasCommunicationAnchor(tokens);
 }
 
 function purposeForOperation(operationId: string): WorkflowPurpose | undefined {
@@ -559,8 +507,16 @@ function recordValue(value: unknown, key: string): unknown {
   return Object.prototype.hasOwnProperty.call(record, key) ? record[key] : undefined;
 }
 
+function semanticCommunicationText(payload: unknown): string | null {
+  const values = [recordValue(payload, "subject"), recordValue(payload, "body")];
+  if (values.every((value) => value === undefined)) return null;
+  if (values.some((value) => value !== undefined && typeof value !== "string")) return null;
+  const text = values.filter((value): value is string => typeof value === "string").join(" ").trim();
+  return text.length === 0 ? null : text;
+}
+
 /**
- * Validate semantic payload fields that can carry a research purpose. Other
+ * Validate semantic payload fields that can carry a workflow purpose. Other
  * fields stay bound to the approved grant and are not interpreted as policy.
  */
 export function validateWorkflowPayload(input: {
@@ -569,7 +525,18 @@ export function validateWorkflowPayload(input: {
   readonly payload: unknown;
   readonly context?: ProjectWorkflowContext;
 }): WorkflowPayloadVerdict {
-  if (input.purpose !== "purchasingResearch") {
+  if (input.purpose === "purchasingCommunication") {
+    const text = semanticCommunicationText(input.payload);
+    if (
+      text === null ||
+      !allowedWorkflowText({
+        text,
+        purpose: input.purpose,
+        ...(input.context === undefined ? {} : { context: input.context }),
+      })
+    ) {
+      return { ok: false, reason: "communication-payload-is-outside-purchasing-workflow" };
+    }
     return { ok: true };
   }
   for (const key of ["query", "topic", "request", "text"]) {
