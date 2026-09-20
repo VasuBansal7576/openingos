@@ -455,26 +455,45 @@ function toProofInput(stored: StoredComparableQuote): Record<string, unknown> {
   };
 }
 
+export type F1ComparisonStatus = "complete" | "estimated" | "incomplete" | "incompatible";
+
+export interface F1EstimatedDeltaRange {
+  readonly minimum: number;
+  readonly maximum: number;
+}
+
 export interface F1Comparison {
-  readonly verdict: "complete" | "incomplete";
+  readonly status: F1ComparisonStatus;
+  /** Exact difference, present only for complete comparisons. */
   readonly differenceMinorUnits: number | null;
+  /** Exact cheaper side, present only for complete comparisons. */
   readonly cheaper: "left" | "right" | "equal" | null;
+  /** Exact signed delta range, present only for estimated comparisons. */
+  readonly estimatedDeltaRange?: F1EstimatedDeltaRange;
   readonly reason: string;
 }
 
 /**
  * Exact comparison over stored quotes through the accepted proofs
- * comparison: matched by stable scope items (reorder-tolerant),
- * incompatible without shared requirement/scope identity, unknown
- * charges blocking, estimates flagged. Mixed currencies stay
- * incomparable until a conversion basis is accepted.
+ * comparison, preserving the proofs status: matched by stable scope
+ * items (reorder-tolerant), incompatible without shared
+ * requirement/scope identity, unknown charges blocking, estimates
+ * exposed as their exact signed delta range. A range that crosses zero
+ * claims no cheaper side, and only complete comparisons carry a
+ * singular difference/cheaper. Mixed currencies stay incomparable
+ * until a conversion basis is accepted.
  */
 export function compareStoredQuotes(left: StoredComparableQuote, right: StoredComparableQuote): F1Comparison {
-  const incomplete = (reason: string): F1Comparison => ({
-    verdict: "incomplete",
+  const end = (
+    status: F1ComparisonStatus,
+    reason: string,
+    extra: Partial<F1Comparison> = {},
+  ): F1Comparison => ({
+    status,
     differenceMinorUnits: null,
     cheaper: null,
     reason,
+    ...extra,
   });
   let leftQuote: Quote;
   let rightQuote: Quote;
@@ -482,7 +501,7 @@ export function compareStoredQuotes(left: StoredComparableQuote, right: StoredCo
     leftQuote = parseQuoteDocument(toProofInput(left) as unknown as QuoteDocumentInput);
     rightQuote = parseQuoteDocument(toProofInput(right) as unknown as QuoteDocumentInput);
   } catch (error) {
-    return incomplete(error instanceof Error ? error.message : "stored quote is invalid");
+    return end("incomplete", error instanceof Error ? error.message : "stored quote is invalid");
   }
   let result: ReturnType<typeof compareQuotes>;
   try {
@@ -490,14 +509,13 @@ export function compareStoredQuotes(left: StoredComparableQuote, right: StoredCo
   } catch (error) {
     const message = error instanceof Error ? error.message : "";
     if (message.includes("currency mismatch")) {
-      return incomplete("mixed-currency-requires-accepted-conversion-basis");
+      return end("incompatible", "mixed-currency-requires-accepted-conversion-basis");
     }
-    return incomplete(message.length > 0 ? message : "comparison-failed");
+    return end("incomplete", message.length > 0 ? message : "comparison-failed");
   }
   if (result.status === "complete" && result.equivalent !== undefined) {
     const delta = result.equivalent.delta.minorUnits;
-    return {
-      verdict: "complete",
+    return end("complete", "equivalent-scope", {
       differenceMinorUnits: Math.abs(delta),
       cheaper:
         result.equivalent.cheaperQuoteId === undefined
@@ -505,39 +523,33 @@ export function compareStoredQuotes(left: StoredComparableQuote, right: StoredCo
           : result.equivalent.cheaperQuoteId === result.left.quoteId
             ? "left"
             : "right",
-      reason: "equivalent-scope",
-    };
+    });
   }
   if (result.status === "estimated" && result.estimatedDeltaRange !== undefined) {
-    // Point estimates settle exactly; true ranges summarize to the
-    // half-up midpoint magnitude, always flagged as estimates.
-    const range = result.estimatedDeltaRange;
-    const sum = BigInt(range.minimum.minorUnits) + BigInt(range.maximum.minorUnits);
-    const negative = sum < 0n;
-    const magnitude = negative ? -sum : sum;
-    const midpoint = magnitude / 2n + (magnitude % 2n === 0n ? 0n : 1n);
-    if (midpoint > BigInt(Number.MAX_SAFE_INTEGER)) {
-      return incomplete("amount-overflow");
-    }
-    return {
-      verdict: "complete",
-      differenceMinorUnits: Number(midpoint),
-      cheaper: midpoint === 0n ? "equal" : negative ? "left" : "right",
-      reason: "equivalent-scope-with-estimates",
-    };
+    const minimum = result.estimatedDeltaRange.minimum.minorUnits;
+    const maximum = result.estimatedDeltaRange.maximum.minorUnits;
+    return end("estimated", "equivalent-scope-with-estimates", {
+      estimatedDeltaRange: { minimum, maximum },
+    });
   }
   if (result.status === "estimated") {
-    return incomplete("estimated comparison has no delta range");
+    return end("incomplete", "estimated comparison has no delta range");
   }
-  return incomplete(result.reasons.join("; "));
+  if (result.status === "incompatible") {
+    return end("incompatible", result.reasons.join("; "));
+  }
+  return end("incomplete", result.reasons.join("; "));
 }
 
 /**
- * Every decision-relevant field hashed for a quote version: identity,
- * money, quantities, charge scopes and states, tax basis, comparison
- * scope, evidence, counterparty lineage, and conversation binding.
+ * Every decision and lineage field hashed for a quote version: tenant,
+ * identity, money, quantities, charge scopes and states, tax basis,
+ * comparison scope, evidence, counterparty lineage, conversation
+ * binding, and the superseded version link.
  */
 export function quoteDecisionFields(input: {
+  readonly organizationId: string;
+  readonly projectId: string;
   readonly version: string;
   readonly currency: string;
   readonly lines: readonly StoredQuoteLine[];
@@ -548,8 +560,11 @@ export function quoteDecisionFields(input: {
   readonly counterpartyRole: string;
   readonly executionMode: string;
   readonly conversationId?: string;
+  readonly supersedes?: string;
 }): Record<string, unknown> {
   return {
+    organizationId: input.organizationId,
+    projectId: input.projectId,
     version: input.version,
     currency: input.currency,
     lines: input.lines.map((line) => ({ ...line })),
@@ -560,6 +575,7 @@ export function quoteDecisionFields(input: {
     counterpartyRole: input.counterpartyRole,
     executionMode: input.executionMode,
     ...(input.conversationId === undefined ? {} : { conversationId: input.conversationId }),
+    ...(input.supersedes === undefined ? {} : { supersedes: input.supersedes }),
   };
 }
 

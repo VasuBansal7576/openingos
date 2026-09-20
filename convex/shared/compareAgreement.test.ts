@@ -107,7 +107,7 @@ describe("money-proof agreement", () => {
         knownCharge({ chargeId: "installation", label: "Installation", amount: money(EUR, 40000) }),
       ]),
     );
-    expect(engine.verdict).toBe("complete");
+    expect(engine.status).toBe("complete");
     expect(engine.differenceMinorUnits).toBe(55000);
     expect(engine.cheaper).toBe("left");
     if (engine.differenceMinorUnits === null) throw new Error("expected a complete difference");
@@ -137,7 +137,7 @@ describe("money-proof agreement", () => {
         includedCharge({ chargeId: "installation", label: "Installation", coveringId: "equipment" }),
       ]),
     );
-    expect(engine.verdict).toBe("incomplete");
+    expect(engine.status).toBe("incomplete");
     expect(engine.differenceMinorUnits).toBeNull();
   });
 
@@ -155,7 +155,10 @@ describe("money-proof agreement", () => {
         estimatedCharge({ chargeId: "freight", label: "Freight", amount: money(EUR, 60000) }),
       ]),
     );
-    expect(engine.verdict).toBe("complete");
+    expect(engine.status).toBe("estimated");
     expect(engine.reason).toBe("equivalent-scope-with-estimates");
+    expect(engine.differenceMinorUnits).toBeNull();
+    expect(engine.cheaper).toBeNull();
+    expect(engine.estimatedDeltaRange).toEqual({ minimum: -15000, maximum: -15000 });
   });
 });

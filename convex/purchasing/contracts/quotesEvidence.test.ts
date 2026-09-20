@@ -105,7 +105,7 @@ describe("P-07 exact-scope comparison", () => {
     const compared = fixture.store.compareControlledQuotes(left.id, right.id);
     expect(compared.ok).toBe(true);
     if (!compared.ok) throw new Error("compare failed");
-    expect(compared.value.verdict).toBe("complete");
+    expect(compared.value.status).toBe("complete");
     expect(compared.value.differenceMinorUnits).toBe(55000);
     expect(compared.value.cheaper).toBe("left");
   });
@@ -125,7 +125,7 @@ describe("P-07 exact-scope comparison", () => {
     const compared = fixture.store.compareControlledQuotes(left.id, incomplete.id);
     expect(compared.ok).toBe(true);
     if (!compared.ok) throw new Error("compare failed");
-    expect(compared.value.verdict).toBe("incomplete");
+    expect(compared.value.status).toBe("incomplete");
     expect(compared.value.differenceMinorUnits).toBeNull();
     expect(compared.value.reason).toContain("unknown");
   });
@@ -163,12 +163,12 @@ describe("P-07 exact-scope comparison", () => {
     const compared = fixture.store.compareControlledQuotes(twoUnits.id, oneUnit.id);
     expect(compared.ok).toBe(true);
     if (!compared.ok) throw new Error("compare failed");
-    expect(compared.value.verdict).toBe("incomplete");
+    expect(compared.value.status).toBe("incompatible");
     expect(compared.value.reason).toContain("not compatible");
 
     const twoCheap = scaled("qq-twocheap", "2", 900_00);
     const even = fixture.store.compareControlledQuotes(twoUnits.id, twoCheap.id);
-    expect(even.ok && even.value.verdict).toBe("complete");
+    expect(even.ok && even.value.status).toBe("complete");
     if (!even.ok) throw new Error("compare failed");
     expect(even.value.differenceMinorUnits).toBe(200_00);
     expect(even.value.cheaper).toBe("right");
@@ -184,7 +184,7 @@ describe("P-07 exact-scope comparison", () => {
     const compared = fixture.store.compareControlledQuotes(bad.id, bad.id);
     expect(compared.ok).toBe(true);
     if (!compared.ok) throw new Error("compare failed");
-    expect(compared.value.verdict).toBe("incomplete");
+    expect(compared.value.status).toBe("incomplete");
     expect(compared.value.reason).toContain("quantity");
 
     const mysteryBase = recordQuote(fixture, "qb-mystery", [{ lineId: "machine", amount: 100_00 }], [
@@ -198,7 +198,7 @@ describe("P-07 exact-scope comparison", () => {
     };
     fixture.store.quotes.set(mysteryRow.id, tamperedState as unknown as typeof mysteryRow);
     const mysteryCompared = fixture.store.compareControlledQuotes(mysteryRow.id, mysteryRow.id);
-    expect(mysteryCompared.ok && mysteryCompared.value.verdict).toBe("incomplete");
+    expect(mysteryCompared.ok && mysteryCompared.value.status).toBe("incomplete");
     if (!mysteryCompared.ok) throw new Error("compare failed");
     expect(mysteryCompared.value.reason).toContain("charge state");
   });
@@ -235,7 +235,7 @@ describe("P-07 exact-scope comparison", () => {
     if (!other.ok) throw new Error("record failed");
     // Equal totals, unrelated scopes: no equivalent claim.
     const compared = fixture.store.compareControlledQuotes(left.id, other.value.id);
-    expect(compared.ok && compared.value.verdict).toBe("incomplete");
+    expect(compared.ok && compared.value.status).toBe("incompatible");
   });
 
   test("reordered lines still compare on stable items", () => {
@@ -278,23 +278,113 @@ describe("P-07 exact-scope comparison", () => {
     const left = mk("qr-a", ["machine", "freight-line"]);
     const right = mk("qr-b", ["freight-line", "machine"]);
     const compared = fixture.store.compareControlledQuotes(left.id, right.id);
-    expect(compared.ok && compared.value.verdict).toBe("complete");
+    expect(compared.ok && compared.value.status).toBe("complete");
     if (!compared.ok) throw new Error("compare failed");
     expect(compared.value.cheaper).toBe("equal");
     expect(compared.value.differenceMinorUnits).toBe(0);
   });
 
-  test("estimated charges compare with an explicit reason flag", () => {
+  test("estimated charges keep their proof status with an exact signed range", () => {
     const fixture = buildControlledFixture();
     const left = recordQuote(fixture, "qe-a", [{ lineId: "machine", amount: 795000 }], []);
     const right = recordQuote(fixture, "qe-b", [{ lineId: "machine", amount: 750000 }], [
       { chargeId: "freight", state: "estimated", amount: 60000 },
     ]);
     const compared = fixture.store.compareControlledQuotes(left.id, right.id);
-    expect(compared.ok && compared.value.verdict).toBe("complete");
+    expect(compared.ok && compared.value.status).toBe("estimated");
     if (!compared.ok) throw new Error("compare failed");
     expect(compared.value.reason).toBe("equivalent-scope-with-estimates");
-    expect(compared.value.differenceMinorUnits).toBe(15000);
+    // No singular difference or cheaper side for estimates: the exact
+    // signed range is exposed instead.
+    expect(compared.value.differenceMinorUnits).toBeNull();
+    expect(compared.value.cheaper).toBeNull();
+    expect(compared.value.estimatedDeltaRange).toEqual({ minimum: -15000, maximum: -15000 });
+  });
+
+  test("estimated ranges expose min/max without collapsing to a midpoint", () => {
+    const fixture = buildControlledFixture();
+    const lines = [{ lineId: "machine", amount: 750000 }];
+    const left = recordQuote(fixture, "qg-a", lines, []);
+    const mkRange = (version: string, minimum: number, maximum: number) => {
+      const result = fixture.store.ingestProviderQuote(
+        fixture.orgPrivateA,
+        fixture.projAOpen,
+        {
+          version,
+          currency: "EUR",
+          lines: [{
+            lineId: "machine",
+            description: "machine",
+            quantity: "1",
+            unitPrice: { currency: "EUR", minorUnits: 750000 },
+            evidenceRefs: [source("m")],
+          }],
+          charges: [{
+            chargeId: "freight",
+            label: "freight",
+            state: {
+              kind: "estimated",
+              estimate: {
+                kind: "range",
+                minimum: { currency: "EUR", minorUnits: minimum },
+                maximum: { currency: "EUR", minorUnits: maximum },
+              },
+            },
+            evidenceRefs: [],
+          }],
+          taxBasis: TAX,
+          comparisonScope: scopeFor([{ lineId: "machine", quantity: "1" }]),
+          evidenceRefs: [source(`${version}-source`)],
+          counterpartyRole: "ownerStandIn",
+          executionMode: "recorded",
+        },
+        fixture.now,
+      );
+      if (!result.ok) throw new Error("record failed");
+      return result.value;
+    };
+    // Right totals 760k..800k against left 750k: range stays positive.
+    const positive = mkRange("qg-pos", 10_00, 50_00);
+    const positiveCompared = fixture.store.compareControlledQuotes(left.id, positive.id);
+    expect(positiveCompared.ok && positiveCompared.value.status).toBe("estimated");
+    if (!positiveCompared.ok) throw new Error("compare failed");
+    expect(positiveCompared.value.estimatedDeltaRange).toEqual({ minimum: -50_00, maximum: -10_00 });
+    expect(positiveCompared.value.cheaper).toBeNull();
+    // Wide range crosses zero against a higher known total: no cheaper
+    // side is claimed.
+    const high = recordQuote(fixture, "qg-high", [{ lineId: "machine", amount: 795000 }], []);
+    const crossing = mkRange("qg-cross", 0, 2000_00);
+    const crossingCompared = fixture.store.compareControlledQuotes(high.id, crossing.id);
+    expect(crossingCompared.ok && crossingCompared.value.status).toBe("estimated");
+    if (!crossingCompared.ok) throw new Error("compare failed");
+    const range = crossingCompared.value.estimatedDeltaRange;
+    if (!range) throw new Error("expected a delta range");
+    expect(range.minimum < 0 && range.maximum > 0).toBe(true);
+    expect(crossingCompared.value.cheaper).toBeNull();
+    expect(crossingCompared.value.differenceMinorUnits).toBeNull();
+  });
+
+  test("incompatible scopes keep their proof status", () => {
+    const fixture = buildControlledFixture();
+    const left = recordQuote(fixture, "qi-a", [{ lineId: "machine", amount: 795000 }], []);
+    const right = recordQuote(fixture, "qi-b", [{ lineId: "machine", amount: 750000 }], []);
+    const scopeB = fixture.store.quotes.get(right.id);
+    if (!scopeB) throw new Error("missing quote");
+    // Same lines, foreign scope identity: totals match, scope does not.
+    const rescoped = {
+      ...scopeB,
+      comparisonScope: {
+        requirementId: "req-elsewhere",
+        scopeId: "scope-elsewhere",
+        items: [{ itemId: "machine", lineId: "machine", unit: "piece", requiredQuantity: "1" }],
+      },
+    };
+    fixture.store.quotes.set(right.id, rescoped);
+    const compared = fixture.store.compareControlledQuotes(left.id, right.id);
+    expect(compared.ok && compared.value.status).toBe("incompatible");
+    if (!compared.ok) throw new Error("compare failed");
+    expect(compared.value.differenceMinorUnits).toBeNull();
+    expect(compared.value.cheaper).toBeNull();
   });
 
   test("record validates versions, duplicates, supersedes, and conversation references", () => {
@@ -573,7 +663,7 @@ describe("P-07 exact-scope comparison", () => {
     );
     if (!other.ok) throw new Error("record failed");
     const compared = fixture.store.compareControlledQuotes(left.id, other.value.id);
-    expect(compared.ok && compared.value.verdict).toBe("incomplete");
+    expect(compared.ok && compared.value.status).toBe("incompatible");
   });
 });
 
@@ -653,6 +743,96 @@ describe("P-06 versions, P-08 distinct totals, D-02/D-08/D-15", () => {
       { chargeId: "freight", state: "included", coveringId: "machine" },
     ]);
     expect(twin.contentHash).not.toBe(left.contentHash);
+  });
+
+  test("organization, project, and supersedes bind the version hash", () => {
+    const fixture = buildControlledFixture();
+    const lines = [{ lineId: "machine", amount: 750000 }];
+    const home = recordQuote(fixture, "qk-v1", lines, []);
+    // Identical content in another project hashes differently: tenant
+    // fields are decision fields.
+    const away = fixture.store.ingestProviderQuote(
+      fixture.orgPrivateA,
+      fixture.projARestricted,
+      {
+        version: "qk-v1",
+        currency: "EUR",
+        lines: [{
+          lineId: "machine",
+          description: "machine",
+          quantity: "1",
+          unitPrice: { currency: "EUR", minorUnits: 750000 },
+          evidenceRefs: [source("machine-source")],
+        }],
+        charges: [],
+        taxBasis: TAX,
+        comparisonScope: scopeFor([{ lineId: "machine", quantity: "1" }]),
+        evidenceRefs: [source("qk-v1-source")],
+        counterpartyRole: "ownerStandIn",
+        executionMode: "recorded",
+      },
+      fixture.now,
+    );
+    if (!away.ok) throw new Error("cross-project record failed");
+    expect(away.value.contentHash).not.toBe(home.contentHash);
+    // A supersedes link changes the hash even when all else matches.
+    const linked = fixture.store.ingestProviderQuote(
+      fixture.orgPrivateA,
+      fixture.projAOpen,
+      {
+        version: "qk-v2",
+        currency: "EUR",
+        lines: [{
+          lineId: "machine",
+          description: "machine",
+          quantity: "1",
+          unitPrice: { currency: "EUR", minorUnits: 750000 },
+          evidenceRefs: [source("machine-source")],
+        }],
+        charges: [],
+        taxBasis: TAX,
+        comparisonScope: scopeFor([{ lineId: "machine", quantity: "1" }]),
+        evidenceRefs: [source("qk-v1-source")],
+        counterpartyRole: "ownerStandIn",
+        executionMode: "recorded",
+        supersedes: home.contentHash,
+      },
+      fixture.now,
+    );
+    if (!linked.ok) throw new Error("linked record failed");
+    expect(linked.value.contentHash).not.toBe(home.contentHash);
+  });
+
+  test("identical content in another project cannot break lineage", () => {
+    const fixture = buildControlledFixture();
+    const lines = [{ lineId: "machine", amount: 750000 }];
+    const home = recordQuote(fixture, "qm-v1", lines, []);
+    // A supersedes pointer at another project's identical hash resolves
+    // nothing here: lineage is project-bound.
+    const foreign = fixture.store.ingestProviderQuote(
+      fixture.orgPrivateA,
+      fixture.projARestricted,
+      {
+        version: "qm-v2",
+        currency: "EUR",
+        lines: [{
+          lineId: "machine",
+          description: "machine",
+          quantity: "1",
+          unitPrice: { currency: "EUR", minorUnits: 750000 },
+          evidenceRefs: [source("machine-source")],
+        }],
+        charges: [],
+        taxBasis: TAX,
+        comparisonScope: scopeFor([{ lineId: "machine", quantity: "1" }]),
+        evidenceRefs: [source("qm-v1-source")],
+        counterpartyRole: "ownerStandIn",
+        executionMode: "recorded",
+        supersedes: home.contentHash,
+      },
+      fixture.now,
+    );
+    expect(foreign.ok).toBe(false);
   });
 
   test("changed terms re-evaluate without overwriting history (D-15)", () => {

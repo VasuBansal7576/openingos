@@ -129,12 +129,15 @@ async function checkQuoteReferences(
   if (fields.version.trim().length === 0) {
     return denial("invalid-payload", "version required");
   }
-  const siblings = await ctx.db
+  // Bounded duplicate check: the compound index fetches at most the one
+  // row carrying this version in this project, never the full history.
+  const duplicate = await ctx.db
     .query("quotes")
-    .withIndex("by_project", (q) => q.eq("projectId", projectId))
-    .collect();
-  const duplicate = siblings.some((sibling) => sibling.version === fields.version);
-  if (duplicate) {
+    .withIndex("by_project_and_version", (q) =>
+      q.eq("projectId", projectId).eq("version", fields.version),
+    )
+    .unique();
+  if (duplicate !== null) {
     return denial("invalid-payload", `duplicate quote version ${fields.version}`);
   }
   if (fields.conversationId !== undefined) {
@@ -148,15 +151,15 @@ async function checkQuoteReferences(
     }
   }
   if (fields.supersedes !== undefined) {
+    // Lineage resolves inside this project only: identical content in
+    // another project carries a different hash and never links here.
     const prior = await ctx.db
       .query("quotes")
-      .withIndex("by_contentHash", (q) => q.eq("contentHash", fields.supersedes ?? ""))
+      .withIndex("by_project_and_contentHash", (q) =>
+        q.eq("projectId", projectId).eq("contentHash", fields.supersedes ?? ""),
+      )
       .unique();
-    if (
-      prior === null ||
-      prior.organizationId !== organizationId ||
-      prior.projectId !== projectId
-    ) {
+    if (prior === null || prior.organizationId !== organizationId) {
       return denial("invalid-payload", "supersedes unknown quote version");
     }
     const sameConversation = (prior.conversationId ?? undefined) === fields.conversationId;
@@ -178,6 +181,8 @@ async function insertQuoteVersion(
 ): Promise<{ quoteId: Id<"quotes">; contentHash: string }> {
   const parts = storedQuoteParts(quote);
   const decision = quoteDecisionFields({
+    organizationId: fields.organizationId,
+    projectId: fields.projectId,
     version: quote.version,
     currency: parts.currency,
     lines: parts.lines,
@@ -188,6 +193,7 @@ async function insertQuoteVersion(
     counterpartyRole: fields.counterpartyRole,
     executionMode: fields.executionMode,
     ...(fields.conversationId === undefined ? {} : { conversationId: fields.conversationId }),
+    ...(fields.supersedes === undefined ? {} : { supersedes: fields.supersedes }),
   });
   const canonical = canonicalJson(decision);
   const contentHash = payloadHash(decision);
@@ -332,9 +338,15 @@ export const ingestProviderQuote = f1InternalMutation({
 const compareResultValidator = v.union(
   v.object({
     ok: v.literal(true),
-    verdict: v.string(),
+    status: v.union(
+      v.literal("complete"),
+      v.literal("estimated"),
+      v.literal("incomplete"),
+      v.literal("incompatible"),
+    ),
     differenceMinorUnits: v.union(v.number(), v.null()),
     cheaper: v.union(v.string(), v.null()),
+    estimatedDeltaRange: v.optional(v.object({ minimum: v.number(), maximum: v.number() })),
     reason: v.string(),
   }),
   denialValidator,
@@ -373,7 +385,7 @@ export const compare = f1Query({
     ) {
       return { ok: false as const, code: "denied-project", message: "quotes are not in this project" };
     }
-    const verdict = compareStoredQuotes(
+    const result = compareStoredQuotes(
       {
         version: left.version,
         currency: left.currency,
@@ -395,10 +407,13 @@ export const compare = f1Query({
     );
     return {
       ok: true as const,
-      verdict: verdict.verdict,
-      differenceMinorUnits: verdict.differenceMinorUnits,
-      cheaper: verdict.cheaper,
-      reason: verdict.reason,
+      status: result.status,
+      differenceMinorUnits: result.differenceMinorUnits,
+      cheaper: result.cheaper,
+      ...(result.estimatedDeltaRange === undefined
+        ? {}
+        : { estimatedDeltaRange: { ...result.estimatedDeltaRange } }),
+      reason: result.reason,
     };
   },
 });
