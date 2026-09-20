@@ -671,6 +671,7 @@ describe("P-06 versions, P-08 distinct totals, D-02/D-08/D-15", () => {
   test("revisions create new immutable versions; old approvals keep their hash", () => {
     const fixture = buildControlledFixture();
     const first = recordQuote(fixture, "q-v1", [{ lineId: "machine", amount: 750000 }], []);
+    expect(first.contentHash).toMatch(/^[0-9a-f]{64}$/);
     const second = fixture.store.ingestProviderQuote(
       fixture.orgPrivateA,
       fixture.projAOpen,
@@ -689,6 +690,7 @@ describe("P-06 versions, P-08 distinct totals, D-02/D-08/D-15", () => {
       fixture.now,
     );
     if (!second.ok) throw new Error("revision failed");
+    expect(second.value.contentHash).toMatch(/^[0-9a-f]{64}$/);
     expect(second.value.contentHash).not.toBe(first.contentHash);
     expect(second.value.supersedes).toBe(first.contentHash);
     expect(fixture.store.quotes.get(first.id)?.contentHash).toBe(first.contentHash);

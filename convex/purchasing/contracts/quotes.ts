@@ -24,7 +24,7 @@
 import { v } from "convex/values";
 import type { Id } from "../../_generated/dataModel.js";
 import { f1InternalMutation, f1Mutation, f1Query, type F1MutationCtx } from "../../server.js";
-import { canonicalJson, payloadHash } from "../../shared/hashing.js";
+import { canonicalJson } from "../../shared/hashing.js";
 import { sha256HexOfCanonical } from "../../shared/sha256.js";
 import {
   compareStoredQuotes,
@@ -195,9 +195,11 @@ async function insertQuoteVersion(
     ...(fields.conversationId === undefined ? {} : { conversationId: fields.conversationId }),
     ...(fields.supersedes === undefined ? {} : { supersedes: fields.supersedes }),
   });
+  // Quote lineage is SHA-256 over the canonical decision fields: the
+  // stored contentHash and payloadSha256 carry the same digest.
   const canonical = canonicalJson(decision);
-  const contentHash = payloadHash(decision);
-  const payloadSha256 = await sha256HexOfCanonical(canonical);
+  const contentHash = await sha256HexOfCanonical(canonical);
+  const payloadSha256 = contentHash;
   const storedTaxBasis = parts.taxBasis.kind === "unknown"
     ? {
       kind: "unknown" as const,
