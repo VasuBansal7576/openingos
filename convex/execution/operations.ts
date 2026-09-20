@@ -30,8 +30,11 @@ import {
   lookupCapability,
   validateWorkflowBinding,
   validateWorkflowPayload,
+  workflowAuthorityForOperation,
+  workflowAuthorityMatchesProject,
   workflowContextKey,
   workflowPurposeForOperation,
+  type WorkflowAuthority,
   type ProjectWorkflowContext,
 } from "../shared/scope.js";
 import { COMMUNICATION_PROFILE_OWNER_ROLEPLAY } from "../shared/provenance.js";
@@ -51,6 +54,14 @@ const BLOCKED_CHANNEL_KINDS = [
 
 function isCommunicationKind(kind: string): boolean {
   return kind === "communication.send" || kind === "communication.clarify";
+}
+
+function isReplyPayload(payload: unknown): boolean {
+  return (
+    isRecord(payload) &&
+    typeof payload["body"] === "string" &&
+    /\breply\b/i.test(payload["body"])
+  );
 }
 
 /**
@@ -80,46 +91,125 @@ function inputVersionsEqual(
   return canonicalJson(left) === canonicalJson(right);
 }
 
-const PROJECT_CONTEXT_REQUIREMENT_LIMIT = 32;
-const PROJECT_CONTEXT_CONVERSATION_LIMIT = 32;
-
 /**
- * Build bounded workflow context from the newest server-owned project rows.
+ * Build workflow context from bounded indexed presence probes and exact
+ * server-materialized refs.
  *
  * The context is deliberately derived from the project and organization
- * records, never from caller-provided terms.  Descending creation order keeps
- * a newly qualifying requirement or conversation visible even when a project
- * has more than the bounded context window of older rows.
+ * records, never from caller-provided terms. Requirement refs are resolved
+ * only by exact indexed lookup of the request text or an authority ref
+ * already carried by the grant/job chain, so unrelated row count or insertion
+ * position cannot hide them.
  */
 export async function projectWorkflowContext(
   ctx: F1MutationCtx,
   organizationId: Id<"organizations">,
   projectId: Id<"projects">,
+  text?: string,
+  grantId?: Id<"grants">,
+  authority?: WorkflowAuthority,
 ): Promise<ProjectWorkflowContext | null> {
   const project = await ctx.db.get(projectId);
   if (project === null || project.organizationId !== organizationId) return null;
-  const requirements = await ctx.db
+  const requirementPresence = await ctx.db
     .query("requirements")
     .withIndex("by_organization_and_project", (q) =>
       q.eq("organizationId", organizationId).eq("projectId", projectId),
     )
-    .order("desc")
-    .take(PROJECT_CONTEXT_REQUIREMENT_LIMIT);
-  const terms = requirements.flatMap((requirement) => [
-    requirement.key,
-    requirement.title,
-    requirement.category,
-  ]);
-  const conversations = await ctx.db
-    .query("conversations")
-    .withIndex("by_organization_and_project", (q) =>
-      q.eq("organizationId", organizationId).eq("projectId", projectId),
-    )
-    .order("desc")
-    .take(PROJECT_CONTEXT_CONVERSATION_LIMIT);
-  let hasPurchasingThread = false;
+    .take(1);
+  const terms: string[] = [];
+  let matchedRequirementId: Id<"requirements"> | undefined =
+    authority !== undefined && "requirementId" in authority
+      ? authority.requirementId
+      : undefined;
+  if (matchedRequirementId !== undefined) {
+    const requirement = await ctx.db.get(matchedRequirementId);
+    if (
+      requirement === null ||
+      requirement.organizationId !== organizationId ||
+      requirement.projectId !== projectId ||
+      requirement.state === "cancelled"
+    ) {
+      return null;
+    }
+    terms.push(requirement.key, requirement.title, requirement.category);
+  }
+  if (text !== undefined) {
+    const textTokens = [...new Set(text.match(/[A-Za-z0-9]+/g) ?? [])].slice(0, 24);
+    const matches = new Map<Id<"requirements">, (typeof requirementPresence)[number]>();
+    for (const token of textTokens) {
+      const variants = [...new Set([
+        token,
+        token.toLocaleLowerCase(),
+        token.length === 0 ? token : token.charAt(0).toLocaleUpperCase() + token.slice(1).toLocaleLowerCase(),
+      ])];
+      for (const variant of variants) {
+        const byTitle = await ctx.db
+          .query("requirements")
+          .withIndex("by_organization_and_project_and_title", (q) =>
+            q.eq("organizationId", organizationId).eq("projectId", projectId).eq("title", variant),
+          )
+          .take(2);
+        for (const requirement of byTitle) matches.set(requirement._id, requirement);
+        const byKey = await ctx.db
+          .query("requirements")
+          .withIndex("by_project_and_key", (q) =>
+            q.eq("projectId", projectId).eq("key", variant),
+          )
+          .take(2);
+        for (const requirement of byKey) matches.set(requirement._id, requirement);
+      }
+    }
+    if (matches.size === 1) {
+      const requirement = [...matches.values()][0];
+      if (requirement !== undefined && requirement.state !== "cancelled") {
+        matchedRequirementId = requirement._id;
+        if (!terms.includes(requirement.key)) {
+          terms.push(requirement.key, requirement.title, requirement.category);
+        }
+      }
+    }
+  }
+  const conversationsByState = await Promise.all(
+    (["draft", "queued", "awaitingReply", "replyReceived"] as const).map((state) =>
+      (grantId === undefined
+        ? ctx.db
+            .query("conversations")
+            .withIndex("by_organization_and_project_and_state", (q) =>
+              q.eq("organizationId", organizationId).eq("projectId", projectId).eq("state", state),
+            )
+        : ctx.db
+            .query("conversations")
+            .withIndex("by_organization_and_project_and_grant_and_state", (q) =>
+              q.eq("organizationId", organizationId)
+                .eq("projectId", projectId)
+                .eq("grantId", grantId)
+                .eq("state", state),
+            ))
+        .take(2),
+    ),
+  );
+  const conversations = conversationsByState.flat();
+  const purchasingConversationIds: Id<"conversations">[] = [];
+  if (
+    authority !== undefined &&
+    "conversationId" in authority &&
+    authority.conversationId !== undefined
+  ) {
+    const conversation = await ctx.db.get(authority.conversationId);
+    if (
+      conversation === null ||
+      conversation.organizationId !== organizationId ||
+      conversation.projectId !== projectId ||
+      (grantId !== undefined && conversation.grantId !== grantId) ||
+      conversation.state === "cancelled" ||
+      conversation.state === "closed"
+    ) {
+      return null;
+    }
+    purchasingConversationIds.push(conversation._id);
+  }
   for (const conversation of conversations) {
-    if (conversation.state === "cancelled") continue;
     const grant = await ctx.db.get(conversation.grantId);
     if (
       grant !== null &&
@@ -130,8 +220,9 @@ export async function projectWorkflowContext(
           operationId === "communication.send" || operationId === "communication.clarify",
       )
     ) {
-      hasPurchasingThread = true;
-      break;
+      if (!purchasingConversationIds.includes(conversation._id)) {
+        purchasingConversationIds.push(conversation._id);
+      }
     }
   }
   return {
@@ -139,9 +230,102 @@ export async function projectWorkflowContext(
     projectId,
     projectName: project.name,
     terms,
-    hasStructuredContext: requirements.length > 0,
-    hasPurchasingThread,
+    hasStructuredContext: requirementPresence.length > 0,
+    hasPurchasingThread: purchasingConversationIds.length > 0,
+    ...(purchasingConversationIds.length === 1
+      ? { purchasingConversationId: purchasingConversationIds[0] }
+      : {}),
+    ...(matchedRequirementId === undefined ? {} : { matchedRequirementId }),
   };
+}
+
+export async function validateWorkflowAuthority(
+  ctx: F1MutationCtx,
+  authority: WorkflowAuthority | null,
+  organizationId: Id<"organizations">,
+  projectId: Id<"projects">,
+  operationId: string,
+  grantId?: Id<"grants">,
+): Promise<boolean> {
+  if (!workflowAuthorityMatchesProject(authority, operationId, projectId)) return false;
+  if (authority === null) return false;
+  if ("requirementId" in authority && authority.requirementId !== undefined) {
+    const requirement = await ctx.db.get(authority.requirementId);
+    if (
+      requirement === null ||
+      requirement.organizationId !== organizationId ||
+      requirement.projectId !== projectId ||
+      requirement.state === "cancelled"
+    ) {
+      return false;
+    }
+  }
+  if ("candidateId" in authority && authority.candidateId !== undefined) {
+    const candidate = await ctx.db.get(authority.candidateId);
+    if (
+      candidate === null ||
+      candidate.organizationId !== organizationId ||
+      candidate.projectId !== projectId ||
+      ("requirementId" in authority &&
+        authority.requirementId !== undefined &&
+        candidate.requirementId !== authority.requirementId)
+    ) {
+      return false;
+    }
+    if (!("requirementId" in authority) || authority.requirementId === undefined) {
+      const candidateRequirement = await ctx.db.get(candidate.requirementId);
+      if (
+        candidateRequirement === null ||
+        candidateRequirement.organizationId !== organizationId ||
+        candidateRequirement.projectId !== projectId ||
+        candidateRequirement.state === "cancelled"
+      ) {
+        return false;
+      }
+    }
+  }
+  if ("conversationId" in authority && authority.conversationId !== undefined) {
+    const conversation = await ctx.db.get(authority.conversationId);
+    if (
+      conversation === null ||
+      conversation.organizationId !== organizationId ||
+      conversation.projectId !== projectId ||
+      (conversation.state === "cancelled" || conversation.state === "closed") ||
+      (grantId !== undefined && conversation.grantId !== grantId)
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function authorityRefsCompatible(
+  parent: WorkflowAuthority,
+  child: WorkflowAuthority,
+): boolean {
+  if (parent.operationId !== child.operationId || parent.projectId !== child.projectId) return false;
+  if (
+    "requirementId" in parent &&
+    parent.requirementId !== undefined &&
+    (!("requirementId" in child) || child.requirementId !== parent.requirementId)
+  ) {
+    return false;
+  }
+  if (
+    "candidateId" in parent &&
+    parent.candidateId !== undefined &&
+    (!("candidateId" in child) || child.candidateId !== parent.candidateId)
+  ) {
+    return false;
+  }
+  if (
+    "conversationId" in parent &&
+    parent.conversationId !== undefined &&
+    (!("conversationId" in child) || child.conversationId !== parent.conversationId)
+  ) {
+    return false;
+  }
+  return true;
 }
 
 function parseCanonicalPayload(payload: string): unknown | null {
@@ -233,10 +417,40 @@ export const create = f1Mutation({
     if (args.grantId !== job.grantId) {
       return { ok: false as const, code: "denied-capability", message: "operation grant must match the job grant" };
     }
+    const grantAuthority = workflowAuthorityForOperation(grant.workflowAuthorities, args.kind);
+    if (grantAuthority === null) {
+      return { ok: false as const, code: "unrelated-refusal", message: "grant has no operation-specific workflow authority" };
+    }
 
-    const context = await projectWorkflowContext(ctx, args.organizationId, args.projectId);
+    const parsed = parseBoundedPayloadJson(args.payloadJson);
+    if (!parsed.ok) return { ok: false as const, code: parsed.code, message: parsed.message };
+    const canonical = parsed.payload.canonical;
+    const hash = parsed.payload.hash;
+    const operationPayload = parseCanonicalPayload(canonical);
+    if (operationPayload === null) {
+      return { ok: false as const, code: "invalid-payload", message: "operation payload is not valid JSON" };
+    }
+    const contextText =
+      isRecord(operationPayload) && typeof operationPayload["query"] === "string"
+        ? operationPayload["query"]
+        : undefined;
+    const context = await projectWorkflowContext(
+      ctx,
+      args.organizationId,
+      args.projectId,
+      contextText,
+      args.grantId,
+      grantAuthority,
+    );
     if (context === null) {
       return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
+    }
+    if (
+      isCommunicationKind(args.kind) &&
+      isReplyPayload(operationPayload) &&
+      context.purchasingConversationId === undefined
+    ) {
+      return { ok: false as const, code: "unrelated-refusal", message: "reply requires one exact active purchasing conversation" };
     }
     const purpose = workflowPurposeForOperation(args.kind);
     if (purpose === undefined) {
@@ -249,14 +463,6 @@ export const create = f1Mutation({
       return { ok: false as const, code: "unrelated-refusal", message: "job is not bound to this OpeningOS workflow purpose" };
     }
 
-    const parsed = parseBoundedPayloadJson(args.payloadJson);
-    if (!parsed.ok) return { ok: false as const, code: parsed.code, message: parsed.message };
-    const canonical = parsed.payload.canonical;
-    const hash = parsed.payload.hash;
-    const operationPayload = parseCanonicalPayload(canonical);
-    if (operationPayload === null) {
-      return { ok: false as const, code: "invalid-payload", message: "operation payload is not valid JSON" };
-    }
     const operationPurpose = validateWorkflowBinding({
       operationId: args.kind,
       jobPurpose: job.workflowPurpose,
@@ -279,6 +485,43 @@ export const create = f1Mutation({
     });
     if (!grantPurpose.ok) {
       return { ok: false as const, code: "unrelated-refusal", message: grantPurpose.reason ?? "grant purpose is not supported" };
+    }
+    let operationAuthority: WorkflowAuthority = grantAuthority;
+    if (
+      args.kind === "research.collect" &&
+      context.matchedRequirementId !== undefined &&
+      operationAuthority.operationId === "research.collect" &&
+      operationAuthority.requirementId === undefined
+    ) {
+      operationAuthority = { ...operationAuthority, requirementId: context.matchedRequirementId };
+    }
+    if (
+      isCommunicationKind(args.kind) &&
+      context.purchasingConversationId !== undefined &&
+      (operationAuthority.operationId === "communication.send" ||
+        operationAuthority.operationId === "communication.clarify") &&
+      operationAuthority.conversationId === undefined
+    ) {
+      operationAuthority = { ...operationAuthority, conversationId: context.purchasingConversationId };
+    }
+    if (job.workflowAuthority !== undefined) {
+      if (!authorityRefsCompatible(grantAuthority, job.workflowAuthority)) {
+        return { ok: false as const, code: "unrelated-refusal", message: "job authority does not match the grant" };
+      }
+      operationAuthority = job.workflowAuthority;
+    }
+    if (
+      !authorityRefsCompatible(grantAuthority, operationAuthority) ||
+      !(await validateWorkflowAuthority(
+        ctx,
+        operationAuthority,
+        args.organizationId,
+        args.projectId,
+        args.kind,
+        grant._id,
+      ))
+    ) {
+      return { ok: false as const, code: "unrelated-refusal", message: "workflow authority is not current for this project" };
     }
     const key = requestKey(args.organizationId, args.kind, args.requestId);
     // Same-request dedupe precedes round-limit rejection: an identical
@@ -320,8 +563,10 @@ export const create = f1Mutation({
       if (grant.communicationProfile !== COMMUNICATION_PROFILE_OWNER_ROLEPLAY) {
         return { ok: false as const, code: "alternate-channel-denied", message: "only the owner-roleplay profile is permitted" };
       }
-      if (grant.conversationId !== undefined) {
-        const conversation = await ctx.db.get(grant.conversationId);
+      const conversationId =
+        "conversationId" in operationAuthority ? operationAuthority.conversationId : undefined;
+      if (conversationId !== undefined) {
+        const conversation = await ctx.db.get(conversationId);
         if (conversation !== null) conversationVersion = conversation.version;
       }
     }
@@ -375,6 +620,7 @@ export const create = f1Mutation({
         ? { recipientConfigVersion: grant.recipientConfigVersion }
         : {}),
       ...(conversationVersion === undefined ? {} : { conversationVersion }),
+      workflowAuthority: operationAuthority,
       state: "prepared",
       ...(reservationRef === undefined ? {} : { reservationId: reservationRef }),
       createdAt: now,
@@ -462,13 +708,50 @@ export const claim = f1InternalMutation({
       return { ok: false as const, code: "denied-capability", message: "operation grant must match the job grant" };
     }
 
-    const context = await projectWorkflowContext(ctx, operation.organizationId, operation.projectId);
-    if (context === null) {
-      return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
-    }
     const operationPayload = parseCanonicalPayload(operation.normalizedPayload);
     if (operationPayload === null) {
       return { ok: false as const, code: "invalid-payload", message: "operation payload is not valid JSON" };
+    }
+    const contextText =
+      isRecord(operationPayload) && typeof operationPayload["query"] === "string"
+        ? operationPayload["query"]
+        : undefined;
+    const context = await projectWorkflowContext(
+      ctx,
+      operation.organizationId,
+      operation.projectId,
+      contextText,
+      grant._id,
+      operation.workflowAuthority,
+    );
+    if (context === null) {
+      return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
+    }
+    if (
+      isCommunicationKind(operation.kind) &&
+      isReplyPayload(operationPayload) &&
+      context.purchasingConversationId === undefined
+    ) {
+      return { ok: false as const, code: "unrelated-refusal", message: "reply requires one exact active purchasing conversation" };
+    }
+    const grantAuthority = workflowAuthorityForOperation(grant.workflowAuthorities, operation.kind);
+    if (grantAuthority === null || operation.workflowAuthority === undefined) {
+      return { ok: false as const, code: "unrelated-refusal", message: "operation authority is unavailable" };
+    }
+    if (
+      !authorityRefsCompatible(grantAuthority, operation.workflowAuthority) ||
+      (job.workflowAuthority !== undefined &&
+        canonicalJson(job.workflowAuthority) !== canonicalJson(operation.workflowAuthority)) ||
+      !(await validateWorkflowAuthority(
+        ctx,
+        operation.workflowAuthority,
+        operation.organizationId,
+        operation.projectId,
+        operation.kind,
+        grant._id,
+      ))
+    ) {
+      return { ok: false as const, code: "unrelated-refusal", message: "operation authority is not current for this project" };
     }
     const purpose = validateWorkflowBinding({
       operationId: operation.kind,
@@ -585,8 +868,12 @@ export const claim = f1InternalMutation({
     }
 
     if (operation.conversationVersion !== undefined) {
-      if (grant.conversationId !== undefined) {
-        const conversation = await ctx.db.get(grant.conversationId);
+      const conversationId =
+        "conversationId" in operation.workflowAuthority
+          ? operation.workflowAuthority.conversationId
+          : undefined;
+      if (conversationId !== undefined) {
+        const conversation = await ctx.db.get(conversationId);
         if (conversation !== null && conversation.version !== operation.conversationVersion) {
           return { ok: false as const, code: "relevant-reply-superseded", message: "a relevant reply arrived after this operation was prepared" };
         }
