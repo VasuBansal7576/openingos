@@ -324,5 +324,6 @@ Integrated R1 bounded Firecrawl search, map and scrape operations with shared al
 Integrated W1 authorized workbench projections using the identity-first authority index and project/requirement/vendor quote tuple index, including 300-row bounded-read regressions.
 Repaired Greptile's PR #2 finding by replacing both unrestricted negative-control scans with explicit 65-row reads while preserving their intended budget failures.
 The combined checkout passes TypeScript, production build, 23 repository tests, 77 proof tests, 244 F1 tests, 155 browser tests, 21 application/communication tests and 199 direct Convex tests.
-R1 and C1 are checked complete only for their controlled implementation packages; U1 integration, live provider evidence, hosted Convex, credentials, allowances, owner-mailbox exchange and publication remain open.
+The next exact-head Greptile review found two actionable P1 defects: C1 could miss bindings beyond a 128-row prefix, and R1 exposed an evidence cursor while silently capping claims and candidates.
+R1 and C1 therefore remain open while indexed binding lookup and independently truthful pagination are repaired; U1 integration, live provider evidence, hosted Convex, credentials, allowances, owner-mailbox exchange and publication also remain open.
 No controlled result is presented as live integration success.
