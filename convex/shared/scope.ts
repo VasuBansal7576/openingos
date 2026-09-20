@@ -7,6 +7,9 @@
  * operations are denied even when a model is confident.
  */
 
+import { v } from "convex/values";
+import type { Id } from "../_generated/dataModel.js";
+
 export const CAPABILITY_CATALOG_VERSION = "capability-catalog-1" as const;
 
 /**
@@ -30,6 +33,142 @@ export interface ProjectWorkflowContext {
   readonly hasStructuredContext?: boolean;
   /** A server-owned, non-cancelled purchasing conversation exists. */
   readonly hasPurchasingThread?: boolean;
+  /** Present only when one exact active purchasing conversation is found. */
+  readonly purchasingConversationId?: Id<"conversations">;
+  /** Present only when one exact requirement term matches the request. */
+  readonly matchedRequirementId?: Id<"requirements">;
+}
+
+/**
+ * A workflow authority names the server-owned records that make an operation
+ * meaningful. Project scope is valid for a new research/RFQ brief; a
+ * requirement, candidate, or conversation ref narrows the same operation to
+ * an exact durable record. The operation discriminator prevents a ref for
+ * one workflow from laundering authority into another.
+ */
+export type WorkflowAuthority =
+  | {
+      readonly operationId: "research.collect";
+      readonly projectId: Id<"projects">;
+      readonly requirementId?: Id<"requirements">;
+    }
+  | {
+      readonly operationId: "research.read";
+      readonly projectId: Id<"projects">;
+      readonly requirementId?: Id<"requirements">;
+      readonly candidateId?: Id<"candidates">;
+    }
+  | {
+      readonly operationId: "evidence.record";
+      readonly projectId: Id<"projects">;
+      readonly requirementId?: Id<"requirements">;
+      readonly candidateId?: Id<"candidates">;
+    }
+  | {
+      readonly operationId: "quote.record";
+      readonly projectId: Id<"projects">;
+      readonly requirementId?: Id<"requirements">;
+      readonly candidateId?: Id<"candidates">;
+    }
+  | {
+      readonly operationId: "comparison.read";
+      readonly projectId: Id<"projects">;
+      readonly requirementId?: Id<"requirements">;
+      readonly candidateId?: Id<"candidates">;
+    }
+  | {
+      readonly operationId: "communication.send";
+      readonly projectId: Id<"projects">;
+      readonly conversationId?: Id<"conversations">;
+    }
+  | {
+      readonly operationId: "communication.clarify";
+      readonly projectId: Id<"projects">;
+      readonly conversationId?: Id<"conversations">;
+    };
+
+export const workflowAuthorityValidator = v.union(
+  v.object({
+    operationId: v.literal("research.collect"),
+    projectId: v.id("projects"),
+    requirementId: v.optional(v.id("requirements")),
+  }),
+  v.object({
+    operationId: v.literal("research.read"),
+    projectId: v.id("projects"),
+    requirementId: v.optional(v.id("requirements")),
+    candidateId: v.optional(v.id("candidates")),
+  }),
+  v.object({
+    operationId: v.literal("evidence.record"),
+    projectId: v.id("projects"),
+    requirementId: v.optional(v.id("requirements")),
+    candidateId: v.optional(v.id("candidates")),
+  }),
+  v.object({
+    operationId: v.literal("quote.record"),
+    projectId: v.id("projects"),
+    requirementId: v.optional(v.id("requirements")),
+    candidateId: v.optional(v.id("candidates")),
+  }),
+  v.object({
+    operationId: v.literal("comparison.read"),
+    projectId: v.id("projects"),
+    requirementId: v.optional(v.id("requirements")),
+    candidateId: v.optional(v.id("candidates")),
+  }),
+  v.object({
+    operationId: v.literal("communication.send"),
+    projectId: v.id("projects"),
+    conversationId: v.optional(v.id("conversations")),
+  }),
+  v.object({
+    operationId: v.literal("communication.clarify"),
+    projectId: v.id("projects"),
+    conversationId: v.optional(v.id("conversations")),
+  }),
+);
+
+export const workflowAuthoritiesValidator = v.array(workflowAuthorityValidator);
+
+export function defaultWorkflowAuthority(
+  operationId: string,
+  projectId: Id<"projects">,
+): WorkflowAuthority | null {
+  switch (operationId) {
+    case "research.collect":
+      return { operationId, projectId };
+    case "research.read":
+      return { operationId, projectId };
+    case "evidence.record":
+      return { operationId, projectId };
+    case "quote.record":
+      return { operationId, projectId };
+    case "comparison.read":
+      return { operationId, projectId };
+    case "communication.send":
+      return { operationId, projectId };
+    case "communication.clarify":
+      return { operationId, projectId };
+    default:
+      return null;
+  }
+}
+
+export function workflowAuthorityForOperation(
+  authorities: readonly WorkflowAuthority[] | undefined,
+  operationId: string,
+): WorkflowAuthority | null {
+  const matches = authorities?.filter((authority) => authority.operationId === operationId) ?? [];
+  return matches.length === 1 && matches[0] !== undefined ? matches[0] : null;
+}
+
+export function workflowAuthorityMatchesProject(
+  authority: WorkflowAuthority | null,
+  operationId: string,
+  projectId: Id<"projects">,
+): boolean {
+  return authority !== null && authority.operationId === operationId && authority.projectId === projectId;
 }
 
 /**
@@ -344,10 +483,10 @@ function tokenize(text: string): string[] {
 }
 
 function contextTokens(context: ProjectWorkflowContext | undefined): ReadonlySet<string> {
-  const values = [
-    ...(context?.terms ?? []),
-    ...(context === undefined ? [] : [context.projectName]),
-  ];
+  // Project names are labels, not workflow authority. Only requirement
+  // terms that were loaded from server-owned records may participate in a
+  // contextual follow-up.
+  const values = [...(context?.terms ?? [])];
   return new Set(values.flatMap((value) => tokenize(value)));
 }
 
@@ -414,7 +553,7 @@ function hasMixedUnsupportedClause(input: {
 }): boolean {
   const clauses = input.text
     .toLocaleLowerCase()
-    .split(/\band\b|\bbut\b|;|\n/)
+    .split(/\band\b|\bbut\b|[.!?;]|\n/)
     .map((clause) => meaningfulTokens(tokenize(clause)))
     .filter((clause) => clause.length > 0);
   if (clauses.length < 2) return false;
@@ -507,21 +646,52 @@ export interface WorkflowPayloadVerdict {
   readonly reason?: string;
 }
 
-function recordValue(value: unknown, key: string): unknown {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
-  const record: Record<string, unknown> = {};
-  for (const [recordKey, recordValue] of Object.entries(value)) {
-    record[recordKey] = recordValue;
-  }
-  return Object.prototype.hasOwnProperty.call(record, key) ? record[key] : undefined;
+function exactObjectKeys(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
 }
 
-function semanticCommunicationText(payload: unknown): string | null {
-  const values = [recordValue(payload, "subject"), recordValue(payload, "body")];
-  if (values.every((value) => value === undefined)) return null;
-  if (values.some((value) => value !== undefined && typeof value !== "string")) return null;
-  const text = values.filter((value): value is string => typeof value === "string").join(" ").trim();
-  return text.length === 0 ? null : text;
+function isResearchCollectionText(
+  text: string,
+  context: ProjectWorkflowContext | undefined,
+): boolean {
+  const tokens = meaningfulTokens(tokenize(text));
+  if (tokens.length === 0) return false;
+  if (
+    hasContextualFollowUp(
+      tokens,
+      contextTokens(context),
+      context?.hasStructuredContext === true,
+    )
+  ) {
+    return true;
+  }
+  // `research.collect` is a supplier/equipment collection operation. A
+  // generic purchasing noun such as "price" or "machine" cannot turn an
+  // unrelated question into collection authority; the request must describe
+  // the collection action and its supplier-facing target. Unknown product
+  // names remain valid data after this structural shape is established.
+  const collectionAction = tokens.some((token) =>
+    token === "research" || token === "source" || token === "identify" || token === "find",
+  );
+  const supplierTarget = tokens.some((token) =>
+    token === "supplier" || token === "suppliers" || token === "vendor" || token === "vendors",
+  );
+  return collectionAction && supplierTarget;
+}
+
+function validatedResearchPayload(
+  payload: unknown,
+  operationId: string,
+  context: ProjectWorkflowContext | undefined,
+): { readonly text: string } | null {
+  if (!exactObjectKeys(payload, ["query"])) return null;
+  const query = payload.query;
+  if (typeof query !== "string" || query.trim().length === 0) return null;
+  if (operationId === "research.collect" && !isResearchCollectionText(query, context)) return null;
+  return { text: query };
 }
 
 /**
@@ -535,11 +705,27 @@ export function validateWorkflowPayload(input: {
   readonly context?: ProjectWorkflowContext;
 }): WorkflowPayloadVerdict {
   if (input.purpose === "purchasingCommunication") {
-    const text = semanticCommunicationText(input.payload);
+    if (!exactObjectKeys(input.payload, ["profile", "to", "cc", "bcc", "subject", "body"])) {
+      return { ok: false, reason: "communication-payload-is-outside-purchasing-workflow" };
+    }
     if (
-      text === null ||
+      input.payload.profile !== "ownerRoleplay" ||
+      typeof input.payload.to !== "string" ||
+      !Array.isArray(input.payload.cc) ||
+      !Array.isArray(input.payload.bcc) ||
+      input.payload.cc.length !== 0 ||
+      input.payload.bcc.length !== 0 ||
+      typeof input.payload.subject !== "string" ||
+      typeof input.payload.body !== "string"
+    ) {
+      return { ok: false, reason: "communication-payload-is-outside-purchasing-workflow" };
+    }
+    // The subject is metadata, not authority. Validate the body on its own
+    // so an "RFQ" or "Clarification" subject cannot launder an unrelated
+    // request into an approved outbound operation.
+    if (
       !allowedWorkflowText({
-        text,
+        text: input.payload.body,
         purpose: input.purpose,
         ...(input.context === undefined ? {} : { context: input.context }),
       })
@@ -548,19 +734,18 @@ export function validateWorkflowPayload(input: {
     }
     return { ok: true };
   }
-  for (const key of ["query", "topic", "request", "text"]) {
-    const value = recordValue(input.payload, key);
-    if (value === undefined) continue;
-    if (
-      typeof value !== "string" ||
-      !allowedWorkflowText({
-        text: value,
-        purpose: input.purpose,
-        ...(input.context === undefined ? {} : { context: input.context }),
-      })
-    ) {
-      return { ok: false, reason: "research-payload-is-outside-purchasing-workflow" };
-    }
+  const research = validatedResearchPayload(input.payload, input.operationId, input.context);
+  if (research === null) {
+    return { ok: false, reason: "research-payload-is-outside-purchasing-workflow" };
+  }
+  if (
+    !allowedWorkflowText({
+      text: research.text,
+      purpose: input.purpose,
+      ...(input.context === undefined ? {} : { context: input.context }),
+    })
+  ) {
+    return { ok: false, reason: "research-payload-is-outside-purchasing-workflow" };
   }
   return { ok: true };
 }

@@ -9,10 +9,18 @@
  */
 
 import { v } from "convex/values";
-import { f1Mutation, f1Query } from "../server.js";
+import type { Id } from "../_generated/dataModel.js";
+import { f1Mutation, f1Query, type F1MutationCtx } from "../server.js";
 import { parseBoundedPayloadJson } from "../shared/hashing.js";
 import { sha256HexOfCanonical } from "../shared/sha256.js";
-import { lookupCapability } from "../shared/scope.js";
+import {
+  defaultWorkflowAuthority,
+  lookupCapability,
+  workflowAuthorityForOperation,
+  workflowAuthorityMatchesProject,
+  workflowAuthoritiesValidator,
+  type WorkflowAuthority,
+} from "../shared/scope.js";
 import { COMMUNICATION_PROFILE_OWNER_ROLEPLAY } from "../shared/provenance.js";
 import { checkProjectAccess, denialValidator, identityOf } from "./checks.js";
 
@@ -33,6 +41,145 @@ const issueResultValidator = v.union(
   denialValidator,
 );
 
+async function validateAuthorityReferences(
+  ctx: F1MutationCtx,
+  authority: WorkflowAuthority,
+  organizationId: Id<"organizations">,
+  projectId: Id<"projects">,
+): Promise<boolean> {
+  if (!workflowAuthorityMatchesProject(authority, authority.operationId, projectId)) return false;
+  if (authority.operationId === "communication.send" || authority.operationId === "communication.clarify") {
+    if (authority.conversationId === undefined) return true;
+    const conversation = await ctx.db.get(authority.conversationId);
+    return (
+      conversation !== null &&
+      conversation.organizationId === organizationId &&
+      conversation.projectId === projectId &&
+      conversation.state !== "cancelled" &&
+      conversation.state !== "closed"
+    );
+  }
+  const requirementId = "requirementId" in authority ? authority.requirementId : undefined;
+  const candidateId = "candidateId" in authority ? authority.candidateId : undefined;
+  let requirement: { readonly _id: Id<"requirements"> } | null = null;
+  if (requirementId !== undefined) {
+    const row = await ctx.db.get(requirementId);
+    if (row === null || row.organizationId !== organizationId || row.projectId !== projectId) return false;
+    if (row.state === "cancelled") return false;
+    requirement = row;
+  }
+  if (candidateId !== undefined) {
+    const candidate = await ctx.db.get(candidateId);
+    if (
+      candidate === null ||
+      candidate.organizationId !== organizationId ||
+      candidate.projectId !== projectId ||
+      (requirement !== null && candidate.requirementId !== requirement._id)
+    ) {
+      return false;
+    }
+    if (requirement === null) {
+      const candidateRequirement = await ctx.db.get(candidate.requirementId);
+      if (
+        candidateRequirement === null ||
+        candidateRequirement.organizationId !== organizationId ||
+        candidateRequirement.projectId !== projectId ||
+        candidateRequirement.state === "cancelled"
+      ) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+/**
+ * Resolve at most one exact requirement from the approved workflow payload.
+ * The payload text is only a lookup hint; authority comes from the returned
+ * server-owned row, and ambiguity deliberately produces no fallback ref.
+ */
+async function uniqueRequirementForPayload(
+  ctx: F1MutationCtx,
+  organizationId: Id<"organizations">,
+  projectId: Id<"projects">,
+  canonicalPayload: string,
+): Promise<Id<"requirements"> | undefined> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(canonicalPayload);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+  const record = parsed as Record<string, unknown>;
+  const keys = Object.keys(record).sort();
+  if (keys.length !== 1 || keys[0] !== "query" || typeof record.query !== "string") return undefined;
+  const tokens = [...new Set(record.query.match(/[A-Za-z0-9]+/g) ?? [])].slice(0, 24);
+  const matches = new Set<Id<"requirements">>();
+  for (const token of tokens) {
+    const variants = [...new Set([
+      token,
+      token.toLocaleLowerCase(),
+      token.length === 0 ? token : token.charAt(0).toLocaleUpperCase() + token.slice(1).toLocaleLowerCase(),
+    ])];
+    for (const variant of variants) {
+      const byTitle = await ctx.db
+        .query("requirements")
+        .withIndex("by_organization_and_project_and_title", (q) =>
+          q.eq("organizationId", organizationId).eq("projectId", projectId).eq("title", variant),
+        )
+        .take(2);
+      for (const requirement of byTitle) matches.add(requirement._id);
+      const byKey = await ctx.db
+        .query("requirements")
+        .withIndex("by_project_and_key", (q) =>
+          q.eq("projectId", projectId).eq("key", variant),
+        )
+        .take(2);
+      for (const requirement of byKey) matches.add(requirement._id);
+    }
+    if (matches.size > 1) return undefined;
+  }
+  if (matches.size > 1) return undefined;
+  const requirementId =
+    matches.size === 1
+      ? [...matches][0]
+      : await (async () => {
+          const rows = (
+            await Promise.all(
+              (["draft", "approved", "sourcing", "readyForDecision", "selected", "fulfilled"] as const).map(
+                (state) =>
+                  ctx.db
+                    .query("requirements")
+                    .withIndex("by_project_and_state", (q) =>
+                      q.eq("projectId", projectId).eq("state", state),
+                    )
+                    .take(2),
+              ),
+            )
+          ).flat();
+          const current = new Map<Id<"requirements">, true>();
+          for (const row of rows) {
+            if (row.organizationId === organizationId && row.projectId === projectId) {
+              current.set(row._id, true);
+            }
+          }
+          const ids = [...current.keys()];
+          return ids.length === 1 ? ids[0] : undefined;
+        })();
+  if (requirementId === undefined) return undefined;
+  const requirement = await ctx.db.get(requirementId);
+  if (
+    requirement === null ||
+    requirement.organizationId !== organizationId ||
+    requirement.projectId !== projectId ||
+    requirement.state === "cancelled"
+  ) {
+    return undefined;
+  }
+  return requirementId;
+}
+
 /** Issue a version-bound grant (approver role or above). */
 export const issue = f1Mutation({
   args: {
@@ -47,6 +194,7 @@ export const issue = f1Mutation({
     roundLimit: v.number(),
     expiresAt: v.number(),
     conversationId: v.optional(v.id("conversations")),
+    workflowAuthorities: v.optional(workflowAuthoritiesValidator),
   },
   returns: issueResultValidator,
   handler: async (ctx, args) => {
@@ -105,7 +253,9 @@ export const issue = f1Mutation({
       if (
         conversation === null ||
         conversation.organizationId !== args.organizationId ||
-        conversation.projectId !== args.projectId
+        conversation.projectId !== args.projectId ||
+        conversation.state === "cancelled" ||
+        conversation.state === "closed"
       ) {
         return { ok: false as const, code: "denied-project", message: "conversation is not in this project" };
       }
@@ -114,6 +264,48 @@ export const issue = f1Mutation({
     if (!parsed.ok) return { ok: false as const, code: parsed.code, message: parsed.message };
     const canonical = parsed.payload.canonical;
     const payloadSha256 = await sha256HexOfCanonical(canonical);
+    const matchedRequirementId = await uniqueRequirementForPayload(
+      ctx,
+      args.organizationId,
+      args.projectId,
+      canonical,
+    );
+    const workflowAuthorities: WorkflowAuthority[] = [];
+    for (const operationId of args.operations) {
+      const explicit = workflowAuthorityForOperation(args.workflowAuthorities, operationId);
+      const baseAuthority =
+        explicit ??
+        (args.workflowAuthorities === undefined
+          ? defaultWorkflowAuthority(operationId, args.projectId)
+          : null);
+      if (baseAuthority === null) {
+        return { ok: false as const, code: "invalid-payload", message: "each grant operation requires one workflow authority" };
+      }
+      const authority =
+        operationId === "research.collect" &&
+        matchedRequirementId !== undefined &&
+        baseAuthority.operationId === "research.collect" &&
+        baseAuthority.requirementId === undefined
+          ? { ...baseAuthority, requirementId: matchedRequirementId }
+          : baseAuthority;
+      const scopedAuthority =
+        args.conversationId !== undefined &&
+        (operationId === "communication.send" || operationId === "communication.clarify")
+          ? { ...authority, conversationId: args.conversationId }
+          : authority;
+      if (
+        !workflowAuthorityMatchesProject(scopedAuthority, operationId, args.projectId) ||
+        !(await validateAuthorityReferences(
+          ctx,
+          scopedAuthority,
+          args.organizationId,
+          args.projectId,
+        ))
+      ) {
+        return { ok: false as const, code: "denied-project", message: "workflow authority is not in this project" };
+      }
+      workflowAuthorities.push(scopedAuthority);
+    }
     const grantId = await ctx.db.insert("grants", {
       organizationId: args.organizationId,
       projectId: args.projectId,
@@ -124,6 +316,7 @@ export const issue = f1Mutation({
       canonicalPayload: canonical,
       payloadHash: parsed.payload.hash,
       payloadSha256,
+      workflowAuthorities,
       costCeilingMicroUsd: args.costCeilingMicroUsd,
       roundLimit: args.roundLimit,
       expiresAt: args.expiresAt,

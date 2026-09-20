@@ -48,6 +48,7 @@ import {
   storedOrderLineValidator,
   storedSelectionLineValidator,
 } from "./shared/domainContracts.js";
+import { workflowAuthoritiesValidator, workflowAuthorityValidator } from "./shared/scope.js";
 
 /**
  * Field-level evidence references for the F1 shared-domain graph use the
@@ -135,7 +136,8 @@ export default defineSchema({
     .index("by_project", ["projectId"])
     .index("by_project_and_key", ["projectId", "key"])
     .index("by_project_and_state", ["projectId", "state"])
-    .index("by_organization_and_project", ["organizationId", "projectId"]),
+    .index("by_organization_and_project", ["organizationId", "projectId"])
+    .index("by_organization_and_project_and_title", ["organizationId", "projectId", "title"]),
 
   dependencies: defineTable({
     organizationId: v.id("organizations"),
@@ -638,6 +640,9 @@ export default defineSchema({
     canonicalPayload: v.string(),
     payloadHash: v.string(),
     payloadSha256: v.optional(v.string()),
+    // A bounded, discriminated authority entry is stored for each allowed
+    // operation and copied into the job/operation that uses it.
+    workflowAuthorities: v.optional(workflowAuthoritiesValidator),
     costCeilingMicroUsd: v.number(),
     roundLimit: v.number(),
     expiresAt: v.number(),
@@ -703,6 +708,10 @@ export default defineSchema({
     cancellationUnresolvedOperationCount: v.optional(v.number()),
     cancellationReconciliationComplete: v.optional(v.boolean()),
     cancellationReconciliationCursor: v.optional(v.union(v.string(), v.null())),
+    // The operation-specific server-owned authority is copied grant -> job
+    // -> operation and revalidated at each protected boundary. Missing
+    // authority on legacy rows fails closed before new work is created.
+    workflowAuthority: v.optional(workflowAuthorityValidator),
   })
     .index("by_project", ["projectId"])
     .index("by_grant", ["grantId"]),
@@ -734,11 +743,13 @@ export default defineSchema({
     reservationId: v.optional(v.id("reservations")),
     attemptToken: v.optional(v.string()),
     linkedResendOf: v.optional(v.id("operations")),
+    workflowAuthority: v.optional(workflowAuthorityValidator),
     createdAt: v.number(),
     updatedAt: v.number(),
   })
     .index("by_requestKey", ["requestKey"])
     .index("by_job", ["jobId"])
+    .index("by_job_and_state", ["jobId", "state"])
     .index("by_reservation", ["reservationId"])
     .index("by_grant", ["grantId"]),
 
@@ -860,7 +871,9 @@ export default defineSchema({
     updatedAt: v.number(),
   })
     .index("by_project", ["projectId"])
-    .index("by_organization_and_project", ["organizationId", "projectId"]),
+    .index("by_organization_and_project", ["organizationId", "projectId"])
+    .index("by_organization_and_project_and_grant_and_state", ["organizationId", "projectId", "grantId", "state"])
+    .index("by_organization_and_project_and_state", ["organizationId", "projectId", "state"]),
 
   quotes: defineTable({
     organizationId: v.id("organizations"),
