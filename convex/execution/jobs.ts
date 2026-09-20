@@ -754,3 +754,77 @@ export const get = f1Query({
     };
   },
 });
+
+/**
+ * F1R-23: authenticated, project-authorized, bounded inventory of the
+ * unresolved operations for one job.
+ *
+ * The cancellation summary on the job keeps a durable total count plus a
+ * 16-ID sample; that sample alone is not the inventory. This query walks
+ * the stable `by_job` operation order one bounded raw page at a time and
+ * returns the `dispatching`/`outcomeUnknown` IDs found on that page. The
+ * continuation cursor is returned whenever the raw scan is not done — even
+ * when the filtered page holds zero IDs — so callers can enumerate every
+ * unresolved operation beyond the first 16 without an unbounded read.
+ */
+export const listUnresolvedOperations = f1Query({
+  args: {
+    jobId: v.id("jobs"),
+    cursor: v.optional(v.string()),
+    limit: v.optional(v.number()),
+  },
+  returns: v.union(
+    v.object({
+      ok: v.literal(true),
+      operationIds: v.array(v.id("operations")),
+      continueCursor: v.union(v.string(), v.null()),
+      isDone: v.boolean(),
+      unresolvedOperationCount: v.number(),
+      reconciliationComplete: v.boolean(),
+    }),
+    denialValidator,
+  ),
+  handler: async (ctx, args) => {
+    const identity = await identityOf(ctx);
+    if (identity === null) {
+      return { ok: false as const, code: "forged-identity", message: "unauthenticated" };
+    }
+    const job = await ctx.db.get(args.jobId);
+    if (job === null) {
+      return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
+    }
+    const access = await checkProjectAccess(
+      ctx,
+      identity,
+      job.organizationId,
+      job.projectId,
+      "viewer",
+      Date.now(),
+    );
+    if (!access.ok) return { ok: false as const, code: access.code, message: access.message };
+    const requested = args.limit ?? CANCELLATION_PAGE_SIZE;
+    const pageSize = Math.min(
+      CANCELLATION_PAGE_SIZE,
+      Math.max(1, Math.floor(requested)),
+    );
+    const page = await ctx.db
+      .query("operations")
+      .withIndex("by_job", (q) => q.eq("jobId", args.jobId))
+      .order("asc")
+      .paginate({ numItems: pageSize, cursor: args.cursor ?? null });
+    const operationIds = page.page
+      .filter(
+        (operation) =>
+          operation.state === "dispatching" || operation.state === "outcomeUnknown",
+      )
+      .map((operation) => operation._id);
+    return {
+      ok: true as const,
+      operationIds,
+      continueCursor: page.isDone ? null : page.continueCursor,
+      isDone: page.isDone,
+      unresolvedOperationCount: job.cancellationUnresolvedOperationCount ?? 0,
+      reconciliationComplete: job.cancellationReconciliationComplete ?? false,
+    };
+  },
+});

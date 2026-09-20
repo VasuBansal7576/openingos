@@ -18,6 +18,10 @@ import { v } from "convex/values";
 import type { Id } from "../_generated/dataModel.js";
 import { f1InternalMutation, f1Query, type F1MutationCtx } from "../server.js";
 import { requestKey } from "../shared/hashing.js";
+import {
+  MAX_OPERATIONS_PER_GRANT,
+  MAX_OPERATIONS_PER_JOB,
+} from "../shared/scope.js";
 import { checkProjectAccess, denialValidator, identityOf } from "../access/checks.js";
 
 const outcomeValidator = v.union(
@@ -328,11 +332,26 @@ export const reviewedResend = f1InternalMutation({
       return { ok: false as const, code: "duplicate-conflict", message: "resend requestId is already in use" };
     }
     const grant = await ctx.db.get(operation.grantId);
+    // F1R-22: a reviewed resend is a new operation, so the existing finite
+    // admission contract binds before insertion. Operation 65 under one
+    // grant (or one job) is refused here with zero new effect. Both reads
+    // are bounded takes; the bounded page is the complete set whenever both
+    // checks pass, which is what makes the round accounting below exact.
+    const grantOperations = await ctx.db
+      .query("operations")
+      .withIndex("by_grant", (q) => q.eq("grantId", operation.grantId))
+      .take(MAX_OPERATIONS_PER_GRANT + 1);
+    if (grantOperations.length >= MAX_OPERATIONS_PER_GRANT) {
+      return { ok: false as const, code: "operation-admission-limit", message: "grant operation admission limit reached" };
+    }
+    const jobOperations = await ctx.db
+      .query("operations")
+      .withIndex("by_job", (q) => q.eq("jobId", operation.jobId))
+      .take(MAX_OPERATIONS_PER_JOB + 1);
+    if (jobOperations.length >= MAX_OPERATIONS_PER_JOB) {
+      return { ok: false as const, code: "operation-admission-limit", message: "job operation admission limit reached" };
+    }
     if (grant !== null) {
-      const grantOperations = await ctx.db
-        .query("operations")
-        .withIndex("by_grant", (q) => q.eq("grantId", operation.grantId))
-        .collect();
       const roundsUsed = grantOperations.filter(
         (entry) => entry.state !== "cancelled" && entry.state !== "denied",
       ).length;
@@ -361,10 +380,7 @@ export const reviewedResend = f1InternalMutation({
     if (freshBudget === null || freshBudget.organizationId !== operation.organizationId) {
       return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
     }
-    const freshSiblings = await ctx.db
-      .query("operations")
-      .withIndex("by_job", (q) => q.eq("jobId", operation.jobId))
-      .collect();
+    const freshSiblings = jobOperations;
     const freshBound = freshSiblings.some(
       (sibling) =>
         sibling.reservationId === args.newReservationId &&
