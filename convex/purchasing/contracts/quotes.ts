@@ -58,6 +58,9 @@ const userQuoteFieldsValidator = v.object({
   comparisonScope: v.optional(quoteComparisonScopeValidator),
   evidenceRefs: v.optional(v.array(quoteEvidenceRefValidator)),
   conversationId: v.optional(v.id("conversations")),
+  requirementId: v.optional(v.id("requirements")),
+  vendorId: v.optional(v.id("vendors")),
+  rfqId: v.optional(v.id("rfqs")),
   supersedes: v.optional(v.string()),
 });
 
@@ -75,6 +78,9 @@ const providerQuoteFieldsValidator = v.object({
   counterpartyRole: v.union(v.literal("vendor"), v.literal("ownerStandIn")),
   executionMode: v.union(v.literal("live"), v.literal("recorded")),
   conversationId: v.optional(v.id("conversations")),
+  requirementId: v.optional(v.id("requirements")),
+  vendorId: v.optional(v.id("vendors")),
+  rfqId: v.optional(v.id("rfqs")),
   supersedes: v.optional(v.string()),
 });
 
@@ -91,6 +97,9 @@ type QuoteFields = {
   counterpartyRole: string;
   executionMode: "live" | "recorded" | "fixture";
   conversationId?: Id<"conversations">;
+  requirementId?: Id<"requirements">;
+  vendorId?: Id<"vendors">;
+  rfqId?: Id<"rfqs">;
   supersedes?: string;
 };
 
@@ -114,17 +123,27 @@ function validateQuoteFields(fields: QuoteFields): AuthorityResult<Quote> {
 }
 
 /**
- * Immutable version, supersedes lineage, and conversation references.
+ * Immutable version, supersedes lineage, and graph references.
  * Versions are never overwritten and are unique per project; a revision
  * must name the exact content hash it replaces, and the superseded
  * version must share the same project, conversation binding, and
- * counterparty lineage. Conversations must live in the same project.
+ * counterparty lineage. Conversations, requirements, vendors, and RFQs
+ * must live in the same project (F1 shared-domain graph).
  */
 async function checkQuoteReferences(
   ctx: F1MutationCtx,
   organizationId: Id<"organizations">,
   projectId: Id<"projects">,
-  fields: Pick<QuoteFields, "version" | "conversationId" | "supersedes" | "counterpartyRole">,
+  fields: Pick<
+    QuoteFields,
+    | "version"
+    | "conversationId"
+    | "requirementId"
+    | "vendorId"
+    | "rfqId"
+    | "supersedes"
+    | "counterpartyRole"
+  >,
 ): Promise<AuthorityResult<true>> {
   if (fields.version.trim().length === 0) {
     return denial("invalid-payload", "version required");
@@ -148,6 +167,35 @@ async function checkQuoteReferences(
       conversation.projectId !== projectId
     ) {
       return denial("denied-project", "conversation is not in this project");
+    }
+  }
+  if (fields.requirementId !== undefined) {
+    const requirement = await ctx.db.get(fields.requirementId);
+    if (
+      requirement === null ||
+      requirement.organizationId !== organizationId ||
+      requirement.projectId !== projectId
+    ) {
+      return denial("denied-project", "requirement is not in this project");
+    }
+  }
+  if (fields.vendorId !== undefined) {
+    // Vendors are organization-scoped supplier identity: the binding
+    // check is the organization, while project authorization to engage
+    // the vendor travels through vendor contacts and RFQ recipients.
+    const vendor = await ctx.db.get(fields.vendorId);
+    if (vendor === null || vendor.organizationId !== organizationId) {
+      return denial("denied-project", "vendor is not in this organization");
+    }
+  }
+  if (fields.rfqId !== undefined) {
+    const rfq = await ctx.db.get(fields.rfqId);
+    if (
+      rfq === null ||
+      rfq.organizationId !== organizationId ||
+      rfq.projectId !== projectId
+    ) {
+      return denial("denied-project", "rfq is not in this project");
     }
   }
   if (fields.supersedes !== undefined) {
@@ -193,6 +241,9 @@ async function insertQuoteVersion(
     counterpartyRole: fields.counterpartyRole,
     executionMode: fields.executionMode,
     ...(fields.conversationId === undefined ? {} : { conversationId: fields.conversationId }),
+    ...(fields.requirementId === undefined ? {} : { requirementId: fields.requirementId }),
+    ...(fields.vendorId === undefined ? {} : { vendorId: fields.vendorId }),
+    ...(fields.rfqId === undefined ? {} : { rfqId: fields.rfqId }),
     ...(fields.supersedes === undefined ? {} : { supersedes: fields.supersedes }),
   });
   // Quote lineage is SHA-256 over the canonical decision fields: the
@@ -221,6 +272,9 @@ async function insertQuoteVersion(
     organizationId: fields.organizationId,
     projectId: fields.projectId,
     ...(fields.conversationId === undefined ? {} : { conversationId: fields.conversationId }),
+    ...(fields.requirementId === undefined ? {} : { requirementId: fields.requirementId }),
+    ...(fields.vendorId === undefined ? {} : { vendorId: fields.vendorId }),
+    ...(fields.rfqId === undefined ? {} : { rfqId: fields.rfqId }),
     version: quote.version,
     contentHash,
     payloadSha256,
@@ -286,6 +340,9 @@ export const record = f1Mutation({
       counterpartyRole: "userImport",
       executionMode: "recorded",
       ...(args.conversationId === undefined ? {} : { conversationId: args.conversationId }),
+      ...(args.requirementId === undefined ? {} : { requirementId: args.requirementId }),
+      ...(args.vendorId === undefined ? {} : { vendorId: args.vendorId }),
+      ...(args.rfqId === undefined ? {} : { rfqId: args.rfqId }),
       ...(args.supersedes === undefined ? {} : { supersedes: args.supersedes }),
     };
     const valid = validateQuoteFields(fields);
@@ -324,6 +381,9 @@ export const ingestProviderQuote = f1InternalMutation({
       counterpartyRole: args.counterpartyRole,
       executionMode: args.executionMode,
       ...(args.conversationId === undefined ? {} : { conversationId: args.conversationId }),
+      ...(args.requirementId === undefined ? {} : { requirementId: args.requirementId }),
+      ...(args.vendorId === undefined ? {} : { vendorId: args.vendorId }),
+      ...(args.rfqId === undefined ? {} : { rfqId: args.rfqId }),
       ...(args.supersedes === undefined ? {} : { supersedes: args.supersedes }),
     };
     const valid = validateQuoteFields(fields);

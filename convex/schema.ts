@@ -43,6 +43,14 @@ import {
   storedQuoteLineValidator,
 } from "./shared/quoteSemantics.js";
 
+/**
+ * Field-level evidence references for the F1 shared-domain graph use the
+ * quote-semantics shape (optional locator): research claims often carry
+ * source/version identity without a byte locator, and handlers narrow
+ * each entry before the write.
+ */
+const domainEvidenceRefValidator = quoteEvidenceRefValidator;
+
 const moneyValidator = v.object({
   currency: v.string(),
   minorUnits: v.number(),
@@ -66,8 +74,400 @@ export default defineSchema({
     organizationId: v.id("organizations"),
     name: v.string(),
     visibility: v.union(v.literal("open"), v.literal("restricted")),
+    locationId: v.optional(v.id("locations")),
+    currency: v.optional(v.string()),
+    budgetMinorUnits: v.optional(v.number()),
+    needByAt: v.optional(v.number()),
     createdAt: v.number(),
   }).index("by_organization", ["organizationId"]),
+
+  locations: defineTable({
+    organizationId: v.id("organizations"),
+    name: v.string(),
+    region: v.string(),
+    reportingCurrency: v.string(),
+    operatingStatus: v.string(),
+    createdAt: v.number(),
+  }).index("by_organization", ["organizationId"]),
+
+  requirements: defineTable({
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    key: v.string(),
+    title: v.string(),
+    category: v.string(),
+    quantity: v.string(),
+    unit: v.string(),
+    priority: v.union(v.literal("P0"), v.literal("P1"), v.literal("P2")),
+    state: v.union(
+      v.literal("draft"),
+      v.literal("approved"),
+      v.literal("sourcing"),
+      v.literal("readyForDecision"),
+      v.literal("selected"),
+      v.literal("fulfilled"),
+      v.literal("cancelled"),
+    ),
+    fulfillment: v.union(
+      v.literal("notOrdered"),
+      v.literal("ordered"),
+      v.literal("partiallyDelivered"),
+      v.literal("delivered"),
+      v.literal("installed"),
+      v.literal("commissioned"),
+      v.literal("cancelled"),
+    ),
+    version: v.number(),
+    budgetMinorUnits: v.optional(v.number()),
+    currency: v.optional(v.string()),
+    needByAt: v.optional(v.number()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_project", ["projectId"])
+    .index("by_project_and_key", ["projectId", "key"])
+    .index("by_project_and_state", ["projectId", "state"]),
+
+  dependencies: defineTable({
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    fromRequirementId: v.id("requirements"),
+    toRequirementId: v.id("requirements"),
+    kind: v.union(v.literal("technical"), v.literal("scheduling")),
+    verification: v.union(
+      v.literal("pending"),
+      v.literal("verified"),
+      v.literal("failed"),
+      v.literal("waived"),
+    ),
+    responsible: v.optional(v.string()),
+    evidenceRefs: v.optional(v.array(domainEvidenceRefValidator)),
+    createdAt: v.number(),
+  })
+    .index("by_project", ["projectId"])
+    .index("by_from_requirement", ["fromRequirementId"])
+    .index("by_to_requirement", ["toRequirementId"]),
+
+  vendors: defineTable({
+    organizationId: v.id("organizations"),
+    name: v.string(),
+    regions: v.array(v.string()),
+    dealerEvidence: v.optional(v.string()),
+    serviceCoverage: v.optional(v.string()),
+    serviceCheckedAt: v.optional(v.number()),
+    createdAt: v.number(),
+  })
+    .index("by_organization", ["organizationId"])
+    .index("by_organization_and_name", ["organizationId", "name"]),
+
+  vendorContacts: defineTable({
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    vendorId: v.id("vendors"),
+    channel: v.string(),
+    detailHash: v.string(),
+    preference: v.optional(v.string()),
+    createdAt: v.number(),
+  })
+    .index("by_project", ["projectId"])
+    .index("by_vendor", ["vendorId"])
+    .index("by_vendor_and_project", ["vendorId", "projectId"]),
+
+  candidates: defineTable({
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    requirementId: v.id("requirements"),
+    vendorId: v.id("vendors"),
+    productModel: v.string(),
+    variant: v.string(),
+    variantKey: v.string(),
+    compatibility: v.union(v.literal("pass"), v.literal("fail"), v.literal("unknown")),
+    compatibilityEvidenceRefs: v.optional(v.array(domainEvidenceRefValidator)),
+    conversationState: v.union(
+      v.literal("draft"),
+      v.literal("awaitingReply"),
+      v.literal("clarificationNeeded"),
+      v.literal("quoteReceived"),
+      v.literal("negotiating"),
+      v.literal("closed"),
+    ),
+    createdAt: v.number(),
+  })
+    .index("by_project", ["projectId"])
+    .index("by_requirement", ["requirementId"])
+    .index("by_requirement_and_variant", ["requirementId", "variantKey"]),
+
+  productEvidence: defineTable({
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    requirementId: v.optional(v.id("requirements")),
+    candidateId: v.optional(v.id("candidates")),
+    field: v.string(),
+    sourceKind: v.string(),
+    sourceUrl: v.optional(v.string()),
+    capturedAt: v.number(),
+    originalValue: v.string(),
+    normalizedValue: v.string(),
+    verification: v.union(
+      v.literal("unverified"),
+      v.literal("verified"),
+      v.literal("conflicted"),
+      v.literal("superseded"),
+    ),
+    freshness: v.union(
+      v.literal("fresh"),
+      v.literal("stale"),
+      v.literal("expired"),
+      v.literal("unknown"),
+    ),
+    lastCheckedAt: v.optional(v.number()),
+    counterpartyRole: v.string(),
+    executionMode: v.union(
+      v.literal("live"),
+      v.literal("recorded"),
+      v.literal("fixture"),
+    ),
+    createdAt: v.number(),
+  })
+    .index("by_project", ["projectId"])
+    .index("by_candidate", ["candidateId"])
+    .index("by_requirement", ["requirementId"]),
+
+  rfqs: defineTable({
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    requirementId: v.id("requirements"),
+    idempotencyKey: v.string(),
+    recipientVendorIds: v.array(v.id("vendors")),
+    briefHash: v.string(),
+    conversationState: v.union(
+      v.literal("draft"),
+      v.literal("awaitingReply"),
+      v.literal("clarificationNeeded"),
+      v.literal("quoteReceived"),
+      v.literal("negotiating"),
+      v.literal("closed"),
+    ),
+    createdAt: v.number(),
+  })
+    .index("by_project", ["projectId"])
+    .index("by_project_and_key", ["projectId", "idempotencyKey"])
+    .index("by_requirement", ["requirementId"]),
+
+  negotiations: defineTable({
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    quoteId: v.id("quotes"),
+    mandateHash: v.string(),
+    targetMinorUnits: v.optional(v.number()),
+    roundLimit: v.number(),
+    roundsUsed: v.number(),
+    state: v.union(
+      v.literal("draft"),
+      v.literal("active"),
+      v.literal("paused"),
+      v.literal("concluded"),
+      v.literal("expired"),
+      v.literal("revoked"),
+    ),
+    expiresAt: v.number(),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_project", ["projectId"])
+    .index("by_quote", ["quoteId"]),
+
+  selections: defineTable({
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    requirementId: v.id("requirements"),
+    candidateId: v.id("candidates"),
+    quoteId: v.id("quotes"),
+    quoteVersion: v.string(),
+    quantity: v.string(),
+    requirementVersion: v.number(),
+    actor: v.string(),
+    createdAt: v.number(),
+  })
+    .index("by_project", ["projectId"])
+    .index("by_requirement", ["requirementId"]),
+
+  approvals: defineTable({
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    scope: v.string(),
+    snapshotCanonical: v.string(),
+    snapshotHash: v.string(),
+    selectionId: v.optional(v.id("selections")),
+    quoteId: v.optional(v.id("quotes")),
+    state: v.union(
+      v.literal("pending"),
+      v.literal("approved"),
+      v.literal("rejected"),
+      v.literal("invalidated"),
+    ),
+    approver: v.string(),
+    decidedAt: v.optional(v.number()),
+    createdAt: v.number(),
+  })
+    .index("by_project", ["projectId"])
+    .index("by_project_and_state", ["projectId", "state"])
+    .index("by_project_and_snapshot", ["projectId", "snapshotHash"]),
+
+  orders: defineTable({
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    selectionId: v.id("selections"),
+    requirementId: v.id("requirements"),
+    quoteId: v.id("quotes"),
+    quoteVersion: v.string(),
+    requirementVersion: v.number(),
+    idempotencyKey: v.string(),
+    orderedQuantity: v.string(),
+    supplierReference: v.optional(v.string()),
+    state: v.union(v.literal("recorded"), v.literal("amended"), v.literal("cancelled")),
+    amendmentCount: v.number(),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_project", ["projectId"])
+    .index("by_project_and_key", ["projectId", "idempotencyKey"])
+    .index("by_selection", ["selectionId"]),
+
+  orderEvents: defineTable({
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    orderId: v.id("orders"),
+    kind: v.union(
+      v.literal("confirmation"),
+      v.literal("shipment"),
+      v.literal("partialDelivery"),
+      v.literal("acceptance"),
+      v.literal("installation"),
+      v.literal("commissioning"),
+    ),
+    acceptedQuantity: v.optional(v.string()),
+    note: v.optional(v.string()),
+    recordedBy: v.string(),
+    createdAt: v.number(),
+  }).index("by_order", ["orderId"]),
+
+  costEntries: defineTable({
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    orderId: v.id("orders"),
+    kind: v.union(
+      v.literal("payment"),
+      v.literal("settledCost"),
+      v.literal("refund"),
+      v.literal("credit"),
+    ),
+    amount: moneyValidator,
+    idempotencyKey: v.string(),
+    linkedEntryId: v.optional(v.id("costEntries")),
+    recordedBy: v.string(),
+    createdAt: v.number(),
+  })
+    .index("by_project", ["projectId"])
+    .index("by_order", ["orderId"])
+    .index("by_project_and_key", ["projectId", "idempotencyKey"]),
+
+  assets: defineTable({
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    locationId: v.optional(v.id("locations")),
+    orderId: v.optional(v.id("orders")),
+    label: v.string(),
+    serial: v.optional(v.string()),
+    constraints: v.optional(v.string()),
+    purchaseProvenance: v.optional(v.string()),
+    createdAt: v.number(),
+  })
+    .index("by_project", ["projectId"])
+    .index("by_location", ["locationId"]),
+
+  assetDocuments: defineTable({
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    assetId: v.id("assets"),
+    kind: v.string(),
+    storageRef: v.optional(v.string()),
+    createdAt: v.number(),
+  }).index("by_asset", ["assetId"]),
+
+  serviceCases: defineTable({
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    assetId: v.id("assets"),
+    urgency: v.union(v.literal("urgent"), v.literal("high"), v.literal("normal"), v.literal("low")),
+    summary: v.string(),
+    state: v.union(
+      v.literal("open"),
+      v.literal("inProgress"),
+      v.literal("waitingForSupplier"),
+      v.literal("resolved"),
+      v.literal("closed"),
+    ),
+    outcome: v.optional(v.string()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_project", ["projectId"])
+    .index("by_asset", ["assetId"]),
+
+  watches: defineTable({
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    targetKind: v.string(),
+    targetId: v.string(),
+    cadenceMs: v.number(),
+    state: v.union(v.literal("active"), v.literal("paused"), v.literal("stopped")),
+    lastResult: v.union(v.literal("ok"), v.literal("stale"), v.literal("error"), v.literal("unknown")),
+    lastCheckedAt: v.optional(v.number()),
+    createdAt: v.number(),
+  })
+    .index("by_project", ["projectId"])
+    .index("by_project_and_state", ["projectId", "state"]),
+
+  projectEvents: defineTable({
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    kind: v.string(),
+    actor: v.string(),
+    evidenceRefs: v.optional(v.array(domainEvidenceRefValidator)),
+    createdAt: v.number(),
+  }).index("by_project", ["projectId"]),
+
+  risks: defineTable({
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    scope: v.string(),
+    severity: v.union(v.literal("critical"), v.literal("high"), v.literal("medium"), v.literal("low")),
+    state: v.union(
+      v.literal("open"),
+      v.literal("mitigating"),
+      v.literal("resolved"),
+      v.literal("accepted"),
+    ),
+    source: v.string(),
+    owner: v.optional(v.string()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_project", ["projectId"])
+    .index("by_project_and_state", ["projectId", "state"]),
+
+  templates: defineTable({
+    organizationId: v.id("organizations"),
+    sourceProjectId: v.id("projects"),
+    name: v.string(),
+    version: v.string(),
+    requirementSnapshot: v.string(),
+    constraintSnapshot: v.string(),
+    createdAt: v.number(),
+  })
+    .index("by_organization", ["organizationId"])
+    .index("by_organization_and_version", ["organizationId", "version"]),
 
   memberships: defineTable({
     organizationId: v.id("organizations"),
@@ -308,6 +708,9 @@ export default defineSchema({
     organizationId: v.id("organizations"),
     projectId: v.id("projects"),
     conversationId: v.optional(v.id("conversations")),
+    requirementId: v.optional(v.id("requirements")),
+    vendorId: v.optional(v.id("vendors")),
+    rfqId: v.optional(v.id("rfqs")),
     version: v.string(),
     contentHash: v.string(),
     payloadSha256: v.optional(v.string()),
