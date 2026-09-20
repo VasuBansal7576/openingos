@@ -303,10 +303,31 @@ test("automatic research creates exact query payload and operation authority", a
     return { job, grant: job === null ? null : await ctx.db.get(job.grantId) };
   });
   expect(rows.grant?.canonicalPayload).toBe(JSON.stringify({ query: text }));
+  expect(rows.grant?.status).toBe("active");
+  expect(rows.grant?.costCeilingMicroUsd).toBe(0);
   expect(rows.grant?.workflowAuthorities).toEqual([
     { operationId: "research.collect", projectId: fixture.projectId },
   ]);
   expect(rows.job?.workflowAuthority).toEqual(rows.grant?.workflowAuthorities?.[0]);
+  expect(await rowCounts(fixture)).toMatchObject({ grants: 1, jobs: 1, operations: 0 });
+});
+
+test("automatic record-changing operation IDs create no grant, job, or operation", async () => {
+  const fixture = await setup();
+  for (const operationId of ["evidence.record", "quote.record"]) {
+    const before = await rowCounts(fixture);
+    const denied = await fixture.asOwner.mutation(startJobRef, {
+      organizationId: fixture.organizationId,
+      projectId: fixture.projectId,
+      text: "Research suppliers for the espresso machine",
+      operationId,
+      kind: "research",
+    });
+    expect(denied.ok, operationId).toBe(false);
+    if (denied.ok) throw new Error(`${operationId} unexpectedly received automatic authority`);
+    expect(denied.code, operationId).toBe("denied-capability");
+    expect(await rowCounts(fixture), operationId).toEqual(before);
+  }
 });
 
 test("missing, stale, foreign, cancelled, mismatched, and ambiguous authority create no job", async () => {

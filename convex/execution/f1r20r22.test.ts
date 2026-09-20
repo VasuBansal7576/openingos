@@ -401,6 +401,57 @@ async function seedLaterPagedCancellationOperation(
   });
 }
 
+async function seedManyPagedCancellationOperations(
+  setup: Awaited<ReturnType<typeof setupResearch>>,
+  jobId: Awaited<ReturnType<typeof startPurchasingJob>>,
+): Promise<Id<"operations">> {
+  return await setup.t.run(async (ctx) => {
+    const now = Date.now();
+    const unresolved: Id<"operations">[] = [];
+    for (let index = 0; index < 17; index += 1) {
+      unresolved.push(await ctx.db.insert("operations", {
+        organizationId: setup.organizationId,
+        projectId: setup.projectId,
+        jobId,
+        kind: "research.collect",
+        requestId: `many-paged-unresolved-${index}`,
+        requestKey: `many-paged-unresolved-${index}`,
+        normalizedPayload: JSON.stringify({ query: "Research suppliers for espresso equipment" }),
+        normalizedPayloadHash: `many-paged-unresolved-${index}`,
+        inputVersions: { brief: "v1" },
+        grantId: setup.grantId,
+        grantVersion: 1,
+        state: "outcomeUnknown",
+        createdAt: now,
+        updatedAt: now,
+      }));
+    }
+    // Keep a later raw page so the seventeenth unresolved row is unsampled
+    // before the reconciliation pass reaches its final page.
+    for (let index = 0; index < 16; index += 1) {
+      await ctx.db.insert("operations", {
+        organizationId: setup.organizationId,
+        projectId: setup.projectId,
+        jobId,
+        kind: "research.collect",
+        requestId: `many-paged-prepared-${index}`,
+        requestKey: `many-paged-prepared-${index}`,
+        normalizedPayload: JSON.stringify({ query: "Research suppliers for espresso equipment" }),
+        normalizedPayloadHash: `many-paged-prepared-${index}`,
+        inputVersions: { brief: "v1" },
+        grantId: setup.grantId,
+        grantVersion: 1,
+        state: "prepared",
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+    const unsampled = unresolved[16];
+    if (unsampled === undefined) throw new Error("unsampled operation setup failed");
+    return unsampled;
+  });
+}
+
 async function setupUnknownCancellation() {
   const setup = await setupResearch();
   const jobId = await startPurchasingJob(setup);
@@ -1091,6 +1142,75 @@ describe("F1R-22 finite admission and cancellation boundaries", () => {
     expect(reconciled.reconciliationComplete).toBe(false);
     expect(reconciled.unresolvedOperationCount).toBe(1);
     expect(reconciled.unresolvedOperationIds).toEqual([laterOperationId]);
+  });
+
+  test("bounded reconciliation replaces a stale unsampled count before the final page returns", async () => {
+    const setup = await setupResearch();
+    const jobId = await startPurchasingJob(setup);
+    const unsampledOperationId = await seedManyPagedCancellationOperations(setup, jobId);
+    const cancelled = (await drainCancellation(setup, jobId)).at(-1);
+    if (cancelled === undefined || !cancelled.ok) throw new Error("cancellation did not return a result");
+    expect(cancelled.complete).toBe(true);
+    expect(cancelled.reconciliationComplete).toBe(false);
+    expect(cancelled.unresolvedOperationCount).toBe(17);
+
+    const firstReconciliationPage = await setup.asOwner.mutation(cancelRef, {
+      jobId,
+      reason: "controlled reconciliation first page",
+    });
+    expect(firstReconciliationPage.ok).toBe(true);
+    if (!firstReconciliationPage.ok) throw new Error("first reconciliation page failed");
+    expect(firstReconciliationPage.complete).toBe(true);
+    expect(firstReconciliationPage.reconciliationComplete).toBe(false);
+    expect(firstReconciliationPage.unresolvedOperationCount).toBe(16);
+
+    const secondReconciliationPage = await setup.asOwner.mutation(cancelRef, {
+      jobId,
+      reason: "controlled reconciliation second page",
+    });
+    expect(secondReconciliationPage.ok).toBe(true);
+    if (!secondReconciliationPage.ok) throw new Error("second reconciliation page failed");
+    expect(secondReconciliationPage.complete).toBe(true);
+    expect(secondReconciliationPage.reconciliationComplete).toBe(false);
+    expect(secondReconciliationPage.unresolvedOperationCount).toBe(17);
+    expect(secondReconciliationPage.unresolvedOperationIds).not.toContain(unsampledOperationId);
+
+    // The seventeenth unresolved operation was not in the durable 16-ID
+    // sample. Resolve it before the final raw page so a sample-only refresh
+    // would incorrectly retain a count of 17.
+    await setup.t.run(async (ctx) => {
+      await ctx.db.patch(unsampledOperationId, {
+        state: "observedFailure",
+        updatedAt: Date.now(),
+      });
+    });
+    const finalPage = await setup.asOwner.mutation(cancelRef, {
+      jobId,
+      reason: "controlled reconciliation final page",
+    });
+    expect(finalPage.ok).toBe(true);
+    if (!finalPage.ok) throw new Error("final reconciliation page failed");
+    expect(finalPage.complete).toBe(true);
+    expect(finalPage.reconciliationComplete).toBe(false);
+    expect(finalPage.unresolvedOperationCount).toBe(16);
+    expect(finalPage.unresolvedOperationIds).toHaveLength(16);
+    expect(finalPage.unresolvedOperationIds).not.toContain(unsampledOperationId);
+
+    await setup.t.run(async (ctx) => {
+      for (const operationId of finalPage.unresolvedOperationIds) {
+        await ctx.db.patch(operationId, {
+          state: "observedFailure",
+          updatedAt: Date.now(),
+        });
+      }
+    });
+    const reconciled = await drainReconciliation(setup, jobId);
+    expect(reconciled.ok).toBe(true);
+    if (!reconciled.ok) throw new Error("reconciliation did not resume");
+    expect(reconciled.complete).toBe(true);
+    expect(reconciled.reconciliationComplete).toBe(true);
+    expect(reconciled.unresolvedOperationCount).toBe(0);
+    expect(reconciled.unresolvedOperationIds).toEqual([]);
   });
 
   test("completed cancellation still exposes unresolved work on repeat", async () => {
