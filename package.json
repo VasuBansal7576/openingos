@@ -11,7 +11,8 @@
     "typecheck:browser": "tsc -p tsconfig.browser-executor.json",
     "typecheck": "tsc --noEmit",
     "build": "vite build",
-    "test": "bun run test:repository && bun run test:proofs && bun run test:browser && bun test app/tests/application.test.ts",
+    "test": "bun run test:repository && bun run test:proofs && bun run test:browser && bun test app/tests/application.test.ts && bun run test:direct",
+    "test:direct": "bunx vitest run convex/handlers.direct.test.ts --environment edge-runtime",
     "test:provider-contracts": "bun test app/tests/provider-contracts.test.ts",
     "test:user-path": "bun test app/tests/user-path.test.ts"
   },

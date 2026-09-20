@@ -168,6 +168,13 @@ describe("exported-handler audit", () => {
     }
   });
 
+  test("direct suite uses explicit generics, never a cast helper", async () => {
+    const source = await readOwned("handlers.direct.test.ts");
+    expect(source.includes("as unknown")).toBe(false);
+    expect(/function ref</.test(source)).toBe(false);
+    expect(source.includes("makeFunctionReference<")).toBe(true);
+  });
+
   test("ID arguments use typed v.id table references", async () => {
     const expectedTables: Record<string, string[]> = {
       "access/memberships.ts": ['v.id("organizations")', 'v.id("projects")', 'v.id("memberships")'],
