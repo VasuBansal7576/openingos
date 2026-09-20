@@ -27,6 +27,12 @@ import { operationLabel, sendAgentMailOneShot } from "./transport.js";
 type MutationArgs<T> = T extends RegisteredMutation<infer _Visibility, infer Args, infer _Return> ? Args : never;
 type MutationReturn<T> = T extends RegisteredMutation<infer _Visibility, infer _Args, infer Return> ? Awaited<Return> : never;
 
+// Legacy callback receipts have no structured provider fields. Only use the
+// bounded fallback when the sentinel proves that every legacy row was read;
+// an incomplete horizon remains unresolved rather than being treated as a
+// successful reconciliation.
+const LEGACY_BINDING_RECOVERY_LIMIT = 64;
+
 const claimRef = makeFunctionReference<
   "mutation",
   MutationArgs<typeof operations.claim>,
@@ -69,6 +75,12 @@ function parseObject(canonical: string): Record<string, unknown> | null {
 
 function denial(code: CommunicationDenial["code"], message: string): { ok: false; code: string; message: string } {
   return { ok: false, code, message };
+}
+
+function normalizedProviderId(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim();
+  return normalized.length > 0 ? normalized : undefined;
 }
 
 /**
@@ -197,8 +209,8 @@ const bindingResultValidator = v.union(
 );
 
 interface BindingFacts {
-  readonly eventId: string;
-  readonly eventType: string;
+  readonly eventId?: string;
+  readonly eventType?: string;
   readonly messageId: string;
   readonly threadId: string;
   readonly inboxId: string;
@@ -206,19 +218,64 @@ interface BindingFacts {
 
 function bindingFacts(value: unknown): BindingFacts | null {
   if (!isRecord(value)) return null;
-  const eventId = value["eventId"];
-  const eventType = value["eventType"];
-  const messageId = value["messageId"];
-  const threadId = value["threadId"];
-  const inboxId = value["inboxId"];
+  const messageId = normalizedProviderId(value["messageId"]);
+  const threadId = normalizedProviderId(value["threadId"]);
+  const inboxId = normalizedProviderId(value["inboxId"]);
+  if (messageId === undefined || threadId === undefined || inboxId === undefined) return null;
+  const eventId = normalizedProviderId(value["eventId"]);
+  const eventType = typeof value["eventType"] === "string" ? value["eventType"] : undefined;
+  return {
+    ...(eventId === undefined ? {} : { eventId }),
+    ...(eventType === undefined ? {} : { eventType }),
+    messageId,
+    threadId,
+    inboxId,
+  };
+}
+
+function rowBindingFacts(row: {
+  readonly outcome: string;
+  readonly providerMessageId?: string;
+  readonly providerThreadId?: string;
+  readonly providerInboxId?: string;
+}): BindingFacts | null {
+  const legacy = bindingFacts(parseObject(row.outcome));
+  const structuredMessageId = normalizedProviderId(row.providerMessageId);
+  const structuredThreadId = normalizedProviderId(row.providerThreadId);
+  const structuredInboxId = normalizedProviderId(row.providerInboxId);
   if (
-    typeof eventId !== "string" ||
-    typeof eventType !== "string" ||
-    typeof messageId !== "string" ||
-    typeof threadId !== "string" ||
-    typeof inboxId !== "string"
+    (structuredMessageId !== undefined && legacy?.messageId !== undefined && structuredMessageId !== legacy.messageId) ||
+    (structuredThreadId !== undefined && legacy?.threadId !== undefined && structuredThreadId !== legacy.threadId) ||
+    (structuredInboxId !== undefined && legacy?.inboxId !== undefined && structuredInboxId !== legacy.inboxId)
   ) return null;
-  return { eventId, eventType, messageId, threadId, inboxId };
+  const messageId = structuredMessageId ?? legacy?.messageId;
+  const threadId = structuredThreadId ?? legacy?.threadId;
+  const inboxId = structuredInboxId ?? legacy?.inboxId;
+  if (messageId === undefined || threadId === undefined || inboxId === undefined) return null;
+  return {
+    ...(legacy?.eventId === undefined ? {} : { eventId: legacy.eventId }),
+    ...(legacy?.eventType === undefined ? {} : { eventType: legacy.eventType }),
+    messageId,
+    threadId,
+    inboxId,
+  };
+}
+
+function matchesBinding(
+  row: {
+    readonly outcome: string;
+    readonly providerMessageId?: string;
+    readonly providerThreadId?: string;
+    readonly providerInboxId?: string;
+  },
+  expected: BindingFacts,
+): boolean {
+  const facts = rowBindingFacts(row);
+  return facts?.messageId === expected.messageId && facts.threadId === expected.threadId && facts.inboxId === expected.inboxId;
+}
+
+function isSuccessEvent(eventType: string | undefined): boolean {
+  return eventType === "message.sent" || eventType === "message.delivered";
 }
 
 /**
@@ -235,7 +292,12 @@ export const recordProviderBinding = f1InternalMutation({
   },
   returns: bindingResultValidator,
   handler: async (ctx, args) => {
-    if (args.messageId.trim().length === 0 || args.threadId.trim().length === 0) {
+    const expected = bindingFacts({
+      messageId: args.messageId,
+      threadId: args.threadId,
+      inboxId: args.inboxId,
+    });
+    if (expected === null) {
       return denial("invalid-payload", "provider response identifiers are required");
     }
     const operation = await ctx.db.get(args.operationId);
@@ -244,19 +306,35 @@ export const recordProviderBinding = f1InternalMutation({
       return denial("alternate-channel-denied", "operation is not communication-bound");
     }
     const scope = { organizationId: operation.organizationId, projectId: operation.projectId };
-    const existing = await ctx.db
+    const existingRows = await ctx.db
       .query("processedEvents")
       .withIndex("by_provider_environment_and_event", (q) =>
-        q.eq("provider", "agentmail-binding").eq("environment", "live").eq("eventId", args.messageId),
+        q.eq("provider", "agentmail-binding").eq("environment", "live").eq("eventId", expected.messageId),
       )
-      .unique();
-    if (existing !== null) {
+      .take(2);
+    if (existingRows.length > 1) return denial("invalid-payload", "provider message binding is ambiguous");
+    const existing = existingRows[0];
+    if (existing !== undefined) {
       if (
         existing.organizationId !== scope.organizationId ||
         existing.projectId !== scope.projectId ||
         existing.operationId !== args.operationId
       ) {
         return denial("invalid-payload", "provider message is already bound to another project");
+      }
+      if (!matchesBinding(existing, expected)) {
+        return denial("invalid-payload", "provider message binding facts conflict");
+      }
+      if (
+        existing.providerMessageId === undefined ||
+        existing.providerThreadId === undefined ||
+        existing.providerInboxId === undefined
+      ) {
+        await ctx.db.patch(existing._id, {
+          providerMessageId: expected.messageId,
+          providerThreadId: expected.threadId,
+          providerInboxId: expected.inboxId,
+        });
       }
       const applied = existing.applicationState === "observedSuccess" || operation.state === "observedSuccess";
       if (applied && existing.applicationState !== "observedSuccess") {
@@ -271,30 +349,58 @@ export const recordProviderBinding = f1InternalMutation({
 
     const now = Date.now();
     let applied = false;
-    const unboundRows = await ctx.db.query("processedEvents").take(128);
-    for (const row of unboundRows) {
-      if (row.provider !== "agentmail-callback" || row.environment !== "live") continue;
-      const facts = bindingFacts(parseObject(row.outcome));
-      if (facts === null || facts.messageId !== args.messageId || facts.threadId !== args.threadId || facts.inboxId !== args.inboxId) continue;
-      if (row.organizationId !== undefined && row.organizationId !== scope.organizationId) {
+    const indexedCallbacks = await ctx.db
+      .query("processedEvents")
+      .withIndex("by_provider_environment_and_provider_message_and_thread_and_inbox", (q) =>
+        q
+          .eq("provider", "agentmail-callback")
+          .eq("environment", "live")
+          .eq("providerMessageId", expected.messageId)
+          .eq("providerThreadId", expected.threadId)
+          .eq("providerInboxId", expected.inboxId),
+      )
+      .take(2);
+    if (indexedCallbacks.length > 1) return denial("invalid-payload", "provider callback binding is ambiguous");
+    let callback = indexedCallbacks[0];
+    if (callback === undefined) {
+      const legacyRows = await ctx.db
+        .query("processedEvents")
+        .withIndex("by_provider_environment_and_event", (q) =>
+          q.eq("provider", "agentmail-callback").eq("environment", "live"),
+        )
+        .take(LEGACY_BINDING_RECOVERY_LIMIT + 1);
+      if (legacyRows.length <= LEGACY_BINDING_RECOVERY_LIMIT) {
+        const matches = legacyRows.filter(
+          (row) =>
+            row.providerMessageId === undefined &&
+            row.providerThreadId === undefined &&
+            row.providerInboxId === undefined &&
+            matchesBinding(row, expected),
+        );
+        if (matches.length > 1) return denial("invalid-payload", "legacy provider callback binding is ambiguous");
+        callback = matches[0];
+      }
+    }
+    if (callback !== undefined) {
+      if (callback.organizationId !== undefined && callback.organizationId !== scope.organizationId) {
         return denial("invalid-payload", "callback belongs to another organization");
       }
-      if (row.projectId !== undefined && row.projectId !== scope.projectId) {
+      if (callback.projectId !== undefined && callback.projectId !== scope.projectId) {
         return denial("invalid-payload", "callback belongs to another project");
       }
-      await ctx.db.patch(row._id, {
-        organizationId: scope.organizationId,
-        projectId: scope.projectId,
-        operationId: args.operationId,
-        applicationOutcome: facts.eventType === "message.sent" || facts.eventType === "message.delivered" ? "success" : "unknown",
-        applicationState: facts.eventType === "message.sent" || facts.eventType === "message.delivered" ? "observedSuccess" : "outcomeUnknown",
-        appliedAt: now,
-      });
-      if (facts.eventType === "message.sent" || facts.eventType === "message.delivered") {
+      if (callback.operationId !== undefined && callback.operationId !== args.operationId) {
+        return denial("invalid-payload", "callback is already bound to another operation");
+      }
+      const facts = rowBindingFacts(callback);
+      if (facts === null || !matchesBinding(callback, expected)) {
+        return denial("invalid-payload", "provider callback binding facts conflict");
+      }
+      const successEvent = isSuccessEvent(facts.eventType);
+      if (successEvent) {
         const token = operation.attemptToken;
         if (operation.state === "observedSuccess") {
           applied = true;
-        } else if (token !== undefined) {
+        } else if (token !== undefined && facts.eventId !== undefined) {
           const late: MutationReturn<typeof reconciliation.recordLateDelivery> = await ctx.runMutation(lateDeliveryRef, {
             operationId: args.operationId,
             token,
@@ -305,14 +411,27 @@ export const recordProviderBinding = f1InternalMutation({
           applied = late.ok;
         }
       }
-      break;
+      await ctx.db.patch(callback._id, {
+        organizationId: scope.organizationId,
+        projectId: scope.projectId,
+        operationId: args.operationId,
+        providerMessageId: expected.messageId,
+        providerThreadId: expected.threadId,
+        providerInboxId: expected.inboxId,
+        applicationOutcome: successEvent && applied ? "success" : "unknown",
+        applicationState: successEvent && applied ? "observedSuccess" : "outcomeUnknown",
+        ...(successEvent && applied ? { appliedAt: now } : {}),
+      });
     }
     await ctx.db.insert("processedEvents", {
       provider: "agentmail-binding",
       environment: "live",
-      eventId: args.messageId,
+      eventId: expected.messageId,
       processingVersion: 1,
-      outcome: JSON.stringify({ messageId: args.messageId, threadId: args.threadId, inboxId: args.inboxId }),
+      outcome: JSON.stringify({ messageId: expected.messageId, threadId: expected.threadId, inboxId: expected.inboxId }),
+      providerMessageId: expected.messageId,
+      providerThreadId: expected.threadId,
+      providerInboxId: expected.inboxId,
       ...scope,
       operationId: args.operationId,
       applicationOutcome: applied ? "success" : "unknown",

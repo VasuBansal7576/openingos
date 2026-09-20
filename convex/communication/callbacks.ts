@@ -29,6 +29,12 @@ import {
 type MutationArgs<T> = T extends RegisteredMutation<infer _Visibility, infer Args, infer _Return> ? Args : never;
 type MutationReturn<T> = T extends RegisteredMutation<infer _Visibility, infer _Args, infer Return> ? Awaited<Return> : never;
 
+// Legacy receipts predate structured binding fields. Recovery is safe only
+// when this bounded provider prefix is known to contain every legacy row. If
+// the extra sentinel row is present, callers leave the record waiting for
+// reconciliation instead of claiming a match that may be outside the page.
+const LEGACY_BINDING_RECOVERY_LIMIT = 64;
+
 const lateDeliveryRef = makeFunctionReference<
   "mutation",
   MutationArgs<typeof reconciliation.recordLateDelivery>,
@@ -46,6 +52,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function nonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
+}
+
+function normalizedProviderId(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim();
+  return normalized.length > 0 ? normalized : undefined;
 }
 
 function parseObject(value: string): Record<string, unknown> | null {
@@ -75,15 +87,15 @@ function eventType(value: unknown): ParsedProviderEvent["eventType"] | null {
 }
 
 function providerId(value: unknown): string | undefined {
-  return isRecord(value) && typeof value["message_id"] === "string" ? value["message_id"] : undefined;
+  return isRecord(value) ? normalizedProviderId(value["message_id"]) : undefined;
 }
 
 function providerThread(value: unknown): string | undefined {
-  return isRecord(value) && typeof value["thread_id"] === "string" ? value["thread_id"] : undefined;
+  return isRecord(value) ? normalizedProviderId(value["thread_id"]) : undefined;
 }
 
 function providerInbox(value: unknown): string | undefined {
-  return isRecord(value) && typeof value["inbox_id"] === "string" ? value["inbox_id"] : undefined;
+  return isRecord(value) ? normalizedProviderId(value["inbox_id"]) : undefined;
 }
 
 function parseProviderEvent(value: unknown): ParsedProviderEvent | CommunicationDenial {
@@ -116,18 +128,124 @@ function parseProviderEvent(value: unknown): ParsedProviderEvent | Communication
   };
 }
 
-function bindingValue(value: string): { readonly messageId?: string; readonly threadId?: string; readonly inboxId?: string } | null {
+interface BindingFacts {
+  readonly eventId?: string;
+  readonly eventType?: string;
+  readonly messageId?: string;
+  readonly threadId?: string;
+  readonly inboxId?: string;
+}
+
+interface BindingKey {
+  readonly messageId: string;
+  readonly threadId: string;
+  readonly inboxId: string;
+}
+
+function bindingKey(
+  messageId: string | undefined,
+  threadId: string | undefined,
+  inboxId: string | undefined,
+): BindingKey | null {
+  const normalizedMessageId = normalizedProviderId(messageId);
+  const normalizedThreadId = normalizedProviderId(threadId);
+  const normalizedInboxId = normalizedProviderId(inboxId);
+  if (normalizedMessageId === undefined || normalizedThreadId === undefined || normalizedInboxId === undefined) return null;
+  return { messageId: normalizedMessageId, threadId: normalizedThreadId, inboxId: normalizedInboxId };
+}
+
+function bindingValue(value: string): BindingFacts | null {
   try {
     const parsed: unknown = JSON.parse(value);
     if (!isRecord(parsed)) return null;
+    const eventId = normalizedProviderId(parsed["eventId"]);
+    const eventType = typeof parsed["eventType"] === "string" ? parsed["eventType"] : undefined;
+    const messageId = normalizedProviderId(parsed["messageId"]);
+    const threadId = normalizedProviderId(parsed["threadId"]);
+    const inboxId = normalizedProviderId(parsed["inboxId"]);
     return {
-      ...(typeof parsed["messageId"] === "string" ? { messageId: parsed["messageId"] } : {}),
-      ...(typeof parsed["threadId"] === "string" ? { threadId: parsed["threadId"] } : {}),
-      ...(typeof parsed["inboxId"] === "string" ? { inboxId: parsed["inboxId"] } : {}),
+      ...(eventId === undefined ? {} : { eventId }),
+      ...(eventType === undefined ? {} : { eventType }),
+      ...(messageId === undefined ? {} : { messageId }),
+      ...(threadId === undefined ? {} : { threadId }),
+      ...(inboxId === undefined ? {} : { inboxId }),
     };
   } catch {
     return null;
   }
+}
+
+function rowBindingFacts(row: {
+  readonly outcome: string;
+  readonly providerMessageId?: string;
+  readonly providerThreadId?: string;
+  readonly providerInboxId?: string;
+}): BindingFacts | null {
+  const legacy = bindingValue(row.outcome);
+  const structuredMessageId = normalizedProviderId(row.providerMessageId);
+  const structuredThreadId = normalizedProviderId(row.providerThreadId);
+  const structuredInboxId = normalizedProviderId(row.providerInboxId);
+  if (
+    (structuredMessageId !== undefined && legacy?.messageId !== undefined && structuredMessageId !== legacy.messageId) ||
+    (structuredThreadId !== undefined && legacy?.threadId !== undefined && structuredThreadId !== legacy.threadId) ||
+    (structuredInboxId !== undefined && legacy?.inboxId !== undefined && structuredInboxId !== legacy.inboxId)
+  ) return null;
+  const eventId = legacy?.eventId;
+  const eventType = legacy?.eventType;
+  const messageId = structuredMessageId ?? legacy?.messageId;
+  const threadId = structuredThreadId ?? legacy?.threadId;
+  const inboxId = structuredInboxId ?? legacy?.inboxId;
+  if (messageId === undefined && threadId === undefined && inboxId === undefined) return null;
+  return {
+    ...(eventId === undefined ? {} : { eventId }),
+    ...(eventType === undefined ? {} : { eventType }),
+    ...(messageId === undefined ? {} : { messageId }),
+    ...(threadId === undefined ? {} : { threadId }),
+    ...(inboxId === undefined ? {} : { inboxId }),
+  };
+}
+
+function matchesBinding(row: {
+  readonly outcome: string;
+  readonly providerMessageId?: string;
+  readonly providerThreadId?: string;
+  readonly providerInboxId?: string;
+}, expected: BindingKey): boolean {
+  const facts = rowBindingFacts(row);
+  return facts?.messageId === expected.messageId && facts.threadId === expected.threadId && facts.inboxId === expected.inboxId;
+}
+
+function matchesThreadAndInbox(row: {
+  readonly outcome: string;
+  readonly providerThreadId?: string;
+  readonly providerInboxId?: string;
+}, expected: BindingKey): boolean {
+  const facts = rowBindingFacts(row);
+  return facts?.threadId === expected.threadId && facts.inboxId === expected.inboxId;
+}
+
+function isSuccessEvent(eventType: string | undefined): boolean {
+  return eventType === "message.sent" || eventType === "message.delivered";
+}
+
+function normalizedInboundMessage(message: InboundMessage): InboundMessage {
+  return {
+    ...message,
+    messageId: normalizedProviderId(message.messageId) ?? message.messageId,
+    threadId: normalizedProviderId(message.threadId) ?? message.threadId,
+    inboxId: normalizedProviderId(message.inboxId) ?? message.inboxId,
+  };
+}
+
+async function legacyBindingRows(ctx: F1MutationCtx, provider: string) {
+  const rows = await ctx.db
+    .query("processedEvents")
+    .withIndex("by_provider_environment_and_event", (q) => q.eq("provider", provider).eq("environment", "live"))
+    .take(LEGACY_BINDING_RECOVERY_LIMIT + 1);
+  return {
+    rows: rows.slice(0, LEGACY_BINDING_RECOVERY_LIMIT),
+    complete: rows.length <= LEGACY_BINDING_RECOVERY_LIMIT,
+  };
 }
 
 async function operationForProviderMessage(
@@ -136,23 +254,50 @@ async function operationForProviderMessage(
   threadId: string | undefined,
   inboxId: string | undefined,
 ): Promise<{ operationId: Id<"operations">; token: string } | null> {
-  // This helper is inlined by `ingestEvent`; its intentionally tiny bounded
-  // scan avoids claiming a project from a sender or subject alone.
-  if (messageId === undefined && threadId === undefined) return null;
-  const rows = await ctx.db.query("processedEvents").take(128);
-  for (const row of rows) {
-    if (row.provider !== "agentmail-binding" || row.environment !== "live" || row.operationId === undefined) continue;
-    const binding = bindingValue(row.outcome);
-    if (
-      binding === null ||
-      (messageId !== undefined && binding.messageId !== messageId) ||
-      (threadId !== undefined && binding.threadId !== threadId) ||
-      (inboxId !== undefined && binding.inboxId !== inboxId)
-    ) continue;
-    const operation = await ctx.db.get(row.operationId);
-    if (operation?.attemptToken !== undefined) return { operationId: operation._id, token: operation.attemptToken };
+  const expected = bindingKey(messageId, threadId, inboxId);
+  if (expected === null) return null;
+  const indexedRows = await ctx.db
+    .query("processedEvents")
+    .withIndex("by_provider_environment_and_provider_message_and_thread_and_inbox", (q) =>
+      q
+        .eq("provider", "agentmail-binding")
+        .eq("environment", "live")
+        .eq("providerMessageId", expected.messageId)
+        .eq("providerThreadId", expected.threadId)
+        .eq("providerInboxId", expected.inboxId),
+    )
+    .take(2);
+  if (indexedRows.length > 1) return null;
+
+  let row = indexedRows[0];
+  if (row === undefined) {
+    // Historical binding rows use eventId=messageId and keep the original
+    // facts only in outcome JSON. This exact lookup is migration-safe and
+    // does not inspect an arbitrary receipt prefix.
+    const legacyRows = await ctx.db
+      .query("processedEvents")
+      .withIndex("by_provider_environment_and_event", (q) =>
+        q.eq("provider", "agentmail-binding").eq("environment", "live").eq("eventId", expected.messageId),
+      )
+      .take(2);
+    if (legacyRows.length > 1) return null;
+    const legacy = legacyRows[0];
+    if (legacy === undefined || !matchesBinding(legacy, expected)) return null;
+    row = legacy;
+    await ctx.db.patch(row._id, {
+      providerMessageId: expected.messageId,
+      providerThreadId: expected.threadId,
+      providerInboxId: expected.inboxId,
+    });
   }
-  return null;
+  if (!matchesBinding(row, expected) || row.operationId === undefined) return null;
+  const operation = await ctx.db.get(row.operationId);
+  if (
+    operation === null ||
+    (operation.kind !== "communication.send" && operation.kind !== "communication.clarify") ||
+    operation.attemptToken === undefined
+  ) return null;
+  return { operationId: operation._id, token: operation.attemptToken };
 }
 
 const eventResultValidator = v.union(
@@ -201,6 +346,9 @@ export const ingestEvent = f1InternalMutation({
       eventId: parsed.eventId,
       processingVersion: 1,
       outcome: serializeProviderEventForBinding(parsed),
+      ...(parsed.messageId === undefined ? {} : { providerMessageId: parsed.messageId }),
+      ...(parsed.threadId === undefined ? {} : { providerThreadId: parsed.threadId }),
+      ...(parsed.inboxId === undefined ? {} : { providerInboxId: parsed.inboxId }),
       ...(binding === null ? {} : { operationId: binding.operationId }),
       ...(boundOperation === null ? {} : { organizationId: boundOperation.organizationId, projectId: boundOperation.projectId }),
       applicationOutcome: isSuccessEvent && applied ? "success" : "unknown",
@@ -233,20 +381,57 @@ async function conversationForMessage(
   ctx: F1MutationCtx,
   message: InboundMessage,
 ): Promise<ConversationBinding | null> {
-  const rows = await ctx.db.query("processedEvents").take(128);
-  for (const row of rows) {
-    if (row.provider !== "agentmail-binding" || row.environment !== "live" || row.operationId === undefined) continue;
-    const binding = bindingValue(row.outcome);
-    if (binding === null || binding.threadId !== message.threadId || binding.inboxId !== message.inboxId) continue;
-    const operation = await ctx.db.get(row.operationId);
-    if (operation === null || operation.grantId === undefined || operation.organizationId === undefined || operation.projectId === undefined) continue;
-    const grant = await ctx.db.get(operation.grantId);
-    if (grant?.conversationId === undefined || grant.organizationId !== operation.organizationId || grant.projectId !== operation.projectId) continue;
-    const conversation = await ctx.db.get(grant.conversationId);
-    if (conversation?.organizationId !== operation.organizationId || conversation.projectId !== operation.projectId) continue;
-    return { conversationId: grant.conversationId, organizationId: operation.organizationId, projectId: operation.projectId };
+  const expected = bindingKey(message.messageId, message.threadId, message.inboxId);
+  if (expected === null) return null;
+  const indexedRows = await ctx.db
+    .query("processedEvents")
+    .withIndex("by_provider_environment_and_provider_thread_and_inbox", (q) =>
+      q
+        .eq("provider", "agentmail-binding")
+        .eq("environment", "live")
+        .eq("providerThreadId", expected.threadId)
+        .eq("providerInboxId", expected.inboxId),
+    )
+    .take(2);
+  if (indexedRows.length > 1) return null;
+
+  let row = indexedRows[0];
+  if (row === undefined) {
+    // Old binding rows have no indexed thread/inbox facts. Recovery is only
+    // accepted when the bounded provider prefix is complete; otherwise the
+    // inbound event stays in waitingForBinding for explicit reconciliation.
+    const legacy = await legacyBindingRows(ctx, "agentmail-binding");
+    if (!legacy.complete) return null;
+    const matches = legacy.rows.filter((candidate) => matchesThreadAndInbox(candidate, expected));
+    if (matches.length !== 1) return null;
+    const candidate = matches[0];
+    if (candidate === undefined) return null;
+    row = candidate;
+    const facts = rowBindingFacts(row);
+    if (facts === null || facts.messageId === undefined || facts.threadId === undefined || facts.inboxId === undefined) return null;
+    await ctx.db.patch(row._id, {
+      providerMessageId: facts.messageId,
+      providerThreadId: facts.threadId,
+      providerInboxId: facts.inboxId,
+    });
   }
-  return null;
+  if (!matchesThreadAndInbox(row, expected) || row.operationId === undefined) return null;
+  const operation = await ctx.db.get(row.operationId);
+  if (operation === null) return null;
+  const grant = await ctx.db.get(operation.grantId);
+  if (
+    grant === null ||
+    grant.conversationId === undefined ||
+    grant.organizationId !== operation.organizationId ||
+    grant.projectId !== operation.projectId
+  ) return null;
+  const conversation = await ctx.db.get(grant.conversationId);
+  if (
+    conversation === null ||
+    conversation.organizationId !== operation.organizationId ||
+    conversation.projectId !== operation.projectId
+  ) return null;
+  return { conversationId: grant.conversationId, organizationId: operation.organizationId, projectId: operation.projectId };
 }
 
 /**
@@ -258,9 +443,14 @@ export const ingestMessage = f1InternalMutation({
   args: { message: v.any(), thread: v.any(), eventId: v.string() },
   returns: inboundResultValidator,
   handler: async (ctx, args) => {
-    const parsed = parseInboundMessage(args.message);
-    if (isCommunicationDenial(parsed)) return parsed;
-    if (isRecord(args.thread) && typeof args.thread["thread_id"] === "string" && args.thread["thread_id"] !== parsed.threadId) {
+    const parsedValue = parseInboundMessage(args.message);
+    if (isCommunicationDenial(parsedValue)) return parsedValue;
+    const parsed = normalizedInboundMessage(parsedValue);
+    if (
+      isRecord(args.thread) &&
+      normalizedProviderId(args.thread["thread_id"]) !== undefined &&
+      normalizedProviderId(args.thread["thread_id"]) !== parsed.threadId
+    ) {
       return denial("invalid-payload", "inbound message and thread identifiers conflict");
     }
     const configRows = await ctx.db
@@ -294,6 +484,9 @@ export const ingestMessage = f1InternalMutation({
         eventId: args.eventId,
         processingVersion: 1,
         outcome: JSON.stringify({ messageId: parsed.messageId, threadId: parsed.threadId, reason: "no verified conversation binding" }),
+        providerMessageId: parsed.messageId,
+        providerThreadId: parsed.threadId,
+        providerInboxId: parsed.inboxId,
         createdAt: Date.now(),
       });
       return { ok: true as const, messageId: parsed.messageId, deduplicated: false, state: "waitingForBinding" as const, evidenceId: null };

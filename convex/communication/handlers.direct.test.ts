@@ -174,6 +174,22 @@ const inbound = (messageId: string, threadId: string, html = "", from = "owner@e
   attachments: [],
 });
 
+async function insertUnrelatedProcessedEvents(f: Fixture, count: number): Promise<void> {
+  await f.t.run(async (ctx) => {
+    const now = Date.now();
+    for (let index = 0; index < count; index += 1) {
+      await ctx.db.insert("processedEvents", {
+        provider: "unrelated-provider",
+        environment: "live",
+        eventId: `unrelated-event-${index}`,
+        processingVersion: 1,
+        outcome: "unrelated",
+        createdAt: now + index,
+      });
+    }
+  });
+}
+
 describe("C1 Convex callback handlers", () => {
   test("locks provider cleanup to seven days before touching component rows", async () => {
     const f = await fixture();
@@ -231,6 +247,77 @@ describe("C1 Convex callback handlers", () => {
     const rows = await f.t.run((ctx) => ctx.db.query("processedEvents").collect());
     expect(rows.filter((row) => row.provider === "agentmail-callback")).toHaveLength(1);
     expect(rows.filter((row) => row.provider === "agentmail-binding")).toHaveLength(1);
+  });
+
+  test("uses exact indexed binding facts after 300 unrelated processed events", async () => {
+    const f = await fixture();
+    await insertUnrelatedProcessedEvents(f, 300);
+    const bound = await f.t.mutation(bindingRef, {
+      operationId: f.operationId,
+      messageId: " provider-message-indexed ",
+      threadId: " provider-thread-indexed ",
+      inboxId: " owner-inbox ",
+    });
+    expect(bound).toEqual({ ok: true, bound: true, applied: false });
+
+    const event = {
+      type: "event",
+      event_id: "event-indexed-after-budget",
+      event_type: "message.sent",
+      send: { message_id: "provider-message-indexed", thread_id: "provider-thread-indexed", inbox_id: "owner-inbox" },
+    } as const;
+    const received = await f.t.mutation(ingestEventRef, { event });
+    expect(received).toEqual({ ok: true, deduplicated: false, applied: true, quarantined: false });
+    const replay = await f.t.mutation(ingestEventRef, { event });
+    expect(replay).toEqual({ ok: true, deduplicated: true, applied: true, quarantined: false });
+
+    const receipt = await f.t.run((ctx) =>
+      ctx.db
+        .query("processedEvents")
+        .take(400)
+        .then((rows) => rows.filter((row) => row.provider === "agentmail-callback" && row.eventId === event.event_id)),
+    );
+    expect(receipt).toHaveLength(1);
+    expect(receipt[0]?.providerMessageId).toBe("provider-message-indexed");
+    expect(receipt[0]?.providerThreadId).toBe("provider-thread-indexed");
+    expect(receipt[0]?.providerInboxId).toBe("owner-inbox");
+    expect(receipt[0]?.applicationState).toBe("observedSuccess");
+  });
+
+  test("reconciles an early callback and routes its inbound reply by indexed thread and inbox", async () => {
+    const f = await fixture();
+    await insertUnrelatedProcessedEvents(f, 300);
+    const event = {
+      type: "event",
+      event_id: "event-before-indexed-binding",
+      event_type: "message.sent",
+      send: { message_id: "provider-message-before-binding", thread_id: "provider-thread-before-binding", inbox_id: "owner-inbox" },
+    } as const;
+    const early = await f.t.mutation(ingestEventRef, { event });
+    expect(early).toEqual({ ok: true, deduplicated: false, applied: false, quarantined: true });
+
+    const bound = await f.t.mutation(bindingRef, {
+      operationId: f.operationId,
+      messageId: "provider-message-before-binding",
+      threadId: "provider-thread-before-binding",
+      inboxId: "owner-inbox",
+    });
+    expect(bound).toEqual({ ok: true, bound: true, applied: true });
+    const replay = await f.t.mutation(ingestEventRef, { event });
+    expect(replay).toEqual({ ok: true, deduplicated: true, applied: true, quarantined: false });
+
+    const reply = await f.t.mutation(ingestMessageRef, {
+      message: inbound("provider-reply-indexed", "provider-thread-before-binding", "<p>Indexed reply</p>"),
+      thread: { thread_id: "provider-thread-before-binding" },
+      eventId: "inbound-indexed-reply",
+    });
+    expect(reply).toMatchObject({ ok: true, messageId: "provider-reply-indexed", deduplicated: false, state: "replyReceived" });
+    const duplicate = await f.t.mutation(ingestMessageRef, {
+      message: inbound("provider-reply-indexed", "provider-thread-before-binding", "<p>Indexed reply</p>"),
+      thread: { thread_id: "provider-thread-before-binding" },
+      eventId: "inbound-indexed-reply-replay",
+    });
+    expect(duplicate).toMatchObject({ ok: true, messageId: "provider-reply-indexed", deduplicated: true, state: "replyReceived" });
   });
 
   test("keeps tenant binding isolated when another operation reuses a provider message id", async () => {

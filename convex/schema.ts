@@ -847,6 +847,12 @@ export default defineSchema({
     // F1R-12: receipt ownership/facts are immutable and separate from the
     // operation binding and application projection below. Optional fields
     // preserve reads of historical receipts created before this contract.
+    // C1 callback binding facts are normalized provider identifiers. Keeping
+    // them outside `outcome` makes message and thread reconciliation use an
+    // exact compound index while the legacy JSON remains readable.
+    providerMessageId: v.optional(v.string()),
+    providerThreadId: v.optional(v.string()),
+    providerInboxId: v.optional(v.string()),
     organizationId: v.optional(v.id("organizations")),
     projectId: v.optional(v.id("projects")),
     operationId: v.optional(v.id("operations")),
@@ -854,7 +860,21 @@ export default defineSchema({
     applicationState: v.optional(v.string()),
     appliedAt: v.optional(v.number()),
     createdAt: v.number(),
-  }).index("by_provider_environment_and_event", ["provider", "environment", "eventId"]),
+  })
+    .index("by_provider_environment_and_event", ["provider", "environment", "eventId"])
+    // Full provider binding lookup used for callback-to-operation matching.
+    // The identifiers are optional for migration compatibility, so legacy
+    // rows without them are intentionally absent from this exact lookup.
+    .index(
+      "by_provider_environment_and_provider_message_and_thread_and_inbox",
+      ["provider", "environment", "providerMessageId", "providerThreadId", "providerInboxId"],
+    )
+    // Replies use the outbound thread and inbox but have a different message
+    // id, so conversation routing needs this second exact key.
+    .index(
+      "by_provider_environment_and_provider_thread_and_inbox",
+      ["provider", "environment", "providerThreadId", "providerInboxId"],
+    ),
 
   evidence: defineTable({
     organizationId: v.id("organizations"),
