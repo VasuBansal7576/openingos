@@ -19,6 +19,7 @@ import {
   decimalToString,
   decimalZero,
   quantity,
+  type Decimal,
 } from "../../proofs/money/decimal.js";
 import { canonicalJson } from "../shared/hashing.js";
 import {
@@ -60,6 +61,39 @@ function selectionReplayKey(
     quoteId: args.quoteId,
     quoteVersion: args.quoteVersion,
     selectionLines: sortLinesById(args.selectionLines),
+    requirementVersion: args.requirementVersion,
+    actor: args.actor,
+  })}`;
+}
+
+/**
+ * Exact pre-F1R-13 derived key for a scalar-quantity call with no
+ * explicit idempotency key (b27b027): the canonical payload carries the
+ * normalized scalar quantity, not a line array. A no-key scalar retry
+ * must resolve the identical key byte-for-byte, including retries of
+ * rows seeded before F1R-13. Explicit line calls without a key use the
+ * line-aware key above; replay comparison binds normalized effective
+ * lines plus actor in both cases.
+ */
+function legacyScalarSelectionKey(args: {
+  readonly organizationId: Id<"organizations">;
+  readonly projectId: Id<"projects">;
+  readonly requirementId: Id<"requirements">;
+  readonly candidateId: Id<"candidates">;
+  readonly quoteId: Id<"quotes">;
+  readonly quoteVersion: string;
+  readonly quantity: string;
+  readonly requirementVersion: number;
+  readonly actor: string;
+}): string {
+  return `legacy:${canonicalJson({
+    organizationId: args.organizationId,
+    projectId: args.projectId,
+    requirementId: args.requirementId,
+    candidateId: args.candidateId,
+    quoteId: args.quoteId,
+    quoteVersion: args.quoteVersion,
+    quantity: args.quantity,
     requirementVersion: args.requirementVersion,
     actor: args.actor,
   })}`;
@@ -249,7 +283,20 @@ export const recordSelection = f1Mutation({
       requirementVersion: args.requirementVersion,
       actor: access.value.identity,
     } satisfies SelectionReplayFields;
-    const idempotencyKey = args.idempotencyKey?.trim() ?? selectionReplayKey(replayFields);
+    // Derived-key compatibility: a scalar call with no explicit key keeps
+    // the exact pre-F1R-13 canonical payload (normalized scalar
+    // quantity). Explicit line calls without a key use the line-aware
+    // key. Replay comparison binds normalized effective lines plus actor
+    // in both cases.
+    const singleLegacyQuantity = args.selectionLines === undefined &&
+        effectiveLines.length === 1 &&
+        effectiveLines[0] !== undefined
+      ? effectiveLines[0].quantity
+      : null;
+    const idempotencyKey = args.idempotencyKey?.trim() ??
+      (singleLegacyQuantity !== null
+        ? legacyScalarSelectionKey({ ...replayFields, quantity: singleLegacyQuantity })
+        : selectionReplayKey(replayFields));
     // Replay lookup follows project authorization but precedes all current
     // basis checks. An exact historical selection remains replayable after
     // its quote is superseded; any changed field or actor conflicts without
@@ -359,6 +406,33 @@ export const recordSelection = f1Mutation({
       requirement.value.currency !== quote.currency
     ) {
       return { ok: false as const, code: "invalid-payload", message: "mixed-currency-requires-accepted-conversion-basis" };
+    }
+    // Every selected line is capped by its immutable quoted line
+    // quantity: partial selection is preserved, but selecting more than
+    // the quote offers on any line is rejected for both the legacy
+    // scalar and explicit line forms. This check sits after the replay
+    // lookup on purpose: an exact historical replay returns its row even
+    // when legacy data would fail this newly introduced cap, matching
+    // the F1R-11 replay-before-current-validation behavior.
+    const quotedByLine = new Map(quote.lines.map((entry) => [entry.lineId, entry.quantity]));
+    for (const line of effectiveLines) {
+      const quoted = quotedByLine.get(line.quoteLineId);
+      if (quoted === undefined) {
+        return { ok: false as const, code: "denied-project", message: `selection line ${line.quoteLineId} is not on this quote` };
+      }
+      let quotedQuantity: Decimal;
+      try {
+        quotedQuantity = quantity(quoted);
+      } catch {
+        return { ok: false as const, code: "invalid-payload", message: "stored quoted quantity is invalid" };
+      }
+      try {
+        if (decimalCompare(quantity(line.quantity), quotedQuantity) > 0) {
+          return { ok: false as const, code: "invalid-payload", message: `selection line ${line.quoteLineId} exceeds the quoted quantity` };
+        }
+      } catch {
+        return { ok: false as const, code: "invalid-payload", message: "selected quantity is not a valid decimal" };
+      }
     }
     // The stored row keeps the authoritative normalized selection lines.
     // The legacy scalar mirror is written only for single-line

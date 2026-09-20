@@ -32,6 +32,7 @@ import {
 } from "convex/server";
 import type { Id } from "../_generated/dataModel.js";
 import schema from "../schema.js";
+import { canonicalJson } from "../shared/hashing.js";
 import * as memberships from "../access/memberships.js";
 import * as quotes from "../purchasing/contracts/quotes.js";
 import * as evidence from "../purchasing/contracts/evidence.js";
@@ -262,9 +263,50 @@ async function setupTwoLineGraph(t: ReturnType<typeof convexTest>, project: Proj
   return {
     requirementId: req.requirementId,
     candidateId: candidate.candidateId,
+    vendorId: vendor.vendorId,
+    rfqId: rfq.rfqId,
     quoteId: quote.quoteId,
     contentHash: quote.contentHash,
   };
+}
+
+/** Extra single-line machine quote in the same offer lineage. */
+async function recordMachineQuote(
+  t: ReturnType<typeof convexTest>,
+  project: Project,
+  refs: { requirementId: Id<"requirements">; vendorId: Id<"vendors">; rfqId: Id<"rfqs"> },
+  version: string,
+  machineQty: string,
+  suffix: string,
+  supersedes?: string,
+) {
+  return t.withIdentity(OWNER).mutation(recordQuoteRef, {
+    organizationId: project.orgId,
+    projectId: project.projectId,
+    version,
+    currency: "EUR",
+    lines: [
+      {
+        lineId: "machine",
+        description: "Espresso machine",
+        quantity: machineQty,
+        unitPrice: { currency: "EUR", minorUnits: 795000 },
+        evidenceRefs: [],
+      },
+    ],
+    charges: [],
+    taxBasis: { kind: "inclusive" as const, basisId: "NL-EUR-INCLUSIVE", evidenceRefs: [] },
+    comparisonScope: {
+      requirementId: `req-${suffix}`,
+      scopeId: `scope-${suffix}-single`,
+      items: [{ itemId: "machine", lineId: "machine", unit: "piece", requiredQuantity: machineQty }],
+    },
+    evidenceRefs: [],
+    requirementId: refs.requirementId,
+    vendorId: refs.vendorId,
+    rfqId: refs.rfqId,
+    ...(supersedes === undefined ? {} : { supersedes }),
+  });
 }
 
 async function tableCounts(t: ReturnType<typeof convexTest>, project: Project) {
@@ -517,6 +559,148 @@ describe("F1R-13 multi-line selection, order, acceptance, and adjustment journey
 
     const counts = await tableCounts(t, project);
     expect(counts).toEqual({ selections: 1, orders: 1, events: 2, entries: 3 });
+  });
+});
+
+describe("F1R-13 legacy derived-key migration and quote-quantity caps", () => {
+  test("a seeded pre-F1R-13 over-quote row still replays after supersession", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, "legacy-key");
+    const graph = await setupTwoLineGraph(t, project, "legacy-key");
+    const asOwner = t.withIdentity(OWNER);
+
+    const v1 = await recordMachineQuote(t, project, graph, "v-single", "2", "legacy-key");
+    if (!v1.ok) throw new Error(`single-line quote failed: ${JSON.stringify(v1)}`);
+
+    // A genuine pre-F1R-13 row: scalar quantity only, no selectionLines,
+    // keyed by the exact old derived canonical payload. It deliberately
+    // exceeds the quoted quantity (3 of 2): the new cap must not break
+    // its exact historical replay.
+    const legacyKey = `legacy:${canonicalJson({
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      requirementId: graph.requirementId,
+      candidateId: graph.candidateId,
+      quoteId: v1.quoteId,
+      quoteVersion: "v-single",
+      quantity: "3",
+      requirementVersion: 1,
+      actor: OWNER.tokenIdentifier,
+    })}`;
+    const seededId = await t.run((ctx) =>
+      ctx.db.insert("selections", {
+        organizationId: project.orgId,
+        projectId: project.projectId,
+        idempotencyKey: legacyKey,
+        requirementId: graph.requirementId,
+        candidateId: graph.candidateId,
+        quoteId: v1.quoteId,
+        quoteVersion: "v-single",
+        quantity: "3",
+        requirementVersion: 1,
+        actor: OWNER.tokenIdentifier,
+        createdAt: Date.now(),
+      }),
+    );
+
+    const v2 = await recordMachineQuote(t, project, graph, "v-single-2", "2", "legacy-key", v1.contentHash);
+    if (!v2.ok) throw new Error(`superseding quote failed: ${JSON.stringify(v2)}`);
+
+    // The same no-key scalar retry resolves the identical derived key
+    // and returns the seeded row despite supersession and the new cap.
+    const replay = await asOwner.mutation(recordSelectionRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      requirementId: graph.requirementId,
+      candidateId: graph.candidateId,
+      quoteId: v1.quoteId,
+      quoteVersion: "v-single",
+      quantity: "3.0",
+      requirementVersion: 1,
+    });
+    if (!replay.ok) throw new Error(`legacy replay failed: ${JSON.stringify(replay)}`);
+    expect(replay.deduplicated).toBe(true);
+    expect(replay.selectionId).toBe(seededId);
+
+    // A new key with the same over-selection is rejected with no write:
+    // the cap governs new authority, never historical replay.
+    const freshOver = await asOwner.mutation(recordSelectionRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      requirementId: graph.requirementId,
+      candidateId: graph.candidateId,
+      quoteId: v1.quoteId,
+      quoteVersion: "v-single",
+      quantity: "3",
+      requirementVersion: 1,
+      idempotencyKey: "sel-fresh-over",
+    });
+    expect(freshOver.ok).toBe(false);
+
+    const rows = await t.run((ctx) => ctx.db.query("selections").collect());
+    expect(rows.filter((row) => row.projectId === project.projectId)).toHaveLength(1);
+  });
+
+  test("over-selection is rejected per line while partial selection is preserved", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, "caps");
+    const graph = await setupTwoLineGraph(t, project, "caps");
+    const asOwner = t.withIdentity(OWNER);
+
+    const single = await recordMachineQuote(t, project, graph, "v-cap-single", "2", "caps");
+    if (!single.ok) throw new Error("single-line quote setup failed");
+
+    // Legacy scalar over-selection on a single-line quote writes nothing.
+    const legacyOver = await asOwner.mutation(recordSelectionRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      requirementId: graph.requirementId,
+      candidateId: graph.candidateId,
+      quoteId: single.quoteId,
+      quoteVersion: "v-cap-single",
+      quantity: "3",
+      requirementVersion: 1,
+      idempotencyKey: "sel-cap-legacy-over",
+    });
+    expect(legacyOver.ok).toBe(false);
+
+    // Explicit over-selection on one line writes nothing even though the
+    // other line is a preserved partial quantity.
+    const explicitOver = await asOwner.mutation(recordSelectionRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      requirementId: graph.requirementId,
+      candidateId: graph.candidateId,
+      quoteId: graph.quoteId,
+      quoteVersion: "v-caps",
+      selectionLines: [
+        { quoteLineId: "machine", quantity: "3", unit: "piece" },
+        { quoteLineId: "chair", quantity: "5", unit: "piece" },
+      ],
+      requirementVersion: 1,
+      idempotencyKey: "sel-cap-explicit-over",
+    });
+    expect(explicitOver.ok).toBe(false);
+
+    // Partial selection on both lines is preserved.
+    const partial = await asOwner.mutation(recordSelectionRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      requirementId: graph.requirementId,
+      candidateId: graph.candidateId,
+      quoteId: graph.quoteId,
+      quoteVersion: "v-caps",
+      selectionLines: [
+        { quoteLineId: "machine", quantity: "1", unit: "piece" },
+        { quoteLineId: "chair", quantity: "5", unit: "piece" },
+      ],
+      requirementVersion: 1,
+      idempotencyKey: "sel-cap-partial",
+    });
+    if (!partial.ok) throw new Error(`partial selection failed: ${JSON.stringify(partial)}`);
+
+    const rows = await t.run((ctx) => ctx.db.query("selections").collect());
+    expect(rows.filter((row) => row.projectId === project.projectId)).toHaveLength(1);
   });
 });
 
