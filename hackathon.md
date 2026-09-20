@@ -241,3 +241,13 @@ PR #1 still points to the older published head `19e6d9f` until this checkpoint a
 F1 remains open until the replacement exact head passes GitHub Actions, its actionable Greptile threads are closed, GitHub reports no conflicts and a separate Astra session accepts the same revision.
 All results are controlled evidence only.
 No hosted Convex state, live provider call, owner-mailbox exchange, public site or commercial outcome was observed.
+
+### 2026-09-20 - 5b5b0bd Greptile reconciliation repair
+
+Integrated Luna's bounded reconciliation-summary repair as `5b5b0bd` on the Vasu-owned PR branch.
+Later reconciliation pages now revalidate the durable unresolved-operation sample before carrying its count forward, and the new regression reproduces an earlier-page operation becoming terminal while a later page remains in progress.
+The exact integrated head passes both TypeScript checks, production build, 23 repository tests, 77 money and Jev proofs, 227 F1 tests, 174 direct Convex tests, 155 browser-executor tests, 2 application tests, 19 provider-contract tests and 5 mounted user-path tests.
+The actionable Greptile thread received exact commit and test evidence and was resolved.
+PR #1 now points to `5b5b0bd`; exact-head GitHub Actions and a new Greptile scan are running, and the separate Astra review remains intentionally deferred until that scan is settled.
+All results are controlled evidence only.
+No hosted Convex state, live provider call, owner-mailbox exchange, public site or commercial outcome was observed.
