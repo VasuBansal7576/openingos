@@ -1,9 +1,10 @@
 import { ConvexAuthProvider, useConvexAuth } from "@convex-dev/auth/react";
 import { ConvexReactClient, useConvexConnectionState } from "convex/react";
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import App from "./App";
 import { statusFromConnection } from "./backend-state";
+import { createConvexWorkbenchAdapter } from "./convex-workbench-adapter";
 import {
   parseWorkbenchSnapshot,
   type WorkbenchActionResult,
@@ -12,7 +13,12 @@ import {
 } from "./workbench-state";
 import "./styles.css";
 
-function ConnectionAwareApp({ onRetry, projectId, workbenchAdapter }: { readonly onRetry: () => void; readonly projectId?: string | undefined; readonly workbenchAdapter?: WorkbenchServerAdapter | undefined }) {
+type RuntimeWorkbenchAdapter = WorkbenchServerAdapter & {
+  readonly discoverProject?: () => Promise<string | null>;
+  readonly dispose?: () => void;
+};
+
+function ConnectionAwareApp({ onRetry, projectId, workbenchAdapter }: { readonly onRetry: () => void; readonly projectId?: string | undefined; readonly workbenchAdapter?: RuntimeWorkbenchAdapter | undefined }) {
   const connection = useConvexConnectionState();
   const auth = useConvexAuth();
   const backendStatus = statusFromConnection({
@@ -34,16 +40,42 @@ function AdapterAwareApp({
   readonly backendStatus: ReturnType<typeof statusFromConnection>;
   readonly onRetry: () => void;
   readonly projectId?: string | undefined;
-  readonly workbenchAdapter?: WorkbenchServerAdapter | undefined;
+  readonly workbenchAdapter?: RuntimeWorkbenchAdapter | undefined;
 }) {
   const [workbench, setWorkbench] = useState<WorkbenchLoadState | undefined>(undefined);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [resolvedProjectId, setResolvedProjectId] = useState<string | undefined>(normaliseProjectId(projectId));
+  const previousContext = useRef<{ readonly projectId: string | undefined; readonly adapter: RuntimeWorkbenchAdapter | undefined }>({ projectId: undefined, adapter: undefined });
 
   useEffect(() => {
-    if (workbenchAdapter === undefined || projectId === undefined || projectId.trim().length === 0) {
+    let disposed = false;
+    const configuredProjectId = normaliseProjectId(projectId);
+    const contextChanged = previousContext.current.projectId !== configuredProjectId || previousContext.current.adapter !== workbenchAdapter;
+    previousContext.current = { projectId: configuredProjectId, adapter: workbenchAdapter };
+    if (contextChanged) setWorkbench(undefined);
+    setResolvedProjectId(configuredProjectId);
+    if (configuredProjectId !== undefined) return () => { disposed = true; };
+    if (workbenchAdapter?.discoverProject === undefined || backendStatus !== "connected") return () => { disposed = true; };
+
+    void workbenchAdapter.discoverProject().then((discoveredProjectId) => {
+      if (disposed) return;
+      setResolvedProjectId(discoveredProjectId ?? undefined);
+      if (discoveredProjectId === null) {
+        setWorkbench({ state: "empty", message: "No authorized project projection is available yet." });
+      }
+    }).catch((error: unknown) => {
+      if (disposed) return;
+      setWorkbench({ state: "error", message: error instanceof Error ? error.message : "Authorized projects could not be discovered." });
+    });
+    return () => { disposed = true; };
+  }, [backendStatus, projectId, workbenchAdapter]);
+
+  useEffect(() => {
+    if (workbenchAdapter === undefined || (resolvedProjectId === undefined && workbenchAdapter.discoverProject === undefined)) {
       setWorkbench(undefined);
       return;
     }
+    if (resolvedProjectId === undefined) return;
     if (backendStatus !== "connected" && backendStatus !== "reconnecting") return;
 
     let disposed = false;
@@ -54,9 +86,9 @@ function AdapterAwareApp({
           : { state: "loading", ...(current?.state === "ready" ? { lastKnown: current.snapshot } : {}) });
       }
       try {
-        const response = await workbenchAdapter.load(projectId, cursor);
+        const response = await workbenchAdapter.load(resolvedProjectId, cursor);
         if (disposed) return;
-        const snapshot = response === null ? null : parseWorkbenchSnapshot(response, projectId);
+        const snapshot = response === null ? null : parseWorkbenchSnapshot(response, resolvedProjectId);
         setWorkbench(snapshot === null ? { state: "empty", message: "No authorized project projection is available yet." } : { state: "ready", snapshot });
       } catch (error) {
         if (disposed) return;
@@ -65,10 +97,10 @@ function AdapterAwareApp({
     };
     void load();
     const unsubscribe = workbenchAdapter.subscribe?.(
-      projectId,
+      resolvedProjectId,
       (response) => {
         if (disposed) return;
-        const snapshot = response === null ? null : parseWorkbenchSnapshot(response, projectId);
+        const snapshot = response === null ? null : parseWorkbenchSnapshot(response, resolvedProjectId);
         setWorkbench(snapshot === null ? { state: "empty", message: "No authorized project projection is available yet." } : { state: "ready", snapshot });
       },
       (error: unknown) => {
@@ -80,7 +112,7 @@ function AdapterAwareApp({
       disposed = true;
       unsubscribe?.();
     };
-  }, [backendStatus, projectId, workbenchAdapter]);
+  }, [backendStatus, resolvedProjectId, workbenchAdapter]);
 
   const handleAction = async (action: Parameters<NonNullable<typeof workbenchAdapter>["act"]>[0]): Promise<WorkbenchActionResult> => {
     if (workbenchAdapter === undefined) return { ok: false, message: "No server action route is configured. Nothing was sent." };
@@ -97,15 +129,20 @@ function AdapterAwareApp({
 
   const handleLoadMore = () => {
     const cursor = workbench?.state === "ready" ? workbench.snapshot.activity.continueCursor : null;
-    if (cursor === null || cursor === undefined || workbenchAdapter === undefined || projectId === undefined) return;
-    void workbenchAdapter.load(projectId, cursor).then((response) => {
+    if (cursor === null || cursor === undefined || workbenchAdapter === undefined || resolvedProjectId === undefined) return;
+    void workbenchAdapter.load(resolvedProjectId, cursor).then((response) => {
       if (response === null) return;
-      const snapshot = parseWorkbenchSnapshot(response, projectId);
+      const snapshot = parseWorkbenchSnapshot(response, resolvedProjectId);
       if (snapshot !== null) setWorkbench({ state: "ready", snapshot });
     }).catch((error: unknown) => setWorkbench({ state: "error", message: error instanceof Error ? error.message : "More project activity could not be loaded." }));
   };
 
   return <><App backendStatus={backendStatus} onRetry={onRetry} workbench={workbench} onAction={handleAction} onLoadMore={handleLoadMore} />{actionError ? <span className="wb-visually-hidden" role="alert">{actionError}</span> : null}</>;
+}
+
+function normaliseProjectId(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed === undefined || trimmed.length === 0 ? undefined : trimmed;
 }
 
 export type ConvexClientFactory = (url: string) => ConvexReactClient;
@@ -125,20 +162,29 @@ function ConvexClientBoundary({
   onRetry: () => void;
   url: string;
   projectId?: string | undefined;
-  workbenchAdapter?: WorkbenchServerAdapter | undefined;
+  workbenchAdapter?: RuntimeWorkbenchAdapter | undefined;
 }) {
   const [clientState, setClientState] = useState<ClientState>(null);
+  const [adapterState, setAdapterState] = useState<RuntimeWorkbenchAdapter | undefined>(undefined);
 
   useEffect(() => {
     let client: ConvexReactClient | null = null;
+    let adapter: RuntimeWorkbenchAdapter | null = null;
     try {
       client = clientFactory(url);
+      adapter = workbenchAdapter ?? createConvexWorkbenchAdapter(client);
       setClientState(client);
+      setAdapterState(adapter);
     } catch {
       setClientState("unavailable");
+      setAdapterState(undefined);
     }
 
     return () => {
+      const adapterToDispose = adapter;
+      adapter = null;
+      adapterToDispose?.dispose?.();
+      setAdapterState((current) => (current === adapterToDispose ? undefined : current));
       const clientToClose = client;
       client = null;
       if (clientToClose === null) return;
@@ -146,7 +192,7 @@ function ConvexClientBoundary({
       void clientToClose.close().catch(() => undefined);
       setClientState((current) => (current === clientToClose ? null : current));
     };
-  }, [clientFactory, url]);
+  }, [clientFactory, url, workbenchAdapter]);
 
   if (clientState === "unavailable") {
     return <App backendStatus="unavailable" onRetry={onRetry} />;
@@ -157,7 +203,7 @@ function ConvexClientBoundary({
 
   return (
     <ConvexAuthProvider client={clientState}>
-      <ConnectionAwareApp onRetry={onRetry} projectId={projectId} workbenchAdapter={workbenchAdapter} />
+      <ConnectionAwareApp onRetry={onRetry} projectId={projectId} workbenchAdapter={adapterState} />
     </ConvexAuthProvider>
   );
 }
@@ -171,7 +217,7 @@ function ConfiguredApplication({
   clientFactory: ConvexClientFactory;
   url: string;
   projectId?: string | undefined;
-  workbenchAdapter?: WorkbenchServerAdapter | undefined;
+  workbenchAdapter?: RuntimeWorkbenchAdapter | undefined;
 }) {
   const [retryGeneration, setRetryGeneration] = useState(0);
   const retry = () => setRetryGeneration((generation) => generation + 1);
@@ -192,7 +238,7 @@ export interface RootApplicationProps {
   configuredUrl?: string;
   clientFactory?: ConvexClientFactory;
   projectId?: string;
-  workbenchAdapter?: WorkbenchServerAdapter;
+  workbenchAdapter?: RuntimeWorkbenchAdapter;
 }
 
 export function RootApplication({ configuredUrl, clientFactory = defaultClientFactory, projectId, workbenchAdapter }: RootApplicationProps) {

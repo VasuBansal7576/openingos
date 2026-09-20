@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { Window as HappyWindow } from "happy-dom";
 import { act, createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { ConvexReactClient } from "convex/react";
+import { ConvexReactClient, type Watch } from "convex/react";
 import App from "../App";
 import { statusFromConnection, type BackendStatus } from "../backend-state";
 import { mountRootApplication, RootApplication } from "../main";
@@ -241,4 +241,138 @@ test("maps live Convex connection signals to honest status states", () => {
   expect(statusFromConnection({ isWebSocketConnected: true, hasEverConnected: true, connectionRetries: 0, authLoading: true })).toBe("authenticating");
   expect(statusFromConnection({ isWebSocketConnected: true, hasEverConnected: true, connectionRetries: 0, authLoading: false })).toBe("connected");
   expect(statusFromConnection({ isWebSocketConnected: false, hasEverConnected: true, connectionRetries: 2, authLoading: false })).toBe("reconnecting");
+});
+
+test("automatically wires the default adapter and discovers the first authorized project", async () => {
+  const dom = new HappyWindow({ url: "https://openingos.test/" });
+  const previousWindow = globalThis.window;
+  const previousDocument = globalThis.document;
+  const previousNavigator = globalThis.navigator;
+  const actEnvironment = globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean };
+  const previousActEnvironment = actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+  const queryArgs: unknown[] = [];
+  let unmounted = false;
+
+  const projectProjection: Record<string, unknown> = {
+    ok: true,
+    project: {
+      id: "project-1",
+      organizationId: "organization-1",
+      name: "Northside café",
+      visibility: "open",
+      currency: "EUR",
+      budgetMinorUnits: null,
+      needByAt: null,
+      createdAt: 1,
+    },
+    access: {
+      role: "viewer",
+      capabilities: {
+        canResearch: false,
+        canRecordEvidence: false,
+        canRecordQuote: false,
+        canCompare: true,
+        canCommunicate: false,
+        canClarify: false,
+      },
+    },
+    requirements: [],
+    requirementsTruncated: false,
+    candidates: [],
+    candidatesTruncated: false,
+    jobs: [],
+    jobsTruncated: false,
+    decisions: [],
+    decisionsTruncated: false,
+    activity: { page: [], continueCursor: null, isDone: true },
+    provenance: { mode: "unknown", label: "No supplier terms", ownerAuthoredTerms: false },
+  };
+  const projectList: Record<string, unknown> = {
+    ok: true,
+    projects: [{
+      id: "project-1",
+      organizationId: "organization-1",
+      name: "Northside café",
+      visibility: "open",
+      currency: "EUR",
+      createdAt: 1,
+      access: {
+        role: "viewer",
+        capabilities: {
+          canResearch: false,
+          canRecordEvidence: false,
+          canRecordQuote: false,
+          canCompare: true,
+          canCommunicate: false,
+          canClarify: false,
+        },
+      },
+    }],
+    continueCursor: null,
+    isDone: true,
+  };
+
+  const browserGlobals = globalThis as unknown as { window: unknown; document: unknown; navigator: unknown };
+  browserGlobals.window = dom as unknown as globalThis.Window;
+  browserGlobals.document = dom.document as unknown as globalThis.Document;
+  browserGlobals.navigator = dom.navigator as unknown as globalThis.Navigator;
+  actEnvironment.IS_REACT_ACT_ENVIRONMENT = true;
+
+  const createControlledClient = (): ConvexReactClient => {
+    const watch = {
+      localQueryResult: () => projectProjection,
+      onUpdate: (_callback: () => void) => () => {},
+    } as unknown as Watch<unknown>;
+    return {
+      address: "https://controlled.convex.cloud",
+      logger: false,
+      setAuth: (_fetchToken: unknown, onChange: (authenticated: boolean) => void) => onChange(false),
+      clearAuth: () => {},
+      connectionState: () => ({ isWebSocketConnected: true, hasEverConnected: true, connectionRetries: 0 }),
+      subscribeToConnectionState: (_callback: unknown) => () => {},
+      query: async (_reference: unknown, args: unknown) => {
+        queryArgs.push(args);
+        if (typeof args === "object" && args !== null && "projectId" in args) return projectProjection;
+        return projectList;
+      },
+      watchQuery: (_reference: unknown, _args: unknown) => watch,
+      close: async () => {},
+    } as unknown as ConvexReactClient;
+  };
+
+  const container = dom.document.createElement("div");
+  dom.document.body.append(container);
+  let root: ReturnType<typeof mountRootApplication> | null = null;
+  const unmountRoot = () => {
+    if (root !== null) root.unmount();
+  };
+  try {
+    await act(async () => {
+      root = mountRootApplication(container as unknown as globalThis.Element, {
+        clientFactory: () => createControlledClient(),
+        configuredUrl: "https://controlled.convex.cloud",
+      });
+    });
+    const deadline = Date.now() + 1_500;
+    while (!container.textContent?.includes("Northside café") && Date.now() < deadline) {
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      });
+    }
+    expect(container.textContent).toContain("Northside café");
+    expect(queryArgs[0]).toEqual({ limit: 1 });
+    expect(queryArgs.some((args) => typeof args === "object" && args !== null && "projectId" in args)).toBe(true);
+    await act(async () => {
+      root?.unmount();
+    });
+    unmounted = true;
+  } finally {
+    if (!unmounted) unmountRoot();
+    dom.close();
+    browserGlobals.window = previousWindow;
+    browserGlobals.document = previousDocument;
+    browserGlobals.navigator = previousNavigator;
+    if (previousActEnvironment === undefined) delete actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+    else actEnvironment.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment;
+  }
 });
