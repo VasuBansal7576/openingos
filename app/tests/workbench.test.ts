@@ -6,7 +6,7 @@ import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import App from "../App";
 import WorkbenchView from "../Workbench";
-import { appendWorkbenchActivity } from "../main";
+import { AdapterAwareApp, appendWorkbenchActivity } from "../main";
 import { formatMoney, parseWorkbenchSnapshot, type WorkbenchAction, type WorkbenchActionResult } from "../workbench-state";
 
 const projection = {
@@ -275,6 +275,131 @@ test("appends later activity pages without replacing the latest snapshot", () =>
   expect(merged.activity.isDone).toBe(true);
 });
 
+test("keeps concurrent activity pages and live updates from regressing pagination", async () => {
+  const dayMs = 86400000;
+  const base = Date.UTC(2026, 8, 20);
+  const at = (offsetDays: number) => base + offsetDays * dayMs;
+  const page = (events: readonly { readonly id: string; readonly at: number }[], continueCursor: string | null, isDone: boolean) => ({
+    ...projection,
+    activity: {
+      page: events.map((event) => ({ id: event.id, kind: "quoteRecorded", createdAt: event.at })),
+      continueCursor,
+      isDone,
+    },
+  });
+
+  interface PendingLoad {
+    readonly cursor: string | null;
+    readonly resolve: (value: unknown) => void;
+    readonly reject: (error: unknown) => void;
+  }
+  const loads: PendingLoad[] = [];
+  let liveListener: ((snapshot: unknown) => void) | null = null;
+  const adapter = {
+    load: (_projectId: string, cursor?: string | null) => new Promise<unknown>((resolve, reject) => {
+      loads.push({ cursor: cursor ?? null, resolve, reject });
+    }),
+    subscribe: (_projectId: string, onSnapshot: (snapshot: unknown) => void, _onError: (error: unknown) => void) => {
+      liveListener = onSnapshot;
+      return () => {
+        liveListener = null;
+      };
+    },
+    act: async () => ({ ok: true }),
+  };
+
+  const dom = new HappyWindow({ url: "https://openingos.test/" });
+  const previousWindow = globalThis.window;
+  const previousDocument = globalThis.document;
+  const previousNavigator = globalThis.navigator;
+  const actEnvironment = globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean };
+  const previousActEnvironment = actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+  const browserGlobals = globalThis as unknown as { window: unknown; document: unknown; navigator: unknown };
+  browserGlobals.window = dom as unknown as globalThis.Window;
+  browserGlobals.document = dom.document as unknown as globalThis.Document;
+  browserGlobals.navigator = dom.navigator as unknown as globalThis.Navigator;
+  actEnvironment.IS_REACT_ACT_ENVIRONMENT = true;
+  const container = dom.document.createElement("div");
+  dom.document.body.append(container);
+  const root = createRoot(container as unknown as globalThis.Element);
+  const findLoadMore = (): HTMLButtonElement | undefined => {
+    const button = Array.from(container.querySelectorAll("button")).find((candidate) => candidate.textContent?.includes("Load older activity"));
+    return button === undefined ? undefined : (button as unknown as HTMLButtonElement);
+  };
+  const resolveLoad = async (index: number, payload: unknown) => {
+    const pending = loads[index];
+    if (pending === undefined) throw new Error(`activity load ${index} was never dispatched`);
+    await act(async () => {
+      pending.resolve(payload);
+    });
+  };
+
+  try {
+    await act(async () => {
+      root.render(createElement(AdapterAwareApp, {
+        backendStatus: "connected",
+        onRetry: () => undefined,
+        projectId: "project-w1-1",
+        workbenchAdapter: adapter,
+      }));
+    });
+    expect(loads.length).toBe(1);
+    await resolveLoad(0, page([{ id: "event-head-1", at: at(4) }], "activity-cursor-1", false));
+    if (findLoadMore() === undefined) throw new Error("Load older activity should be available after the head page");
+
+    // A live projection refresh arrives before the user paginates.
+    await act(async () => {
+      liveListener?.(page([
+        { id: "event-live-0", at: at(5) },
+        { id: "event-head-1", at: at(4) },
+      ], "activity-cursor-1", false));
+    });
+    if (liveListener === null) throw new Error("workbench adapter should stay subscribed");
+
+    // Two concurrent "Load older activity" requests share the same cursor.
+    await act(async () => {
+      findLoadMore()?.click();
+    });
+    await act(async () => {
+      findLoadMore()?.click();
+    });
+    expect(loads.length).toBe(3);
+    expect(loads[1]?.cursor).toBe("activity-cursor-1");
+    expect(loads[2]?.cursor).toBe("activity-cursor-1");
+
+    // The newer request resolves first and finishes pagination.
+    await resolveLoad(2, page([{ id: "event-tail-new", at: at(3) }], null, true));
+    expect(findLoadMore()).toBeUndefined();
+
+    // The older request resolves last with a stale cursor and a repeated head
+    // item: it must contribute only its unseen tail item without regressing
+    // the finished cursor or duplicating the head item.
+    await resolveLoad(1, page([
+      { id: "event-head-1", at: at(4) },
+      { id: "event-tail-old", at: at(2) },
+    ], "activity-cursor-stale", false));
+    expect(findLoadMore()).toBeUndefined();
+    expect(container.querySelectorAll(".wb-activity-item").length).toBe(4);
+
+    await act(async () => {
+      const recovery = Array.from(container.querySelectorAll("button")).find((candidate) => candidate.textContent?.includes("Recovery"));
+      if (recovery === undefined) throw new Error("Recovery tab not found");
+      recovery.click();
+    });
+    const story = Array.from(container.querySelectorAll(".wb-recovery-story > div"));
+    expect(story.length).toBe(4);
+    expect(new Set(story.map((entry) => entry.textContent ?? "")).size).toBe(4);
+  } finally {
+    await act(async () => {
+      root.unmount();
+    });
+    browserGlobals.window = previousWindow;
+    browserGlobals.document = previousDocument;
+    browserGlobals.navigator = previousNavigator;
+    if (previousActEnvironment === undefined) delete actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+    else actEnvironment.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment;
+  }
+});
 test("places activity pagination in the activity area instead of supplier results", () => {
   const snapshot = parseWorkbenchSnapshot({
     ...projection,

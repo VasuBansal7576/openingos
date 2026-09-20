@@ -118,6 +118,42 @@ describe("J-06 domain evaluation corpus", () => {
     expect([...ids].sort()).toEqual(ids);
   });
 
+  test("rejects duplicate case IDs before scoring, latency, or evidence construction", () => {
+    const first = J06_CORPUS[0];
+    if (first === undefined) throw new Error("empty corpus");
+    const appended: EvalCase[] = [...J06_CORPUS, { ...first }];
+    expect(() => evaluateCorpus(appended, thresholdsCopy())).toThrow("eval-duplicate-case:j06-inc-01");
+    const prepended: EvalCase[] = [{ ...first }, ...J06_CORPUS];
+    expect(() => evaluateCorpus(prepended, thresholdsCopy())).toThrow("eval-duplicate-case:j06-inc-01");
+  });
+
+  test("rejects duplicates without reading stub metrics, so no model work is consumed", () => {
+    const first = J06_CORPUS[0];
+    if (first === undefined) throw new Error("empty corpus");
+    const boobyTrapped = { ...first };
+    Object.defineProperty(boobyTrapped, "stubConfidence", {
+      enumerable: true,
+      get() {
+        throw new Error("model-called");
+      },
+    });
+    Object.defineProperty(boobyTrapped, "stubModelLatencyMs", {
+      enumerable: true,
+      get() {
+        throw new Error("model-called");
+      },
+    });
+    expect(() => evaluateCorpus([...J06_CORPUS, boobyTrapped], thresholdsCopy())).toThrow("eval-duplicate-case");
+  });
+
+  test("keeps the valid corpus free of duplicates and skew", () => {
+    const report = evaluateCorpus(J06_CORPUS, thresholdsCopy());
+    expect(report.cases.length).toBe(J06_CORPUS.length);
+    expect(new Set(report.cases.map((row) => row.id)).size).toBe(J06_CORPUS.length);
+    const scored = report.results.reduce((total, result) => total + result.latency.count, 0);
+    expect(scored).toBe(J06_CORPUS.length);
+  });
+
   test("rejects a corpus missing a required category", () => {
     const subset = J06_CORPUS.filter((item) => item.category !== "adversarial");
     expect(() => evaluateCorpus(subset, thresholdsCopy())).toThrow("eval-missing-category:adversarial");

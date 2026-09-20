@@ -203,6 +203,17 @@ export function evaluateCorpus(
   validateThresholds(thresholds);
 
   const ordered = [...cases].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  // Reject duplicate case IDs before grouping, scoring, latency summaries, or
+  // evidence construction so a repeated case can never skew error rates or
+  // intervention counts. This runs before any per-case metric reads, so no
+  // model/adapter work is consumed by a duplicated corpus.
+  const seenIds = new Set<string>();
+  for (const item of ordered) {
+    if (seenIds.has(item.id)) {
+      throw new Error(`eval-duplicate-case:${item.id}`);
+    }
+    seenIds.add(item.id);
+  }
   for (const item of ordered) validateCase(item, expected);
 
   const seenCategories = new Set<string>();
