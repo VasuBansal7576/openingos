@@ -664,11 +664,16 @@ export const create = f1Mutation({
       const canonicalizeSegments =
         operationClassification.refusedSegments.length > 0 ||
         grantClassification.refusedSegments.length > 0;
+      // A fully supported draft is still bound to the approved segment. Only
+      // mixed input compares against the canonical supported projection.
+      const comparableGrantPayload = canonicalizeSegments
+        ? supportedGrantPayload
+        : grantPayload;
       if (
         supportedGrantPayload === null ||
-        (canonicalizeSegments &&
-          grantClassification.supportedSegment !== operationClassification.supportedSegment) ||
-        (canonicalizeSegments && canonicalJson(supportedGrantPayload) !== canonical)
+        grantClassification.supportedSegment !== operationClassification.supportedSegment ||
+        comparableGrantPayload === null ||
+        canonicalJson(comparableGrantPayload) !== canonical
       ) {
         return { ok: false as const, code: "changed-draft", message: "operation segment does not match the approved grant" };
       }

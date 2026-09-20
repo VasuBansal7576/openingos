@@ -948,6 +948,75 @@ describe("F1R-20 allowlisted workflow purpose", () => {
     expect(claimed.ok).toBe(true);
   });
 
+  test("fully supported communication draft is bound before consuming its request key or grant allowance", async () => {
+    const setup = await setupCommunication();
+    const started = await setup.asOwner.mutation(startJobRef, {
+      organizationId: setup.organizationId,
+      projectId: setup.projectId,
+      text: "Send the RFQ to the demo supplier.",
+      operationId: "communication.send",
+      kind: "communication",
+      grantId: setup.grantId,
+    });
+    expect(started.ok).toBe(true);
+    if (!started.ok) throw new Error("communication job setup failed");
+
+    const reserved = await setup.asOwner.mutation(reserveRef, {
+      jobId: started.jobId,
+      organizationId: setup.organizationId,
+      projectId: setup.projectId,
+      amountMicroUsd: 10,
+      pricingBasis: "controlled-f1r20r22",
+    });
+    if (!reserved.ok) throw new Error("communication reservation setup failed");
+
+    const changedPayload = {
+      ...supportedCommunicationPayload,
+      body: "Send the controlled RFQ to the owner playing supplier and clarify the quote.",
+    };
+    const requestId = "fully-supported-communication-create-binding";
+    const before = await countRows(setup.t);
+    const changed = await setup.asOwner.mutation(createOperationRef, {
+      jobId: started.jobId,
+      organizationId: setup.organizationId,
+      projectId: setup.projectId,
+      kind: "communication.send",
+      requestId,
+      payloadJson: JSON.stringify(changedPayload),
+      grantId: setup.grantId,
+      reservationId: reserved.reservationId,
+    });
+    expect(changed.ok).toBe(false);
+    if (changed.ok) throw new Error("fully supported changed communication unexpectedly succeeded");
+    expect(changed.code).toBe("changed-draft");
+    expect(await countRows(setup.t)).toEqual(before);
+
+    const correctedPayload = {
+      ...supportedCommunicationPayload,
+      body: "Send the controlled RFQ to the owner playing supplier.",
+    };
+    const corrected = await setup.asOwner.mutation(createOperationRef, {
+      jobId: started.jobId,
+      organizationId: setup.organizationId,
+      projectId: setup.projectId,
+      kind: "communication.send",
+      requestId,
+      payloadJson: JSON.stringify(correctedPayload),
+      grantId: setup.grantId,
+      reservationId: reserved.reservationId,
+    });
+    expect(corrected.ok).toBe(true);
+    if (!corrected.ok) throw new Error("corrected communication retry was denied");
+    expect(corrected.deduped).toBe(false);
+    const operation = await setup.t.run((ctx) => ctx.db.get(corrected.operationId));
+    expect(operation?.normalizedPayload).toBe(canonicalJson(correctedPayload));
+    const claimed = await setup.t.mutation(claimRef, {
+      operationId: corrected.operationId,
+      identity: setup.identity.tokenIdentifier,
+    });
+    expect(claimed.ok).toBe(true);
+  });
+
   test("mixed communication persists its supported segment and claims it, while a changed short body fails closed", async () => {
     const setup = await setupCommunication();
     const started = await setup.asOwner.mutation(startJobRef, {
