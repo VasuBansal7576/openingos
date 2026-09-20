@@ -17,6 +17,7 @@ import {
   candidateInputValidator,
   candidateVariantKey,
   compatibilityVerificationInputValidator,
+  COMPATIBILITY_RULE_VERSION,
   negotiationInputValidator,
   productEvidenceInputValidator,
   providerProductEvidenceInputValidator,
@@ -237,8 +238,19 @@ export const recordCandidate = f1Mutation({
 
 /**
  * Verify a candidate's compatibility against evidence. Only an approver
- * (or above) may set pass/fail, every verdict carries its evidence
- * references, and the candidate must live in the caller's project.
+ * (or above) may set pass/fail. F1R-06: every reference must resolve to
+ * supporting field evidence inside the caller's project, at the exact
+ * stated version, relevant to this candidate's requirement (and variant
+ * via the evidence's candidate binding). Each supporting row must
+ * already be verification=verified: an unverified owner import can
+ * never justify compatibility=pass. The finding pins the requirement
+ * version and the compatibility rule version it was decided against.
+ * Unsupported facts stay `unknown`: any unresolvable, foreign,
+ * stale-version, non-fresh, unverified, disputed, or unrelated
+ * reference denies the whole write. There is deliberately no
+ * human-override path: a verified-evidence-backed pass is the only
+ * pass, so no separate actor/reason/risk override record exists to
+ * maintain.
  */
 export const verifyCompatibility = f1Mutation({
   args: compatibilityVerificationInputValidator.fields,
@@ -264,9 +276,63 @@ export const verifyCompatibility = f1Mutation({
     if (args.evidenceRefs.length === 0) {
       return { ok: false as const, code: "invalid-payload", message: "verification requires evidence" };
     }
+    const requirement = await ctx.db.get(candidate.value.requirementId);
+    if (
+      requirement === null ||
+      requirement.organizationId !== args.organizationId ||
+      requirement.projectId !== args.projectId
+    ) {
+      return { ok: false as const, code: "denied-project", message: "requirement is not in this project" };
+    }
+    for (const ref of args.evidenceRefs) {
+      let evidence: {
+        organizationId: Id<"organizations">;
+        projectId: Id<"projects">;
+        requirementId?: Id<"requirements">;
+        candidateId?: Id<"candidates">;
+        version: string;
+        verification: string;
+        freshness: string;
+      } | null = null;
+      try {
+        evidence = await ctx.db.get(ref.sourceId as Id<"productEvidence">);
+      } catch {
+        evidence = null;
+      }
+      if (evidence === null) {
+        return { ok: false as const, code: "unknown-evidence", message: "compatibility evidence does not resolve" };
+      }
+      if (
+        evidence.organizationId !== args.organizationId ||
+        evidence.projectId !== args.projectId
+      ) {
+        return { ok: false as const, code: "denied-project", message: "compatibility evidence is not in this project" };
+      }
+      if (ref.version !== evidence.version) {
+        return { ok: false as const, code: "stale-evidence", message: "compatibility evidence version changed; re-verify against the current revision" };
+      }
+      if (evidence.freshness !== "fresh") {
+        return { ok: false as const, code: "stale-evidence", message: "compatibility evidence is no longer fresh" };
+      }
+      if (evidence.verification === "conflicted" || evidence.verification === "superseded") {
+        return { ok: false as const, code: "conflicted-evidence", message: "compatibility evidence is disputed" };
+      }
+      if (evidence.verification !== "verified") {
+        return { ok: false as const, code: "unverified-evidence", message: "compatibility evidence is not verified" };
+      }
+      if (evidence.candidateId !== undefined) {
+        if (evidence.candidateId !== args.candidateId) {
+          return { ok: false as const, code: "unrelated-evidence", message: "compatibility evidence concerns another variant" };
+        }
+      } else if (evidence.requirementId !== requirement._id) {
+        return { ok: false as const, code: "unrelated-evidence", message: "compatibility evidence concerns another requirement" };
+      }
+    }
     await ctx.db.patch(args.candidateId, {
       compatibility: args.result,
       compatibilityEvidenceRefs: [...args.evidenceRefs],
+      compatibilityRequirementVersion: requirement.version,
+      compatibilityRuleVersion: COMPATIBILITY_RULE_VERSION,
     });
     return { ok: true as const };
   },
@@ -385,12 +451,26 @@ async function checkProductEvidenceRefs(
   return { ok: true as const };
 }
 
+/**
+ * F1R-07: one normalized immutable input snapshot. Replay identity
+ * covers every material relationship and provenance field: the
+ * requirement/candidate bindings, the source URL and capture time, and
+ * freshness/last-checked state alongside the value, source, and
+ * counterparty fields. Any divergence is a conflicting replay, never a
+ * silent merge of differently attributed records.
+ */
 function sameProductEvidenceFields(
   existing: {
+    readonly requirementId?: Id<"requirements">;
+    readonly candidateId?: Id<"candidates">;
     readonly field: string;
     readonly sourceKind: string;
+    readonly sourceUrl?: string;
+    readonly capturedAt: number;
     readonly originalValue: string;
     readonly normalizedValue: string;
+    readonly freshness: string;
+    readonly lastCheckedAt?: number;
     readonly counterpartyRole: string;
     readonly executionMode: string;
     readonly origin: string;
@@ -398,10 +478,16 @@ function sameProductEvidenceFields(
   fields: ProductEvidenceFields,
 ): boolean {
   return (
+    (existing.requirementId ?? undefined) === fields.requirementId &&
+    (existing.candidateId ?? undefined) === fields.candidateId &&
     existing.field === fields.field &&
     existing.sourceKind === fields.sourceKind &&
+    (existing.sourceUrl ?? undefined) === fields.sourceUrl &&
+    existing.capturedAt === fields.capturedAt &&
     existing.originalValue === fields.originalValue &&
     existing.normalizedValue === fields.normalizedValue &&
+    existing.freshness === fields.freshness &&
+    (existing.lastCheckedAt ?? undefined) === fields.lastCheckedAt &&
     existing.counterpartyRole === fields.counterpartyRole &&
     existing.executionMode === fields.executionMode &&
     existing.origin === fields.origin
@@ -432,8 +518,83 @@ async function insertProductEvidence(
     origin: fields.origin,
     conflictEvidenceIds: [],
     idempotencyKey: fields.idempotencyKey,
+    // F1R-06: every evidence row starts at revision "1". Verification
+    // or freshness changes bump it so outstanding finding references
+    // go stale instead of silently covering new terms.
+    version: "1",
     createdAt: now,
   });
+}
+
+/** Next evidence revision after a verification/freshness change. */
+function bumpEvidenceVersion(version: string): string {
+  const parsed = Number.parseInt(version, 10);
+  return Number.isSafeInteger(parsed) ? String(parsed + 1) : `${version}.1`;
+}
+
+/**
+ * F1R-06: invalidate compatibility findings whose supporting evidence
+ * just changed meaningfully (conflicted or superseded). Findings that
+ * cited the evidence row return to `unknown` with their basis pins
+ * cleared; findings on other evidence are untouched.
+ */
+async function invalidateDependentCompatibility(
+  ctx: F1MutationCtx,
+  evidence: {
+    readonly _id: Id<"productEvidence">;
+    readonly organizationId: Id<"organizations">;
+    readonly projectId: Id<"projects">;
+    readonly requirementId?: Id<"requirements">;
+    readonly candidateId?: Id<"candidates">;
+  },
+): Promise<void> {
+  const seen = new Set<string>();
+  const rows: {
+    readonly _id: Id<"candidates">;
+    readonly compatibilityEvidenceRefs?: readonly {
+      readonly sourceId: string;
+      readonly version: string;
+      readonly locator?: string;
+    }[];
+  }[] = [];
+  if (evidence.candidateId !== undefined) {
+    const direct = await ctx.db.get(evidence.candidateId);
+    if (
+      direct !== null &&
+      direct.organizationId === evidence.organizationId &&
+      direct.projectId === evidence.projectId
+    ) {
+      rows.push(direct);
+      seen.add(direct._id);
+    }
+  }
+  if (evidence.requirementId !== undefined) {
+    const scoped = await ctx.db
+      .query("candidates")
+      .withIndex("by_requirement", (q) => q.eq("requirementId", evidence.requirementId as Id<"requirements">))
+      .take(50);
+    for (const row of scoped) {
+      if (
+        row.organizationId === evidence.organizationId &&
+        row.projectId === evidence.projectId &&
+        !seen.has(row._id)
+      ) {
+        rows.push(row);
+        seen.add(row._id);
+      }
+    }
+  }
+  for (const row of rows) {
+    const refs = row.compatibilityEvidenceRefs ?? [];
+    if (refs.some((ref) => ref.sourceId === evidence._id)) {
+      await ctx.db.patch(row._id, {
+        compatibility: "unknown",
+        compatibilityEvidenceRefs: [],
+        compatibilityRequirementVersion: undefined,
+        compatibilityRuleVersion: undefined,
+      });
+    }
+  }
 }
 
 const productEvidenceResultValidator = v.union(
@@ -583,8 +744,9 @@ export const ingestProductEvidence = f1InternalMutation({
 /**
  * Link conflicting field evidence. Every conflicting row must live in
  * the caller's project; the link moves verification to `conflicted`
- * from `unverified` only, so verified findings are never silently
- * disputed and self-links are rejected.
+ * from `unverified` or `verified`, so findings decided against the
+ * undisputed revision are invalidated rather than silently disputed,
+ * and self-links are rejected. Terminal states never move again.
  */
 export const linkEvidenceConflict = f1Mutation({
   args: {
@@ -612,8 +774,8 @@ export const linkEvidenceConflict = f1Mutation({
     if (!evidence.ok) {
       return { ok: false as const, code: evidence.code, message: evidence.message };
     }
-    if (evidence.value.verification !== "unverified") {
-      return { ok: false as const, code: "invalid-payload", message: "only unverified evidence can gain conflicts" };
+    if (evidence.value.verification !== "unverified" && evidence.value.verification !== "verified") {
+      return { ok: false as const, code: "invalid-payload", message: "only undisputed evidence can gain conflicts" };
     }
     if (args.conflictingIds.length === 0) {
       return { ok: false as const, code: "invalid-payload", message: "at least one conflicting row required" };
@@ -631,10 +793,14 @@ export const linkEvidenceConflict = f1Mutation({
         return { ok: false as const, code: conflicting.code, message: conflicting.message };
       }
     }
+    // F1R-06: disputing the evidence bumps its revision and invalidates
+    // compatibility findings decided against the undisputed revision.
     await ctx.db.patch(args.evidenceId, {
       verification: "conflicted",
       conflictEvidenceIds: [...args.conflictingIds],
+      version: bumpEvidenceVersion(evidence.value.version),
     });
+    await invalidateDependentCompatibility(ctx, evidence.value);
     return { ok: true as const };
   },
 });
@@ -672,10 +838,17 @@ export const verifyProductEvidence = f1Mutation({
     if (evidence.value.verification !== "unverified" && evidence.value.verification !== "conflicted") {
       return { ok: false as const, code: "invalid-payload", message: "evidence already resolved" };
     }
+    // F1R-06: resolving the evidence bumps its revision so outstanding
+    // references go stale. A supersession additionally invalidates
+    // compatibility findings decided against the superseded revision.
     await ctx.db.patch(args.evidenceId, {
       verification: args.verdict,
       lastCheckedAt: Date.now(),
+      version: bumpEvidenceVersion(evidence.value.version),
     });
+    if (args.verdict === "superseded") {
+      await invalidateDependentCompatibility(ctx, evidence.value);
+    }
     return { ok: true as const };
   },
 });
@@ -750,9 +923,14 @@ export const createRfq = f1Mutation({
       if (existing.organizationId !== args.organizationId) {
         return { ok: false as const, code: "denied-project", message: "reference is not in this project" };
       }
+      // F1R-07: replay identity uses normalized vendor-set equality:
+      // duplicates and order never distinguish a replay from the
+      // original row, while a different set conflicts.
+      const existingVendors = new Set(existing.scenarioVendorIds);
+      const wantedVendors = new Set(args.scenarioVendorIds);
       const sameVendors =
-        existing.scenarioVendorIds.length === args.scenarioVendorIds.length &&
-        existing.scenarioVendorIds.every((id) => args.scenarioVendorIds.includes(id));
+        existingVendors.size === wantedVendors.size &&
+        [...existingVendors].every((id) => wantedVendors.has(id));
       const sameLines =
         existing.lineItems.length === normalizedLines.length &&
         existing.lineItems.every((line, index) => {

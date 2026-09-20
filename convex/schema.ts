@@ -185,6 +185,11 @@ export default defineSchema({
     variantKey: v.string(),
     compatibility: v.union(v.literal("pass"), v.literal("fail"), v.literal("unknown")),
     compatibilityEvidenceRefs: v.optional(v.array(domainEvidenceRefValidator)),
+    // F1R-06: a compatibility finding pins the exact basis it was
+    // decided against — the requirement version and the compatibility
+    // rule version — so later input changes can be detected as stale.
+    compatibilityRequirementVersion: v.optional(v.number()),
+    compatibilityRuleVersion: v.optional(v.string()),
     conversationState: v.union(
       v.literal("draft"),
       v.literal("awaitingReply"),
@@ -232,6 +237,10 @@ export default defineSchema({
     origin: v.union(v.literal("internal"), v.literal("ownerImport")),
     conflictEvidenceIds: v.array(v.id("productEvidence")),
     idempotencyKey: v.string(),
+    // F1R-06: explicit evidence revision. Compatibility findings bind
+    // the exact version they were decided against; any verification or
+    // freshness change bumps it so outstanding refs go stale.
+    version: v.string(),
     createdAt: v.number(),
   })
     .index("by_project", ["projectId"])
