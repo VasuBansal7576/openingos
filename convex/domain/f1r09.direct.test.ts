@@ -26,6 +26,7 @@ import {
 } from "convex/server";
 import type { Id } from "../_generated/dataModel.js";
 import schema from "../schema.js";
+import { membershipScopeKey } from "../access/checks.js";
 import * as memberships from "../access/memberships.js";
 import * as quotes from "../purchasing/contracts/quotes.js";
 import * as requirements from "./requirements.js";
@@ -514,5 +515,131 @@ describe("F1R-09 cost entry money validation", () => {
       idempotencyKey: "pay-ok-1",
     });
     expect(accepted.ok).toBe(true);
+  });
+});
+
+describe("organization authority guard exact ranges", () => {
+  test("project history cannot hide current legacy or projected org authority", async () => {
+    const t = convexTest({ schema, modules, transactionLimits: { documentsRead: 64 } });
+    const projectedIdentity = "f1r09-guard-projected-owner";
+    const legacyIdentity = "f1r09-guard-legacy-owner";
+    const now = Date.now();
+
+    const organizations = await t.run(async (ctx) => {
+      const organizationId = await ctx.db.insert("organizations", {
+        name: "Guard exact-range organization",
+        kind: "private",
+        createdAt: now,
+      });
+      const otherOrganizationId = await ctx.db.insert("organizations", {
+        name: "Guard tenant-isolation organization",
+        kind: "private",
+        createdAt: now,
+      });
+
+      for (const identity of [projectedIdentity, legacyIdentity]) {
+        for (let index = 0; index < 32; index += 1) {
+          const projectId = await ctx.db.insert("projects", {
+            organizationId,
+            name: `Historical project ${identity} ${index}`,
+            visibility: "open",
+            createdAt: now,
+          });
+          await ctx.db.insert("memberships", {
+            organizationId,
+            projectId,
+            identity,
+            role: "viewer",
+            status: "revoked",
+            version: 1,
+            revokedAt: now,
+            updatedAt: now,
+          });
+        }
+      }
+
+      const projectedLegacy = await ctx.db.insert("memberships", {
+        organizationId,
+        identity: projectedIdentity,
+        role: "owner",
+        status: "active",
+        version: 1,
+        expiresAt: now - 1,
+        updatedAt: now,
+      });
+      const projectedMembership = await ctx.db.insert("memberships", {
+        organizationId,
+        identity: projectedIdentity,
+        role: "owner",
+        status: "active",
+        version: 1,
+        expiresAt: now + 3_600_000,
+        updatedAt: now,
+      });
+      await ctx.db.insert("membershipAuthorities", {
+        organizationId,
+        identity: projectedIdentity,
+        scopeKey: membershipScopeKey(undefined),
+        role: "owner",
+        membershipId: projectedMembership,
+        authorityUntil: now + 3_600_000,
+        expiresAt: now + 3_600_000,
+        updatedAt: now,
+      });
+
+      const legacyMembership = await ctx.db.insert("memberships", {
+        organizationId,
+        identity: legacyIdentity,
+        role: "owner",
+        status: "active",
+        version: 1,
+        updatedAt: now,
+      });
+      const expiredProjectedMembership = await ctx.db.insert("memberships", {
+        organizationId,
+        identity: legacyIdentity,
+        role: "owner",
+        status: "active",
+        version: 1,
+        expiresAt: now - 1,
+        updatedAt: now,
+      });
+      await ctx.db.insert("membershipAuthorities", {
+        organizationId,
+        identity: legacyIdentity,
+        scopeKey: membershipScopeKey(undefined),
+        role: "owner",
+        membershipId: expiredProjectedMembership,
+        authorityUntil: now - 1,
+        expiresAt: now - 1,
+        updatedAt: now,
+      });
+
+      // Keep these values live in the transaction so the test proves the
+      // exact legacy/projection coexistence rather than a synthetic ID.
+      if (projectedLegacy === projectedMembership || legacyMembership === expiredProjectedMembership) {
+        throw new Error("authority setup unexpectedly reused membership IDs");
+      }
+      return { organizationId, otherOrganizationId };
+    });
+
+    for (const [identity, label] of [
+      [projectedIdentity, "projected"],
+      [legacyIdentity, "legacy"],
+    ] as const) {
+      const accepted = await t.withIdentity({ tokenIdentifier: identity }).mutation(recordVendorRef, {
+        organizationId: organizations.organizationId,
+        name: `Guard vendor ${label}`,
+        regions: ["NL"],
+      });
+      expect(accepted, label).toMatchObject({ ok: true });
+    }
+
+    const foreignTenant = await t.withIdentity({ tokenIdentifier: projectedIdentity }).mutation(recordVendorRef, {
+      organizationId: organizations.otherOrganizationId,
+      name: "Foreign tenant vendor",
+      regions: ["NL"],
+    });
+    expect(foreignTenant).toMatchObject({ ok: false, code: "denied-membership" });
   });
 });
