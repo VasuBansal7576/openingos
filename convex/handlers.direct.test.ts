@@ -7,9 +7,13 @@
  * mocks, no source-text assertions. Static guards and ControlledBackend
  * parity tests remain, but the proofs below come from handler execution:
  * public ID validator failures, cross-org and restricted-project denials
- * before dedupe, forged `now` input handling, internal-only visibility of
+ * before dedupe, forged `now` input rejection, internal-only visibility of
  * claim/outcome/event/late-delivery transitions, fixture-seed absence,
  * and no public fake-send endpoint.
+ *
+ * Function references use explicit makeFunctionReference generics
+ * instantiated from conditional Args/Return extraction: no cast helper,
+ * no assertions.
  */
 
 import { convexTest } from "convex-test";
@@ -17,18 +21,9 @@ import { describe, expect, test } from "vitest";
 import {
   makeFunctionReference,
   type FunctionReference,
-  type RegisteredAction,
   type RegisteredMutation,
   type RegisteredQuery,
 } from "convex/server";
-
-type RefFromExport<T> = T extends RegisteredQuery<infer V, infer A, infer R>
-  ? FunctionReference<"query", V, A, R>
-  : T extends RegisteredMutation<infer V, infer A, infer R>
-    ? FunctionReference<"mutation", V, A, R>
-    : T extends RegisteredAction<infer V, infer A, infer R>
-      ? FunctionReference<"action", V, A, R>
-      : never;
 import schema from "./schema.js";
 import * as memberships from "./access/memberships.js";
 import * as grants from "./access/grants.js";
@@ -56,9 +51,56 @@ const modules = import.meta.glob([
   "!./shared/**/*.test.ts",
 ]);
 
-function ref<ModuleExport>(path: string): ModuleExport {
-  return makeFunctionReference(path) as ModuleExport;
-}
+type MutationArgs<T> = T extends RegisteredMutation<any, infer A, any> ? A : never;
+type MutationReturn<T> = T extends RegisteredMutation<any, any, infer R> ? R : never;
+type QueryArgs<T> = T extends RegisteredQuery<any, infer A, any> ? A : never;
+type QueryReturn<T> = T extends RegisteredQuery<any, any, infer R> ? R : never;
+
+const createOrganizationRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof memberships.createOrganization>,
+  MutationReturn<typeof memberships.createOrganization>
+>("access/memberships:createOrganization");
+const createProjectRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof memberships.createProject>,
+  MutationReturn<typeof memberships.createProject>
+>("access/memberships:createProject");
+const grantProjectAccessRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof memberships.grantProjectAccess>,
+  MutationReturn<typeof memberships.grantProjectAccess>
+>("access/memberships:grantProjectAccess");
+const myProjectRoleRef = makeFunctionReference<
+  "query",
+  QueryArgs<typeof memberships.myProjectRole>,
+  QueryReturn<typeof memberships.myProjectRole>
+>("access/memberships:myProjectRole");
+const configureRecipientRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof recipients.configure>,
+  MutationReturn<typeof recipients.configure>
+>("access/recipients:configure");
+const issueGrantRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof grants.issue>,
+  MutationReturn<typeof grants.issue>
+>("access/grants:issue");
+const startJobRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof jobs.start>,
+  MutationReturn<typeof jobs.start>
+>("execution/jobs:start");
+const createOperationRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof operations.create>,
+  MutationReturn<typeof operations.create>
+>("execution/operations:create");
+const getOperationRef = makeFunctionReference<
+  "query",
+  QueryArgs<typeof operations.get>,
+  QueryReturn<typeof operations.get>
+>("execution/operations:get");
 
 const OWNER_A = { tokenIdentifier: "direct-owner-a" };
 const APPROVER_A = { tokenIdentifier: "direct-approver-a" };
@@ -75,17 +117,13 @@ async function setupCommsProject(
   issuer: { tokenIdentifier: string } = owner,
 ) {
   const asOwner = t.withIdentity(owner);
-  const org = await asOwner.mutation(
-    ref<RefFromExport<typeof memberships.createOrganization>>(
-      "access/memberships:createOrganization",
-    ),
-    { name: "Direct org", kind: "private" },
-  );
+  const org = await asOwner.mutation(createOrganizationRef, { name: "Direct org", kind: "private" });
   if (!org.ok) throw new Error("org setup failed");
-  const proj = await asOwner.mutation(
-    ref<RefFromExport<typeof memberships.createProject>>("access/memberships:createProject"),
-    { organizationId: org.organizationId, name: "Direct project", visibility },
-  );
+  const proj = await asOwner.mutation(createProjectRef, {
+    organizationId: org.organizationId,
+    name: "Direct project",
+    visibility,
+  });
   if (!proj.ok) throw new Error("project setup failed");
   if (seed.length > 0) {
     // Test scaffolding only: direct membership rows for identities that the
@@ -105,26 +143,23 @@ async function setupCommsProject(
       }
     });
   }
-  const recipient = await asOwner.mutation(
-    ref<RefFromExport<typeof recipients.configure>>("access/recipients:configure"),
-    { organizationId: org.organizationId, mailbox: OWNER_MAILBOX },
-  );
+  const recipient = await asOwner.mutation(configureRecipientRef, {
+    organizationId: org.organizationId,
+    mailbox: OWNER_MAILBOX,
+  });
   if (!recipient.ok) throw new Error("recipient setup failed");
-  const grant = await t.withIdentity(issuer).mutation(
-    ref<RefFromExport<typeof grants.issue>>("access/grants:issue"),
-    {
-      organizationId: org.organizationId,
-      projectId: proj.projectId,
-      operations: ["communication.send"],
-      communicationProfile: COMMUNICATION_PROFILE_OWNER_ROLEPLAY,
-      recipientConfigVersion: recipient.version,
-      inputVersions: { brief: "v1" },
-      payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
-      costCeilingMicroUsd: 100_000,
-      roundLimit: 2,
-      expiresAt: Date.now() + 3_600_000,
-    },
-  );
+  const grant = await t.withIdentity(issuer).mutation(issueGrantRef, {
+    organizationId: org.organizationId,
+    projectId: proj.projectId,
+    operations: ["communication.send"],
+    communicationProfile: COMMUNICATION_PROFILE_OWNER_ROLEPLAY,
+    recipientConfigVersion: recipient.version,
+    inputVersions: { brief: "v1" },
+    payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
+    costCeilingMicroUsd: 100_000,
+    roundLimit: 2,
+    expiresAt: Date.now() + 3_600_000,
+  });
   if (!grant.ok) throw new Error("grant setup failed");
   return { orgId: org.organizationId, projectId: proj.projectId, grantId: grant.grantId };
 }
@@ -133,9 +168,9 @@ describe("direct public ID validator failures", () => {
   test("malformed IDs are rejected by v.id before any handler logic", async () => {
     const t = convexTest(schema, modules);
     const asOwner = t.withIdentity(OWNER_A);
-    // Loosely typed ref: the precise RefFromExport type already rejects
-    // this at compile time; here the malformed value must reach the
-    // registered runtime validator.
+    // Loosely typed ref: precise handler types already reject this at
+    // compile time; here the malformed value must reach the registered
+    // runtime validator.
     const getOp: FunctionReference<"query", "public", Record<string, unknown>, unknown> =
       makeFunctionReference("execution/operations:get");
     await expect(asOwner.query(getOp, { operationId: "not-an-id" })).rejects.toThrow();
@@ -144,12 +179,7 @@ describe("direct public ID validator failures", () => {
   test("wrong-table IDs are rejected by v.id", async () => {
     const t = convexTest(schema, modules);
     const asOwner = t.withIdentity(OWNER_A);
-    const org = await asOwner.mutation(
-      ref<RefFromExport<typeof memberships.createOrganization>>(
-        "access/memberships:createOrganization",
-      ),
-      { name: "ID org", kind: "private" },
-    );
+    const org = await asOwner.mutation(createOrganizationRef, { name: "ID org", kind: "private" });
     if (!org.ok) throw new Error("org setup failed");
     const getOp: FunctionReference<"query", "public", Record<string, unknown>, unknown> =
       makeFunctionReference("execution/operations:get");
@@ -164,60 +194,48 @@ describe("direct cross-org and restricted denials before dedupe", () => {
     const t = convexTest(schema, modules);
     const victim = await setupCommsProject(t, OWNER_A);
     const asVictim = t.withIdentity(OWNER_A);
-    const job = await asVictim.mutation(
-      ref<RefFromExport<typeof jobs.start>>("execution/jobs:start"),
-      {
-        organizationId: victim.orgId,
-        projectId: victim.projectId,
-        text: "Send the RFQ to the demo supplier.",
-        kind: "communication",
-        grantId: victim.grantId,
-      },
-    );
+    const job = await asVictim.mutation(startJobRef, {
+      organizationId: victim.orgId,
+      projectId: victim.projectId,
+      text: "Send the RFQ to the demo supplier.",
+      kind: "communication",
+      grantId: victim.grantId,
+    });
     if (!job.ok) throw new Error("job setup failed");
     const payloadJson = JSON.stringify(commsPayload(OWNER_MAILBOX));
-    const created = await asVictim.mutation(
-      ref<RefFromExport<typeof operations.create>>("execution/operations:create"),
-      {
-        jobId: job.jobId,
-        organizationId: victim.orgId,
-        projectId: victim.projectId,
-        kind: "communication.send",
-        requestId: "req-direct-victim",
-        payloadJson,
-        grantId: victim.grantId,
-      },
-    );
+    const created = await asVictim.mutation(createOperationRef, {
+      jobId: job.jobId,
+      organizationId: victim.orgId,
+      projectId: victim.projectId,
+      kind: "communication.send",
+      requestId: "req-direct-victim",
+      payloadJson,
+      grantId: victim.grantId,
+    });
     expect(created.ok).toBe(true);
 
     const asForeign = t.withIdentity(OWNER_B);
-    const forged = await asForeign.mutation(
-      ref<RefFromExport<typeof operations.create>>("execution/operations:create"),
-      {
-        jobId: job.jobId,
-        organizationId: victim.orgId,
-        projectId: victim.projectId,
-        kind: "communication.send",
-        requestId: "req-direct-victim",
-        payloadJson,
-        grantId: victim.grantId,
-      },
-    );
+    const forged = await asForeign.mutation(createOperationRef, {
+      jobId: job.jobId,
+      organizationId: victim.orgId,
+      projectId: victim.projectId,
+      kind: "communication.send",
+      requestId: "req-direct-victim",
+      payloadJson,
+      grantId: victim.grantId,
+    });
     expect(forged.ok).toBe(false);
     if (!forged.ok) expect(forged.code).toBe("denied-membership");
 
-    const changed = await asForeign.mutation(
-      ref<RefFromExport<typeof operations.create>>("execution/operations:create"),
-      {
-        jobId: job.jobId,
-        organizationId: victim.orgId,
-        projectId: victim.projectId,
-        kind: "communication.send",
-        requestId: "req-direct-victim",
-        payloadJson: JSON.stringify(commsPayload("other@example.test")),
-        grantId: victim.grantId,
-      },
-    );
+    const changed = await asForeign.mutation(createOperationRef, {
+      jobId: job.jobId,
+      organizationId: victim.orgId,
+      projectId: victim.projectId,
+      kind: "communication.send",
+      requestId: "req-direct-victim",
+      payloadJson: JSON.stringify(commsPayload("other@example.test")),
+      grantId: victim.grantId,
+    });
     expect(changed.ok).toBe(false);
     if (!changed.ok) expect(changed.code).toBe("denied-membership");
   });
@@ -238,73 +256,55 @@ describe("direct cross-org and restricted denials before dedupe", () => {
     // The public grant path works for an authorized approver: a new viewer
     // can be admitted and can then read their own role.
     const GRANTEE = { tokenIdentifier: "direct-grantee" };
-    const granted = await asApprover.mutation(
-      ref<RefFromExport<typeof memberships.grantProjectAccess>>(
-        "access/memberships:grantProjectAccess",
-      ),
-      {
-        organizationId: setup.orgId,
-        projectId: setup.projectId,
-        targetIdentity: GRANTEE.tokenIdentifier,
-        role: "viewer",
-      },
-    );
+    const granted = await asApprover.mutation(grantProjectAccessRef, {
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      targetIdentity: GRANTEE.tokenIdentifier,
+      role: "viewer",
+    });
     expect(granted.ok).toBe(true);
-    const granteeRole = await t.withIdentity(GRANTEE).query(
-      ref<RefFromExport<typeof memberships.myProjectRole>>(
-        "access/memberships:myProjectRole",
-      ),
-      { organizationId: setup.orgId, projectId: setup.projectId },
-    );
+    const granteeRole = await t.withIdentity(GRANTEE).query(myProjectRoleRef, {
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+    });
     expect(granteeRole.ok).toBe(true);
     // Contributor holds org-level membership but no restricted-project grant.
     const asContrib = t.withIdentity(CONTRIB_A);
-    const role = await asContrib.query(
-      ref<RefFromExport<typeof memberships.myProjectRole>>(
-        "access/memberships:myProjectRole",
-      ),
-      { organizationId: setup.orgId, projectId: setup.projectId },
-    );
+    const role = await asContrib.query(myProjectRoleRef, {
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+    });
     expect(role.ok).toBe(false);
 
-    const job = await asApprover.mutation(
-      ref<RefFromExport<typeof jobs.start>>("execution/jobs:start"),
-      {
-        organizationId: setup.orgId,
-        projectId: setup.projectId,
-        text: "Send the RFQ to the demo supplier.",
-        kind: "communication",
-        grantId: setup.grantId,
-      },
-    );
+    const job = await asApprover.mutation(startJobRef, {
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      text: "Send the RFQ to the demo supplier.",
+      kind: "communication",
+      grantId: setup.grantId,
+    });
     if (!job.ok) throw new Error("restricted job failed");
     const payloadJson = JSON.stringify(commsPayload(OWNER_MAILBOX));
-    const created = await asApprover.mutation(
-      ref<RefFromExport<typeof operations.create>>("execution/operations:create"),
-      {
-        jobId: job.jobId,
-        organizationId: setup.orgId,
-        projectId: setup.projectId,
-        kind: "communication.send",
-        requestId: "req-direct-restricted",
-        payloadJson,
-        grantId: setup.grantId,
-      },
-    );
+    const created = await asApprover.mutation(createOperationRef, {
+      jobId: job.jobId,
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      kind: "communication.send",
+      requestId: "req-direct-restricted",
+      payloadJson,
+      grantId: setup.grantId,
+    });
     expect(created.ok).toBe(true);
 
-    const forged = await asContrib.mutation(
-      ref<RefFromExport<typeof operations.create>>("execution/operations:create"),
-      {
-        jobId: job.jobId,
-        organizationId: setup.orgId,
-        projectId: setup.projectId,
-        kind: "communication.send",
-        requestId: "req-direct-restricted",
-        payloadJson,
-        grantId: setup.grantId,
-      },
-    );
+    const forged = await asContrib.mutation(createOperationRef, {
+      jobId: job.jobId,
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      kind: "communication.send",
+      requestId: "req-direct-restricted",
+      payloadJson,
+      grantId: setup.grantId,
+    });
     expect(forged.ok).toBe(false);
     if (!forged.ok) expect(forged.code).toBe("denied-membership");
   });
@@ -313,80 +313,57 @@ describe("direct cross-org and restricted denials before dedupe", () => {
     const t = convexTest(schema, modules);
     const victim = await setupCommsProject(t, OWNER_A);
     const asVictim = t.withIdentity(OWNER_A);
-    const job = await asVictim.mutation(
-      ref<RefFromExport<typeof jobs.start>>("execution/jobs:start"),
-      {
-        organizationId: victim.orgId,
-        projectId: victim.projectId,
-        text: "Send the RFQ to the demo supplier.",
-        kind: "communication",
-        grantId: victim.grantId,
-      },
-    );
+    const job = await asVictim.mutation(startJobRef, {
+      organizationId: victim.orgId,
+      projectId: victim.projectId,
+      text: "Send the RFQ to the demo supplier.",
+      kind: "communication",
+      grantId: victim.grantId,
+    });
     if (!job.ok) throw new Error("job setup failed");
-    const created = await asVictim.mutation(
-      ref<RefFromExport<typeof operations.create>>("execution/operations:create"),
-      {
-        jobId: job.jobId,
-        organizationId: victim.orgId,
-        projectId: victim.projectId,
-        kind: "communication.send",
-        requestId: "req-direct-oracle",
-        payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
-        grantId: victim.grantId,
-      },
-    );
+    const created = await asVictim.mutation(createOperationRef, {
+      jobId: job.jobId,
+      organizationId: victim.orgId,
+      projectId: victim.projectId,
+      kind: "communication.send",
+      requestId: "req-direct-oracle",
+      payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
+      grantId: victim.grantId,
+    });
     if (!created.ok) throw new Error("operation setup failed");
 
-    const anonymous = await t.query(
-      ref<RefFromExport<typeof operations.get>>("execution/operations:get"),
-      { operationId: created.operationId },
-    );
+    const anonymous = await t.query(getOperationRef, { operationId: created.operationId });
     expect(anonymous.ok).toBe(false);
     if (!anonymous.ok) expect(anonymous.code).toBe("forged-identity");
 
     const attacker = t.withIdentity(ATTACKER);
-    const probed = await attacker.query(
-      ref<RefFromExport<typeof operations.get>>("execution/operations:get"),
-      { operationId: created.operationId },
-    );
+    const probed = await attacker.query(getOperationRef, { operationId: created.operationId });
     expect(probed.ok).toBe(false);
     if (!probed.ok) expect(probed.code).toBe("denied-membership");
   });
 });
 
 describe("direct forged now handling", () => {
-  test("extra now input is rejected or ignored while server time governs", async () => {
+  test("extra now input is rejected by the registered validator", async () => {
     const t = convexTest(schema, modules);
     const asOwner = t.withIdentity(OWNER_A);
     // Loosely typed ref so the forged field passes compile-time checks and
     // exercises the registered validator directly.
     const looseCreate: FunctionReference<"mutation", "public", Record<string, unknown>, unknown> =
       makeFunctionReference("access/memberships:createOrganization");
-    let rejected = false;
-    let createdOk = false;
-    try {
-      const created = await asOwner.mutation(looseCreate, {
-        name: "Clock org",
-        kind: "private",
-        now: 1,
-      });
-      createdOk = created !== null && (created as { ok?: boolean }).ok === true;
-    } catch {
-      rejected = true;
-    }
-    expect(rejected || createdOk).toBe(true);
+    await expect(
+      asOwner.mutation(looseCreate, { name: "Clock org", kind: "private", now: 1 }),
+    ).rejects.toThrow(/Unexpected field/);
   });
 
-  test("past expiry is rejected even with a forged future now", async () => {
+  test("past expiry is rejected under the server clock", async () => {
     const t = convexTest(schema, modules);
     const setup = await setupCommsProject(t, OWNER_A);
     const asOwner = t.withIdentity(OWNER_A);
     // The registered validator accepts no `now` field (proven by the
     // companion rejection test), so expiry can only follow the server
     // clock: a past expiry is rejected even though the caller wants it live.
-    const issue = ref<RefFromExport<typeof grants.issue>>("access/grants:issue");
-    const expired = await asOwner.mutation(issue, {
+    const expired = await asOwner.mutation(issueGrantRef, {
       organizationId: setup.orgId,
       projectId: setup.projectId,
       operations: ["research.collect"],
