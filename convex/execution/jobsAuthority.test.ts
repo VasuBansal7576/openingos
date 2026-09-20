@@ -232,7 +232,7 @@ test("start copies the selected operation authority through the job to the opera
   expect(rows.operation?.workflowAuthority).toEqual(selected);
 });
 
-test("supplied grant text cannot pivot away from its bound requirement", async () => {
+test("supplied grant rejects an anchored text pivot from its bound requirement", async () => {
   const fixture = await setup();
   const boundRequirementId = await insertRequirement(fixture, "Quasar");
   await insertRequirement(fixture, "Espresso");
@@ -244,7 +244,7 @@ test("supplied grant text cannot pivot away from its bound requirement", async (
   const denied = await fixture.asOwner.mutation(startJobRef, {
     organizationId: fixture.organizationId,
     projectId: fixture.projectId,
-    text: "What changes for Espresso?",
+    text: "Research suppliers for Espresso",
     operationId: "research.collect",
     kind: "research",
     grantId,

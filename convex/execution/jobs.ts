@@ -549,6 +549,16 @@ export const start = f1Mutation({
       ) {
         return { ok: false as const, code: "unrelated-refusal", message: "workflow authority is not current for this project" };
       }
+      const routingRequirementId = routingContext.matchedRequirementId;
+      const authorityRequirementId =
+        "requirementId" in grantAuthority ? grantAuthority.requirementId : undefined;
+      if (
+        routingRequirementId !== undefined &&
+        authorityRequirementId !== undefined &&
+        routingRequirementId !== authorityRequirementId
+      ) {
+        return { ok: false as const, code: "unrelated-refusal", message: "request requirement does not match the grant authority" };
+      }
       const boundContext = await projectWorkflowContext(
         ctx,
         args.organizationId,
