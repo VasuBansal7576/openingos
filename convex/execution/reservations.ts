@@ -11,8 +11,13 @@
  */
 
 import { v } from "convex/values";
-import { f1Mutation, f1Query } from "../server.js";
+import type { Id } from "../_generated/dataModel.js";
+import { f1Mutation, f1Query, type F1MutationCtx } from "../server.js";
 import { checkProjectAccess, denialValidator, identityOf } from "../access/checks.js";
+import {
+  MAX_JOBS_PER_GRANT,
+  MAX_RESERVATIONS_PER_JOB,
+} from "../shared/scope.js";
 
 const reservationViewValidator = v.object({
   id: v.id("reservations"),
@@ -24,6 +29,30 @@ const reservationViewValidator = v.object({
   pricingBasis: v.string(),
   state: v.string(),
 });
+
+async function boundedGrantExposure(
+  ctx: F1MutationCtx,
+  grantId: Id<"grants">,
+): Promise<{ ok: true; committedMicroUsd: number } | { ok: false }> {
+  const grantJobs = await ctx.db
+    .query("jobs")
+    .withIndex("by_grant", (q) => q.eq("grantId", grantId))
+    .take(MAX_JOBS_PER_GRANT + 1);
+  if (grantJobs.length > MAX_JOBS_PER_GRANT) return { ok: false };
+  let committedMicroUsd = 0;
+  for (const grantJob of grantJobs) {
+    const reservations = await ctx.db
+      .query("reservations")
+      .withIndex("by_job", (q) => q.eq("jobId", grantJob._id))
+      .take(MAX_RESERVATIONS_PER_JOB + 1);
+    if (reservations.length > MAX_RESERVATIONS_PER_JOB) return { ok: false };
+    for (const reservation of reservations) {
+      committedMicroUsd +=
+        reservation.reservedMicroUsd + reservation.spentMicroUsd + reservation.unresolvedMicroUsd;
+    }
+  }
+  return { ok: true, committedMicroUsd };
+}
 
 /** Reserve shared allowance for a job (atomic against the org ledger). */
 export const reserve = f1Mutation({
@@ -80,23 +109,19 @@ export const reserve = f1Mutation({
     if (args.amountMicroUsd > grant.costCeilingMicroUsd) {
       return { ok: false as const, code: "grant-ceiling-exceeded", message: "reservation exceeds the grant cost ceiling" };
     }
-    const grantJobs = await ctx.db
-      .query("jobs")
-      .withIndex("by_grant", (q) => q.eq("grantId", grant._id))
-      .collect();
-    let grantCommitted = 0;
-    for (const grantJob of grantJobs) {
-      const grantJobReservations = await ctx.db
-        .query("reservations")
-        .withIndex("by_job", (q) => q.eq("jobId", grantJob._id))
-        .collect();
-      for (const reservation of grantJobReservations) {
-        grantCommitted +=
-          reservation.reservedMicroUsd + reservation.spentMicroUsd + reservation.unresolvedMicroUsd;
-      }
+    const exposure = await boundedGrantExposure(ctx, grant._id);
+    if (!exposure.ok) {
+      return { ok: false as const, code: "grant-accounting-limit", message: "grant exposure exceeds the bounded accounting contract" };
     }
-    if (grantCommitted + args.amountMicroUsd > grant.costCeilingMicroUsd) {
+    if (exposure.committedMicroUsd + args.amountMicroUsd > grant.costCeilingMicroUsd) {
       return { ok: false as const, code: "grant-ceiling-exceeded", message: "grant-wide reservations exceed the grant cost ceiling" };
+    }
+    const jobReservations = await ctx.db
+      .query("reservations")
+      .withIndex("by_job", (q) => q.eq("jobId", args.jobId))
+      .take(MAX_RESERVATIONS_PER_JOB + 1);
+    if (jobReservations.length >= MAX_RESERVATIONS_PER_JOB) {
+      return { ok: false as const, code: "reservation-admission-limit", message: "job reservation admission limit reached" };
     }
     const budget = await ctx.db
       .query("providerBudgets")
@@ -187,7 +212,10 @@ export const ledger = f1Query({
     const reservations = await ctx.db
       .query("reservations")
       .withIndex("by_job", (q) => q.eq("jobId", args.jobId))
-      .collect();
+      .take(MAX_RESERVATIONS_PER_JOB + 1);
+    if (reservations.length > MAX_RESERVATIONS_PER_JOB) {
+      return { ok: false as const, code: "reservation-admission-limit", message: "job reservation history exceeds the bounded contract" };
+    }
     return {
       ok: true as const,
       budget: budget

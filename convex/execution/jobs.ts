@@ -12,11 +12,20 @@
 
 import { v } from "convex/values";
 import type { Id } from "../_generated/dataModel.js";
-import { f1Mutation, f1Query } from "../server.js";
+import { f1Mutation, f1Query, type F1MutationCtx } from "../server.js";
 import { canonicalJson, payloadHash } from "../shared/hashing.js";
 import { sha256HexOfCanonical } from "../shared/sha256.js";
 import { isExpired } from "../shared/time.js";
-import { classifyScope, containsInstructionOverride } from "../shared/scope.js";
+import {
+  classifyScope,
+  containsInstructionOverride,
+  MAX_JOBS_PER_GRANT,
+  MAX_OPERATIONS_PER_JOB,
+  MAX_RESERVATIONS_PER_JOB,
+  validateWorkflowPayload,
+  workflowContextKey,
+  type ProjectWorkflowContext,
+} from "../shared/scope.js";
 import { checkProjectAccess, denialValidator, identityOf, requireCapability } from "../access/checks.js";
 
 const jobKindValidator = v.union(
@@ -35,6 +44,42 @@ const jobViewValidator = v.object({
   cancelledAt: v.optional(v.number()),
   cancelReason: v.optional(v.string()),
 });
+
+const PROJECT_CONTEXT_REQUIREMENT_LIMIT = 32;
+
+async function projectWorkflowContext(
+  ctx: F1MutationCtx,
+  organizationId: Id<"organizations">,
+  projectId: Id<"projects">,
+): Promise<ProjectWorkflowContext | null> {
+  const project = await ctx.db.get(projectId);
+  if (project === null || project.organizationId !== organizationId) return null;
+  const requirements = await ctx.db
+    .query("requirements")
+    .withIndex("by_project", (q) => q.eq("projectId", projectId))
+    .take(PROJECT_CONTEXT_REQUIREMENT_LIMIT);
+  const terms = requirements.flatMap((requirement) => [
+    requirement.key,
+    requirement.title,
+    requirement.category,
+  ]);
+  return {
+    organizationId,
+    projectId,
+    projectName: project.name,
+    terms,
+    hasStructuredContext: requirements.length > 0,
+  };
+}
+
+function parseCanonicalPayload(payload: string): unknown | null {
+  try {
+    const parsed: unknown = JSON.parse(payload);
+    return parsed;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Start a scope-gated job. Unrelated/unavailable requests are refused with
@@ -64,17 +109,10 @@ export const start = f1Mutation({
     if (containsInstructionOverride(args.text)) {
       return { ok: false as const, code: "prompt-injection-denied", message: "supplier evidence cannot expand capabilities" };
     }
-    const classified = classifyScope({
-      text: args.text,
-      ...(args.operationId === undefined ? {} : { operationId: args.operationId }),
-    });
-    if (classified.verdict === "unrelatedRefused") {
-      return { ok: false as const, code: "unrelated-refusal", message: classified.reason };
-    }
-    if (classified.verdict === "unavailableRefused") {
-      return { ok: false as const, code: "unavailable-capability", message: classified.reason };
-    }
-    const operationId = classified.operationId;
+
+    // Resolve project context from server-owned records before classifying the
+    // request. A caller cannot supply a project name, requirement, or topic
+    // to manufacture OpeningOS authority.
     const access = await checkProjectAccess(
       ctx,
       identity,
@@ -84,12 +122,47 @@ export const start = f1Mutation({
       now,
     );
     if (!access.ok) return { ok: false as const, code: access.code, message: access.message };
+    const context = await projectWorkflowContext(ctx, args.organizationId, args.projectId);
+    if (context === null) {
+      return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
+    }
+
+    // Validate an explicitly supplied grant before classification so a grant
+    // payload cannot smuggle an unrelated query through the text path. This
+    // is still a no-write read boundary.
+    const suppliedGrant = args.grantId === undefined ? null : await ctx.db.get(args.grantId);
+    if (args.grantId !== undefined && suppliedGrant === null) {
+      return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
+    }
+    if (
+      suppliedGrant !== null &&
+      (suppliedGrant.organizationId !== args.organizationId || suppliedGrant.projectId !== args.projectId)
+    ) {
+      return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
+    }
+
+    const classified = classifyScope({
+      text: args.text,
+      ...(args.operationId === undefined ? {} : { operationId: args.operationId }),
+      projectContext: context,
+    });
+    if (classified.verdict === "unrelatedRefused") {
+      return { ok: false as const, code: "unrelated-refusal", message: classified.reason };
+    }
+    if (classified.verdict === "unavailableRefused") {
+      return { ok: false as const, code: "unavailable-capability", message: classified.reason };
+    }
+    const operationId = classified.operationId;
     const capability = requireCapability(operationId, access.value);
     if (!capability.ok) {
       return { ok: false as const, code: capability.code, message: capability.message };
     }
 
     const kind = args.kind ?? "research";
+    const expectedKind = classified.purpose === "purchasingCommunication" ? "communication" : "research";
+    if (kind !== expectedKind) {
+      return { ok: false as const, code: "unrelated-refusal", message: "job kind does not match the OpeningOS workflow purpose" };
+    }
     let grantId: Id<"grants"> | undefined = args.grantId;
     let grantVersion = 0;
     let inputVersions: Record<string, string> = {};
@@ -98,7 +171,7 @@ export const start = f1Mutation({
       // organization/project, active, unexpired, and authorizing the
       // classified operation. A foreign, revoked, expired, or
       // non-authorizing grant starts no job.
-      const grant = await ctx.db.get(grantId);
+      const grant = suppliedGrant;
       if (
         grant === null ||
         grant.organizationId !== args.organizationId ||
@@ -114,6 +187,19 @@ export const start = f1Mutation({
       }
       if (!grant.operations.includes(operationId)) {
         return { ok: false as const, code: "denied-capability", message: `grant does not authorize ${operationId}` };
+      }
+      const grantPayload = parseCanonicalPayload(grant.canonicalPayload);
+      if (grantPayload === null) {
+        return { ok: false as const, code: "invalid-payload", message: "grant payload is not valid JSON" };
+      }
+      const purposePayload = validateWorkflowPayload({
+        operationId,
+        purpose: classified.purpose,
+        payload: grantPayload,
+        context,
+      });
+      if (!purposePayload.ok) {
+        return { ok: false as const, code: "unrelated-refusal", message: purposePayload.reason ?? "grant purpose is not supported" };
       }
       grantVersion = grant.revocationVersion;
       inputVersions = { ...grant.inputVersions };
@@ -151,12 +237,28 @@ export const start = f1Mutation({
       grantVersion = 1;
     }
 
+    // A grant can legally contain several operations, but every job remains
+    // a bounded unit of work. Once the finite admission is reached we deny
+    // without creating another job or changing the grant/budget.
+    if (grantId === undefined) {
+      return { ok: false as const, code: "denied-capability", message: "job authority could not be established" };
+    }
+    const grantJobs = await ctx.db
+      .query("jobs")
+      .withIndex("by_grant", (q) => q.eq("grantId", grantId))
+      .take(MAX_JOBS_PER_GRANT + 1);
+    if (grantJobs.length >= MAX_JOBS_PER_GRANT) {
+      return { ok: false as const, code: "job-admission-limit", message: "grant job admission limit reached" };
+    }
+
     const jobId = await ctx.db.insert("jobs", {
       organizationId: args.organizationId,
       projectId: args.projectId,
       grantId,
       grantVersion,
       kind,
+      workflowPurpose: classified.purpose,
+      workflowContext: workflowContextKey(context, classified.purpose),
       state: "queued",
       inputVersions,
       createdAt: now,
@@ -195,7 +297,21 @@ export const cancel = f1Mutation({
     const operations = await ctx.db
       .query("operations")
       .withIndex("by_job", (q) => q.eq("jobId", args.jobId))
-      .collect();
+      .take(MAX_OPERATIONS_PER_JOB + 1);
+    const jobReservations = await ctx.db
+      .query("reservations")
+      .withIndex("by_job", (q) => q.eq("jobId", args.jobId))
+      .take(MAX_RESERVATIONS_PER_JOB + 1);
+    // Admission keeps new jobs below these limits. Legacy or directly seeded
+    // oversized rows fail closed before any patch, so cancellation cannot
+    // partially release exposure or make unknown charges look settled.
+    if (operations.length > MAX_OPERATIONS_PER_JOB || jobReservations.length > MAX_RESERVATIONS_PER_JOB) {
+      return {
+        ok: false as const,
+        code: "cancellation-work-limit",
+        message: "cancellation requires bounded cleanup; unresolved exposure remains held",
+      };
+    }
     const unresolved: Id<"operations">[] = [];
     for (const operation of operations) {
       if (operation.state === "prepared") {
@@ -238,10 +354,6 @@ export const cancel = f1Mutation({
         )
         .map((operation) => operation.reservationId as Id<"reservations">),
     );
-    const jobReservations = await ctx.db
-      .query("reservations")
-      .withIndex("by_job", (q) => q.eq("jobId", args.jobId))
-      .collect();
     for (const reservation of jobReservations) {
       if (reservation.state !== "open" || reservation.reservedMicroUsd <= 0) continue;
       if (reservation.spentMicroUsd > 0 || reservation.unresolvedMicroUsd > 0) continue;

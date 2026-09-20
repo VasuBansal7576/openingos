@@ -658,6 +658,13 @@ export default defineSchema({
       v.literal("communication"),
       v.literal("execution"),
     ),
+    // F1R-20: jobs retain the server-validated OpeningOS purpose and the
+    // organization/project binding used again at operation claim. Optional
+    // keeps legacy controlled rows readable; new jobs always populate both.
+    workflowPurpose: v.optional(
+      v.union(v.literal("purchasingResearch"), v.literal("purchasingCommunication")),
+    ),
+    workflowContext: v.optional(v.string()),
     state: v.union(
       v.literal("queued"),
       v.literal("running"),

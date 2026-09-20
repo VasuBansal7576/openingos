@@ -17,12 +17,23 @@
 
 import { v } from "convex/values";
 import type { Id } from "../_generated/dataModel.js";
-import { f1InternalMutation, f1Mutation, f1Query } from "../server.js";
+import { f1InternalMutation, f1Mutation, f1Query, type F1MutationCtx } from "../server.js";
 import { canonicalJson, parseBoundedPayloadJson, requestKey } from "../shared/hashing.js";
 import { normalizeMailbox } from "../shared/mailbox.js";
 import { sameCanonicalPayload, sha256BindingOk, sha256HexOfCanonical } from "../shared/sha256.js";
 import { isExpired } from "../shared/time.js";
-import { lookupCapability } from "../shared/scope.js";
+import {
+  MAX_JOBS_PER_GRANT,
+  MAX_OPERATIONS_PER_GRANT,
+  MAX_OPERATIONS_PER_JOB,
+  MAX_RESERVATIONS_PER_JOB,
+  lookupCapability,
+  validateWorkflowBinding,
+  validateWorkflowPayload,
+  workflowContextKey,
+  workflowPurposeForOperation,
+  type ProjectWorkflowContext,
+} from "../shared/scope.js";
 import { COMMUNICATION_PROFILE_OWNER_ROLEPLAY } from "../shared/provenance.js";
 import { checkProjectAccess, denialValidator, identityOf, requireCapability } from "../access/checks.js";
 
@@ -67,6 +78,42 @@ function inputVersionsEqual(
   right: Record<string, string>,
 ): boolean {
   return canonicalJson(left) === canonicalJson(right);
+}
+
+const PROJECT_CONTEXT_REQUIREMENT_LIMIT = 32;
+
+async function projectWorkflowContext(
+  ctx: F1MutationCtx,
+  organizationId: Id<"organizations">,
+  projectId: Id<"projects">,
+): Promise<ProjectWorkflowContext | null> {
+  const project = await ctx.db.get(projectId);
+  if (project === null || project.organizationId !== organizationId) return null;
+  const requirements = await ctx.db
+    .query("requirements")
+    .withIndex("by_project", (q) => q.eq("projectId", projectId))
+    .take(PROJECT_CONTEXT_REQUIREMENT_LIMIT);
+  const terms = requirements.flatMap((requirement) => [
+    requirement.key,
+    requirement.title,
+    requirement.category,
+  ]);
+  return {
+    organizationId,
+    projectId,
+    projectName: project.name,
+    terms,
+    hasStructuredContext: requirements.length > 0,
+  };
+}
+
+function parseCanonicalPayload(payload: string): unknown | null {
+  try {
+    const parsed: unknown = JSON.parse(payload);
+    return parsed;
+  } catch {
+    return null;
+  }
 }
 
 const createResultValidator = v.union(
@@ -150,10 +197,52 @@ export const create = f1Mutation({
       return { ok: false as const, code: "denied-capability", message: "operation grant must match the job grant" };
     }
 
+    const context = await projectWorkflowContext(ctx, args.organizationId, args.projectId);
+    if (context === null) {
+      return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
+    }
+    const purpose = workflowPurposeForOperation(args.kind);
+    if (purpose === undefined) {
+      return { ok: false as const, code: "unknown-operation", message: `operation purpose unavailable for ${args.kind}` };
+    }
+    if (
+      job.workflowPurpose !== purpose ||
+      job.workflowContext !== workflowContextKey(context, purpose)
+    ) {
+      return { ok: false as const, code: "unrelated-refusal", message: "job is not bound to this OpeningOS workflow purpose" };
+    }
+
     const parsed = parseBoundedPayloadJson(args.payloadJson);
     if (!parsed.ok) return { ok: false as const, code: parsed.code, message: parsed.message };
     const canonical = parsed.payload.canonical;
     const hash = parsed.payload.hash;
+    const operationPayload = parseCanonicalPayload(canonical);
+    if (operationPayload === null) {
+      return { ok: false as const, code: "invalid-payload", message: "operation payload is not valid JSON" };
+    }
+    const operationPurpose = validateWorkflowBinding({
+      operationId: args.kind,
+      jobPurpose: job.workflowPurpose,
+      jobContext: job.workflowContext,
+      context,
+      payload: operationPayload,
+    });
+    if (!operationPurpose.ok) {
+      return { ok: false as const, code: "unrelated-refusal", message: operationPurpose.reason ?? "operation purpose is not supported" };
+    }
+    const grantPayload = parseCanonicalPayload(grant.canonicalPayload);
+    if (grantPayload === null) {
+      return { ok: false as const, code: "invalid-payload", message: "grant payload is not valid JSON" };
+    }
+    const grantPurpose = validateWorkflowPayload({
+      operationId: args.kind,
+      purpose,
+      payload: grantPayload,
+      context,
+    });
+    if (!grantPurpose.ok) {
+      return { ok: false as const, code: "unrelated-refusal", message: grantPurpose.reason ?? "grant purpose is not supported" };
+    }
     const key = requestKey(args.organizationId, args.kind, args.requestId);
     // Same-request dedupe precedes round-limit rejection: an identical
     // retry returns the one existing operation without consuming another
@@ -178,7 +267,10 @@ export const create = f1Mutation({
     const grantOperations = await ctx.db
       .query("operations")
       .withIndex("by_grant", (q) => q.eq("grantId", args.grantId))
-      .collect();
+      .take(MAX_OPERATIONS_PER_GRANT + 1);
+    if (grantOperations.length >= MAX_OPERATIONS_PER_GRANT) {
+      return { ok: false as const, code: "operation-admission-limit", message: "grant operation admission limit reached" };
+    }
     const roundsUsed = grantOperations.filter(
       (operation) => operation.state !== "cancelled" && operation.state !== "denied",
     ).length;
@@ -212,7 +304,10 @@ export const create = f1Mutation({
       const siblings = await ctx.db
         .query("operations")
         .withIndex("by_job", (q) => q.eq("jobId", args.jobId))
-        .collect();
+        .take(MAX_OPERATIONS_PER_JOB + 1);
+      if (siblings.length >= MAX_OPERATIONS_PER_JOB) {
+        return { ok: false as const, code: "operation-admission-limit", message: "job operation admission limit reached" };
+      }
       const alreadyBound = siblings.some(
         (sibling) =>
           sibling.reservationId === args.reservationId &&
@@ -308,6 +403,12 @@ export const claim = f1InternalMutation({
     if (grant === null) {
       return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
     }
+    if (grant.organizationId !== operation.organizationId || grant.projectId !== operation.projectId) {
+      return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
+    }
+    if (!grant.operations.includes(operation.kind)) {
+      return { ok: false as const, code: "denied-capability", message: `grant does not authorize ${operation.kind}` };
+    }
     if (grant.status !== "active") {
       return { ok: false as const, code: "revoked-grant", message: "grant was revoked" };
     }
@@ -322,6 +423,38 @@ export const claim = f1InternalMutation({
     // job grant's revocation.
     if (operation.grantId !== job.grantId || operation.grantId !== grant._id) {
       return { ok: false as const, code: "denied-capability", message: "operation grant must match the job grant" };
+    }
+
+    const context = await projectWorkflowContext(ctx, operation.organizationId, operation.projectId);
+    if (context === null) {
+      return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
+    }
+    const operationPayload = parseCanonicalPayload(operation.normalizedPayload);
+    if (operationPayload === null) {
+      return { ok: false as const, code: "invalid-payload", message: "operation payload is not valid JSON" };
+    }
+    const purpose = validateWorkflowBinding({
+      operationId: operation.kind,
+      context,
+      payload: operationPayload,
+      ...(job.workflowPurpose === undefined ? {} : { jobPurpose: job.workflowPurpose }),
+      ...(job.workflowContext === undefined ? {} : { jobContext: job.workflowContext }),
+    });
+    if (!purpose.ok) {
+      return { ok: false as const, code: "unrelated-refusal", message: purpose.reason ?? "job purpose is not supported" };
+    }
+    const grantPayload = parseCanonicalPayload(grant.canonicalPayload);
+    if (grantPayload === null) {
+      return { ok: false as const, code: "invalid-payload", message: "grant payload is not valid JSON" };
+    }
+    const grantPurpose = validateWorkflowPayload({
+      operationId: operation.kind,
+      purpose: workflowPurposeForOperation(operation.kind) ?? "purchasingResearch",
+      payload: grantPayload,
+      context,
+    });
+    if (!grantPurpose.ok) {
+      return { ok: false as const, code: "unrelated-refusal", message: grantPurpose.reason ?? "grant purpose is not supported" };
     }
     // F1-22: compare the operation's captured versions against current
     // authority. Coordinated job/grant advancement still stales prepared
@@ -338,13 +471,19 @@ export const claim = f1InternalMutation({
     const grantJobs = await ctx.db
       .query("jobs")
       .withIndex("by_grant", (q) => q.eq("grantId", grant._id))
-      .collect();
+      .take(MAX_JOBS_PER_GRANT + 1);
+    if (grantJobs.length > MAX_JOBS_PER_GRANT) {
+      return { ok: false as const, code: "grant-accounting-limit", message: "grant exposure exceeds the bounded accounting contract" };
+    }
     let grantCommitted = 0;
     for (const grantJob of grantJobs) {
       const grantJobReservations = await ctx.db
         .query("reservations")
         .withIndex("by_job", (q) => q.eq("jobId", grantJob._id))
-        .collect();
+        .take(MAX_RESERVATIONS_PER_JOB + 1);
+      if (grantJobReservations.length > MAX_RESERVATIONS_PER_JOB) {
+        return { ok: false as const, code: "grant-accounting-limit", message: "grant exposure exceeds the bounded accounting contract" };
+      }
       for (const reservation of grantJobReservations) {
         grantCommitted +=
           reservation.reservedMicroUsd + reservation.spentMicroUsd + reservation.unresolvedMicroUsd;
@@ -453,7 +592,10 @@ export const claim = f1InternalMutation({
       const jobOperations = await ctx.db
         .query("operations")
         .withIndex("by_job", (q) => q.eq("jobId", operation.jobId))
-        .collect();
+        .take(MAX_OPERATIONS_PER_JOB + 1);
+      if (jobOperations.length > MAX_OPERATIONS_PER_JOB) {
+        return { ok: false as const, code: "operation-admission-limit", message: "job operation history exceeds the bounded contract" };
+      }
       const doubleBound = jobOperations.some(
         (sibling) =>
           sibling._id !== operation._id &&
