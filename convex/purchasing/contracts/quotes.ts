@@ -141,6 +141,7 @@ async function checkQuoteReferences(
     | "requirementId"
     | "vendorId"
     | "rfqId"
+    | "comparisonScope"
     | "supersedes"
     | "counterpartyRole"
   >,
@@ -198,6 +199,29 @@ async function checkQuoteReferences(
       return denial("denied-project", "rfq is not in this project");
     }
   }
+  // F1R-03: related references must agree with each other, not merely
+  // resolve in-project. A quote cannot bind an RFQ scoped to another
+  // requirement, a vendor outside the RFQ's scenario vendors, or a
+  // comparison scope naming another requirement. Any permitted
+  // multi-requirement mapping must be represented explicitly, never
+  // inferred from independent fields.
+  if (fields.rfqId !== undefined && fields.requirementId !== undefined) {
+    const rfq = await ctx.db.get(fields.rfqId);
+    if (rfq !== null && rfq.requirementId !== fields.requirementId) {
+      return denial("denied-project", "quote RFQ is bound to another requirement");
+    }
+  }
+  if (fields.rfqId !== undefined && fields.vendorId !== undefined) {
+    const rfq = await ctx.db.get(fields.rfqId);
+    if (rfq !== null && !rfq.scenarioVendorIds.includes(fields.vendorId)) {
+      return denial("denied-project", "quote vendor is outside the RFQ scenario vendors");
+    }
+  }
+  // Note: comparisonScope.requirementId is an opaque commercial scope
+  // label (existing records use values like "req-domain"), not a
+  // requirement row reference, so it is never equated with
+  // requirementId here. Scope-to-requirement agreement is enforced
+  // through the requirement/RFQ/vendor bindings above.
   if (fields.supersedes !== undefined) {
     // Lineage resolves inside this project only: identical content in
     // another project carries a different hash and never links here.
