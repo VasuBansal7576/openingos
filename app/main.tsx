@@ -20,6 +20,14 @@ type RuntimeWorkbenchAdapter = WorkbenchServerAdapter & {
   readonly dispose?: () => void;
 };
 
+interface WorkbenchRequestContext {
+  readonly generation: number;
+  readonly projectId: string;
+  readonly adapter: RuntimeWorkbenchAdapter;
+  readonly fence: { requested: number; applied: number };
+  disposed: boolean;
+}
+
 /**
  * Append a validated activity page to the latest snapshot without replacing
  * the other W1 fields with the page response's partial snapshot.
@@ -127,12 +135,19 @@ export function AdapterAwareApp({
   const previousContext = useRef<{ readonly projectId: string | undefined; readonly adapter: RuntimeWorkbenchAdapter | undefined }>({ projectId: undefined, adapter: undefined });
   const backendStatusRef = useRef(backendStatus);
   backendStatusRef.current = backendStatus;
-  // Monotonic fence: every head load, load-more page, and live update takes a
-  // request generation at dispatch/event time; appliedGeneration only moves
-  // forward so a stale page can add unseen items but never regress
-  // continueCursor/isDone. Stale head responses and failures are discarded
-  // entirely against the latest requested generation.
-  const activityFence = useRef({ requested: 0, applied: 0 });
+  // A request context is tied to one project, adapter and connected client
+  // generation. Reconnects, revocations and adapter replacement invalidate the
+  // context before an old load can apply to a fresh snapshot for the same ID.
+  const activeContextRef = useRef<WorkbenchRequestContext | null>(null);
+  const contextGenerationRef = useRef(0);
+  const invalidateActiveContext = () => {
+    const context = activeContextRef.current;
+    if (context === null) return;
+    context.disposed = true;
+    activeContextRef.current = null;
+  };
+  const isCurrentContext = (context: WorkbenchRequestContext): boolean =>
+    activeContextRef.current === context && !context.disposed && backendStatusRef.current === "connected";
 
   useEffect(() => {
     let disposed = false;
@@ -158,69 +173,93 @@ export function AdapterAwareApp({
   }, [backendStatus, projectId, workbenchAdapter]);
 
   useEffect(() => {
+    invalidateActiveContext();
     if (workbenchAdapter === undefined || (resolvedProjectId === undefined && workbenchAdapter.discoverProject === undefined)) {
       setWorkbench(undefined);
       return;
     }
     if (resolvedProjectId === undefined) return;
-    if (backendStatus !== "connected" && backendStatus !== "reconnecting") return;
+    // Keep the last snapshot visible through the outer reconnecting state, but
+    // do not dispatch or retain work under a disconnected client generation.
+    if (backendStatus !== "connected") return;
 
     let disposed = false;
+    const context: WorkbenchRequestContext = {
+      generation: contextGenerationRef.current + 1,
+      projectId: resolvedProjectId,
+      adapter: workbenchAdapter,
+      fence: { requested: 0, applied: 0 },
+      disposed: false,
+    };
+    contextGenerationRef.current = context.generation;
+    activeContextRef.current = context;
+    const isCurrent = () => !disposed && isCurrentContext(context);
+    const nextRequestGeneration = () => {
+      context.fence.requested += 1;
+      return context.fence.requested;
+    };
     const load = async (cursor?: string | null) => {
       if (!disposed) {
-        setWorkbench((current) => current?.state === "ready" && backendStatus === "reconnecting"
-          ? { state: "reconnecting", lastKnown: current.snapshot }
-          : { state: "loading", ...(current?.state === "ready" ? { lastKnown: current.snapshot } : {}) });
+        setWorkbench((current) => ({ state: "loading", ...(current?.state === "ready" ? { lastKnown: current.snapshot } : {}) }));
       }
-      activityFence.current.requested += 1;
-      const loadGeneration = activityFence.current.requested;
+      const loadGeneration = nextRequestGeneration();
       try {
-        const response = await workbenchAdapter.load(resolvedProjectId, cursor);
-        if (disposed || backendStatusRef.current !== "connected") return;
+        const response = await context.adapter.load(context.projectId, cursor);
+        if (!isCurrent()) return;
         // A newer request, page, or live update was dispatched after this
         // head load: discard the stale response entirely so it cannot replace
         // newer head fields or move the activity cursor.
-        if (loadGeneration < activityFence.current.requested) return;
-        const snapshot = response === null ? null : parseWorkbenchSnapshot(response, resolvedProjectId);
+        if (loadGeneration < context.fence.requested) return;
+        const snapshot = response === null ? null : parseWorkbenchSnapshot(response, context.projectId);
         if (snapshot === null) {
-          activityFence.current.applied = loadGeneration;
+          context.fence.applied = loadGeneration;
           setWorkbench({ state: "empty", message: "No authorized project projection is available yet." });
           return;
         }
-        activityFence.current.applied = loadGeneration;
+        context.fence.applied = loadGeneration;
         setWorkbench((current) => {
-          if (current?.state !== "ready" || current.snapshot.project.id !== resolvedProjectId) return { state: "ready", snapshot };
+          if (current?.state !== "ready" || current.snapshot.project.id !== context.projectId) return { state: "ready", snapshot };
           return { state: "ready", snapshot: applyLiveWorkbenchSnapshot(current.snapshot, snapshot) };
         });
       } catch (error) {
-        if (disposed || backendStatusRef.current !== "connected") return;
+        if (!isCurrent()) return;
         // A newer request superseded this head load: a stale failure must not
         // overwrite a newer successful projection with an error.
-        if (loadGeneration < activityFence.current.requested) return;
-        setWorkbench({ state: "error", message: error instanceof Error ? error.message : "The project projection could not be read." });
+        if (loadGeneration < context.fence.requested) return;
+        setWorkbench((current) => ({
+          state: "error",
+          message: error instanceof Error ? error.message : "The project projection could not be read.",
+          ...(current?.state === "ready" ? { lastKnown: current.snapshot } : {}),
+        }));
       }
     };
     void load();
-    const unsubscribe = workbenchAdapter.subscribe?.(
-      resolvedProjectId,
+    const unsubscribe = context.adapter.subscribe?.(
+      context.projectId,
       (response) => {
-        if (disposed || backendStatusRef.current !== "connected") return;
-        const snapshot = response === null ? null : parseWorkbenchSnapshot(response, resolvedProjectId);
-        activityFence.current.requested += 1;
-        activityFence.current.applied = activityFence.current.requested;
+        if (!isCurrent()) return;
+        const snapshot = response === null ? null : parseWorkbenchSnapshot(response, context.projectId);
+        const updateGeneration = nextRequestGeneration();
+        context.fence.applied = updateGeneration;
         setWorkbench((current) => {
           if (snapshot === null) return { state: "empty", message: "No authorized project projection is available yet." };
-          if (current?.state !== "ready" || current.snapshot.project.id !== resolvedProjectId) return { state: "ready", snapshot };
+          if (current?.state !== "ready" || current.snapshot.project.id !== context.projectId) return { state: "ready", snapshot };
           return { state: "ready", snapshot: applyLiveWorkbenchSnapshot(current.snapshot, snapshot) };
         });
       },
       (error: unknown) => {
-        if (disposed || backendStatusRef.current !== "connected") return;
+        if (!isCurrent()) return;
+        // A revoked or malformed subscription invalidates all in-flight loads
+        // for this client generation. A later reconnect creates a new context.
+        context.disposed = true;
+        if (activeContextRef.current === context) activeContextRef.current = null;
         setWorkbench({ state: "error", message: error instanceof Error ? error.message : "The project projection could not be refreshed." });
       },
     );
     return () => {
       disposed = true;
+      context.disposed = true;
+      if (activeContextRef.current === context) activeContextRef.current = null;
       unsubscribe?.();
     };
   }, [backendStatus, resolvedProjectId, workbenchAdapter]);
@@ -241,24 +280,38 @@ export function AdapterAwareApp({
 
   const handleLoadMore = () => {
     if (backendStatusRef.current !== "connected") return;
+    const context = activeContextRef.current;
     const cursor = workbench?.state === "ready" ? workbench.snapshot.activity.continueCursor : null;
-    if (cursor === null || cursor === undefined || workbenchAdapter === undefined || resolvedProjectId === undefined) return;
-    activityFence.current.requested += 1;
-    const requestGeneration = activityFence.current.requested;
-    void workbenchAdapter.load(resolvedProjectId, cursor).then((response) => {
-      if (response === null || backendStatusRef.current !== "connected") return;
-      const snapshot = parseWorkbenchSnapshot(response, resolvedProjectId);
-      if (snapshot === null || backendStatusRef.current !== "connected") return;
+    if (context === null || cursor === null || cursor === undefined || context.projectId !== resolvedProjectId || context.adapter !== workbenchAdapter) return;
+    const requestGeneration = context.fence.requested + 1;
+    context.fence.requested = requestGeneration;
+    void context.adapter.load(context.projectId, cursor).then((response) => {
+      if (!isCurrentContext(context)) return;
+      if (response === null) {
+        if (requestGeneration < context.fence.requested) return;
+        context.fence.applied = requestGeneration;
+        setWorkbench({ state: "empty", message: "No authorized project projection is available yet." });
+        return;
+      }
+      const snapshot = parseWorkbenchSnapshot(response, context.projectId);
+      if (snapshot === null || !isCurrentContext(context)) return;
       setWorkbench((current) => {
-        if (backendStatusRef.current !== "connected") return current;
-        if (current?.state !== "ready" || current.snapshot.project.id !== resolvedProjectId) return { state: "ready", snapshot };
-        const merged = mergeFencedActivityPage(current.snapshot, snapshot, requestGeneration, activityFence.current.applied);
-        activityFence.current.applied = merged.appliedGeneration;
+        if (!isCurrentContext(context)) return current;
+        if (current?.state !== "ready" || current.snapshot.project.id !== context.projectId) return current;
+        const merged = mergeFencedActivityPage(current.snapshot, snapshot, requestGeneration, context.fence.applied);
+        context.fence.applied = merged.appliedGeneration;
         return { state: "ready", snapshot: merged.snapshot };
       });
     }).catch((error: unknown) => {
-      if (backendStatusRef.current !== "connected") return;
-      setWorkbench({ state: "error", message: error instanceof Error ? error.message : "More project activity could not be loaded." });
+      if (!isCurrentContext(context) || requestGeneration < context.fence.requested) return;
+      setWorkbench((current) => {
+        if (current?.state !== "ready" || current.snapshot.project.id !== context.projectId) return current;
+        return {
+          state: "error",
+          message: error instanceof Error ? error.message : "More project activity could not be loaded.",
+          lastKnown: current.snapshot,
+        };
+      });
     });
   };
 

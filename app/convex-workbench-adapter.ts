@@ -38,6 +38,8 @@ const getProjectionReference = makeFunctionReference<
 >("workbench/projection:getProjection");
 
 const WORKBENCH_PROJECTION_LIMIT = 12;
+const PROJECT_DISCOVERY_LIMIT = 1;
+const MAX_PROJECT_DISCOVERY_PAGES = 32;
 
 /** The narrow client surface used by the adapter and its controlled tests. */
 export type ConvexWorkbenchClient = Pick<ConvexReactClient, "query" | "watchQuery">;
@@ -97,10 +99,16 @@ function validatedProjection(value: unknown, projectId: string): unknown | null 
   return parseWorkbenchSnapshot(value, projectId) === null ? null : value;
 }
 
-function parseAccessibleProjectId(value: unknown): string | null {
+interface AccessibleProjectPage {
+  readonly projectId: string | null;
+  readonly continueCursor: string | null;
+  readonly isDone: boolean;
+}
+
+function parseAccessibleProjectPage(value: unknown): AccessibleProjectPage {
   if (!isRecord(value)) throw new Error("Convex returned an invalid accessible-project response.");
   if (containsPrivateProjectionKey(value)) throw new Error("Convex returned an invalid accessible-project response.");
-  if (value.ok === false) return null;
+  if (value.ok === false) return { projectId: null, continueCursor: null, isDone: true };
   if (value.ok !== true) throw new Error("Convex returned an invalid accessible-project response.");
   if (
     !Array.isArray(value.projects) ||
@@ -109,7 +117,14 @@ function parseAccessibleProjectId(value: unknown): string | null {
   ) {
     throw new Error("Convex returned an invalid accessible-project response.");
   }
-  if (value.projects.length === 0) return null;
+  const continueCursor = value.continueCursor === null
+    ? null
+    : typeof value.continueCursor === "string"
+      ? value.continueCursor
+      : null;
+  if (value.projects.length === 0) {
+    return { projectId: null, continueCursor, isDone: value.isDone };
+  }
   const first = value.projects[0];
   if (!isRecord(first)) throw new Error("Convex returned an invalid accessible-project response.");
   const id = requiredString(first.id);
@@ -131,7 +146,7 @@ function parseAccessibleProjectId(value: unknown): string | null {
   ) {
     throw new Error("Convex returned an invalid accessible-project response.");
   }
-  return id;
+  return { projectId: id, continueCursor, isDone: value.isDone };
 }
 
 function noop(): void {}
@@ -154,9 +169,24 @@ export function createConvexWorkbenchAdapter(client: ConvexWorkbenchClient): Con
 
   const discoverProject = async (): Promise<string | null> => {
     if (disposed) return null;
-    const result = await client.query(listAccessibleProjectsReference, { limit: 1 });
-    if (disposed) return null;
-    return parseAccessibleProjectId(result);
+    let cursor: string | undefined;
+    const seenCursors = new Set<string>();
+    for (let pageNumber = 0; pageNumber < MAX_PROJECT_DISCOVERY_PAGES; pageNumber += 1) {
+      const args: W1ListAccessibleProjectsArgs = cursor === undefined
+        ? { limit: PROJECT_DISCOVERY_LIMIT }
+        : { cursor, limit: PROJECT_DISCOVERY_LIMIT };
+      const result = await client.query(listAccessibleProjectsReference, args);
+      if (disposed) return null;
+      const page = parseAccessibleProjectPage(result);
+      if (page.projectId !== null) return page.projectId;
+      if (page.isDone || page.continueCursor === null) return null;
+      if (seenCursors.has(page.continueCursor)) {
+        throw new Error("Convex returned a repeated accessible-project cursor.");
+      }
+      seenCursors.add(page.continueCursor);
+      cursor = page.continueCursor;
+    }
+    throw new Error("Accessible-project discovery exceeded its page safety limit.");
   };
 
   const load = async (projectId: string, cursor?: string | null): Promise<unknown> => {
