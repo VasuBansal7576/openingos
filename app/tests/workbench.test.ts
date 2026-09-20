@@ -24,14 +24,16 @@ const projection = {
     needByAt: Date.UTC(2026, 9, 12),
     createdAt: Date.UTC(2026, 8, 1),
   },
-  effectiveRole: "approver",
-  capabilities: {
-    canResearch: true,
-    canRecordEvidence: true,
-    canRecordQuote: true,
-    canCompare: true,
-    canCommunicate: true,
-    canClarify: true,
+  access: {
+    role: "approver",
+    capabilities: {
+      canResearch: true,
+      canRecordEvidence: true,
+      canRecordQuote: true,
+      canCompare: true,
+      canCommunicate: true,
+      canClarify: true,
+    },
   },
   requirements: [{
     id: "requirement-w1-1",
@@ -139,6 +141,11 @@ test("rejects malformed, cross-project, and private W1 projection payloads", () 
   expect(parseWorkbenchSnapshot({ ...projection, project: { ...projection.project, ownerEmail: "private@example.test" } }, projection.project.id)).toBeNull();
   expect(parseWorkbenchSnapshot({ ...projection, candidates: [{ ...projection.candidates[0], latestValidQuote: { ...projection.candidates[0]!.latestValidQuote!, charges: [{ ...projection.candidates[0]!.latestValidQuote!.charges[0], state: { kind: "known", amount: null } }] } }] }, projection.project.id)).toBeNull();
   expect(parseWorkbenchSnapshot({ ...projection, activity: { ...projection.activity, page: [{ id: "event-w1-1", kind: "quoteRecorded", createdAt: "not-a-time" }] } }, projection.project.id)).toBeNull();
+});
+
+test("rejects the obsolete top-level access fixture", () => {
+  const { access: _access, ...legacyProjection } = projection;
+  expect(parseWorkbenchSnapshot({ ...legacyProjection, effectiveRole: "approver", capabilities: projection.access.capabilities }, projection.project.id)).toBeNull();
 });
 
 test("formats unknown money without turning missing charges into zero", () => {
