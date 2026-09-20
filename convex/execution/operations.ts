@@ -83,7 +83,15 @@ function inputVersionsEqual(
 const PROJECT_CONTEXT_REQUIREMENT_LIMIT = 32;
 const PROJECT_CONTEXT_CONVERSATION_LIMIT = 32;
 
-async function projectWorkflowContext(
+/**
+ * Build bounded workflow context from the newest server-owned project rows.
+ *
+ * The context is deliberately derived from the project and organization
+ * records, never from caller-provided terms.  Descending creation order keeps
+ * a newly qualifying requirement or conversation visible even when a project
+ * has more than the bounded context window of older rows.
+ */
+export async function projectWorkflowContext(
   ctx: F1MutationCtx,
   organizationId: Id<"organizations">,
   projectId: Id<"projects">,
@@ -92,7 +100,10 @@ async function projectWorkflowContext(
   if (project === null || project.organizationId !== organizationId) return null;
   const requirements = await ctx.db
     .query("requirements")
-    .withIndex("by_project", (q) => q.eq("projectId", projectId))
+    .withIndex("by_organization_and_project", (q) =>
+      q.eq("organizationId", organizationId).eq("projectId", projectId),
+    )
+    .order("desc")
     .take(PROJECT_CONTEXT_REQUIREMENT_LIMIT);
   const terms = requirements.flatMap((requirement) => [
     requirement.key,
@@ -101,7 +112,10 @@ async function projectWorkflowContext(
   ]);
   const conversations = await ctx.db
     .query("conversations")
-    .withIndex("by_project", (q) => q.eq("projectId", projectId))
+    .withIndex("by_organization_and_project", (q) =>
+      q.eq("organizationId", organizationId).eq("projectId", projectId),
+    )
+    .order("desc")
     .take(PROJECT_CONTEXT_CONVERSATION_LIMIT);
   let hasPurchasingThread = false;
   for (const conversation of conversations) {

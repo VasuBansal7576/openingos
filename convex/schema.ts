@@ -134,7 +134,8 @@ export default defineSchema({
   })
     .index("by_project", ["projectId"])
     .index("by_project_and_key", ["projectId", "key"])
-    .index("by_project_and_state", ["projectId", "state"]),
+    .index("by_project_and_state", ["projectId", "state"])
+    .index("by_organization_and_project", ["organizationId", "projectId"]),
 
   dependencies: defineTable({
     organizationId: v.id("organizations"),
@@ -695,6 +696,13 @@ export default defineSchema({
     cancellationReservationCursor: v.optional(v.union(v.string(), v.null())),
     cancellationOperationsProcessed: v.optional(v.number()),
     cancellationReservationsProcessed: v.optional(v.number()),
+    // Reconciliation is separate from bounded cleanup completion. The sample
+    // is capped by the execution handler and the count remains the durable
+    // aggregate when more unresolved operations exist than can be returned.
+    cancellationUnresolvedOperationIds: v.optional(v.array(v.id("operations"))),
+    cancellationUnresolvedOperationCount: v.optional(v.number()),
+    cancellationReconciliationComplete: v.optional(v.boolean()),
+    cancellationReconciliationCursor: v.optional(v.union(v.string(), v.null())),
   })
     .index("by_project", ["projectId"])
     .index("by_grant", ["grantId"]),
@@ -850,7 +858,9 @@ export default defineSchema({
     lastReplyAt: v.optional(v.number()),
     cancelledAt: v.optional(v.number()),
     updatedAt: v.number(),
-  }).index("by_project", ["projectId"]),
+  })
+    .index("by_project", ["projectId"])
+    .index("by_organization_and_project", ["organizationId", "projectId"]),
 
   quotes: defineTable({
     organizationId: v.id("organizations"),

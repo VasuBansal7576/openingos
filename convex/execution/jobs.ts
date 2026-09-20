@@ -17,6 +17,7 @@ import {
   f1Query,
   type F1MutationCtx,
 } from "../server.js";
+import { projectWorkflowContext } from "./operations.js";
 import { canonicalJson, payloadHash } from "../shared/hashing.js";
 import { sha256HexOfCanonical } from "../shared/sha256.js";
 import { isExpired } from "../shared/time.js";
@@ -26,7 +27,6 @@ import {
   MAX_JOBS_PER_GRANT,
   validateWorkflowPayload,
   workflowContextKey,
-  type ProjectWorkflowContext,
 } from "../shared/scope.js";
 import { checkProjectAccess, denialValidator, identityOf, requireCapability } from "../access/checks.js";
 
@@ -45,11 +45,14 @@ const jobViewValidator = v.object({
   grantVersion: v.number(),
   cancelledAt: v.optional(v.number()),
   cancelReason: v.optional(v.string()),
+  cancellationPhase: v.optional(v.string()),
+  cancellationUnresolvedOperationIds: v.optional(v.array(v.id("operations"))),
+  cancellationUnresolvedOperationCount: v.optional(v.number()),
+  cancellationReconciliationComplete: v.optional(v.boolean()),
 });
 
-const PROJECT_CONTEXT_REQUIREMENT_LIMIT = 32;
-const PROJECT_CONTEXT_CONVERSATION_LIMIT = 32;
 const CANCELLATION_PAGE_SIZE = 16;
+const CANCELLATION_UNRESOLVED_SAMPLE_LIMIT = 16;
 
 type CancellationPhase = "operations" | "reservations" | "complete";
 
@@ -60,6 +63,10 @@ type CancellationJobProgress = {
   readonly cancellationReservationCursor?: string | null;
   readonly cancellationOperationsProcessed?: number;
   readonly cancellationReservationsProcessed?: number;
+  readonly cancellationUnresolvedOperationIds?: readonly Id<"operations">[];
+  readonly cancellationUnresolvedOperationCount?: number;
+  readonly cancellationReconciliationComplete?: boolean;
+  readonly cancellationReconciliationCursor?: string | null;
   readonly cancelledAt?: number;
 };
 
@@ -69,6 +76,8 @@ const cancellationResultValidator = v.union(
     state: v.string(),
     unresolvedOperationIds: v.array(v.id("operations")),
     complete: v.boolean(),
+    reconciliationComplete: v.boolean(),
+    unresolvedOperationCount: v.number(),
     phase: v.string(),
     processedOperations: v.number(),
     processedReservations: v.number(),
@@ -81,57 +90,12 @@ type CancellationResult = {
   readonly state: string;
   readonly unresolvedOperationIds: Id<"operations">[];
   readonly complete: boolean;
+  readonly reconciliationComplete: boolean;
+  readonly unresolvedOperationCount: number;
   readonly phase: CancellationPhase;
   readonly processedOperations: number;
   readonly processedReservations: number;
 };
-
-async function projectWorkflowContext(
-  ctx: F1MutationCtx,
-  organizationId: Id<"organizations">,
-  projectId: Id<"projects">,
-): Promise<ProjectWorkflowContext | null> {
-  const project = await ctx.db.get(projectId);
-  if (project === null || project.organizationId !== organizationId) return null;
-  const requirements = await ctx.db
-    .query("requirements")
-    .withIndex("by_project", (q) => q.eq("projectId", projectId))
-    .take(PROJECT_CONTEXT_REQUIREMENT_LIMIT);
-  const terms = requirements.flatMap((requirement) => [
-    requirement.key,
-    requirement.title,
-    requirement.category,
-  ]);
-  const conversations = await ctx.db
-    .query("conversations")
-    .withIndex("by_project", (q) => q.eq("projectId", projectId))
-    .take(PROJECT_CONTEXT_CONVERSATION_LIMIT);
-  let hasPurchasingThread = false;
-  for (const conversation of conversations) {
-    if (conversation.state === "cancelled") continue;
-    const grant = await ctx.db.get(conversation.grantId);
-    if (
-      grant !== null &&
-      grant.organizationId === organizationId &&
-      grant.projectId === projectId &&
-      grant.operations.some(
-        (operationId) =>
-          operationId === "communication.send" || operationId === "communication.clarify",
-      )
-    ) {
-      hasPurchasingThread = true;
-      break;
-    }
-  }
-  return {
-    organizationId,
-    projectId,
-    projectName: project.name,
-    terms,
-    hasStructuredContext: requirements.length > 0,
-    hasPurchasingThread,
-  };
-}
 
 function parseCanonicalPayload(payload: string): unknown | null {
   try {
@@ -164,6 +128,51 @@ type CancellationReservation = {
   readonly unresolvedMicroUsd: number;
   readonly state: string;
 };
+
+type UnresolvedSummary = {
+  readonly count: number;
+  readonly ids: Id<"operations">[];
+};
+
+function unresolvedSummary(job: CancellationJobProgress): UnresolvedSummary {
+  return {
+    count: job.cancellationUnresolvedOperationCount ?? 0,
+    ids: [...(job.cancellationUnresolvedOperationIds ?? [])],
+  };
+}
+
+function recordUnresolved(
+  summary: UnresolvedSummary,
+  operationId: Id<"operations">,
+): UnresolvedSummary {
+  if (summary.ids.includes(operationId) || summary.ids.length >= CANCELLATION_UNRESOLVED_SAMPLE_LIMIT) {
+    return { count: summary.count + 1, ids: summary.ids };
+  }
+  return { count: summary.count + 1, ids: [...summary.ids, operationId] };
+}
+
+function cancellationResult(
+  job: CancellationJobProgress,
+  state: string,
+  complete: boolean,
+  phase: CancellationPhase,
+  reconciliationComplete: boolean,
+  processedOperations: number,
+  processedReservations: number,
+): CancellationResult {
+  const summary = unresolvedSummary(job);
+  return {
+    ok: true,
+    state,
+    unresolvedOperationIds: summary.ids,
+    unresolvedOperationCount: summary.count,
+    complete,
+    reconciliationComplete,
+    phase,
+    processedOperations,
+    processedReservations,
+  };
+}
 
 async function releaseUnusedReservation(
   ctx: F1MutationCtx,
@@ -220,14 +229,14 @@ async function processCancellationRows(
   reservations: readonly CancellationReservation[],
   now: number,
 ): Promise<CancellationResult> {
-  const unresolvedOperationIds: Id<"operations">[] = [];
+  let summary = unresolvedSummary(job);
   for (const operation of operations) {
     if (operation.state === "prepared") {
       // Do not release here.  The reservation phase must inspect all
       // operation bindings before it can prove a hold is unused.
       await ctx.db.patch(operation._id, { state: "cancelled", updatedAt: now });
     } else if (operation.state === "dispatching" || operation.state === "outcomeUnknown") {
-      unresolvedOperationIds.push(operation._id);
+      summary = recordUnresolved(summary, operation._id);
     }
   }
   for (const reservation of reservations) {
@@ -240,18 +249,27 @@ async function processCancellationRows(
     cancellationReservationCursor: null,
     cancellationOperationsProcessed: operations.length,
     cancellationReservationsProcessed: reservations.length,
+    cancellationUnresolvedOperationIds: summary.ids,
+    cancellationUnresolvedOperationCount: summary.count,
+    cancellationReconciliationComplete: summary.count === 0,
+    cancellationReconciliationCursor: null,
     ...(job.cancelledAt === undefined ? { cancelledAt: now } : {}),
     updatedAt: now,
   });
-  return {
-    ok: true,
-    state: "cancelled",
-    unresolvedOperationIds,
-    complete: true,
-    phase: "complete",
-    processedOperations: operations.length,
-    processedReservations: reservations.length,
-  };
+  return cancellationResult(
+    {
+      ...job,
+      cancellationUnresolvedOperationIds: summary.ids,
+      cancellationUnresolvedOperationCount: summary.count,
+      cancellationReconciliationComplete: summary.count === 0,
+    },
+    "cancelled",
+    true,
+    "complete",
+    summary.count === 0,
+    operations.length,
+    reservations.length,
+  );
 }
 
 /**
@@ -270,7 +288,7 @@ async function processCancellationPage(
   let reservationCursor = job.cancellationReservationCursor ?? null;
   let processedOperations = job.cancellationOperationsProcessed ?? 0;
   let processedReservations = job.cancellationReservationsProcessed ?? 0;
-  const unresolvedOperationIds: Id<"operations">[] = [];
+  let summary = unresolvedSummary(job);
 
   if (phase === "operations") {
     const page = await ctx.db
@@ -282,7 +300,7 @@ async function processCancellationPage(
       if (operation.state === "prepared") {
         await ctx.db.patch(operation._id, { state: "cancelled", updatedAt: now });
       } else if (operation.state === "dispatching" || operation.state === "outcomeUnknown") {
-        unresolvedOperationIds.push(operation._id);
+        summary = recordUnresolved(summary, operation._id);
       }
     }
     processedOperations += page.page.length;
@@ -319,19 +337,81 @@ async function processCancellationPage(
     cancellationReservationCursor: reservationCursor,
     cancellationOperationsProcessed: processedOperations,
     cancellationReservationsProcessed: processedReservations,
+    cancellationUnresolvedOperationIds: summary.ids,
+    cancellationUnresolvedOperationCount: summary.count,
+    cancellationReconciliationComplete: complete ? summary.count === 0 : false,
+    cancellationReconciliationCursor: null,
     ...(complete && job.cancelledAt === undefined ? { cancelledAt: now } : {}),
     updatedAt: now,
   });
 
-  return {
-    ok: true,
-    state: complete ? "cancelled" : "cancelling",
-    unresolvedOperationIds,
+  return cancellationResult(
+    {
+      ...job,
+      cancellationUnresolvedOperationIds: summary.ids,
+      cancellationUnresolvedOperationCount: summary.count,
+      cancellationReconciliationComplete: complete ? summary.count === 0 : false,
+    },
+    complete ? "cancelled" : "cancelling",
     complete,
     phase,
+    complete && summary.count === 0,
     processedOperations,
     processedReservations,
-  };
+  );
+}
+
+/**
+ * Re-scan one bounded operations page after cancellation cleanup.  Cleanup is
+ * complete even when a provider outcome is still ambiguous, so this phase
+ * keeps the job cancelled while durable reconciliation remains explicitly
+ * incomplete.  A null cursor starts a fresh bounded pass and rebuilds the
+ * count/sample from current operation states.
+ */
+async function processReconciliationPage(
+  ctx: F1MutationCtx,
+  job: CancellationJobProgress,
+  now: number,
+): Promise<CancellationResult> {
+  const cursor = job.cancellationReconciliationCursor ?? null;
+  let summary: UnresolvedSummary =
+    cursor === null ? { count: 0, ids: [] } : unresolvedSummary(job);
+  const page = await ctx.db
+    .query("operations")
+    .withIndex("by_job", (q) => q.eq("jobId", job._id))
+    .order("asc")
+    .paginate({ numItems: CANCELLATION_PAGE_SIZE, cursor });
+  for (const operation of page.page) {
+    if (operation.state === "dispatching" || operation.state === "outcomeUnknown") {
+      summary = recordUnresolved(summary, operation._id);
+    }
+  }
+  const reconciliationComplete = page.isDone && summary.count === 0;
+  const nextCursor = page.isDone ? null : page.continueCursor;
+  await ctx.db.patch(job._id, {
+    state: "cancelled",
+    cancellationPhase: "complete",
+    cancellationReconciliationCursor: nextCursor,
+    cancellationUnresolvedOperationIds: summary.ids,
+    cancellationUnresolvedOperationCount: summary.count,
+    cancellationReconciliationComplete: reconciliationComplete,
+    updatedAt: now,
+  });
+  return cancellationResult(
+    {
+      ...job,
+      cancellationUnresolvedOperationIds: summary.ids,
+      cancellationUnresolvedOperationCount: summary.count,
+      cancellationReconciliationComplete: reconciliationComplete,
+      cancellationReconciliationCursor: nextCursor,
+    },
+    "cancelled",
+    true,
+    "complete",
+    reconciliationComplete,
+    job.cancellationOperationsProcessed ?? 0,
+    job.cancellationReservationsProcessed ?? 0,
+  );
 }
 
 /**
@@ -548,15 +628,21 @@ export const cancel = f1Mutation({
     // A completed cancellation is idempotent.  In-flight provider outcomes
     // may still reconcile against the retained operation/reservation facts.
     if (job.state === "cancelled") {
-      return {
-        ok: true as const,
-        state: "cancelled",
-        unresolvedOperationIds: [],
-        complete: true,
-        phase: "complete",
-        processedOperations: job.cancellationOperationsProcessed ?? 0,
-        processedReservations: job.cancellationReservationsProcessed ?? 0,
-      };
+      if (job.cancellationReconciliationComplete === true) {
+        return cancellationResult(
+          job,
+          "cancelled",
+          true,
+          "complete",
+          true,
+          job.cancellationOperationsProcessed ?? 0,
+          job.cancellationReservationsProcessed ?? 0,
+        );
+      }
+      // A cancelled job is still a valid reconciliation handle.  Repeated
+      // calls rebuild a bounded operation summary after a late provider
+      // outcome instead of forgetting an unresolved earlier page.
+      return processReconciliationPage(ctx, job, now);
     }
 
     // The first write is the durable non-dispatchable fence.  Unlike the
@@ -587,6 +673,10 @@ export const cancel = f1Mutation({
         cancellationReservationCursor: null,
         cancellationOperationsProcessed: 0,
         cancellationReservationsProcessed: 0,
+        cancellationUnresolvedOperationIds: [],
+        cancellationUnresolvedOperationCount: 0,
+        cancellationReconciliationComplete: false,
+        cancellationReconciliationCursor: null,
         updatedAt: now,
       });
       if (smallEnough) {
@@ -604,7 +694,9 @@ export const cancel = f1Mutation({
         ok: true as const,
         state: "cancelling",
         unresolvedOperationIds: [],
+        unresolvedOperationCount: 0,
         complete: false,
+        reconciliationComplete: false,
         phase: "operations",
         processedOperations: 0,
         processedReservations: 0,
@@ -649,6 +741,16 @@ export const get = f1Query({
       grantVersion: job.grantVersion,
       ...(job.cancelledAt === undefined ? {} : { cancelledAt: job.cancelledAt }),
       ...(job.cancelReason === undefined ? {} : { cancelReason: job.cancelReason }),
+      ...(job.cancellationPhase === undefined ? {} : { cancellationPhase: job.cancellationPhase }),
+      ...(job.cancellationUnresolvedOperationIds === undefined
+        ? {}
+        : { cancellationUnresolvedOperationIds: [...job.cancellationUnresolvedOperationIds] }),
+      ...(job.cancellationUnresolvedOperationCount === undefined
+        ? {}
+        : { cancellationUnresolvedOperationCount: job.cancellationUnresolvedOperationCount }),
+      ...(job.cancellationReconciliationComplete === undefined
+        ? {}
+        : { cancellationReconciliationComplete: job.cancellationReconciliationComplete }),
     };
   },
 });
