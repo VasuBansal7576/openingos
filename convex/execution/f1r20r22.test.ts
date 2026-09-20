@@ -114,7 +114,7 @@ const reviewedResendRef = makeFunctionReference<
   MutationReturn<typeof attempts.reviewedResend>
 >("execution/attempts:reviewedResend");
 
-async function setupResearch() {
+async function setupResearch(query = "Research suppliers for espresso equipment") {
   const t = convexTest(schema, modules);
   const identity = { tokenIdentifier: "f1r20r22-owner" };
   const asOwner = t.withIdentity(identity);
@@ -138,7 +138,7 @@ async function setupResearch() {
     communicationProfile: "ownerRoleplay",
     recipientConfigVersion: 0,
     inputVersions: { brief: "v1" },
-    payloadJson: JSON.stringify({ query: "Research suppliers for espresso equipment" }),
+    payloadJson: JSON.stringify({ query }),
     costCeilingMicroUsd: 10_000,
     roundLimit: 1_000,
     expiresAt: Date.now() + 3_600_000,
@@ -613,7 +613,7 @@ describe("F1R-20 allowlisted workflow purpose", () => {
     ).toBe("supported");
   });
 
-  test("the three exact unrelated probes refuse with zero backend effects", async () => {
+  test("unrelated probes refuse with zero backend effects", async () => {
     const setup = await setupResearch();
     const unrelatedGrant = await setup.asOwner.mutation(issueGrantRef, {
       organizationId: setup.organizationId,
@@ -658,20 +658,107 @@ describe("F1R-20 allowlisted workflow purpose", () => {
         kind: "research",
         grantId: unrelatedGrant.grantId,
       },
-      {
-        organizationId: setup.organizationId,
-        projectId: setup.projectId,
-        text: "Research suppliers and tell me a joke",
-        operationId: "research.collect",
-        kind: "research",
-        grantId: setup.grantId,
-      },
     ];
     for (const probe of probes) {
       const result = await setup.asOwner.mutation(startJobRef, probe);
       expect(result.ok).toBe(false);
     }
     expect(await countRows(setup.t)).toEqual(before);
+  });
+
+  test("mixed research executes only the supported segment and reports the refusal", async () => {
+    const setup = await setupResearch("Research espresso-machine suppliers");
+    const started = await setup.asOwner.mutation(startJobRef, {
+      organizationId: setup.organizationId,
+      projectId: setup.projectId,
+      text: "Research espresso-machine suppliers and tell me a joke",
+      operationId: "research.collect",
+      kind: "research",
+      grantId: setup.grantId,
+    });
+    expect(started.ok).toBe(true);
+    if (!started.ok) throw new Error("mixed research job was refused");
+    expect(started.supportedSegment).toBe("Research espresso-machine suppliers");
+    expect(started.refusedSegments).toEqual([
+      {
+        text: "tell me a joke",
+        verdict: "unrelatedRefused",
+        reason: "request-is-not-an-allowlisted-openingos-workflow",
+      },
+    ]);
+
+    const grant = await setup.t.run((ctx) => ctx.db.get(setup.grantId));
+    expect(grant?.operations).toEqual(["research.collect"]);
+    expect(grant?.canonicalPayload).toBe(
+      JSON.stringify({ query: "Research espresso-machine suppliers" }),
+    );
+    const reserved = await setup.asOwner.mutation(reserveRef, {
+      jobId: started.jobId,
+      organizationId: setup.organizationId,
+      projectId: setup.projectId,
+      amountMicroUsd: 100,
+      pricingBasis: "controlled-f1r20r22",
+    });
+    if (!reserved.ok) throw new Error("mixed research reservation failed");
+    const created = await setup.asOwner.mutation(createOperationRef, {
+      jobId: started.jobId,
+      organizationId: setup.organizationId,
+      projectId: setup.projectId,
+      kind: "research.collect",
+      requestId: "f1r20-mixed-research",
+      payloadJson: JSON.stringify({
+        query: "Research espresso-machine suppliers and tell me a joke",
+      }),
+      grantId: setup.grantId,
+      reservationId: reserved.reservationId,
+    });
+    expect(created.ok).toBe(true);
+    if (!created.ok) throw new Error("mixed research operation was refused");
+    const operation = await setup.t.run((ctx) => ctx.db.get(created.operationId));
+    expect(operation?.normalizedPayload).toBe(
+      JSON.stringify({ query: "Research espresso-machine suppliers" }),
+    );
+    const claimed = await setup.t.mutation(claimRef, {
+      operationId: created.operationId,
+      identity: setup.identity.tokenIdentifier,
+    });
+    expect(claimed.ok).toBe(true);
+    expect((await countRows(setup.t)).attempts).toBe(1);
+  });
+
+  test("purely unrelated text creates no job or grant", async () => {
+    const setup = await setupResearch();
+    const before = await countRows(setup.t);
+    const refused = await setup.asOwner.mutation(startJobRef, {
+      organizationId: setup.organizationId,
+      projectId: setup.projectId,
+      text: "Tell me a joke",
+      operationId: "research.collect",
+      kind: "research",
+    });
+    expect(refused.ok).toBe(false);
+    expect(await countRows(setup.t)).toEqual(before);
+  });
+
+  test("unsupported purchase clause stays refused and cannot add purchase authority", async () => {
+    const setup = await setupResearch();
+    const started = await setup.asOwner.mutation(startJobRef, {
+      organizationId: setup.organizationId,
+      projectId: setup.projectId,
+      text: "Research suppliers for espresso equipment and place the equipment order",
+      operationId: "research.collect",
+      kind: "research",
+      grantId: setup.grantId,
+    });
+    expect(started.ok).toBe(true);
+    if (!started.ok) throw new Error("research segment was refused");
+    expect(started.refusedSegments[0]?.verdict).toBe("unavailableRefused");
+    expect(started.refusedSegments[0]?.reason).toBe("operation-unavailable:purchase.placeOrder");
+    const grant = await setup.t.run((ctx) => ctx.db.get(setup.grantId));
+    expect(grant?.operations).toEqual(["research.collect"]);
+    expect(grant?.canonicalPayload).toBe(
+      JSON.stringify({ query: "Research suppliers for espresso equipment" }),
+    );
   });
 
   test("claim rechecks purpose after each unsupported probe is tampered", async () => {
