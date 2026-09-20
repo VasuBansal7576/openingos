@@ -58,6 +58,11 @@ const myProjectRoleRef = makeFunctionReference<
   QueryArgs<typeof memberships.myProjectRole>,
   QueryReturn<typeof memberships.myProjectRole>
 >("access/memberships:myProjectRole");
+const expireMembershipRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof memberships.expireMembership>,
+  MutationReturn<typeof memberships.expireMembership>
+>("access/memberships:expireMembership");
 
 const OWNER = { tokenIdentifier: "membership-regression-owner" };
 const TEMPORARY_APPROVER = { tokenIdentifier: "membership-regression-temporary-approver" };
@@ -132,6 +137,45 @@ async function insertLegacyMembership(
 
 async function membershipCount(t: ReturnType<typeof convexTest>) {
   return t.run((ctx) => ctx.db.query("memberships").collect()).then((rows) => rows.length);
+}
+
+function createKit() {
+  return convexTest(schema, modules);
+}
+
+type Kit = ReturnType<typeof createKit>;
+
+async function authorityCountFor(
+  t: Kit,
+  membershipId: Id<"memberships">,
+): Promise<number> {
+  return t.run(async (ctx) => {
+    const rows = await ctx.db
+      .query("membershipAuthorities")
+      .withIndex("by_membership", (q) => q.eq("membershipId", membershipId))
+      .take(2);
+    return rows.length;
+  });
+}
+
+async function membershipStatus(
+  t: Kit,
+  membershipId: Id<"memberships">,
+): Promise<string | null> {
+  return t.run(async (ctx) => {
+    const row = await ctx.db.get(membershipId);
+    return row?.status ?? null;
+  });
+}
+
+/**
+ * Let real-clock scheduled expiry transitions fire and drain. Temporary
+ * grants in these tests expire ~200ms after creation, so a 1.5s settle
+ * window proves the mutation-time schedule registered and executed.
+ */
+async function settleScheduledExpiries(t: Kit): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 1500));
+  await t.finishInProgressScheduledFunctions();
 }
 
 test("temporary approvers cannot grant access beyond their authority expiry", async () => {
@@ -714,5 +758,244 @@ test("revoke denies inaccessible existing and absent memberships uniformly", asy
     ok: false,
     code: "denied-membership",
     message: "not authorized for this project",
+  });
+});
+
+test("temporary grants schedule expiry while permanent grants and stronger authority persist", async () => {
+  const t = convexTest(schema, modules);
+  const asOwner = t.withIdentity(OWNER);
+  const organization = await asOwner.mutation(createOrganizationRef, {
+    name: "Membership scheduled expiry organization",
+    kind: "private",
+  });
+  if (!organization.ok) throw new Error("organization setup failed");
+  const project = await asOwner.mutation(createProjectRef, {
+    organizationId: organization.organizationId,
+    name: "Scheduled expiry project",
+    visibility: "restricted",
+  });
+  if (!project.ok) throw new Error("project setup failed");
+
+  const expiring = "membership-regression-scheduled-expiring";
+  const steady = "membership-regression-scheduled-steady";
+  const dual = "membership-regression-scheduled-dual";
+  const expiresAt = Date.now() + 200;
+  const grant = {
+    organizationId: organization.organizationId,
+    projectId: project.projectId,
+  };
+
+  const tempViewer = await asOwner.mutation(grantProjectAccessRef, {
+    ...grant,
+    targetIdentity: expiring,
+    role: "viewer",
+    expiresAt,
+  });
+  if (!tempViewer.ok) throw new Error("temporary grant setup failed");
+  const permanentViewer = await asOwner.mutation(grantProjectAccessRef, {
+    ...grant,
+    targetIdentity: steady,
+    role: "viewer",
+  });
+  if (!permanentViewer.ok) throw new Error("permanent grant setup failed");
+  const dualPermanent = await asOwner.mutation(grantProjectAccessRef, {
+    ...grant,
+    targetIdentity: dual,
+    role: "approver",
+  });
+  if (!dualPermanent.ok) throw new Error("dual permanent grant setup failed");
+  const dualTemp = await asOwner.mutation(grantProjectAccessRef, {
+    ...grant,
+    targetIdentity: dual,
+    role: "viewer",
+    expiresAt,
+  });
+  if (!dualTemp.ok) throw new Error("dual temporary grant setup failed");
+
+  for (const [identity, role] of [
+    [expiring, "viewer"],
+    [steady, "viewer"],
+    [dual, "approver"],
+  ] as const) {
+    const before = await t.withIdentity({ tokenIdentifier: identity }).query(myProjectRoleRef, grant);
+    expect(before, identity).toMatchObject({ ok: true, role });
+  }
+
+  await settleScheduledExpiries(t);
+
+  // The scheduled transition revoked the temporary-only grant.
+  const expiredRole = await t.withIdentity({ tokenIdentifier: expiring }).query(myProjectRoleRef, grant);
+  expect(expiredRole).toMatchObject({ ok: false, code: "revoked-membership" });
+  expect(await membershipStatus(t, tempViewer.membershipId)).toBe("revoked");
+  expect(await authorityCountFor(t, tempViewer.membershipId)).toBe(0);
+
+  // Permanent grants schedule nothing, so steady access is untouched.
+  const steadyRole = await t.withIdentity({ tokenIdentifier: steady }).query(myProjectRoleRef, grant);
+  expect(steadyRole).toMatchObject({ ok: true, role: "viewer" });
+  expect(await membershipStatus(t, permanentViewer.membershipId)).toBe("active");
+  expect(await authorityCountFor(t, permanentViewer.membershipId)).toBe(1);
+
+  // The dual identity loses only its exact temporary authority; the
+  // independent permanent approver grant remains valid.
+  const dualRole = await t.withIdentity({ tokenIdentifier: dual }).query(myProjectRoleRef, grant);
+  expect(dualRole).toMatchObject({ ok: true, role: "approver" });
+  expect(await authorityCountFor(t, dualTemp.membershipId)).toBe(0);
+  expect(await authorityCountFor(t, dualPermanent.membershipId)).toBe(1);
+
+  // Repeated expiry on an already-revoked row and expiry on a permanent
+  // row are safe no-ops.
+  expect(await t.mutation(expireMembershipRef, { membershipId: tempViewer.membershipId })).toEqual({
+    ok: true,
+    expired: false,
+  });
+  expect(await t.mutation(expireMembershipRef, { membershipId: permanentViewer.membershipId })).toEqual({
+    ok: true,
+    expired: false,
+  });
+  expect(await t.withIdentity({ tokenIdentifier: steady }).query(myProjectRoleRef, grant)).toMatchObject({
+    ok: true,
+    role: "viewer",
+  });
+  expect(await t.withIdentity({ tokenIdentifier: dual }).query(myProjectRoleRef, grant)).toMatchObject({
+    ok: true,
+    role: "approver",
+  });
+});
+
+test("temporary organization-owner project grants schedule their own expiry", async () => {
+  const t = convexTest(schema, modules);
+  const asOwner = t.withIdentity(OWNER);
+  const organization = await asOwner.mutation(createOrganizationRef, {
+    name: "Membership scheduled project-owner organization",
+    kind: "private",
+  });
+  if (!organization.ok) throw new Error("organization setup failed");
+
+  const temporaryOwner = "membership-regression-scheduled-organization-owner";
+  const authorityExpiry = Date.now() + 200;
+  await insertMembershipWithAuthority(t, {
+    organizationId: organization.organizationId,
+    identity: temporaryOwner,
+    role: "owner",
+    expiresAt: authorityExpiry,
+  });
+
+  const created = await t.withIdentity({ tokenIdentifier: temporaryOwner }).mutation(createProjectRef, {
+    organizationId: organization.organizationId,
+    name: "Scheduled organization owner project",
+    visibility: "restricted",
+  });
+  expect(created).toMatchObject({ ok: true });
+  if (!created.ok) throw new Error("temporary owner project creation failed");
+
+  const stored = await t.run(async (ctx) => {
+    const membership = await ctx.db
+      .query("memberships")
+      .withIndex("by_project_and_identity", (q) =>
+        q.eq("projectId", created.projectId).eq("identity", temporaryOwner),
+      )
+      .unique();
+    if (membership === null) throw new Error("project owner membership missing");
+    return { membershipId: membership._id, membershipExpiresAt: membership.expiresAt };
+  });
+  expect(stored.membershipExpiresAt).toBe(authorityExpiry);
+
+  const beforeExpiry = await t.withIdentity({ tokenIdentifier: temporaryOwner }).query(myProjectRoleRef, {
+    organizationId: organization.organizationId,
+    projectId: created.projectId,
+  });
+  expect(beforeExpiry).toMatchObject({ ok: true, role: "owner" });
+
+  await settleScheduledExpiries(t);
+
+  const afterExpiry = await t.withIdentity({ tokenIdentifier: temporaryOwner }).query(myProjectRoleRef, {
+    organizationId: organization.organizationId,
+    projectId: created.projectId,
+  });
+  expect(afterExpiry.ok).toBe(false);
+  expect(await membershipStatus(t, stored.membershipId)).toBe("revoked");
+  expect(await authorityCountFor(t, stored.membershipId)).toBe(0);
+  expect(await t.mutation(expireMembershipRef, { membershipId: stored.membershipId })).toEqual({
+    ok: true,
+    expired: false,
+  });
+});
+
+test("expiry execution is safe when early, permanent, or membership-scoped to a missing row", async () => {
+  const t = convexTest(schema, modules);
+  const asOwner = t.withIdentity(OWNER);
+  const organization = await asOwner.mutation(createOrganizationRef, {
+    name: "Membership expiry safety organization",
+    kind: "private",
+  });
+  if (!organization.ok) throw new Error("organization setup failed");
+  const project = await asOwner.mutation(createProjectRef, {
+    organizationId: organization.organizationId,
+    name: "Expiry safety project",
+    visibility: "restricted",
+  });
+  if (!project.ok) throw new Error("project setup failed");
+  const grant = {
+    organizationId: organization.organizationId,
+    projectId: project.projectId,
+  };
+
+  const early = await asOwner.mutation(grantProjectAccessRef, {
+    ...grant,
+    targetIdentity: "membership-regression-expiry-early",
+    role: "viewer",
+    expiresAt: Date.now() + 400,
+  });
+  if (!early.ok) throw new Error("early grant setup failed");
+  const permanent = await asOwner.mutation(grantProjectAccessRef, {
+    ...grant,
+    targetIdentity: "membership-regression-expiry-permanent",
+    role: "viewer",
+  });
+  if (!permanent.ok) throw new Error("permanent grant setup failed");
+  const ghost = await asOwner.mutation(grantProjectAccessRef, {
+    ...grant,
+    targetIdentity: "membership-regression-expiry-ghost",
+    role: "viewer",
+  });
+  if (!ghost.ok) throw new Error("ghost grant setup failed");
+
+  // Executing before the stored expiry is a no-op that keeps authority.
+  expect(await t.mutation(expireMembershipRef, { membershipId: early.membershipId })).toEqual({
+    ok: true,
+    expired: false,
+  });
+  expect(await t.withIdentity({ tokenIdentifier: "membership-regression-expiry-early" }).query(myProjectRoleRef, grant)).toMatchObject({
+    ok: true,
+    role: "viewer",
+  });
+  expect(await authorityCountFor(t, early.membershipId)).toBe(1);
+
+  // Permanent memberships never expire through this transition.
+  expect(await t.mutation(expireMembershipRef, { membershipId: permanent.membershipId })).toEqual({
+    ok: true,
+    expired: false,
+  });
+
+  // A missing membership row is a no-op scoped to that id: unrelated and
+  // orphaned authority rows are left alone.
+  await t.run((ctx) => ctx.db.delete(ghost.membershipId));
+  expect(await t.mutation(expireMembershipRef, { membershipId: ghost.membershipId })).toEqual({
+    ok: true,
+    expired: false,
+  });
+  expect(await authorityCountFor(t, ghost.membershipId)).toBe(1);
+  expect(await authorityCountFor(t, early.membershipId)).toBe(1);
+  expect(await authorityCountFor(t, permanent.membershipId)).toBe(1);
+
+  // The early grant's own scheduled transition still lands afterwards while
+  // the permanent grant stays current.
+  await settleScheduledExpiries(t);
+  expect(await t.withIdentity({ tokenIdentifier: "membership-regression-expiry-early" }).query(myProjectRoleRef, grant)).toMatchObject({
+    ok: false,
+  });
+  expect(await t.withIdentity({ tokenIdentifier: "membership-regression-expiry-permanent" }).query(myProjectRoleRef, grant)).toMatchObject({
+    ok: true,
+    role: "viewer",
   });
 });

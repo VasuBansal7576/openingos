@@ -597,7 +597,8 @@ function containsPrivateEquipmentKey(value: unknown): boolean {
 
 function optionalNonEmptyString(value: unknown): string | null | undefined {
   if (value === undefined || value === null) return null;
-  if (typeof value !== "string" || value.trim().length === 0) return undefined;
+  if (typeof value !== "string") return undefined;
+  if (value.trim().length === 0) return null;
   return value;
 }
 

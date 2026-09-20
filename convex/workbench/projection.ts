@@ -890,6 +890,10 @@ export const listAccessibleProjects = f1Query({
     } catch {
       return { ok: false as const, code: "invalid-payload", message: "invalid authority cursor" };
     }
+    // Reactive invalidation arrives through the scheduled
+    // access/memberships:expireMembership state mutation, which removes the
+    // expired membership's authority projection; this server-clock read is
+    // only the defensive fence for rows whose transition has not committed.
     const now = Date.now();
     const projects: Array<ReturnType<typeof readProjectSummary> extends Promise<infer Summary>
       ? Summary & { readonly access: ReturnType<typeof accessView> }
@@ -936,6 +940,10 @@ export const getProjection = f1Query({
     if (identity === null) return { ok: false as const, code: "forged-identity", message: "unauthenticated" };
     const project = await ctx.db.get(args.projectId);
     if (project === null) return denialForProject();
+    // Reactive invalidation arrives through the scheduled
+    // access/memberships:expireMembership state mutation, which revokes the
+    // expired membership row this guard reads; the server clock here is only
+    // the defensive fence for rows whose transition has not committed.
     const access = await checkProjectAccess(ctx, identity, project.organizationId, project._id, "viewer", Date.now());
     if (!access.ok) return denialForProject();
     const pageSize = boundedLimit(args.limit, MAX_ACTIVITY_PAGE);

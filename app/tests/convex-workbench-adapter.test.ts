@@ -4,6 +4,7 @@ import {
   createConvexWorkbenchAdapter,
   type ConvexWorkbenchClient,
 } from "../convex-workbench-adapter";
+import { parseWorkbenchSnapshot } from "../workbench-state";
 
 function projection(projectId = "project-1"): Record<string, unknown> {
   return {
@@ -215,4 +216,82 @@ test("keeps unsupported actions explicitly unavailable without querying or sendi
   });
   expect(queryArgs).toHaveLength(0);
   expect(watchArgs).toHaveLength(0);
+});
+
+function assetFixture(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: "asset-e1-1",
+    label: "Atlas 2G espresso machine",
+    serial: "ATLAS-0042",
+    constraints: "Requires water filtration",
+    purchaseProvenance: "Order ord-7",
+    createdAt: 100,
+    documents: [{ kind: "warranty", createdAt: 110 }],
+    documentsTruncated: false,
+    serviceCases: [{
+      id: "case-e1-1",
+      urgency: "high",
+      summary: "Pressure fault on group head",
+      state: "open",
+      outcome: "Replaced heating element",
+      createdAt: 120,
+      updatedAt: 130,
+    }],
+    serviceCasesTruncated: false,
+    ...overrides,
+  };
+}
+
+function projectionWithAssets(assets: unknown): Record<string, unknown> {
+  return { ...projection(), equipment: { assets, assetsTruncated: false } };
+}
+
+async function loadWithAssets(assets: unknown): Promise<unknown> {
+  const controls = controlledWatch(() => projectionWithAssets(assets));
+  const adapter = createConvexWorkbenchAdapter(fakeClient(projectionWithAssets(assets), controls.watch, [], []));
+  return adapter.load("project-1");
+}
+
+test("treats empty or whitespace optional display metadata as absent instead of dropping the projection", async () => {
+  const payload = projectionWithAssets([
+    assetFixture({ serial: "", constraints: "   ", purchaseProvenance: "" }),
+    assetFixture({
+      id: "asset-e1-2",
+      serial: "   ",
+      constraints: "",
+      purchaseProvenance: "  ",
+      serviceCases: [{
+        id: "case-e1-2",
+        urgency: "low",
+        summary: "Annual descale reminder",
+        state: "open",
+        outcome: "",
+        createdAt: 140,
+        updatedAt: 140,
+      }],
+    }),
+  ]);
+  await expect(loadWithAssets(payload.equipment && (payload.equipment as Record<string, unknown>).assets)).resolves.toEqual(payload);
+
+  const snapshot = parseWorkbenchSnapshot(payload, "project-1");
+  if (snapshot === null) throw new Error("Equipment with blank optional fields should parse.");
+  expect(snapshot.equipment.assets).toHaveLength(2);
+  expect(snapshot.equipment.assets[0]?.serial).toBeNull();
+  expect(snapshot.equipment.assets[0]?.constraints).toBeNull();
+  expect(snapshot.equipment.assets[0]?.purchaseProvenance).toBeNull();
+  expect(snapshot.equipment.assets[0]?.serviceCases[0]?.outcome).toBe("Replaced heating element");
+  expect(snapshot.equipment.assets[1]?.serial).toBeNull();
+  expect(snapshot.equipment.assets[1]?.constraints).toBeNull();
+  expect(snapshot.equipment.assets[1]?.purchaseProvenance).toBeNull();
+  expect(snapshot.equipment.assets[1]?.serviceCases[0]?.outcome).toBeNull();
+});
+
+test("rejects defined non-string optional display metadata", async () => {
+  const seededCase = assetFixture().serviceCases as ReadonlyArray<Record<string, unknown>>;
+  await expect(loadWithAssets([assetFixture({ serial: 42 })])).resolves.toBeNull();
+  await expect(loadWithAssets([assetFixture({ constraints: { text: "220V" } })])).resolves.toBeNull();
+  await expect(loadWithAssets([assetFixture({ purchaseProvenance: false })])).resolves.toBeNull();
+  await expect(loadWithAssets([assetFixture({
+    serviceCases: [{ ...seededCase[0], outcome: 42 }],
+  })])).resolves.toBeNull();
 });

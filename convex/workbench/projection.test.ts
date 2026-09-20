@@ -61,6 +61,16 @@ const createProjectRef = makeFunctionReference<
   MutationArgs<typeof memberships.createProject>,
   MutationReturn<typeof memberships.createProject>
 >("access/memberships:createProject");
+const grantProjectAccessRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof memberships.grantProjectAccess>,
+  MutationReturn<typeof memberships.grantProjectAccess>
+>("access/memberships:grantProjectAccess");
+const expireMembershipRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof memberships.expireMembership>,
+  MutationReturn<typeof memberships.expireMembership>
+>("access/memberships:expireMembership");
 const createRequirementRef = makeFunctionReference<
   "mutation",
   MutationArgs<typeof requirements.create>,
@@ -732,5 +742,103 @@ describe("E1 equipment and service projection", () => {
     expect(result.decisions.length).toBeGreaterThan(0);
     expect(result.equipment.assets).toEqual([]);
     expect(result.equipment.assetsTruncated).toBe(false);
+  });
+});
+
+describe("W1 scheduled membership expiry", () => {
+  test("expiry transition denies project list and projection while stronger authority remains", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, OWNER, "expiry");
+    const asOwner = t.withIdentity(OWNER);
+    const grant = { organizationId: project.organizationId, projectId: project.projectId };
+    const solo = "workbench-expiry-solo";
+    const dual = "workbench-expiry-dual";
+    const expiresAt = Date.now() + 200;
+
+    const soloTemp = await asOwner.mutation(grantProjectAccessRef, {
+      ...grant,
+      targetIdentity: solo,
+      role: "viewer",
+      expiresAt,
+    });
+    if (!soloTemp.ok) throw new Error(`solo grant setup failed: ${JSON.stringify(soloTemp)}`);
+    const dualPermanent = await asOwner.mutation(grantProjectAccessRef, {
+      ...grant,
+      targetIdentity: dual,
+      role: "approver",
+    });
+    if (!dualPermanent.ok) throw new Error(`dual permanent setup failed: ${JSON.stringify(dualPermanent)}`);
+    const dualTemp = await asOwner.mutation(grantProjectAccessRef, {
+      ...grant,
+      targetIdentity: dual,
+      role: "viewer",
+      expiresAt,
+    });
+    if (!dualTemp.ok) throw new Error(`dual temporary setup failed: ${JSON.stringify(dualTemp)}`);
+
+    const soloListBefore = await t.withIdentity({ tokenIdentifier: solo }).query(listProjectsRef, { limit: 10 });
+    expect(soloListBefore.ok).toBe(true);
+    if (!soloListBefore.ok) throw new Error("solo list denied before expiry");
+    expect(soloListBefore.projects.map((item) => item.id)).toContain(project.projectId);
+    const soloProjectionBefore = await t.withIdentity({ tokenIdentifier: solo }).query(getProjectionRef, {
+      projectId: project.projectId,
+      limit: 1,
+    });
+    expect(soloProjectionBefore.ok).toBe(true);
+
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    await t.finishInProgressScheduledFunctions();
+
+    // The transition removes exactly the expired authorities.
+    const remaining = await t.run(async (ctx) => {
+      const countFor = async (membershipId: Id<"memberships">) =>
+        (
+          await ctx.db
+            .query("membershipAuthorities")
+            .withIndex("by_membership", (q) => q.eq("membershipId", membershipId))
+            .take(2)
+        ).length;
+      return {
+        solo: await countFor(soloTemp.membershipId),
+        dualTemp: await countFor(dualTemp.membershipId),
+        dualPermanent: await countFor(dualPermanent.membershipId),
+      };
+    });
+    expect(remaining).toEqual({ solo: 0, dualTemp: 0, dualPermanent: 1 });
+
+    // The temporary-only identity loses both surfaces.
+    const soloListAfter = await t.withIdentity({ tokenIdentifier: solo }).query(listProjectsRef, { limit: 10 });
+    expect(soloListAfter.ok).toBe(true);
+    if (!soloListAfter.ok) throw new Error("solo list denied after expiry");
+    expect(soloListAfter.projects.map((item) => item.id)).not.toContain(project.projectId);
+    const soloProjectionAfter = await t.withIdentity({ tokenIdentifier: solo }).query(getProjectionRef, {
+      projectId: project.projectId,
+      limit: 1,
+    });
+    expect(soloProjectionAfter).toEqual({
+      ok: false,
+      code: "denied-membership",
+      message: "not authorized for this project",
+    });
+
+    // The dual identity keeps both surfaces through its independent
+    // permanent approver grant.
+    const dualListAfter = await t.withIdentity({ tokenIdentifier: dual }).query(listProjectsRef, { limit: 10 });
+    expect(dualListAfter.ok).toBe(true);
+    if (!dualListAfter.ok) throw new Error("dual list denied after expiry");
+    expect(dualListAfter.projects.map((item) => item.id)).toContain(project.projectId);
+    const dualProjectionAfter = await t.withIdentity({ tokenIdentifier: dual }).query(getProjectionRef, {
+      projectId: project.projectId,
+      limit: 1,
+    });
+    expect(dualProjectionAfter.ok).toBe(true);
+    if (!dualProjectionAfter.ok) throw new Error("dual projection denied after expiry");
+    expect(dualProjectionAfter.access.role).toBe("approver");
+
+    // Repeated expiry on the revoked row stays a safe no-op.
+    expect(await t.mutation(expireMembershipRef, { membershipId: soloTemp.membershipId })).toEqual({
+      ok: true,
+      expired: false,
+    });
   });
 });
