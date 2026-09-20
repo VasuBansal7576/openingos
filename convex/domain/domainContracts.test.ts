@@ -12,6 +12,7 @@ import { describe, expect, test } from "bun:test";
 import {
   CONTROLLED_COUNTERPARTY_ROLES,
   TEMPLATE_REUSE_COLLECTIONS,
+  acceptanceLineInputValidator,
   approvalInputValidator,
   assetDocumentInputValidator,
   assetInputValidator,
@@ -22,6 +23,7 @@ import {
   costEntryInputValidator,
   dependencyCreatesCycle,
   dependencyInputValidator,
+  financialEvidenceRefValidator,
   inboundClassificationValidator,
   isActionableApproval,
   isReusableFreshness,
@@ -30,10 +32,13 @@ import {
   jevDecisionValidator,
   locationInputValidator,
   negotiationInputValidator,
+  normalizeLineQuantity,
+  normalizeLineUnit,
   openAIDraftValidator,
   openAIExtractionValidator,
   orderEventInputValidator,
   orderInputValidator,
+  orderLineInputValidator,
   outboundBriefValidator,
   productEvidenceInputValidator,
   projectEventInputValidator,
@@ -43,8 +48,11 @@ import {
   researchCollectionValidator,
   rfqInputValidator,
   riskInputValidator,
+  scopedLineUnit,
   selectionInputValidator,
+  selectionLineInputValidator,
   serviceCaseInputValidator,
+  sortLinesById,
   templateInputValidator,
   templateReuseExcludesHistoricFinancials,
   uiProjectionValidator,
@@ -157,6 +165,63 @@ describe("immutable version and idempotency keys", () => {
     expect(selectionInputValidator.fields.idempotencyKey).toBeDefined();
     expect(selectionInputValidator.fields.quoteVersion).toBeDefined();
     expect(selectionInputValidator.fields.requirementVersion).toBeDefined();
+  });
+
+  test("selections, orders, and events carry explicit line arrays with units", () => {
+    expect(selectionLineInputValidator.fields.quoteLineId).toBeDefined();
+    expect(selectionLineInputValidator.fields.quantity).toBeDefined();
+    expect(selectionLineInputValidator.fields.unit).toBeDefined();
+    expect(orderLineInputValidator.fields.quoteLineId).toBeDefined();
+    expect(orderLineInputValidator.fields.quantity).toBeDefined();
+    expect(orderLineInputValidator.fields.unit).toBeDefined();
+    expect(acceptanceLineInputValidator.fields.quoteLineId).toBeDefined();
+    expect(acceptanceLineInputValidator.fields.acceptedQuantity).toBeDefined();
+    expect(acceptanceLineInputValidator.fields.unit).toBeDefined();
+    expect("selectionLines" in selectionInputValidator.fields).toBe(true);
+    expect("orderLines" in orderInputValidator.fields).toBe(true);
+    expect("acceptanceLines" in orderEventInputValidator.fields).toBe(true);
+  });
+
+  test("cost entries carry line, affected quantity, and evidence lineage", () => {
+    expect("quoteLineId" in costEntryInputValidator.fields).toBe(true);
+    expect("affectedQuantity" in costEntryInputValidator.fields).toBe(true);
+    expect("affectedUnit" in costEntryInputValidator.fields).toBe(true);
+    expect("evidenceRefs" in costEntryInputValidator.fields).toBe(true);
+    expect(financialEvidenceRefValidator.fields.evidenceId).toBeDefined();
+    expect(financialEvidenceRefValidator.fields.contentHash).toBeDefined();
+  });
+
+  test("line normalization keeps canonical decimals and requires units", () => {
+    expect(normalizeLineQuantity("2.0", "qty")).toBe("2");
+    expect(normalizeLineQuantity("8.00", "qty")).toBe("8");
+    expect(normalizeLineUnit(" piece ", "unit")).toBe("piece");
+    expect(() => normalizeLineQuantity("0", "qty")).toThrow();
+    expect(() => normalizeLineQuantity("abc", "qty")).toThrow();
+    expect(() => normalizeLineUnit("  ", "unit")).toThrow();
+  });
+
+  test("line replay order is deterministic and scope units resolve", () => {
+    const lines = [
+      { quoteLineId: "machine", quantity: "2", unit: "piece" },
+      { quoteLineId: "chair", quantity: "10", unit: "piece" },
+    ];
+    expect(sortLinesById([...lines].reverse()).map((line) => line.quoteLineId)).toEqual([
+      "chair",
+      "machine",
+    ]);
+    expect(
+      scopedLineUnit(
+        { items: [{ lineId: "machine", unit: "piece" }] },
+        "machine",
+      ),
+    ).toBe("piece");
+    expect(
+      scopedLineUnit(
+        { items: [{ lineId: "machine", unit: "piece" }] },
+        "ghost",
+      ),
+    ).toBeUndefined();
+    expect(scopedLineUnit(undefined, "machine")).toBeUndefined();
   });
 });
 
