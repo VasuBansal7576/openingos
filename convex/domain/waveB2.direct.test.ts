@@ -21,6 +21,7 @@ import { describe, expect, test } from "vitest";
 import {
   makeFunctionReference,
   type RegisteredMutation,
+  type RegisteredQuery,
 } from "convex/server";
 import type { Id } from "../_generated/dataModel.js";
 import schema from "../schema.js";
@@ -29,6 +30,7 @@ import * as quotes from "../purchasing/contracts/quotes.js";
 import * as requirements from "./requirements.js";
 import * as sourcing from "./sourcing.js";
 import * as workspace from "./workspace.js";
+import { COMPATIBILITY_RULE_VERSION } from "../shared/domainContracts.js";
 
 const rawModules = import.meta.glob([
   "../access/**/*.ts",
@@ -57,6 +59,8 @@ for (const [path, loader] of Object.entries(rawModules)) {
 
 type MutationArgs<T> = T extends RegisteredMutation<infer _V, infer A, infer _R> ? A : never;
 type MutationReturn<T> = T extends RegisteredMutation<infer _V, infer _A, infer R> ? R : never;
+type QueryArgs<T> = T extends RegisteredQuery<infer _V, infer A, infer _R> ? A : never;
+type QueryReturn<T> = T extends RegisteredQuery<infer _V, infer _A, infer R> ? R : never;
 
 const createOrganizationRef = makeFunctionReference<
   "mutation",
@@ -83,6 +87,11 @@ const recordCandidateRef = makeFunctionReference<
   MutationArgs<typeof sourcing.recordCandidate>,
   MutationReturn<typeof sourcing.recordCandidate>
 >("domain/sourcing:recordCandidate");
+const listCandidatesRef = makeFunctionReference<
+  "query",
+  QueryArgs<typeof sourcing.listCandidates>,
+  QueryReturn<typeof sourcing.listCandidates>
+>("domain/sourcing:listCandidates");
 const recordProductEvidenceRef = makeFunctionReference<
   "mutation",
   MutationArgs<typeof sourcing.recordProductEvidence>,
@@ -528,6 +537,17 @@ describe("F1R-06 compatibility binds resolving versioned evidence", () => {
         .take(sourcing.MAX_COMPATIBILITY_FANOUT + 1),
     );
     expect(indexed).toHaveLength(2);
+    const historicalCandidateId = candidateIds[1];
+    if (historicalCandidateId === undefined) throw new Error("historical candidate missing");
+    await t.run(async (ctx) => {
+      await ctx.db.patch(historicalCandidateId, {
+        compatibility: "pass",
+        compatibilityEvidenceRefs: [{ sourceId: shared.evidenceId, version: sharedVersion }],
+        compatibilityRequirementVersion: 1,
+        compatibilityRuleVersion: COMPATIBILITY_RULE_VERSION,
+        compatibilityEvidenceIndexComplete: undefined,
+      });
+    });
     const conflicting = await recordFieldEvidence(
       t,
       project,
@@ -544,6 +564,15 @@ describe("F1R-06 compatibility binds resolving versioned evidence", () => {
     expect(disputed.ok).toBe(true);
     expect((await t.run((ctx) => ctx.db.get(graph.candidateId)))?.compatibility).toBe("unknown");
     expect((await t.run((ctx) => ctx.db.get(tailCandidateId)))?.compatibility).toBe("unknown");
+    const listed = await t.withIdentity(OWNER).query(listCandidatesRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      requirementId: graph.requirementId,
+      limit: 50,
+    });
+    if (!listed.ok) throw new Error("candidate list failed");
+    expect(listed.candidates.find((candidate) => candidate.id === historicalCandidateId)?.compatibility)
+      .toBe("unknown");
 
     // The candidate-specific index remains independently addressable after
     // the shared requirement evidence has been disputed.
@@ -567,7 +596,52 @@ describe("F1R-06 compatibility binds resolving versioned evidence", () => {
     expect((await t.run((ctx) => ctx.db.get(tailCandidateId)))?.compatibility).toBe("unknown");
   });
 
-  test("fanout above the integrity bound is denied before evidence or pass rows change", async () => {
+  test("bounds multi-evidence fanout preflight before the fifth source", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, "compat-evidence-ref-boundary");
+    const graph = await setupGraph(t, project, "evidence-ref-boundary");
+    const refs: { sourceId: string; version: string }[] = [];
+    for (let index = 0; index < sourcing.MAX_COMPATIBILITY_EVIDENCE_REFS; index += 1) {
+      const evidence = await recordFieldEvidence(
+        t,
+        project,
+        { requirementId: graph.requirementId },
+        `compat-evidence-ref-boundary-${index}`,
+      );
+      if (!evidence.ok) throw new Error("evidence setup failed");
+      refs.push({
+        sourceId: evidence.evidenceId,
+        version: await resolveVerified(t, project, evidence.evidenceId),
+      });
+    }
+    expect((await verify(t, project, graph.candidateId, refs)).ok).toBe(true);
+    const committed = await t.run((ctx) => ctx.db.get(graph.candidateId));
+
+    const fifthEvidence = await recordFieldEvidence(
+      t,
+      project,
+      { requirementId: graph.requirementId },
+      "compat-evidence-ref-boundary-fifth",
+    );
+    if (!fifthEvidence.ok) throw new Error("fifth evidence setup failed");
+    refs.push({
+      sourceId: fifthEvidence.evidenceId,
+      version: await resolveVerified(t, project, fifthEvidence.evidenceId),
+    });
+    const denied = await verify(t, project, graph.candidateId, refs);
+    expect(denied.ok).toBe(false);
+    if (!denied.ok) expect(denied.code).toBe("invalid-payload");
+    expect(await t.run((ctx) => ctx.db.get(graph.candidateId))).toEqual(committed);
+    const bindings = await t.run((ctx) =>
+      ctx.db
+        .query("compatibilityEvidenceBindings")
+        .withIndex("by_candidate_and_evidence", (q) => q.eq("candidateId", graph.candidateId))
+        .take(sourcing.MAX_COMPATIBILITY_EVIDENCE_REFS + 1),
+    );
+    expect(bindings).toHaveLength(sourcing.MAX_COMPATIBILITY_EVIDENCE_REFS);
+  });
+
+  test("the 257th dependent binding is denied before candidate or index writes", async () => {
     const t = convexTest(schema, modules);
     const project = await setupProject(t, "compat-fanout-boundary");
     const asOwner = t.withIdentity(OWNER);
@@ -576,6 +650,7 @@ describe("F1R-06 compatibility binds resolving versioned evidence", () => {
     if (!shared.ok) throw new Error("shared evidence setup failed");
     const version = await resolveVerified(t, project, shared.evidenceId);
     const count = sourcing.MAX_COMPATIBILITY_FANOUT + 1;
+    const candidateIds: Id<"candidates">[] = [graph.candidateId];
     for (let index = 1; index < count; index += 1) {
       const created = await asOwner.mutation(recordCandidateRef, {
         organizationId: project.orgId,
@@ -587,40 +662,58 @@ describe("F1R-06 compatibility binds resolving versioned evidence", () => {
         conversationState: "draft",
       });
       if (!created.ok) throw new Error("candidate setup failed");
+      candidateIds.push(created.candidateId);
     }
-    await t.run(async (ctx) => {
-      const candidates = await ctx.db
-        .query("candidates")
-        .withIndex("by_requirement", (q) => q.eq("requirementId", graph.requirementId))
-        .take(count);
-      expect(candidates).toHaveLength(count);
-      for (const candidate of candidates) {
-        await ctx.db.patch(candidate._id, {
-          compatibility: "pass",
-          compatibilityEvidenceRefs: [{ sourceId: shared.evidenceId, version }],
-        });
-      }
+    expect(candidateIds).toHaveLength(count);
+    for (const candidateId of candidateIds.slice(0, sourcing.MAX_COMPATIBILITY_FANOUT)) {
+      expect((await verify(t, project, candidateId, [
+        { sourceId: shared.evidenceId, version },
+      ])).ok).toBe(true);
+    }
+    const lastCandidateId = candidateIds[candidateIds.length - 1];
+    if (lastCandidateId === undefined) throw new Error("last candidate missing");
+    const beforeLastCandidate = await t.run((ctx) => ctx.db.get(lastCandidateId));
+    const beforeBindings = await t.run((ctx) =>
+      ctx.db
+        .query("compatibilityEvidenceBindings")
+        .withIndex("by_evidence", (q) => q.eq("evidenceId", shared.evidenceId))
+        .take(sourcing.MAX_COMPATIBILITY_FANOUT + 1),
+    );
+    expect(beforeBindings).toHaveLength(sourcing.MAX_COMPATIBILITY_FANOUT);
+    const deniedBinding = await asOwner.mutation(verifyCompatibilityRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      candidateId: lastCandidateId,
+      result: "pass",
+      evidenceRefs: [{ sourceId: shared.evidenceId, version }],
     });
-    const beforeEvidence = await t.run((ctx) => ctx.db.get(shared.evidenceId));
+    expect(deniedBinding.ok).toBe(false);
+    if (!deniedBinding.ok) expect(deniedBinding.code).toBe("invalid-payload");
+    expect(await t.run((ctx) => ctx.db.get(lastCandidateId))).toEqual(beforeLastCandidate);
+    const afterDeniedBindings = await t.run((ctx) =>
+      ctx.db
+        .query("compatibilityEvidenceBindings")
+        .withIndex("by_evidence", (q) => q.eq("evidenceId", shared.evidenceId))
+        .take(sourcing.MAX_COMPATIBILITY_FANOUT + 1),
+    );
+    expect(afterDeniedBindings).toEqual(beforeBindings);
+
     const conflicting = await recordFieldEvidence(t, project, { requirementId: graph.requirementId }, "compat-fanout-boundary-conflict");
     if (!conflicting.ok) throw new Error("conflicting evidence setup failed");
-    const denied = await asOwner.mutation(linkEvidenceConflictRef, {
+    const disputed = await asOwner.mutation(linkEvidenceConflictRef, {
       organizationId: project.orgId,
       projectId: project.projectId,
       evidenceId: shared.evidenceId,
       conflictingIds: [conflicting.evidenceId],
     });
-    expect(denied.ok).toBe(false);
-    if (!denied.ok) expect(denied.code).toBe("invalid-payload");
-    const afterEvidence = await t.run((ctx) => ctx.db.get(shared.evidenceId));
-    expect(afterEvidence).toEqual(beforeEvidence);
+    expect(disputed.ok).toBe(true);
     const rows = await t.run((ctx) =>
       ctx.db
         .query("candidates")
         .withIndex("by_requirement", (q) => q.eq("requirementId", graph.requirementId))
         .take(count),
     );
-    expect(rows.every((row) => row.compatibility === "pass")).toBe(true);
+    expect(rows.every((row) => row.compatibility === "unknown")).toBe(true);
   });
 });
 
@@ -688,7 +781,7 @@ describe("F1R-07 replays compare the full material snapshot", () => {
       originalValue: "220V",
       normalizedValue: "220V",
       freshness: "fresh" as const,
-      lastCheckedAt: 7,
+      lastCheckedAt: 100,
       counterpartyRole: "vendor" as const,
       idempotencyKey: "replay-legacy-identity",
     };
@@ -713,7 +806,56 @@ describe("F1R-07 replays compare the full material snapshot", () => {
     });
     expect(changedFreshness.ok).toBe(false);
     if (!changedFreshness.ok) expect(changedFreshness.code).toBe("duplicate-conflict");
+    const changedCheckTime = await t.withIdentity(OWNER).mutation(recordProductEvidenceRef, {
+      ...args,
+      lastCheckedAt: 200,
+    });
+    expect(changedCheckTime.ok).toBe(false);
+    if (!changedCheckTime.ok) expect(changedCheckTime.code).toBe("duplicate-conflict");
   });
+
+  test.each(["public", "internal"] as const)(
+    "pre-resolved legacy %s evidence without a captured identity fails closed",
+    async (route) => {
+      const t = convexTest(schema, modules);
+      const project = await setupProject(t, `replay-legacy-ambiguous-${route}`);
+      const baseArgs = {
+        organizationId: project.orgId,
+        projectId: project.projectId,
+        field: "power",
+        sourceKind: "manual",
+        capturedAt: 1,
+        originalValue: "220V",
+        normalizedValue: "220V",
+        freshness: "fresh" as const,
+        lastCheckedAt: 100,
+        counterpartyRole: "vendor" as const,
+        idempotencyKey: `replay-legacy-ambiguous-${route}`,
+      };
+      const invoke = route === "internal"
+        ? async (value: typeof baseArgs) =>
+            t.mutation(ingestProductEvidenceRef, { ...value, executionMode: "recorded" as const })
+        : async (value: typeof baseArgs) =>
+            t.withIdentity(OWNER).mutation(recordProductEvidenceRef, value);
+      const first = await invoke(baseArgs);
+      expect(first.ok).toBe(true);
+      if (!first.ok) throw new Error("legacy evidence setup failed");
+      await t.run(async (ctx) => {
+        await ctx.db.patch(first.evidenceId, {
+          ingestionIdentity: undefined,
+          verification: "verified",
+          lastCheckedAt: 200,
+          version: "2",
+          legacyReplayIdentity: undefined,
+        });
+      });
+      const before = await t.run((ctx) => ctx.db.get(first.evidenceId));
+      const replay = await invoke(baseArgs);
+      expect(replay.ok).toBe(false);
+      if (!replay.ok) expect(replay.code).toBe("duplicate-conflict");
+      expect(await t.run((ctx) => ctx.db.get(first.evidenceId))).toEqual(before);
+    },
+  );
 
   test("each omitted evidence field conflicts on the public path", async () => {
     const t = convexTest(schema, modules);

@@ -196,6 +196,10 @@ export default defineSchema({
     // rule version — so later input changes can be detected as stale.
     compatibilityRequirementVersion: v.optional(v.number()),
     compatibilityRuleVersion: v.optional(v.string()),
+    // F1R-06: current writes maintain a complete reverse index for the
+    // cited evidence refs. Historical rows without this marker fail closed
+    // at the list projection until they are re-verified.
+    compatibilityEvidenceIndexComplete: v.optional(v.boolean()),
     conversationState: v.union(
       v.literal("draft"),
       v.literal("awaitingReply"),
@@ -247,6 +251,10 @@ export default defineSchema({
     // freshness, and status projections may change without changing replay
     // identity, while any material ingestion input still conflicts.
     ingestionIdentity: v.optional(v.string()),
+    // F1R-07 migration bridge: a current deployment captures the legacy
+    // replay identity before mutating an old row, or records explicit
+    // ambiguity when that original check-time value is already unavailable.
+    legacyReplayIdentity: v.optional(v.string()),
     // F1R-06: explicit evidence revision. Compatibility findings bind
     // the exact version they were decided against; any verification or
     // freshness change bumps it so outstanding refs go stale.
