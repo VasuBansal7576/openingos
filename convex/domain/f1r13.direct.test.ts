@@ -279,6 +279,7 @@ async function recordMachineQuote(
   machineQty: string,
   suffix: string,
   supersedes?: string,
+  omitScope = false,
 ) {
   return t.withIdentity(OWNER).mutation(recordQuoteRef, {
     organizationId: project.orgId,
@@ -296,11 +297,15 @@ async function recordMachineQuote(
     ],
     charges: [],
     taxBasis: { kind: "inclusive" as const, basisId: "NL-EUR-INCLUSIVE", evidenceRefs: [] },
-    comparisonScope: {
-      requirementId: `req-${suffix}`,
-      scopeId: `scope-${suffix}-single`,
-      items: [{ itemId: "machine", lineId: "machine", unit: "piece", requiredQuantity: machineQty }],
-    },
+    ...(omitScope
+      ? {}
+      : {
+        comparisonScope: {
+          requirementId: `req-${suffix}`,
+          scopeId: `scope-${suffix}-single`,
+          items: [{ itemId: "machine", lineId: "machine", unit: "piece", requiredQuantity: machineQty }],
+        },
+      }),
     evidenceRefs: [],
     requirementId: refs.requirementId,
     vendorId: refs.vendorId,
@@ -1566,5 +1571,704 @@ describe("cost-entry exclusive pairing over the link index", () => {
 
     const counts = await tableCounts(t, project);
     expect(counts.entries).toBe(16);
+  });
+});
+
+describe("F1R-14 cumulative per-line commitment caps across orders", () => {
+  test("split orders share one allowance; excess denies with no writes", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, "cumulative");
+    const graph = await setupTwoLineGraph(t, project, "cumulative");
+    const asOwner = t.withIdentity(OWNER);
+    const select = (idempotencyKey: string) => asOwner.mutation(recordSelectionRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      requirementId: graph.requirementId,
+      candidateId: graph.candidateId,
+      quoteId: graph.quoteId,
+      quoteVersion: "v-cumulative",
+      selectionLines: [
+        { quoteLineId: "machine", quantity: "2", unit: "piece" },
+        { quoteLineId: "chair", quantity: "10", unit: "piece" },
+      ],
+      requirementVersion: 1,
+      idempotencyKey,
+    });
+    const selection = await select("sel-cumulative");
+    if (!selection.ok) throw new Error("selection setup failed");
+    const order = (key: string, lines: { quoteLineId: string; quantity: string; unit: string }[]) =>
+      asOwner.mutation(recordOrderRef, {
+        organizationId: project.orgId,
+        projectId: project.projectId,
+        selectionId: selection.selectionId,
+        idempotencyKey: key,
+        orderLines: lines,
+      });
+
+    // Valid split: 1 + 1 machines cover the selected pair together.
+    const first = await order("ord-split-1", [{ quoteLineId: "machine", quantity: "1", unit: "piece" }]);
+    if (!first.ok) throw new Error(`first split failed: ${JSON.stringify(first)}`);
+    const second = await order("ord-split-2", [{ quoteLineId: "machine", quantity: "1", unit: "piece" }]);
+    if (!second.ok) throw new Error(`second split failed: ${JSON.stringify(second)}`);
+
+    // A third machine exceeds the cumulative allowance: no write.
+    const before = await tableCounts(t, project);
+    const excess = await order("ord-split-3", [{ quoteLineId: "machine", quantity: "1", unit: "piece" }]);
+    expect(excess).toMatchObject({ ok: false, code: "invalid-payload" });
+    expect(await tableCounts(t, project)).toEqual(before);
+
+    // Exact replay of a committed split still deduplicates.
+    const replay = await order("ord-split-1", [{ quoteLineId: "machine", quantity: "1.0", unit: "piece" }]);
+    if (!replay.ok) throw new Error("split replay failed");
+    expect(replay.deduplicated).toBe(true);
+    expect(replay.orderId).toBe(first.orderId);
+  });
+
+  test("an exact-full first order blocks any second order", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, "cumulative-full");
+    const graph = await setupTwoLineGraph(t, project, "cumulative-full");
+    const asOwner = t.withIdentity(OWNER);
+    const selection = await asOwner.mutation(recordSelectionRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      requirementId: graph.requirementId,
+      candidateId: graph.candidateId,
+      quoteId: graph.quoteId,
+      quoteVersion: "v-cumulative-full",
+      selectionLines: [
+        { quoteLineId: "machine", quantity: "2", unit: "piece" },
+        { quoteLineId: "chair", quantity: "10", unit: "piece" },
+      ],
+      requirementVersion: 1,
+      idempotencyKey: "sel-full",
+    });
+    if (!selection.ok) throw new Error("selection setup failed");
+    const full = await asOwner.mutation(recordOrderRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      selectionId: selection.selectionId,
+      idempotencyKey: "ord-full",
+      orderLines: [{ quoteLineId: "machine", quantity: "2", unit: "piece" }],
+    });
+    if (!full.ok) throw new Error("full order failed");
+    const before = await tableCounts(t, project);
+    const extra = await asOwner.mutation(recordOrderRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      selectionId: selection.selectionId,
+      idempotencyKey: "ord-extra",
+      orderLines: [{ quoteLineId: "machine", quantity: "1", unit: "piece" }],
+    });
+    expect(extra).toMatchObject({ ok: false, code: "invalid-payload" });
+    expect(await tableCounts(t, project)).toEqual(before);
+  });
+
+  test("concurrent excess orders commit exactly once", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, "cumulative-race");
+    const graph = await setupTwoLineGraph(t, project, "cumulative-race");
+    const asOwner = t.withIdentity(OWNER);
+    const selection = await asOwner.mutation(recordSelectionRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      requirementId: graph.requirementId,
+      candidateId: graph.candidateId,
+      quoteId: graph.quoteId,
+      quoteVersion: "v-cumulative-race",
+      selectionLines: [
+        { quoteLineId: "machine", quantity: "2", unit: "piece" },
+        { quoteLineId: "chair", quantity: "10", unit: "piece" },
+      ],
+      requirementVersion: 1,
+      idempotencyKey: "sel-race",
+    });
+    if (!selection.ok) throw new Error("selection setup failed");
+    const attempt = (key: string) => asOwner.mutation(recordOrderRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      selectionId: selection.selectionId,
+      idempotencyKey: key,
+      orderLines: [{ quoteLineId: "machine", quantity: "2", unit: "piece" }],
+    });
+    const results = await Promise.all([attempt("ord-race-a"), attempt("ord-race-b")]);
+    expect(results.filter((r) => r.ok)).toHaveLength(1);
+    const rows = await t.run((ctx) => ctx.db.query("orders").collect());
+    expect(rows.filter((row) => row.projectId === project.projectId)).toHaveLength(1);
+  });
+
+  test("scalar legacy orders accumulate against the same cap", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, "cumulative-scalar");
+    const graph = await setupTwoLineGraph(t, project, "cumulative-scalar");
+    const asOwner = t.withIdentity(OWNER);
+    const single = await recordMachineQuote(t, project, graph, "v-scalar", "2", "cumulative-scalar");
+    if (!single.ok) throw new Error("single-line quote setup failed");
+    const selection = await asOwner.mutation(recordSelectionRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      requirementId: graph.requirementId,
+      candidateId: graph.candidateId,
+      quoteId: single.quoteId,
+      quoteVersion: "v-scalar",
+      quantity: "2",
+      requirementVersion: 1,
+      idempotencyKey: "sel-scalar",
+    });
+    if (!selection.ok) throw new Error("selection setup failed");
+    const order = (key: string, orderedQuantity: string) => asOwner.mutation(recordOrderRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      selectionId: selection.selectionId,
+      idempotencyKey: key,
+      orderedQuantity,
+    });
+    const first = await order("ord-scalar-1", "1");
+    if (!first.ok) throw new Error("first scalar order failed");
+    const before = await tableCounts(t, project);
+    expect(await order("ord-scalar-2", "2")).toMatchObject({ ok: false, code: "invalid-payload" });
+    expect(await tableCounts(t, project)).toEqual(before);
+    const replay = await order("ord-scalar-1", "1.0");
+    if (!replay.ok) throw new Error("scalar replay failed");
+    expect(replay.deduplicated).toBe(true);
+    const second = await order("ord-scalar-3", "1");
+    if (!second.ok) throw new Error(`second scalar split failed: ${JSON.stringify(second)}`);
+  });
+});
+
+describe("F1R-15 adjustment quantity and unit bind to the order line", () => {
+  test("affected quantity is capped by the ordered line; exact and partial pass", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, "adjust-cap");
+    const graph = await setupTwoLineGraph(t, project, "adjust-cap");
+    const asOwner = t.withIdentity(OWNER);
+    const selection = await asOwner.mutation(recordSelectionRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      requirementId: graph.requirementId,
+      candidateId: graph.candidateId,
+      quoteId: graph.quoteId,
+      quoteVersion: "v-adjust-cap",
+      selectionLines: [
+        { quoteLineId: "machine", quantity: "2", unit: "piece" },
+        { quoteLineId: "chair", quantity: "10", unit: "piece" },
+      ],
+      requirementVersion: 1,
+      idempotencyKey: "sel-adjust-cap",
+    });
+    if (!selection.ok) throw new Error("selection setup failed");
+    const order = await asOwner.mutation(recordOrderRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      selectionId: selection.selectionId,
+      idempotencyKey: "ord-adjust-cap",
+      orderLines: [
+        { quoteLineId: "machine", quantity: "2", unit: "piece" },
+        { quoteLineId: "chair", quantity: "8", unit: "piece" },
+      ],
+    });
+    if (!order.ok) throw new Error("order setup failed");
+    const noteHash = await sha256Hex("adjust-cap-note");
+    const note = await asOwner.mutation(recordEvidenceRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      sourceKind: "supplier-credit-note",
+      contentHash: noteHash,
+      completeness: "complete",
+    });
+    if (!note.ok) throw new Error("evidence setup failed");
+    const refs = [{ evidenceId: note.evidenceId, contentHash: noteHash }];
+    const credit = (key: string, extra: Record<string, unknown>) => asOwner.mutation(recordCostEntryRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      orderId: order.orderId,
+      kind: "credit",
+      amount: { currency: "EUR", minorUnits: 5000 },
+      idempotencyKey: key,
+      quoteLineId: "machine",
+      affectedQuantity: "2",
+      affectedUnit: "piece",
+      evidenceRefs: refs,
+      ...extra,
+    });
+    // 999 machines on an order for two writes nothing.
+    const before = await tableCounts(t, project);
+    expect(await credit("credit-excess", { affectedQuantity: "999" })).toMatchObject({ ok: false, code: "invalid-payload" });
+    expect(await tableCounts(t, project)).toEqual(before);
+    // Exact (2 of 2) and partial quantities pass.
+    const exact = await credit("credit-exact", {});
+    if (!exact.ok) throw new Error(`exact credit failed: ${JSON.stringify(exact)}`);
+    const partial = await asOwner.mutation(recordCostEntryRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      orderId: order.orderId,
+      kind: "credit",
+      amount: { currency: "EUR", minorUnits: 5000 },
+      idempotencyKey: "credit-partial",
+      quoteLineId: "chair",
+      affectedQuantity: "3",
+      affectedUnit: "piece",
+      evidenceRefs: refs,
+    });
+    if (!partial.ok) throw new Error(`partial credit failed: ${JSON.stringify(partial)}`);
+  });
+
+  test("scope-less quotes still bind the affected unit to the order line", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, "adjust-scope");
+    const graph = await setupTwoLineGraph(t, project, "adjust-scope");
+    const asOwner = t.withIdentity(OWNER);
+    const single = await recordMachineQuote(t, project, graph, "v-no-scope", "1", "adjust-scope", undefined, true);
+    if (!single.ok) throw new Error(`scope-less quote failed: ${JSON.stringify(single)}`);
+    const lines = [{ quoteLineId: "machine", quantity: "1", unit: "piece" }];
+    const selection = await asOwner.mutation(recordSelectionRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      requirementId: graph.requirementId,
+      candidateId: graph.candidateId,
+      quoteId: single.quoteId,
+      quoteVersion: "v-no-scope",
+      requirementVersion: 1,
+      selectionLines: lines,
+      idempotencyKey: "sel-no-scope",
+    });
+    if (!selection.ok) throw new Error("selection setup failed");
+    const order = await asOwner.mutation(recordOrderRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      selectionId: selection.selectionId,
+      orderLines: lines,
+      idempotencyKey: "ord-no-scope",
+    });
+    if (!order.ok) throw new Error("order setup failed");
+    const noteHash = await sha256Hex("no-scope-note");
+    const note = await asOwner.mutation(recordEvidenceRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      sourceKind: "supplier-credit-note",
+      contentHash: noteHash,
+      completeness: "complete",
+    });
+    if (!note.ok) throw new Error("evidence setup failed");
+    const refs = [{ evidenceId: note.evidenceId, contentHash: noteHash }];
+    const base = {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      orderId: order.orderId,
+      kind: "credit" as const,
+      amount: { currency: "EUR", minorUnits: 5000 },
+      quoteLineId: "machine",
+      affectedQuantity: "1",
+      evidenceRefs: refs,
+    };
+    const before = await tableCounts(t, project);
+    expect(
+      await asOwner.mutation(recordCostEntryRef, { ...base, affectedUnit: "litre", idempotencyKey: "credit-litre" }),
+    ).toMatchObject({ ok: false, code: "invalid-payload" });
+    expect(await tableCounts(t, project)).toEqual(before);
+    const matching = await asOwner.mutation(recordCostEntryRef, { ...base, affectedUnit: "piece", idempotencyKey: "credit-piece" });
+    if (!matching.ok) throw new Error(`matching credit failed: ${JSON.stringify(matching)}`);
+  });
+
+  test("legacy unit-less order lines accept any nonempty affected unit", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, "adjust-legacy-unit");
+    const graph = await setupTwoLineGraph(t, project, "adjust-legacy-unit");
+    const asOwner = t.withIdentity(OWNER);
+    const single = await recordMachineQuote(t, project, graph, "v-legacy-unit", "1", "adjust-legacy-unit", undefined, true);
+    if (!single.ok) throw new Error("scope-less quote setup failed");
+    const selection = await asOwner.mutation(recordSelectionRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      requirementId: graph.requirementId,
+      candidateId: graph.candidateId,
+      quoteId: single.quoteId,
+      quoteVersion: "v-legacy-unit",
+      quantity: "1",
+      requirementVersion: 1,
+      idempotencyKey: "sel-legacy-unit",
+    });
+    if (!selection.ok) throw new Error("selection setup failed");
+    const order = await asOwner.mutation(recordOrderRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      selectionId: selection.selectionId,
+      idempotencyKey: "ord-legacy-unit",
+      orderedQuantity: "1",
+    });
+    if (!order.ok) throw new Error("order setup failed");
+    const storedOrder = await t.run((ctx) => ctx.db.get(order.orderId));
+    expect(storedOrder?.orderLines?.[0]?.unit).toBe("");
+    const noteHash = await sha256Hex("legacy-unit-note");
+    const note = await asOwner.mutation(recordEvidenceRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      sourceKind: "supplier-credit-note",
+      contentHash: noteHash,
+      completeness: "complete",
+    });
+    if (!note.ok) throw new Error("evidence setup failed");
+    const credit = await asOwner.mutation(recordCostEntryRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      orderId: order.orderId,
+      kind: "credit",
+      amount: { currency: "EUR", minorUnits: 5000 },
+      idempotencyKey: "credit-legacy-unit",
+      quoteLineId: "machine",
+      affectedQuantity: "1",
+      affectedUnit: "widget",
+      evidenceRefs: [{ evidenceId: note.evidenceId, contentHash: noteHash }],
+    });
+    if (!credit.ok) throw new Error(`legacy-unit credit failed: ${JSON.stringify(credit)}`);
+  });
+});
+
+describe("F1R-16 reload stays truthful at the history bound", () => {
+  test("199 and 200 histories are complete; 201 is explicitly incomplete", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, "reload-bound");
+    const graph = await setupTwoLineGraph(t, project, "reload-bound");
+    const asOwner = t.withIdentity(OWNER);
+    const single = await recordMachineQuote(t, project, graph, "v-bound", "1", "reload-bound");
+    if (!single.ok) throw new Error("quote setup failed");
+    const selection = await asOwner.mutation(recordSelectionRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      requirementId: graph.requirementId,
+      candidateId: graph.candidateId,
+      quoteId: single.quoteId,
+      quoteVersion: "v-bound",
+      quantity: "1",
+      requirementVersion: 1,
+      idempotencyKey: "sel-bound",
+    });
+    if (!selection.ok) throw new Error("selection setup failed");
+    const order = await asOwner.mutation(recordOrderRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      selectionId: selection.selectionId,
+      idempotencyKey: "ord-bound",
+      orderedQuantity: "1",
+    });
+    if (!order.ok) throw new Error("order setup failed");
+    const accept = (i: number) => asOwner.mutation(appendOrderEventRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      orderId: order.orderId,
+      kind: "acceptance",
+      acceptedQuantity: "0.001",
+      idempotencyKey: `evt-bound-${i}`,
+    });
+    for (let i = 0; i < 199; i += 1) {
+      const event = await accept(i);
+      if (!event.ok) throw new Error(`event ${i} failed`);
+    }
+    const at199 = await asOwner.query(getOrderLineageRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      orderId: order.orderId,
+    });
+    if (!at199.ok) throw new Error("199-event lineage failed");
+    expect(at199.acceptedByLine).toEqual([{ quoteLineId: "machine", acceptedQuantity: "0.199", unit: "piece" }]);
+    expect(at199.events).toHaveLength(199);
+    for (let i = 199; i < 200; i += 1) {
+      const event = await accept(i);
+      if (!event.ok) throw new Error(`event ${i} failed`);
+    }
+    const at200 = await asOwner.query(getOrderLineageRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      orderId: order.orderId,
+    });
+    if (!at200.ok) throw new Error("200-event lineage failed");
+    expect(at200.acceptedByLine).toEqual([{ quoteLineId: "machine", acceptedQuantity: "0.2", unit: "piece" }]);
+    const overflow = await accept(200);
+    if (!overflow.ok) throw new Error("201st event failed");
+    // The 201st acceptance persists, but reload refuses to present a
+    // prefix aggregate as authoritative.
+    const stored = await t.run((ctx) => ctx.db.query("orderEvents").collect());
+    expect(stored.filter((row) => row.projectId === project.projectId)).toHaveLength(201);
+    const at201 = await asOwner.query(getOrderLineageRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      orderId: order.orderId,
+    });
+    expect(at201).toMatchObject({ ok: false, code: "incomplete-history" });
+    // Access controls still deny before any history reasoning.
+    const stranger = await t.withIdentity(STRANGER).query(getOrderLineageRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      orderId: order.orderId,
+    });
+    expect(stranger.ok).toBe(false);
+  });
+
+  test("200 entries stay complete; a boundary-spanning linked pair is incomplete", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, "reload-entries");
+    const graph = await setupTwoLineGraph(t, project, "reload-entries");
+    const asOwner = t.withIdentity(OWNER);
+    const selection = await asOwner.mutation(recordSelectionRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      requirementId: graph.requirementId,
+      candidateId: graph.candidateId,
+      quoteId: graph.quoteId,
+      quoteVersion: "v-reload-entries",
+      selectionLines: [
+        { quoteLineId: "machine", quantity: "2", unit: "piece" },
+        { quoteLineId: "chair", quantity: "10", unit: "piece" },
+      ],
+      requirementVersion: 1,
+      idempotencyKey: "sel-reload-entries",
+    });
+    if (!selection.ok) throw new Error("selection setup failed");
+    const order = await asOwner.mutation(recordOrderRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      selectionId: selection.selectionId,
+      idempotencyKey: "ord-reload-entries",
+      orderLines: [
+        { quoteLineId: "machine", quantity: "2", unit: "piece" },
+        { quoteLineId: "chair", quantity: "8", unit: "piece" },
+      ],
+    });
+    if (!order.ok) throw new Error("order setup failed");
+    for (let i = 0; i < 199; i += 1) {
+      const payment = await asOwner.mutation(recordCostEntryRef, {
+        organizationId: project.orgId,
+        projectId: project.projectId,
+        orderId: order.orderId,
+        kind: "payment",
+        amount: { currency: "EUR", minorUnits: 1 },
+        idempotencyKey: `pay-bound-${i}`,
+      });
+      if (!payment.ok) throw new Error(`payment ${i} failed`);
+    }
+    const noteHash = await sha256Hex("boundary-note");
+    const note = await asOwner.mutation(recordEvidenceRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      sourceKind: "supplier-credit-note",
+      contentHash: noteHash,
+      completeness: "complete",
+    });
+    if (!note.ok) throw new Error("evidence setup failed");
+    const refs = [{ evidenceId: note.evidenceId, contentHash: noteHash }];
+    // Entry 200 (credit) keeps the history complete with its link target
+    // visible; entry 201 (refund) straddles the bound.
+    const credit = await asOwner.mutation(recordCostEntryRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      orderId: order.orderId,
+      kind: "credit",
+      amount: { currency: "EUR", minorUnits: 5000 },
+      idempotencyKey: "credit-bound",
+      quoteLineId: "chair",
+      affectedQuantity: "1",
+      affectedUnit: "piece",
+      evidenceRefs: refs,
+    });
+    if (!credit.ok) throw new Error("boundary credit failed");
+    const at200 = await asOwner.query(getOrderLineageRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      orderId: order.orderId,
+    });
+    if (!at200.ok) throw new Error("200-entry lineage failed");
+    expect(at200.costEntries).toHaveLength(200);
+    expect(at200.costEntries.find((entry) => entry.id === credit.entryId)?.kind).toBe("credit");
+    const refund = await asOwner.mutation(recordCostEntryRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      orderId: order.orderId,
+      kind: "refund",
+      amount: { currency: "EUR", minorUnits: 5000 },
+      idempotencyKey: "refund-bound",
+      linkedEntryId: credit.entryId,
+      quoteLineId: "chair",
+      affectedQuantity: "1",
+      affectedUnit: "piece",
+      evidenceRefs: refs,
+    });
+    if (!refund.ok) throw new Error("boundary refund failed");
+    const at201 = await asOwner.query(getOrderLineageRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      orderId: order.orderId,
+    });
+    // The linked refund persists, but reload will not show a history
+    // that silently drops it.
+    expect(at201).toMatchObject({ ok: false, code: "incomplete-history" });
+  });
+});
+
+describe("F1R-17 historical pre-F1R13 commands replay before new-write validation", () => {
+  test("a seeded multi-line scalar selection replays, conflicts, and stays strict for new keys", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, "historic-selection");
+    const graph = await setupTwoLineGraph(t, project, "historic-selection");
+    const asOwner = t.withIdentity(OWNER);
+    const grant = await asOwner.mutation(grantProjectAccessRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      targetIdentity: OTHER_ACTOR.tokenIdentifier,
+      role: "approver",
+    });
+    if (!grant.ok) throw new Error("actor access setup failed");
+
+    // The exact pre-upgrade shape: scalar quantity on a two-line quote
+    // with an explicit key, no selection lines invented.
+    const historic = {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      requirementId: graph.requirementId,
+      candidateId: graph.candidateId,
+      quoteId: graph.quoteId,
+      quoteVersion: "v-historic-selection",
+      quantity: "1",
+      requirementVersion: 1,
+      idempotencyKey: "pre-upgrade",
+    };
+    const seededId = await t.run((ctx) =>
+      ctx.db.insert("selections", { ...historic, actor: OWNER.tokenIdentifier, createdAt: Date.now() }),
+    );
+    const replay = await asOwner.mutation(recordSelectionRef, historic);
+    if (!replay.ok) throw new Error(`historic replay failed: ${JSON.stringify(replay)}`);
+    expect(replay.deduplicated).toBe(true);
+    expect(replay.selectionId).toBe(seededId);
+
+    // Every material change to the historical key conflicts.
+    const changed = await asOwner.mutation(recordSelectionRef, { ...historic, quantity: "2" });
+    expect(changed).toMatchObject({ ok: false, code: "duplicate-conflict" });
+
+    // Another actor replaying the identical scalar still conflicts.
+    const actorReplay = await t.withIdentity(OTHER_ACTOR).mutation(recordSelectionRef, historic);
+    expect(actorReplay).toMatchObject({ ok: false, code: "duplicate-conflict" });
+
+    // A new key with the same scalar stays strictly rejected: multi-line
+    // quotes require explicit lines for new records.
+    const before = await tableCounts(t, project);
+    const fresh = await asOwner.mutation(recordSelectionRef, { ...historic, idempotencyKey: "fresh-scalar" });
+    expect(fresh).toMatchObject({ ok: false, code: "invalid-payload" });
+    expect(await tableCounts(t, project)).toEqual(before);
+
+    // The historical replay also survives supersession of its quote.
+    const v2 = await asOwner.mutation(recordQuoteRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      version: "v-historic-selection-2",
+      currency: "EUR",
+      lines: [
+        { lineId: "machine", description: "Espresso machine", quantity: "2", unitPrice: { currency: "EUR", minorUnits: 795000 }, evidenceRefs: [] },
+        { lineId: "chair", description: "Cafe chair", quantity: "10", unitPrice: { currency: "EUR", minorUnits: 5000 }, evidenceRefs: [] },
+      ],
+      charges: [],
+      taxBasis: { kind: "inclusive" as const, basisId: "NL-EUR-INCLUSIVE", evidenceRefs: [] },
+      comparisonScope: {
+        requirementId: "req-historic-selection",
+        scopeId: "scope-historic-selection",
+        items: [
+          { itemId: "machine", lineId: "machine", unit: "piece", requiredQuantity: "2" },
+          { itemId: "chair", lineId: "chair", unit: "piece", requiredQuantity: "10" },
+        ],
+      },
+      evidenceRefs: [],
+      requirementId: graph.requirementId,
+      vendorId: graph.vendorId,
+      rfqId: graph.rfqId,
+      supersedes: graph.contentHash,
+    });
+    if (!v2.ok) throw new Error(`superseding quote failed: ${JSON.stringify(v2)}`);
+    const afterSupersession = await asOwner.mutation(recordSelectionRef, historic);
+    if (!afterSupersession.ok) throw new Error("post-supersession replay failed");
+    expect(afterSupersession.deduplicated).toBe(true);
+    expect(afterSupersession.selectionId).toBe(seededId);
+    const rows = await t.run((ctx) => ctx.db.query("selections").collect());
+    expect(rows.filter((row) => row.projectId === project.projectId)).toHaveLength(1);
+  });
+
+  test("a seeded scalar order and a field-less credit replay exactly", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, "historic-order");
+    const graph = await setupTwoLineGraph(t, project, "historic-order");
+    const asOwner = t.withIdentity(OWNER);
+    const selection = await asOwner.mutation(recordSelectionRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      requirementId: graph.requirementId,
+      candidateId: graph.candidateId,
+      quoteId: graph.quoteId,
+      quoteVersion: "v-historic-order",
+      selectionLines: [
+        { quoteLineId: "machine", quantity: "2", unit: "piece" },
+        { quoteLineId: "chair", quantity: "10", unit: "piece" },
+      ],
+      requirementVersion: 1,
+      idempotencyKey: "sel-historic-order",
+    });
+    if (!selection.ok) throw new Error("selection setup failed");
+
+    // The exact pre-upgrade order shape: scalar quantity, explicit key.
+    const historicOrder = {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      selectionId: selection.selectionId,
+      orderedQuantity: "1",
+      idempotencyKey: "historic-order",
+    };
+    const seededOrderId = await t.run((ctx) =>
+      ctx.db.insert("orders", {
+        ...historicOrder,
+        requirementId: graph.requirementId,
+        quoteId: graph.quoteId,
+        quoteVersion: "v-historic-order",
+        requirementVersion: 1,
+        state: "recorded" as const,
+        amendmentCount: 0,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      }),
+    );
+    const replayOrder = await asOwner.mutation(recordOrderRef, historicOrder);
+    if (!replayOrder.ok) throw new Error(`historic order replay failed: ${JSON.stringify(replayOrder)}`);
+    expect(replayOrder.deduplicated).toBe(true);
+    expect(replayOrder.orderId).toBe(seededOrderId);
+    const changedOrder = await asOwner.mutation(recordOrderRef, { ...historicOrder, orderedQuantity: "2" });
+    expect(changedOrder).toMatchObject({ ok: false, code: "duplicate-conflict" });
+
+    // The exact pre-upgrade credit shape: no affected line, no evidence.
+    const historicCredit = {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      orderId: seededOrderId,
+      kind: "credit" as const,
+      amount: { currency: "EUR", minorUnits: 100 },
+      idempotencyKey: "historic-credit",
+    };
+    const seededCreditId = await t.run((ctx) =>
+      ctx.db.insert("costEntries", {
+        ...historicCredit,
+        recordedBy: OWNER.tokenIdentifier,
+        createdAt: Date.now(),
+      }),
+    );
+    const replayCredit = await asOwner.mutation(recordCostEntryRef, historicCredit);
+    if (!replayCredit.ok) throw new Error(`historic credit replay failed: ${JSON.stringify(replayCredit)}`);
+    expect(replayCredit.deduplicated).toBe(true);
+    expect(replayCredit.entryId).toBe(seededCreditId);
+    const changedCredit = await asOwner.mutation(recordCostEntryRef, {
+      ...historicCredit,
+      amount: { currency: "EUR", minorUnits: 200 },
+    });
+    expect(changedCredit).toMatchObject({ ok: false, code: "duplicate-conflict" });
+
+    // New keys keep the strict contract: a field-less credit is rejected
+    // with no write.
+    const before = await tableCounts(t, project);
+    const freshCredit = await asOwner.mutation(recordCostEntryRef, { ...historicCredit, idempotencyKey: "fresh-credit" });
+    expect(freshCredit).toMatchObject({ ok: false, code: "invalid-payload" });
+    expect(await tableCounts(t, project)).toEqual(before);
   });
 });

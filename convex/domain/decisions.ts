@@ -190,6 +190,64 @@ export const recordSelection = f1Mutation({
     if (args.selectionLines !== undefined && args.quantity !== undefined) {
       return { ok: false as const, code: "invalid-payload", message: "supply either selection lines or a single quantity, not both" };
     }
+    // F1R-17: exact historical replay precedes new-write validation. A
+    // scalar call resolves its idempotency key without touching the
+    // quote, so a stored pre-F1R-13 row (scalar quantity only, accepted
+    // even behind a multi-line quote by the old handlers) is recognized
+    // before multi-line ambiguity, unit, or cap rules for new records
+    // can reject it. No lineage is invented: the stored row is compared
+    // field-for-field against the normalized scalar plus actor and
+    // returned as-is. New keys and material changes keep strict
+    // validation on the full line-aware path below.
+    if (args.selectionLines === undefined && args.quantity !== undefined) {
+      let historicalQuantity: string;
+      try {
+        historicalQuantity = normalizeLineQuantity(args.quantity, "selected quantity");
+      } catch (error) {
+        return { ok: false as const, code: "invalid-payload", message: error instanceof Error ? error.message : "selected quantity is not a valid decimal" };
+      }
+      const historicalKey = args.idempotencyKey?.trim() ?? legacyScalarSelectionKey({
+        organizationId: args.organizationId,
+        projectId: args.projectId,
+        requirementId: args.requirementId,
+        candidateId: args.candidateId,
+        quoteId: args.quoteId,
+        quoteVersion: args.quoteVersion,
+        quantity: historicalQuantity,
+        requirementVersion: args.requirementVersion,
+        actor: access.value.identity,
+      });
+      const historical = await ctx.db
+        .query("selections")
+        .withIndex("by_project_and_key", (q) =>
+          q.eq("projectId", args.projectId).eq("idempotencyKey", historicalKey),
+        )
+        .unique();
+      if (historical !== null && historical.selectionLines === undefined) {
+        let storedQuantity: string | null = null;
+        try {
+          storedQuantity = historical.quantity === undefined
+            ? null
+            : decimalToString(quantity(historical.quantity));
+        } catch {
+          storedQuantity = null;
+        }
+        if (
+          storedQuantity !== null &&
+          historical.organizationId === args.organizationId &&
+          historical.requirementId === args.requirementId &&
+          historical.candidateId === args.candidateId &&
+          historical.quoteId === args.quoteId &&
+          historical.quoteVersion === args.quoteVersion &&
+          storedQuantity === historicalQuantity &&
+          historical.requirementVersion === args.requirementVersion &&
+          historical.actor === access.value.identity
+        ) {
+          return { ok: true as const, selectionId: historical._id, deduplicated: true };
+        }
+        return { ok: false as const, code: "duplicate-conflict", message: "idempotency key already used with different fields" };
+      }
+    }
     const quote = await ctx.db.get(args.quoteId);
     if (
       quote === null ||

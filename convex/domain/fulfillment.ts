@@ -49,6 +49,14 @@ const orderResultValidator = v.union(
   denialValidator,
 );
 
+/**
+ * F1R-16 reload bound: at most this many events and cost entries per
+ * lineage call. One row past the bound is probed to detect truncation;
+ * over-bound histories return explicit incompleteness, never prefix
+ * aggregates labeled complete.
+ */
+const ORDER_LINEAGE_HISTORY_BOUND = 200;
+
 // -- F1R-13 effective-line helpers (no I/O) ----------------------------------
 
 type QuoteLineRef = {
@@ -195,6 +203,47 @@ export const recordOrder = f1Mutation({
     }
     if (args.orderLines !== undefined && args.orderedQuantity !== undefined) {
       return { ok: false as const, code: "invalid-payload", message: "supply either order lines or a single ordered quantity, not both" };
+    }
+    // F1R-17: exact historical replay precedes new-write validation. A
+    // scalar call looks up its explicit key before the selection is ever
+    // loaded, so a stored pre-F1R-13 row (scalar quantity only, accepted
+    // by the old handlers without any line mapping) is recognized before
+    // multi-line or cap rules for new records can reject it. No lineage
+    // is invented: the stored row is compared field-for-field and
+    // returned as-is.
+    if (args.orderLines === undefined && args.orderedQuantity !== undefined) {
+      let historicalOrdered: string;
+      try {
+        historicalOrdered = normalizeLineQuantity(args.orderedQuantity, "ordered quantity");
+      } catch (error) {
+        return { ok: false as const, code: "invalid-payload", message: error instanceof Error ? error.message : "ordered quantity is not a valid decimal" };
+      }
+      const historical = await ctx.db
+        .query("orders")
+        .withIndex("by_project_and_key", (q) =>
+          q.eq("projectId", args.projectId).eq("idempotencyKey", args.idempotencyKey),
+        )
+        .unique();
+      if (historical !== null && historical.orderLines === undefined) {
+        let storedOrdered: string | null = null;
+        try {
+          storedOrdered = historical.orderedQuantity === undefined
+            ? null
+            : decimalToString(quantity(historical.orderedQuantity));
+        } catch {
+          storedOrdered = null;
+        }
+        if (
+          storedOrdered !== null &&
+          historical.organizationId === args.organizationId &&
+          historical.selectionId === args.selectionId &&
+          storedOrdered === historicalOrdered &&
+          (historical.supplierReference ?? undefined) === args.supplierReference
+        ) {
+          return { ok: true as const, orderId: historical._id, deduplicated: true };
+        }
+        return { ok: false as const, code: "duplicate-conflict", message: "idempotency key already used with different fields" };
+      }
     }
     // Shape-normalize explicit lines before any read, so the replay key
     // binds the complete normalized payload. Line-against-selection
@@ -352,6 +401,54 @@ export const recordOrder = f1Mutation({
       }
       if (decimalCompare(ordered, capped) > 0) {
         return { ok: false as const, code: "invalid-payload", message: `order line ${line.quoteLineId} exceeds the selected quantity` };
+      }
+    }
+    // F1R-14: cumulative commitment cap across every order on this
+    // selection. Prior orders count toward each selected line, so a new
+    // idempotency key can never reset the allowance: split orders may
+    // cover the selected quantity together, but their combined lines can
+    // never exceed it. The scan and the insert below execute in one
+    // atomic mutation transaction, so concurrent excess attempts
+    // conflict on the shared selection range and the loser rechecks on
+    // retry instead of double-committing. Exact replays return above,
+    // before this cap is enforced.
+    const committedByLine = new Map<string, Decimal>();
+    for await (const prior of ctx.db
+      .query("orders")
+      .withIndex("by_selection", (q) => q.eq("selectionId", args.selectionId))) {
+      if (
+        prior.organizationId !== args.organizationId ||
+        prior.projectId !== args.projectId
+      ) {
+        continue;
+      }
+      for (const priorLine of effectiveOrderLines(prior, selectionLines)) {
+        try {
+          const priorQuantity = quantity(priorLine.quantity);
+          const running = committedByLine.get(priorLine.quoteLineId);
+          committedByLine.set(
+            priorLine.quoteLineId,
+            running === undefined ? priorQuantity : decimalAdd(running, priorQuantity),
+          );
+        } catch {
+          return { ok: false as const, code: "invalid-payload", message: "stored ordered quantity is invalid" };
+        }
+      }
+    }
+    for (const line of effectiveLines) {
+      const selected = selectedByLine.get(line.quoteLineId);
+      if (selected === undefined) continue;
+      let wanted: Decimal;
+      let cap: Decimal;
+      try {
+        wanted = quantity(line.quantity);
+        cap = quantity(selected.quantity);
+      } catch {
+        return { ok: false as const, code: "invalid-payload", message: "stored selected quantity is invalid" };
+      }
+      const committed = committedByLine.get(line.quoteLineId) ?? decimalZero();
+      if (decimalCompare(decimalAdd(committed, wanted), cap) > 0) {
+        return { ok: false as const, code: "invalid-payload", message: `order line ${line.quoteLineId} exceeds the remaining selected quantity` };
       }
     }
     const now = Date.now();
@@ -688,8 +785,10 @@ const costEntryResultValidator = v.union(
  * order line and quantity with nonempty immutable evidence; payments and
  * settled costs may stay order-level (no line fields) or name a complete
  * line triple. Every evidence reference is validated — same authorized
- * project and matching content hash — before replay or write, and the
- * exact references are stored. A linked entry must form a credit/refund
+ * project and matching content hash — before any new write, and the
+ * exact references are stored. F1R-17: an exact stored command replays
+ * before those new-write rules, so pre-F1R-13 entries without line or
+ * evidence fields remain replayable without inventing lineage. A linked entry must form a credit/refund
  * pair on the same order, line, quantity, and currency, and neither side
  * may be paired twice, so entries cannot be silently cross-linked or
  * double-counted. Quote-level shared charges stay quote-level: no line
@@ -753,30 +852,14 @@ export const recordCostEntry = f1Mutation({
         return { ok: false as const, code: "invalid-payload", message: "evidence content hash required" };
       }
     }
-    if (args.kind === "credit" || args.kind === "refund") {
-      if (normalizedLineId === undefined || normalizedAffected === undefined || normalizedAffectedUnit === undefined) {
-        return { ok: false as const, code: "invalid-payload", message: `${args.kind} must name the affected order line and quantity` };
-      }
-      if (evidenceRefs.length === 0) {
-        return { ok: false as const, code: "invalid-payload", message: `${args.kind} requires nonempty evidence` };
-      }
-    }
-    // Financial evidence validates before replay or write: each
-    // referenced immutable evidence row must live in the authorized
-    // project and its stored hash must equal the referenced hash.
-    for (const ref of evidenceRefs) {
-      const evidence = await ctx.db.get(ref.evidenceId);
-      if (
-        evidence === null ||
-        evidence.organizationId !== args.organizationId ||
-        evidence.projectId !== args.projectId
-      ) {
-        return { ok: false as const, code: "denied-project", message: "evidence is not in this project" };
-      }
-      if (evidence.contentHash !== ref.contentHash) {
-        return { ok: false as const, code: "invalid-payload", message: "evidence content hash does not match" };
-      }
-    }
+    // F1R-17: exact historical replay precedes new-write validation. The
+    // lookup compares the complete stored command — order, kind, exact
+    // money, link, line triple, and evidence references, with absent
+    // fields matching only absent fields — so a stored pre-F1R-13 entry
+    // (no affected line or evidence, accepted by the old handlers) is
+    // recognized before triple, evidence, currency, or pairing rules for
+    // new records can reject it. No lineage is invented: the stored row
+    // is returned as-is, and any material change conflicts.
     const existing = await ctx.db
       .query("costEntries")
       .withIndex("by_project_and_key", (q) =>
@@ -814,6 +897,32 @@ export const recordCostEntry = f1Mutation({
         return { ok: false as const, code: "duplicate-conflict", message: "idempotency key already used with different fields" };
       }
       return { ok: true as const, entryId: existing._id, deduplicated: true };
+    }
+    if (args.kind === "credit" || args.kind === "refund") {
+      if (normalizedLineId === undefined || normalizedAffected === undefined || normalizedAffectedUnit === undefined) {
+        return { ok: false as const, code: "invalid-payload", message: `${args.kind} must name the affected order line and quantity` };
+      }
+      if (evidenceRefs.length === 0) {
+        return { ok: false as const, code: "invalid-payload", message: `${args.kind} requires nonempty evidence` };
+      }
+    }
+    // Financial evidence validates before any new write: each
+    // referenced immutable evidence row must live in the authorized
+    // project and its stored hash must equal the referenced hash.
+    // (Exact replays already returned above, so this never re-validates
+    // the evidence behind a stored historical command.)
+    for (const ref of evidenceRefs) {
+      const evidence = await ctx.db.get(ref.evidenceId);
+      if (
+        evidence === null ||
+        evidence.organizationId !== args.organizationId ||
+        evidence.projectId !== args.projectId
+      ) {
+        return { ok: false as const, code: "denied-project", message: "evidence is not in this project" };
+      }
+      if (evidence.contentHash !== ref.contentHash) {
+        return { ok: false as const, code: "invalid-payload", message: "evidence content hash does not match" };
+      }
     }
     const order = await requireOwnedRef(
       await ctx.db.get(args.orderId),
@@ -853,19 +962,28 @@ export const recordCostEntry = f1Mutation({
         order.value,
         effectiveSelectionLines(selection.value, quote),
       );
-      if (!orderLines.some((entry) => entry.quoteLineId === normalizedLineId)) {
+      const orderedLine = orderLines.find((entry) => entry.quoteLineId === normalizedLineId);
+      if (orderedLine === undefined) {
         return { ok: false as const, code: "denied-project", message: `order line ${normalizedLineId} is not on this order` };
       }
-      const scoped = scopedLineUnit(quote.comparisonScope, normalizedLineId);
-      if (
-        normalizedAffectedUnit !== undefined &&
-        scoped !== undefined &&
-        normalizedAffectedUnit !== scoped
-      ) {
-        const orderedUnit = orderLines.find((entry) => entry.quoteLineId === normalizedLineId)?.unit;
-        if (orderedUnit === undefined || normalizedAffectedUnit !== orderedUnit) {
-          return { ok: false as const, code: "invalid-payload", message: `order line ${normalizedLineId} unit does not match the ordered unit` };
+      // F1R-15: the adjustment binds to the effective order line even
+      // when the quote carries no comparison scope. The affected unit
+      // must equal the ordered unit (a quantity-changing amendment or an
+      // explicit unit conversion needs its own validated basis), and the
+      // affected quantity must fit inside the ordered line quantity.
+      // Order lines predating units carry an empty unit and accept any
+      // nonempty affected unit as valid legacy lineage.
+      if (orderedLine.unit !== "" && normalizedAffectedUnit !== orderedLine.unit) {
+        return { ok: false as const, code: "invalid-payload", message: `order line ${normalizedLineId} unit does not match the ordered unit` };
+      }
+      try {
+        const affected = quantity(normalizedAffected ?? "");
+        const ordered = quantity(orderedLine.quantity);
+        if (decimalCompare(affected, ordered) > 0) {
+          return { ok: false as const, code: "invalid-payload", message: `affected quantity exceeds the ordered line quantity` };
         }
+      } catch {
+        return { ok: false as const, code: "invalid-payload", message: "affected quantity is not a valid decimal" };
       }
     }
     if (args.linkedEntryId !== undefined) {
@@ -1115,14 +1233,19 @@ const orderLineageValidator = v.object({
 });
 
 /**
- * Read the durable order lineage needed after reload (F1R-13). A bounded
- * authorized query over the order's own indexes: the pinned quote lines
- * with exact money, the authoritative selection and order lines, the
- * per-line acceptance totals, and the typed cost entries with evidence
- * hashes and links. The payload carries every stored id, quantity, unit,
- * hash, and link required for accepted-quantity calculation without
- * reconstructing descriptions. Event and entry lists cap at 200 rows
- * each; larger histories page through repeated calls.
+ * Read the durable order lineage needed after reload (F1R-13, F1R-16). A
+ * bounded authorized query over the order's own indexes: the pinned quote
+ * lines with exact money, the authoritative selection and order lines,
+ * the per-line acceptance totals, and the typed cost entries with
+ * evidence hashes and links. The payload carries every stored id,
+ * quantity, unit, hash, and link required for accepted-quantity
+ * calculation without reconstructing descriptions.
+ *
+ * The history bound is 200 events and 200 entries per call. Histories
+ * beyond the bound are never presented as complete: the probe reads one
+ * row past the bound, and an over-bound history returns an explicit
+ * typed `incomplete-history` denial instead of prefix aggregates, so no
+ * caller can mistake a truncated total for an authoritative one.
  */
 export const getOrderLineage = f1Query({
   args: {
@@ -1170,11 +1293,18 @@ export const getOrderLineage = f1Query({
     const events = await ctx.db
       .query("orderEvents")
       .withIndex("by_order", (q) => q.eq("orderId", args.orderId))
-      .take(200);
+      .take(ORDER_LINEAGE_HISTORY_BOUND + 1);
     const entries = await ctx.db
       .query("costEntries")
       .withIndex("by_order", (q) => q.eq("orderId", args.orderId))
-      .take(200);
+      .take(ORDER_LINEAGE_HISTORY_BOUND + 1);
+    if (events.length > ORDER_LINEAGE_HISTORY_BOUND || entries.length > ORDER_LINEAGE_HISTORY_BOUND) {
+      return {
+        ok: false as const,
+        code: "incomplete-history",
+        message: "order history exceeds the reload bound; totals are unavailable until paginated reads land",
+      };
+    }
     const acceptedTotals = new Map<string, { quantity: Decimal; unit: string }>();
     for (const event of events) {
       if (
