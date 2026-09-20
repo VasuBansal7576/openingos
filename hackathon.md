@@ -327,3 +327,15 @@ The combined checkout passes TypeScript, production build, 23 repository tests, 
 The next exact-head Greptile review found two actionable P1 defects: C1 could miss bindings beyond a 128-row prefix, and R1 exposed an evidence cursor while silently capping claims and candidates.
 R1 and C1 therefore remain open while indexed binding lookup and independently truthful pagination are repaired; U1 integration, live provider evidence, hosted Convex, credentials, allowances, owner-mailbox exchange and publication also remain open.
 No controlled result is presented as live integration success.
+
+### 2026-09-21 - R1/C1 indexed and paginated repair checkpoint
+
+Integrated the selected purchasing-workbench UI and its strict nested W1 access-boundary parser without inventing missing aggregates or approval authority.
+Integrated R1's independently bounded native pagination for evidence, normalized claims and candidates, including complete traversal of 130 claims and 130 candidates without duplicates or omissions, invalid-cursor handling and cross-project denial.
+Integrated C1's normalized AgentMail message, thread and inbox binding fields with exact compound indexes for callback-to-operation and inbound conversation routing.
+Current callback paths no longer depend on an arbitrary `processedEvents` prefix; legacy JSON recovery remains bounded and refuses an incomplete prefix rather than misbinding it.
+The combined local head through `ddc4d3a` passes TypeScript, production build, the full repository, money/Jev, F1, browser, application and communication suite, plus 203 direct Convex tests.
+The R1 and C1 roadmap boxes remain open until this replacement PR head passes exact-head GitHub Actions and Greptile review.
+J-03 allowance enforcement, D-17 mixed-scope partitioning and the real Convex UI adapter remain active worker packages.
+All evidence in this checkpoint is controlled local execution only.
+No live provider call, hosted deployment, owner-mailbox exchange or external effect was observed.
