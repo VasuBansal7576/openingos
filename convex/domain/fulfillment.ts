@@ -13,7 +13,7 @@
  */
 
 import { v } from "convex/values";
-import { paginationOptsValidator } from "convex/server";
+import { paginationOptsValidator, paginationResultValidator } from "convex/server";
 import type { Id } from "../_generated/dataModel.js";
 import { f1Mutation, f1Query } from "../server.js";
 import { denialValidator } from "../access/checks.js";
@@ -1273,6 +1273,16 @@ const orderHistoryEntryValidator = v.object({
   linkedEntryId: v.optional(v.id("costEntries")),
 });
 
+const orderHistoryEventsPageValidator = paginationResultValidator(orderHistoryEventValidator).extend({
+  ok: v.literal(true),
+  kind: v.literal("events"),
+});
+
+const orderHistoryEntriesPageValidator = paginationResultValidator(orderHistoryEntryValidator).extend({
+  ok: v.literal(true),
+  kind: v.literal("entries"),
+});
+
 const orderLineageValidator = v.object({
   ok: v.literal(true),
   order: v.object({
@@ -1575,13 +1585,8 @@ export const listOrderHistoryPage = f1Query({
     paginationOpts: paginationOptsValidator,
   },
   returns: v.union(
-    v.object({
-      ok: v.literal(true),
-      kind: v.string(),
-      page: v.array(v.union(orderHistoryEventValidator, orderHistoryEntryValidator)),
-      isDone: v.boolean(),
-      continueCursor: v.string(),
-    }),
+    orderHistoryEventsPageValidator,
+    orderHistoryEntriesPageValidator,
     denialValidator,
   ),
   handler: async (ctx, args) => {
@@ -1629,7 +1634,6 @@ export const listOrderHistoryPage = f1Query({
         .paginate(clampHistoryPageOpts(args.paginationOpts));
       return {
         ok: true as const,
-        kind: args.kind,
         page: result.page
           .filter(
             (event) =>
@@ -1643,8 +1647,11 @@ export const listOrderHistoryPage = f1Query({
             ...(event.acceptedQuantity === undefined ? {} : { acceptedQuantity: event.acceptedQuantity }),
             ...(event.note === undefined ? {} : { note: event.note }),
           })),
+        ...(result.splitCursor === undefined ? {} : { splitCursor: result.splitCursor }),
+        ...(result.pageStatus === undefined ? {} : { pageStatus: result.pageStatus }),
         isDone: result.isDone,
         continueCursor: result.continueCursor,
+        kind: args.kind,
       };
     }
     const result = await ctx.db
@@ -1653,7 +1660,6 @@ export const listOrderHistoryPage = f1Query({
       .paginate(clampHistoryPageOpts(args.paginationOpts));
     return {
       ok: true as const,
-      kind: args.kind,
       page: result.page
         .filter(
           (entry) =>
@@ -1670,8 +1676,11 @@ export const listOrderHistoryPage = f1Query({
           evidenceRefs: entry.evidenceRefs !== undefined ? [...entry.evidenceRefs] : [],
           ...(entry.linkedEntryId === undefined ? {} : { linkedEntryId: entry.linkedEntryId }),
         })),
+      ...(result.splitCursor === undefined ? {} : { splitCursor: result.splitCursor }),
+      ...(result.pageStatus === undefined ? {} : { pageStatus: result.pageStatus }),
       isDone: result.isDone,
       continueCursor: result.continueCursor,
+      kind: args.kind,
     };
   },
 });
