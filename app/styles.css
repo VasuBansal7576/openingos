@@ -324,7 +324,7 @@ h1, h2, h3, p { margin-top: 0; }
   .wb-supplier-actions { grid-column: 2 / -1; justify-content: flex-end; }
 }
 
-@media (max-width: 800px) {
+@media (max-width: 900px) {
   .foundation-principles { grid-template-columns: 1fr; gap: 2rem; }
   .foundation-principle-grid { grid-template-columns: 1fr; gap: 1.5rem; }
   .wb-demo-banner { padding-inline: 1rem; }
