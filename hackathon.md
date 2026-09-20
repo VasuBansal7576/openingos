@@ -295,3 +295,14 @@ The corrected integrated head `fc3ff7b` passes TypeScript, production build, 23 
 All evidence is controlled local execution only.
 No live provider, hosted identity, deployment, vendor outreach or external effect was claimed.
 F1 and PR merge remain open until this replacement exact head passes GitHub Actions and Greptile, GitHub reports no conflict and a fresh separate Astra reviewer accepts the same revision.
+
+### 2026-09-21 - 52df491 fourth Astra-repair checkpoint
+
+The separate GPT-6 Astra reviewer rejected exact PR head `e9068fc` after controlled public-handler probes found three authority defects.
+A temporary approver combined with a permanent viewer or contributor could delegate that lower role permanently, a temporary organization owner received permanent project ownership, and a 25-row history prefix could hide valid organization authority.
+Luna repaired the three defects with role-qualified delegation horizons, propagated organization-owner expiry into project membership and authority projection rows, and replaced the history-prefix scan with bounded exact projection and legacy ranges.
+The exact integrated head passes both TypeScript checks, production build, 23 repository tests, 77 money and Jev proofs, 244 F1 tests, 180 direct Convex tests, 155 browser-executor tests, 2 application tests, 19 provider-contract tests and 5 mounted user-path tests.
+The implementation worker ran as GPT-5.6 Luna with max reasoning on the Vasu-owned branch, and its pushed commit `c6d2059c` matched the remote before integration as `52df491`.
+All evidence is controlled local execution only.
+No live provider, hosted identity, deployment, vendor outreach or external effect was claimed.
+F1 and PR merge remain open until this replacement exact head passes GitHub Actions and Greptile, GitHub reports no conflict and a fresh separate Astra reviewer accepts the same revision.
