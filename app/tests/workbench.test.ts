@@ -129,4 +129,3 @@ test("formats unknown money without turning missing charges into zero", () => {
   expect(formatMoney(null, "EUR")).toBe("Unknown");
   expect(formatMoney(795000, "EUR")).toContain("7,950");
 });
-
