@@ -66,6 +66,8 @@ This file supplies order, not duplicate contracts or a running automation.
 - [x] Pass the full local matrix at `c7637ba`: both TypeScript checks, production build, 23 repository tests, 77 money/Jev proofs, 226 F1 tests, 174 direct Convex tests, 155 browser tests, 2 application tests, 19 provider-contract tests and 5 user-path tests.
 - [x] Repair and resolve Greptile's stale paginated reconciliation-summary finding at `5b5b0bd`, with a regression covering an earlier-page operation becoming terminal during a later-page pass.
 - [x] Pass the full local matrix at `5b5b0bd`: both TypeScript checks, production build, 23 repository tests, 77 money/Jev proofs, 227 F1 tests, 174 direct Convex tests, 155 browser tests, 2 application tests, 19 provider-contract tests and 5 user-path tests.
+- [x] Repair Greptile's exact-head automatic-authority and unsampled-reconciliation findings at `497636d`: omitted-grant record-changing operations create no effect, while bounded current-state probes keep oversized reconciliation explicitly incomplete and resumable until an exact snapshot fits.
+- [x] Pass the full local matrix at `497636d`: both TypeScript checks, production build, 23 repository tests, 77 money/Jev proofs, 229 F1 tests, 174 direct Convex tests, 155 browser tests, 2 application tests, 19 provider-contract tests and 5 user-path tests.
 - [ ] Confirm the latest PR head has no new actionable Greptile findings, obtain a fresh ACCEPT verdict from the separate Astra reviewer on that same fixed commit, and verify GitHub reports no conflicts before checking F1 or dispatching R1/C1/U1.
 - [x] Shut down settled worker/reviewer sessions and remove both completed worker worktrees through Orca after verifying clean status and remote preservation.
 

@@ -251,3 +251,15 @@ The actionable Greptile thread received exact commit and test evidence and was r
 PR #1 now points to `5b5b0bd`; exact-head GitHub Actions and a new Greptile scan are running, and the separate Astra review remains intentionally deferred until that scan is settled.
 All results are controlled evidence only.
 No hosted Convex state, live provider call, owner-mailbox exchange, public site or commercial outcome was observed.
+
+### 2026-09-20 - 497636d exact-head P1 repair
+
+Integrated Luna's two exact-head Greptile P1 repairs as `497636d` on the Vasu-owned PR branch.
+The automatic no-grant path now admits only bounded research/read operations, while record-changing operations require an explicit version-bound grant and create zero rows when omitted.
+Cancellation reconciliation now takes bounded indexed current-state probes at the end of a page, replaces stale counts when the exact unresolved set fits, and stays explicitly incomplete and resumable when more than 16 unresolved operations remain.
+The exact integrated head passes both TypeScript checks, production build, 23 repository tests, 77 money and Jev proofs, 229 F1 tests, 174 direct Convex tests, 155 browser-executor tests, 2 application tests, 19 provider-contract tests and 5 mounted user-path tests.
+The focused authority and reconciliation suite passes 24 tests with 248 assertions, including zero-effect record-changing probes and a 17-unresolved-operation pagination case.
+The completed reconciliation and direct-fixture worker worktrees were removed through Orca after their exact commits were preserved on Vasu-named remote branches.
+PR #1 still requires exact-latest-head Actions and Greptile closure plus one separate Astra ACCEPT verdict before F1 can be checked complete or merged.
+All results are controlled evidence only.
+No hosted Convex state, live provider call, owner-mailbox exchange, public site or commercial outcome was observed.
