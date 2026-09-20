@@ -29,16 +29,85 @@ import { sha256BindingOk } from "../shared/sha256.js";
 import { isExpired } from "../shared/time.js";
 
 export const JEV_MAX_ATTEMPTS = 3;
+export const JEV_PRICING_ENV_VARS = {
+  attemptMaxCostMicroUsd: "JEV_ATTEMPT_MAX_COST_MICRO_USD",
+  pricingVersion: "JEV_PRICING_VERSION",
+  pricingBasis: "JEV_PRICING_BASIS",
+} as const;
+
+export interface JevPricingPolicy {
+  readonly attemptMaxCostMicroUsd: number;
+  readonly maxReservationMicroUsd: number;
+  readonly pricingVersion: string;
+  readonly pricingBasis: string;
+  readonly reservationPricingBasis: string;
+}
+
+export type JevPricingPolicyResult =
+  | { readonly ok: true; readonly policy: JevPricingPolicy }
+  | { readonly ok: false; readonly code: "invalid-pricing-config"; readonly message: string };
+
+function invalidJevPricingPolicy(): JevPricingPolicyResult {
+  return {
+    ok: false,
+    code: "invalid-pricing-config",
+    message: "Jev pricing policy is unavailable or invalid",
+  };
+}
+
+function reservationPricingBasis(
+  pricingVersion: string,
+  pricingBasis: string,
+): string {
+  return canonicalJson({
+    basis: pricingBasis,
+    provider: "jev",
+    version: pricingVersion,
+  });
+}
+
 /**
- * Conservative per-request allowance bound for the pinned Jev transport.
- * The reservation covers all three possible HTTP attempts before the first
- * request, so a retry cannot race another job for the same remaining budget.
+ * Read the owner-configured Jev allowance policy at the server boundary.
+ * Pricing is intentionally not a source constant: the owner must configure
+ * a versioned basis and a positive safe-integer per-attempt maximum before
+ * any operation can claim or dispatch.
  */
-export const JEV_ATTEMPT_MAX_COST_MICRO_USD = 1_000;
-export const JEV_MAX_RESERVATION_MICRO_USD =
-  JEV_MAX_ATTEMPTS * JEV_ATTEMPT_MAX_COST_MICRO_USD;
-export const JEV_PRICING_BASIS =
-  `typesafe-jev-1.13.0;max-attempts=${JEV_MAX_ATTEMPTS};maximum-cost-micro-usd=${JEV_MAX_RESERVATION_MICRO_USD}`;
+export function loadJevPricingPolicy(): JevPricingPolicyResult {
+  const rawCost = env[JEV_PRICING_ENV_VARS.attemptMaxCostMicroUsd]?.trim();
+  const pricingVersion = env[JEV_PRICING_ENV_VARS.pricingVersion]?.trim();
+  const pricingBasis = env[JEV_PRICING_ENV_VARS.pricingBasis]?.trim();
+  if (
+    rawCost === undefined ||
+    pricingVersion === undefined ||
+    pricingVersion.length === 0 ||
+    pricingBasis === undefined ||
+    pricingBasis.length === 0 ||
+    !/^[0-9]+$/.test(rawCost)
+  ) {
+    return invalidJevPricingPolicy();
+  }
+
+  const attemptMaxCostMicroUsd = Number(rawCost);
+  if (!Number.isSafeInteger(attemptMaxCostMicroUsd) || attemptMaxCostMicroUsd <= 0) {
+    return invalidJevPricingPolicy();
+  }
+  const maxReservationMicroUsd = attemptMaxCostMicroUsd * JEV_MAX_ATTEMPTS;
+  if (!Number.isSafeInteger(maxReservationMicroUsd) || maxReservationMicroUsd <= 0) {
+    return invalidJevPricingPolicy();
+  }
+
+  return {
+    ok: true,
+    policy: {
+      attemptMaxCostMicroUsd,
+      maxReservationMicroUsd,
+      pricingVersion,
+      pricingBasis,
+      reservationPricingBasis: reservationPricingBasis(pricingVersion, pricingBasis),
+    },
+  };
+}
+
 const JEV_RETRY_BACKOFF_MS = [250, 1_000] as const;
 
 function isAborted(signal: AbortSignal | undefined): boolean {
@@ -502,7 +571,8 @@ const attemptFenceResultValidator = v.union(
  * Recheck the durable authority chain between bounded Jev transport attempts.
  * The initial claim mints the single-use attempt token; this query prevents a
  * retry from starting after cancellation, grant/input drift, expiry, or loss
- * of the reservation's full three-attempt bound.
+ * of the reservation's full three-attempt bound or its configured pricing
+ * version/basis.
  */
 export const attemptFence = f1InternalQuery({
   args: {
@@ -512,6 +582,8 @@ export const attemptFence = f1InternalQuery({
   },
   returns: attemptFenceResultValidator,
   handler: async (ctx, args) => {
+    const pricing = loadJevPricingPolicy();
+    if (!pricing.ok) return pricing;
     if (args.identity.trim().length === 0) {
       return { ok: false as const, code: "forged-identity", message: "missing operation identity" };
     }
@@ -587,9 +659,12 @@ export const attemptFence = f1InternalQuery({
       reservation.state !== "open" ||
       reservation.jobId !== operation.jobId ||
       reservation.organizationId !== operation.organizationId ||
-      reservation.reservedMicroUsd + reservation.unresolvedMicroUsd < JEV_MAX_RESERVATION_MICRO_USD
+      reservation.reservedMicroUsd < pricing.policy.maxReservationMicroUsd
     ) {
       return { ok: false as const, code: "allowance-exhausted", message: "Jev reservation cannot cover its bounded attempts" };
+    }
+    if (reservation.pricingBasis !== pricing.policy.reservationPricingBasis) {
+      return { ok: false as const, code: "stale-pricing-basis", message: "Jev reservation pricing policy is stale" };
     }
     const budget = await ctx.db.get(reservation.budgetId);
     if (budget === null || budget.organizationId !== operation.organizationId) {
@@ -624,6 +699,8 @@ export const classify = internalAction({
   },
   returns: actionResultValidator,
   handler: async (ctx, args): Promise<JevClassificationResult | { ok: false; code: string; message: string }> => {
+    const pricing = loadJevPricingPolicy();
+    if (!pricing.ok) return pricing;
     if (args.identity.trim().length === 0) {
       return { ok: false as const, code: "forged-identity", message: "missing operation identity" };
     }
