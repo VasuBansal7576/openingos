@@ -23,6 +23,7 @@ import {
   type CommunicationDenial,
 } from "./contracts.js";
 import { operationLabel, sendAgentMailOneShot } from "./transport.js";
+import type * as callbacks from "./callbacks.js";
 
 type MutationArgs<T> = T extends RegisteredMutation<infer _Visibility, infer Args, infer _Return> ? Args : never;
 type MutationReturn<T> = T extends RegisteredMutation<infer _Visibility, infer _Args, infer Return> ? Awaited<Return> : never;
@@ -48,6 +49,11 @@ const lateDeliveryRef = makeFunctionReference<
   MutationArgs<typeof reconciliation.recordLateDelivery>,
   MutationReturn<typeof reconciliation.recordLateDelivery>
 >("execution/reconciliation:recordLateDelivery");
+const replayWaitingRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof callbacks.replayWaitingInbound>,
+  MutationReturn<typeof callbacks.replayWaitingInbound>
+>("communication/callbacks:replayWaitingInbound");
 
 const snapshotResultValidator = v.union(
   v.object({
@@ -439,6 +445,13 @@ export const recordProviderBinding = f1InternalMutation({
       ...(applied ? { appliedAt: now } : {}),
       createdAt: now,
     });
+    // Retained pre-binding replies take effect now that their conversation
+    // binding exists. The replay is bounded and marker-idempotent.
+    const replay: MutationReturn<typeof callbacks.replayWaitingInbound> = await ctx.runMutation(replayWaitingRef, {
+      threadId: expected.threadId,
+      inboxId: expected.inboxId,
+    });
+    if (!replay.ok) return { ok: false as const, code: replay.code, message: replay.message };
     return { ok: true as const, bound: true, applied };
   },
 });

@@ -35,6 +35,21 @@ type MutationReturn<T> = T extends RegisteredMutation<infer _Visibility, infer _
 // reconciliation instead of claiming a match that may be outside the page.
 const LEGACY_BINDING_RECOVERY_LIMIT = 64;
 
+// One binding row exists per provider message in a thread, so a thread
+// routinely matches several rows. Resolution reads stay exact (equality on
+// the thread and inbox) and bounded; a larger horizon fails closed instead
+// of sampling an arbitrary prefix.
+const THREAD_BINDING_RESOLVE_LIMIT = 64;
+
+// Retained pre-binding replies replayed per trigger. The bound keeps one
+// repair pass finite; leftovers stay waitingForBinding for the next trigger.
+const WAITING_REPLAY_LIMIT = 8;
+
+// Retained inbound snapshot cap. Larger bodies stay waiting with an explicit
+// marker for the bounded provider-read repair path instead of being
+// truncated into a conflicting source hash.
+const WAITING_SNAPSHOT_MAX_BYTES = 65_536;
+
 const lateDeliveryRef = makeFunctionReference<
   "mutation",
   MutationArgs<typeof reconciliation.recordLateDelivery>,
@@ -248,6 +263,17 @@ async function legacyBindingRows(ctx: F1MutationCtx, provider: string) {
   };
 }
 
+interface StoredBindingRow {
+  readonly _id: Id<"processedEvents">;
+  readonly outcome: string;
+  readonly providerMessageId?: string;
+  readonly providerThreadId?: string;
+  readonly providerInboxId?: string;
+  readonly organizationId?: Id<"organizations">;
+  readonly projectId?: Id<"projects">;
+  readonly operationId?: Id<"operations">;
+}
+
 async function operationForProviderMessage(
   ctx: F1MutationCtx,
   messageId: string | undefined,
@@ -256,7 +282,7 @@ async function operationForProviderMessage(
 ): Promise<{ operationId: Id<"operations">; token: string } | null> {
   const expected = bindingKey(messageId, threadId, inboxId);
   if (expected === null) return null;
-  const indexedRows = await ctx.db
+  const indexedRows: StoredBindingRow[] = await ctx.db
     .query("processedEvents")
     .withIndex("by_provider_environment_and_provider_message_and_thread_and_inbox", (q) =>
       q
@@ -266,31 +292,42 @@ async function operationForProviderMessage(
         .eq("providerThreadId", expected.threadId)
         .eq("providerInboxId", expected.inboxId),
     )
-    .take(2);
-  if (indexedRows.length > 1) return null;
-
-  let row = indexedRows[0];
-  if (row === undefined) {
-    // Historical binding rows use eventId=messageId and keep the original
-    // facts only in outcome JSON. This exact lookup is migration-safe and
-    // does not inspect an arbitrary receipt prefix.
-    const legacyRows = await ctx.db
-      .query("processedEvents")
-      .withIndex("by_provider_environment_and_event", (q) =>
-        q.eq("provider", "agentmail-binding").eq("environment", "live").eq("eventId", expected.messageId),
-      )
-      .take(2);
-    if (legacyRows.length > 1) return null;
-    const legacy = legacyRows[0];
-    if (legacy === undefined || !matchesBinding(legacy, expected)) return null;
-    row = legacy;
-    await ctx.db.patch(row._id, {
-      providerMessageId: expected.messageId,
-      providerThreadId: expected.threadId,
-      providerInboxId: expected.inboxId,
-    });
+    .take(THREAD_BINDING_RESOLVE_LIMIT + 1);
+  if (indexedRows.length > THREAD_BINDING_RESOLVE_LIMIT) return null;
+  // Compatible duplicates (same exact key, same operation) resolve to that
+  // operation; rows pointing at different operations fail closed.
+  let resolved: { operationId: Id<"operations">; token: string } | null = null;
+  for (const row of indexedRows) {
+    if (!matchesBinding(row, expected) || row.operationId === undefined) return null;
+    const operation = await ctx.db.get(row.operationId);
+    if (
+      operation === null ||
+      (operation.kind !== "communication.send" && operation.kind !== "communication.clarify") ||
+      operation.attemptToken === undefined
+    ) return null;
+    if (resolved !== null && resolved.operationId !== operation._id) return null;
+    resolved = { operationId: operation._id, token: operation.attemptToken };
   }
-  if (!matchesBinding(row, expected) || row.operationId === undefined) return null;
+  if (resolved !== null) return resolved;
+
+  // Historical binding rows use eventId=messageId and keep the original
+  // facts only in outcome JSON. This exact lookup is migration-safe and
+  // does not inspect an arbitrary receipt prefix.
+  const legacyRows: StoredBindingRow[] = await ctx.db
+    .query("processedEvents")
+    .withIndex("by_provider_environment_and_event", (q) =>
+      q.eq("provider", "agentmail-binding").eq("environment", "live").eq("eventId", expected.messageId),
+    )
+    .take(2);
+  if (legacyRows.length > 1) return null;
+  const row = legacyRows[0];
+  if (row === undefined || !matchesBinding(row, expected)) return null;
+  await ctx.db.patch(row._id, {
+    providerMessageId: expected.messageId,
+    providerThreadId: expected.threadId,
+    providerInboxId: expected.inboxId,
+  });
+  if (row.operationId === undefined) return null;
   const operation = await ctx.db.get(row.operationId);
   if (
     operation === null ||
@@ -377,44 +414,11 @@ interface ConversationBinding {
   readonly projectId: Id<"projects">;
 }
 
-async function conversationForMessage(
+async function resolveBindingRowConversation(
   ctx: F1MutationCtx,
-  message: InboundMessage,
+  row: StoredBindingRow,
+  expected: BindingKey,
 ): Promise<ConversationBinding | null> {
-  const expected = bindingKey(message.messageId, message.threadId, message.inboxId);
-  if (expected === null) return null;
-  const indexedRows = await ctx.db
-    .query("processedEvents")
-    .withIndex("by_provider_environment_and_provider_thread_and_inbox", (q) =>
-      q
-        .eq("provider", "agentmail-binding")
-        .eq("environment", "live")
-        .eq("providerThreadId", expected.threadId)
-        .eq("providerInboxId", expected.inboxId),
-    )
-    .take(2);
-  if (indexedRows.length > 1) return null;
-
-  let row = indexedRows[0];
-  if (row === undefined) {
-    // Old binding rows have no indexed thread/inbox facts. Recovery is only
-    // accepted when the bounded provider prefix is complete; otherwise the
-    // inbound event stays in waitingForBinding for explicit reconciliation.
-    const legacy = await legacyBindingRows(ctx, "agentmail-binding");
-    if (!legacy.complete) return null;
-    const matches = legacy.rows.filter((candidate) => matchesThreadAndInbox(candidate, expected));
-    if (matches.length !== 1) return null;
-    const candidate = matches[0];
-    if (candidate === undefined) return null;
-    row = candidate;
-    const facts = rowBindingFacts(row);
-    if (facts === null || facts.messageId === undefined || facts.threadId === undefined || facts.inboxId === undefined) return null;
-    await ctx.db.patch(row._id, {
-      providerMessageId: facts.messageId,
-      providerThreadId: facts.threadId,
-      providerInboxId: facts.inboxId,
-    });
-  }
   if (!matchesThreadAndInbox(row, expected) || row.operationId === undefined) return null;
   const operation = await ctx.db.get(row.operationId);
   if (operation === null) return null;
@@ -432,6 +436,346 @@ async function conversationForMessage(
     conversation.projectId !== operation.projectId
   ) return null;
   return { conversationId: grant.conversationId, organizationId: operation.organizationId, projectId: operation.projectId };
+}
+
+async function conversationForMessage(
+  ctx: F1MutationCtx,
+  message: Pick<InboundMessage, "messageId" | "threadId" | "inboxId">,
+): Promise<ConversationBinding | null> {
+  const expected = bindingKey(message.messageId, message.threadId, message.inboxId);
+  if (expected === null) return null;
+  const indexedRows: StoredBindingRow[] = await ctx.db
+    .query("processedEvents")
+    .withIndex("by_provider_environment_and_provider_thread_and_inbox", (q) =>
+      q
+        .eq("provider", "agentmail-binding")
+        .eq("environment", "live")
+        .eq("providerThreadId", expected.threadId)
+        .eq("providerInboxId", expected.inboxId),
+    )
+    .take(THREAD_BINDING_RESOLVE_LIMIT + 1);
+  if (indexedRows.length > THREAD_BINDING_RESOLVE_LIMIT) return null;
+  // Several binding rows routinely share one thread (one per provider
+  // message). Compatible rows that resolve to the same conversation return
+  // it; rows implying different conversations fail closed.
+  let resolved: ConversationBinding | null = null;
+  for (const row of indexedRows) {
+    const single = await resolveBindingRowConversation(ctx, row, expected);
+    if (single === null) return null;
+    if (
+      resolved !== null &&
+      (resolved.conversationId !== single.conversationId ||
+        resolved.organizationId !== single.organizationId ||
+        resolved.projectId !== single.projectId)
+    ) return null;
+    resolved = single;
+  }
+  if (resolved !== null) return resolved;
+  // Old binding rows have no indexed thread/inbox facts. Recovery is only
+  // accepted when the bounded provider prefix is complete; otherwise the
+  // inbound event stays in waitingForBinding for explicit reconciliation.
+  const legacy = await legacyBindingRows(ctx, "agentmail-binding");
+  if (!legacy.complete) return null;
+  const matches = legacy.rows.filter((candidate) => matchesThreadAndInbox(candidate, expected));
+  if (matches.length !== 1) return null;
+  const candidate = matches[0];
+  if (candidate === undefined) return null;
+  const facts = rowBindingFacts(candidate);
+  if (facts === null || facts.messageId === undefined || facts.threadId === undefined || facts.inboxId === undefined) return null;
+  await ctx.db.patch(candidate._id, {
+    providerMessageId: facts.messageId,
+    providerThreadId: facts.threadId,
+    providerInboxId: facts.inboxId,
+  });
+  return resolveBindingRowConversation(ctx, candidate, expected);
+}
+
+interface WaitingInboundSnapshot {
+  readonly messageId: string;
+  readonly threadId: string;
+  readonly inboxId: string;
+  readonly from: string;
+  readonly text: string;
+  readonly html: string;
+  readonly timestamp: number;
+  readonly attachmentCount: number;
+}
+
+/**
+ * Bounded snapshot of a retained pre-binding reply. Oversized bodies are not
+ * truncated into a conflicting source hash; they stay waiting with an
+ * explicit marker for the bounded provider-read repair path.
+ */
+function waitingSnapshotOf(message: InboundMessage): WaitingInboundSnapshot | null {
+  const bytes = new TextEncoder().encode(message.text).byteLength + new TextEncoder().encode(message.html).byteLength;
+  if (bytes > WAITING_SNAPSHOT_MAX_BYTES) return null;
+  return {
+    messageId: message.messageId,
+    threadId: message.threadId,
+    inboxId: message.inboxId,
+    from: message.from,
+    text: message.text,
+    html: message.html,
+    timestamp: message.timestamp,
+    attachmentCount: message.attachments.length,
+  };
+}
+
+function parseWaitingSnapshot(value: unknown): WaitingInboundSnapshot | null {
+  if (!isRecord(value)) return null;
+  const snapshot = value["snapshot"];
+  if (!isRecord(snapshot)) return null;
+  const messageId = normalizedProviderId(snapshot["messageId"]);
+  const threadId = normalizedProviderId(snapshot["threadId"]);
+  const inboxId = normalizedProviderId(snapshot["inboxId"]);
+  const from = typeof snapshot["from"] === "string" ? snapshot["from"] : undefined;
+  const text = typeof snapshot["text"] === "string" ? snapshot["text"] : undefined;
+  const html = typeof snapshot["html"] === "string" ? snapshot["html"] : undefined;
+  const timestamp = typeof snapshot["timestamp"] === "number" ? snapshot["timestamp"] : undefined;
+  const attachmentCount = typeof snapshot["attachmentCount"] === "number" ? snapshot["attachmentCount"] : undefined;
+  if (
+    messageId === undefined || threadId === undefined || inboxId === undefined ||
+    from === undefined || text === undefined || html === undefined || timestamp === undefined ||
+    attachmentCount === undefined || !Number.isInteger(attachmentCount) || attachmentCount < 0
+  ) return null;
+  return { messageId, threadId, inboxId, from, text, html, timestamp, attachmentCount };
+}
+
+function inboundContentHash(message: Pick<InboundMessage, "messageId" | "text" | "html">): string {
+  return payloadHash({ messageId: message.messageId, text: message.text, html: message.html });
+}
+
+/**
+ * Resolve a source marker to its exact evidence row through the durable
+ * marker link. Legacy markers without the link use one exact content-hash
+ * lookup; zero or several matches fail closed instead of scanning a project
+ * evidence prefix.
+ */
+async function resolveMarkerEvidence(
+  ctx: F1MutationCtx,
+  binding: ConversationBinding,
+  marker: { readonly sourceEvidenceId?: Id<"evidence"> },
+  parsed: Pick<InboundMessage, "messageId" | "text" | "html">,
+): Promise<Id<"evidence"> | CommunicationDenial> {
+  const expectedHash = inboundContentHash(parsed);
+  if (marker.sourceEvidenceId !== undefined) {
+    const evidence = await ctx.db.get(marker.sourceEvidenceId);
+    if (
+      evidence === null ||
+      evidence.organizationId !== binding.organizationId ||
+      evidence.projectId !== binding.projectId ||
+      evidence.contentHash !== expectedHash
+    ) {
+      return denial("invalid-payload", "replayed message conflicts with the stored source");
+    }
+    return evidence._id;
+  }
+  const rows = await ctx.db
+    .query("evidence")
+    .withIndex("by_project_and_contentHash", (q) =>
+      q.eq("projectId", binding.projectId).eq("contentHash", expectedHash),
+    )
+    .take(2);
+  if (rows.length !== 1) {
+    return denial("invalid-payload", "replayed message conflicts with the stored source");
+  }
+  const evidence = rows[0];
+  if (evidence === undefined || evidence.organizationId !== binding.organizationId) {
+    return denial("invalid-payload", "replayed message conflicts with the stored source");
+  }
+  return evidence._id;
+}
+
+type BoundIngestResult =
+  | {
+      readonly ok: true;
+      readonly messageId: string;
+      readonly deduplicated: boolean;
+      readonly state: "replyReceived" | "needsReview";
+      readonly evidenceId: Id<"evidence"> | null;
+    }
+  | CommunicationDenial;
+
+/**
+ * Shared bound-ingest core used by the live callback and by the waiting
+ * replay. Marker idempotency makes replay safe: a retained reply takes
+ * effect exactly once with no duplicate evidence or quote input.
+ */
+async function ingestBoundMessage(
+  ctx: F1MutationCtx,
+  parsed: InboundMessage,
+  binding: ConversationBinding,
+): Promise<BoundIngestResult> {
+  const configRows = await ctx.db
+    .query("recipientConfigs")
+    .withIndex("by_active", (q) => q.eq("active", true))
+    .take(2);
+  const config = configRows.length === 1 ? configRows[0] : undefined;
+  const fromMatches = config !== undefined && normalizeMailbox(parsed.from) === normalizeMailbox(config.mailboxNormalized);
+  const content = sanitizeInboundContent(parsed);
+  const sourceVersion = !fromMatches || content.needsReview ? "source:1:review" : "source:1";
+  const key = `agentmail:${parsed.messageId}:source:1`;
+  const markerRows = await ctx.db
+    .query("productEvidence")
+    .withIndex("by_project_and_key", (q) => q.eq("projectId", binding.projectId).eq("idempotencyKey", key))
+    .take(2);
+  if (markerRows.length > 1) return denial("invalid-payload", "duplicate extraction markers detected");
+  if (markerRows[0] !== undefined) {
+    const resolved = await resolveMarkerEvidence(ctx, binding, markerRows[0], parsed);
+    if (isCommunicationDenial(resolved)) return resolved;
+    return {
+      ok: true as const,
+      messageId: parsed.messageId,
+      deduplicated: true,
+      state: content.needsReview || !fromMatches ? "needsReview" as const : "replyReceived" as const,
+      evidenceId: resolved,
+    };
+  }
+  const attachmentCount = parsed.attachments.length;
+  const hasText = parsed.text.length > 0 || parsed.html.length > 0;
+  // C1 has no approved inbound-attachment byte store, so a message carrying
+  // attachments is never labeled complete even when its text survived. The
+  // gap stays explicit through the missing-attachment marker below.
+  const completeness = hasText && attachmentCount === 0 ? "complete" : "partial";
+  const contentHash = inboundContentHash(parsed);
+  const evidenceId = await ctx.db.insert("evidence", {
+    organizationId: binding.organizationId,
+    projectId: binding.projectId,
+    sourceKind: "agentmail.message",
+    providerIds: JSON.stringify({ messageId: parsed.messageId, threadId: parsed.threadId, inboxId: parsed.inboxId }),
+    capturedAt: parsed.timestamp,
+    contentHash,
+    completeness,
+    counterpartyRole: "ownerStandIn",
+    executionMode: "live",
+    locator: `redacted:${contentHash}`,
+  });
+  await ctx.db.insert("productEvidence", {
+    organizationId: binding.organizationId,
+    projectId: binding.projectId,
+    field: "agentmail.message",
+    sourceKind: "agentmail.message",
+    capturedAt: parsed.timestamp,
+    originalValue: content.text.slice(0, 8_000),
+    normalizedValue: content.text.slice(0, 8_000),
+    verification: "unverified",
+    freshness: "fresh",
+    counterpartyRole: "ownerStandIn",
+    executionMode: "live",
+    origin: "ownerImport",
+    conflictEvidenceIds: [],
+    idempotencyKey: key,
+    ingestionIdentity: `${parsed.messageId}:source:1`,
+    sourceEvidenceId: evidenceId,
+    version: sourceVersion,
+    createdAt: Date.now(),
+  });
+  if (attachmentCount > 0) {
+    await ctx.db.insert("productEvidence", {
+      organizationId: binding.organizationId,
+      projectId: binding.projectId,
+      field: "missing:attachment",
+      sourceKind: "agentmail.message",
+      capturedAt: parsed.timestamp,
+      originalValue: "unknown",
+      normalizedValue: "unknown",
+      verification: "unverified",
+      freshness: "unknown",
+      counterpartyRole: "ownerStandIn",
+      executionMode: "live",
+      origin: "ownerImport",
+      conflictEvidenceIds: [],
+      idempotencyKey: `${key}:missing:attachment`,
+      ingestionIdentity: `${parsed.messageId}:missing:attachment`,
+      version: sourceVersion,
+      createdAt: Date.now(),
+    });
+  }
+  const conversation = await ctx.db.get(binding.conversationId);
+  if (conversation === null) return denial("invalid-payload", "conversation binding disappeared");
+  // F04: any verified owner reply retires stale follow-up authority by
+  // advancing the conversation version. The bump happens for review-gated
+  // content too; only the replyReceived state waits for clean content.
+  const verifiedReply = fromMatches && conversation.state !== "cancelled" && conversation.state !== "closed";
+  if (verifiedReply) {
+    await ctx.db.patch(binding.conversationId, {
+      version: conversation.version + 1,
+      ...(content.needsReview ? {} : { state: "replyReceived" }),
+      lastReplyAt: parsed.timestamp,
+      updatedAt: Date.now(),
+    });
+  }
+  return {
+    ok: true as const,
+    messageId: parsed.messageId,
+    deduplicated: false,
+    state: verifiedReply && !content.needsReview ? "replyReceived" as const : "needsReview" as const,
+    evidenceId,
+  };
+}
+
+async function replayWaitingForThread(
+  ctx: F1MutationCtx,
+  threadId: string,
+  inboxId: string,
+): Promise<{ readonly replayed: number; readonly stillWaiting: number }> {
+  const rows = await ctx.db
+    .query("processedEvents")
+    .withIndex("by_provider_environment_and_provider_thread_and_inbox", (q) =>
+      q
+        .eq("provider", "agentmail-inbound")
+        .eq("environment", "live")
+        .eq("providerThreadId", threadId)
+        .eq("providerInboxId", inboxId),
+    )
+    .take(WAITING_REPLAY_LIMIT + 1);
+  let replayed = 0;
+  let stillWaiting = 0;
+  for (const row of rows.slice(0, WAITING_REPLAY_LIMIT)) {
+    if (row.applicationState === "observedSuccess") continue;
+    const stored = parseWaitingSnapshot(parseObject(row.outcome));
+    if (
+      stored === null ||
+      stored.threadId !== threadId ||
+      stored.inboxId !== inboxId ||
+      row.providerMessageId === undefined ||
+      stored.messageId !== row.providerMessageId
+    ) {
+      stillWaiting += 1;
+      continue;
+    }
+    const binding = await conversationForMessage(ctx, stored);
+    if (binding === null) {
+      stillWaiting += 1;
+      continue;
+    }
+    const result = await ingestBoundMessage(
+      ctx,
+      {
+        ...stored,
+        to: [],
+        cc: [],
+        subject: "",
+        references: [],
+        attachments: Array.from({ length: stored.attachmentCount }),
+      },
+      binding,
+    );
+    if (!result.ok) {
+      stillWaiting += 1;
+      continue;
+    }
+    await ctx.db.patch(row._id, {
+      organizationId: binding.organizationId,
+      projectId: binding.projectId,
+      applicationOutcome: "success",
+      applicationState: "observedSuccess",
+      appliedAt: Date.now(),
+    });
+    replayed += 1;
+  }
+  if (rows.length > WAITING_REPLAY_LIMIT) stillWaiting += rows.length - WAITING_REPLAY_LIMIT;
+  return { replayed, stillWaiting };
 }
 
 /**
@@ -453,109 +797,80 @@ export const ingestMessage = f1InternalMutation({
     ) {
       return denial("invalid-payload", "inbound message and thread identifiers conflict");
     }
-    const configRows = await ctx.db
-      .query("recipientConfigs")
-      .withIndex("by_active", (q) => q.eq("active", true))
-      .take(2);
-    const config = configRows.length === 1 ? configRows[0] : undefined;
-    const fromMatches = config !== undefined && normalizeMailbox(parsed.from) === normalizeMailbox(config.mailboxNormalized);
-    const content = sanitizeInboundContent(parsed);
-    const sourceVersion = !fromMatches || content.needsReview ? "source:1:review" : "source:1";
     const binding = await conversationForMessage(ctx, parsed);
     if (binding === null) {
-      const seenEvent = await ctx.db
+      // Exact full-identity dedupe: the same provider message retained under
+      // a different event id must not create a second waiting row.
+      const retained = await ctx.db
         .query("processedEvents")
-        .withIndex("by_provider_environment_and_event", (q) =>
-          q.eq("provider", "agentmail-inbound").eq("environment", "live").eq("eventId", args.eventId),
+        .withIndex("by_provider_environment_and_provider_message_and_thread_and_inbox", (q) =>
+          q
+            .eq("provider", "agentmail-inbound")
+            .eq("environment", "live")
+            .eq("providerMessageId", parsed.messageId)
+            .eq("providerThreadId", parsed.threadId)
+            .eq("providerInboxId", parsed.inboxId),
         )
-        .unique();
-      if (seenEvent !== null) {
-        return {
-          ok: true as const,
-          messageId: parsed.messageId,
-          deduplicated: true,
-          state: "waitingForBinding" as const,
-          evidenceId: null,
-        };
+        .take(2);
+      if (retained.length > 0) {
+        return { ok: true as const, messageId: parsed.messageId, deduplicated: true, state: "waitingForBinding" as const, evidenceId: null };
       }
+      const snapshot = waitingSnapshotOf(parsed);
       await ctx.db.insert("processedEvents", {
         provider: "agentmail-inbound",
         environment: "live",
         eventId: args.eventId,
         processingVersion: 1,
-        outcome: JSON.stringify({ messageId: parsed.messageId, threadId: parsed.threadId, reason: "no verified conversation binding" }),
+        outcome: JSON.stringify({
+          messageId: parsed.messageId,
+          threadId: parsed.threadId,
+          inboxId: parsed.inboxId,
+          reason: "no verified conversation binding",
+          ...(snapshot === null ? { snapshotOversized: true } : { snapshot }),
+        }),
         providerMessageId: parsed.messageId,
         providerThreadId: parsed.threadId,
         providerInboxId: parsed.inboxId,
+        applicationOutcome: "unknown",
+        applicationState: "outcomeUnknown",
         createdAt: Date.now(),
       });
       return { ok: true as const, messageId: parsed.messageId, deduplicated: false, state: "waitingForBinding" as const, evidenceId: null };
     }
-    const key = `agentmail:${parsed.messageId}:source:1`;
-    const markerRows = await ctx.db
-      .query("productEvidence")
-      .withIndex("by_project_and_key", (q) => q.eq("projectId", binding.projectId).eq("idempotencyKey", key))
-      .take(2);
-    if (markerRows.length > 1) return denial("invalid-payload", "duplicate extraction markers detected");
-    if (markerRows[0] !== undefined) {
-      const evidenceRows = await ctx.db
-        .query("evidence")
-        .withIndex("by_project", (q) => q.eq("projectId", binding.projectId))
-        .take(128);
-      const evidence = evidenceRows.find((row) => row.contentHash === payloadHash({ messageId: parsed.messageId, text: parsed.text, html: parsed.html }));
-      if (evidence === undefined) return denial("invalid-payload", "replayed message conflicts with the stored source");
-      return { ok: true as const, messageId: parsed.messageId, deduplicated: true, state: content.needsReview || !fromMatches ? "needsReview" as const : "replyReceived" as const, evidenceId: evidence?._id ?? null };
-    }
-    const contentHash = payloadHash({ messageId: parsed.messageId, text: parsed.text, html: parsed.html });
-    const evidenceId = await ctx.db.insert("evidence", {
-      organizationId: binding.organizationId,
-      projectId: binding.projectId,
-      sourceKind: "agentmail.message",
-      providerIds: JSON.stringify({ messageId: parsed.messageId, threadId: parsed.threadId, inboxId: parsed.inboxId }),
-      capturedAt: parsed.timestamp,
-      contentHash,
-      completeness: parsed.text.length > 0 || parsed.html.length > 0 ? "complete" : "partial",
-      counterpartyRole: "ownerStandIn",
-      executionMode: "live",
-      locator: `redacted:${contentHash}`,
-    });
-    await ctx.db.insert("productEvidence", {
-      organizationId: binding.organizationId,
-      projectId: binding.projectId,
-      field: "agentmail.message",
-      sourceKind: "agentmail.message",
-      capturedAt: parsed.timestamp,
-      originalValue: content.text.slice(0, 8_000),
-      normalizedValue: content.text.slice(0, 8_000),
-      verification: "unverified",
-      freshness: "fresh",
-      counterpartyRole: "ownerStandIn",
-      executionMode: "live",
-      origin: "ownerImport",
-      conflictEvidenceIds: [],
-      idempotencyKey: key,
-      ingestionIdentity: `${parsed.messageId}:source:1`,
-      version: sourceVersion,
-      createdAt: Date.now(),
-    });
-    const conversation = await ctx.db.get(binding.conversationId);
-    if (conversation === null) return denial("invalid-payload", "conversation binding disappeared");
-    const canAdvance = fromMatches && !content.needsReview && conversation.state !== "cancelled" && conversation.state !== "closed";
-    if (canAdvance) {
-      await ctx.db.patch(binding.conversationId, {
-        version: conversation.version + 1,
-        state: "replyReceived",
-        lastReplyAt: parsed.timestamp,
-        updatedAt: Date.now(),
-      });
-    }
+    // Retained pre-binding replies take effect exactly once before newer
+    // content. The replay is bounded and marker-idempotent.
+    await replayWaitingForThread(ctx, parsed.threadId, parsed.inboxId);
+    const result = await ingestBoundMessage(ctx, parsed, binding);
+    if (isCommunicationDenial(result)) return result;
     return {
       ok: true as const,
-      messageId: parsed.messageId,
-      deduplicated: false,
-      state: canAdvance ? "replyReceived" as const : "needsReview" as const,
-      evidenceId,
+      messageId: result.messageId,
+      deduplicated: result.deduplicated,
+      state: result.state,
+      evidenceId: result.evidenceId,
     };
+  },
+});
+
+/**
+ * Bounded S-15 repair: replay retained pre-binding replies once their
+ * conversation binding exists. Marker idempotency keeps the replay to one
+ * evidence snapshot and one extraction input per source and version.
+ */
+export const replayWaitingInbound = f1InternalMutation({
+  args: { threadId: v.string(), inboxId: v.string() },
+  returns: v.union(
+    v.object({ ok: v.literal(true), replayed: v.number(), stillWaiting: v.number() }),
+    denialValidator,
+  ),
+  handler: async (ctx, args) => {
+    const threadId = normalizedProviderId(args.threadId);
+    const inboxId = normalizedProviderId(args.inboxId);
+    if (threadId === undefined || inboxId === undefined) {
+      return denial("invalid-payload", "thread and inbox identifiers are required");
+    }
+    const result = await replayWaitingForThread(ctx, threadId, inboxId);
+    return { ok: true as const, replayed: result.replayed, stillWaiting: result.stillWaiting };
   },
 });
 
@@ -563,6 +878,81 @@ const quoteResultValidator = v.union(
   v.object({ ok: v.literal(true), quoteId: v.id("quotes"), deduplicated: v.boolean(), executionMode: v.string() }),
   denialValidator,
 );
+
+/**
+ * Prove the extraction source's exact conversation binding. The stored
+ * evidence snapshot identifies the provider thread and inbox; every binding
+ * row under that exact key must resolve to the requesting conversation.
+ * Zero, several, or foreign bindings fail closed.
+ */
+async function verifyQuoteSourceConversation(
+  ctx: F1MutationCtx,
+  args: {
+    readonly organizationId: Id<"organizations">;
+    readonly projectId: Id<"projects">;
+    readonly conversationId: Id<"conversations">;
+  },
+  source: { readonly sourceEvidenceId?: Id<"evidence"> },
+): Promise<{ readonly ok: true } | CommunicationDenial> {
+  if (source.sourceEvidenceId === undefined) {
+    return denial("invalid-payload", "quote source predates verifiable conversation binding");
+  }
+  const evidence = await ctx.db.get(source.sourceEvidenceId);
+  if (
+    evidence === null ||
+    evidence.organizationId !== args.organizationId ||
+    evidence.projectId !== args.projectId
+  ) {
+    return denial("invalid-payload", "quote source snapshot is not in this project");
+  }
+  const providerIds = parseObject(evidence.providerIds ?? "");
+  const threadId = normalizedProviderId(providerIds?.["threadId"]);
+  const inboxId = normalizedProviderId(providerIds?.["inboxId"]);
+  if (threadId === undefined || inboxId === undefined) {
+    return denial("invalid-payload", "quote source snapshot lacks provider thread binding");
+  }
+  const rows: StoredBindingRow[] = await ctx.db
+    .query("processedEvents")
+    .withIndex("by_provider_environment_and_provider_thread_and_inbox", (q) =>
+      q
+        .eq("provider", "agentmail-binding")
+        .eq("environment", "live")
+        .eq("providerThreadId", threadId)
+        .eq("providerInboxId", inboxId),
+    )
+    .take(THREAD_BINDING_RESOLVE_LIMIT + 1);
+  if (rows.length === 0 || rows.length > THREAD_BINDING_RESOLVE_LIMIT) {
+    return denial("invalid-payload", "quote source conversation binding is ambiguous");
+  }
+  for (const row of rows) {
+    if (
+      row.organizationId !== args.organizationId ||
+      row.projectId !== args.projectId ||
+      row.operationId === undefined
+    ) {
+      return denial("invalid-payload", "quote source conversation binding conflicts");
+    }
+    const operation = await ctx.db.get(row.operationId);
+    if (
+      operation === null ||
+      operation.organizationId !== args.organizationId ||
+      operation.projectId !== args.projectId
+    ) {
+      return denial("invalid-payload", "quote source conversation binding conflicts");
+    }
+    const grant = await ctx.db.get(operation.grantId);
+    if (
+      grant === null ||
+      grant.organizationId !== args.organizationId ||
+      grant.projectId !== args.projectId ||
+      grant.conversationId === undefined ||
+      grant.conversationId !== args.conversationId
+    ) {
+      return denial("invalid-payload", "quote source belongs to another conversation");
+    }
+  }
+  return { ok: true as const };
+}
 
 /** Versioned extraction handoff. The model result is data, never authority. */
 export const ingestQuote = f1InternalMutation({
@@ -594,6 +984,8 @@ export const ingestQuote = f1InternalMutation({
     const source = sourceRows[0];
     if (source === undefined) return denial("invalid-payload", "quote source is not available");
     if (source.version !== "source:1") return denial("malicious-content", "quote source requires manual review");
+    const conversationProof = await verifyQuoteSourceConversation(ctx, args, source);
+    if (isCommunicationDenial(conversationProof)) return conversationProof;
     const content = sanitizeInboundContent({ text: source.normalizedValue, html: "" });
     if (content.needsReview) return denial("malicious-content", "supplier instructions require manual review");
     const bounded = parseBoundedPayloadJson(args.quoteJson);
@@ -610,12 +1002,35 @@ export const ingestQuote = f1InternalMutation({
       if (!isRecord(marker) || marker["extractionHash"] !== extractionHash) {
         return denial("invalid-payload", "replayed extraction conflicts with the stored result");
       }
-      const quoteRows = await ctx.db
-        .query("quotes")
-        .withIndex("by_project", (q) => q.eq("projectId", args.projectId))
-        .take(128);
-      const quote = quoteRows.find((row) => row.conversationId === args.conversationId && row.evidenceRefs.some((ref) => ref.sourceId === `agentmail:${args.providerMessageId}` && ref.version === args.extractionVersion));
-      if (quote !== undefined) return { ok: true as const, quoteId: quote._id, deduplicated: true, executionMode: quote.executionMode };
+      // The marker carries the exact durable link to its quote; no project
+      // quote prefix is scanned.
+      if (typeof marker["quoteId"] !== "string") {
+        return denial("invalid-payload", "extraction marker has no linked quote");
+      }
+      let quote: {
+        readonly _id: Id<"quotes">;
+        readonly organizationId: Id<"organizations">;
+        readonly projectId: Id<"projects">;
+        readonly conversationId?: Id<"conversations">;
+        readonly evidenceRefs: ReadonlyArray<{ readonly sourceId: string; readonly version: string }>;
+        readonly executionMode: string;
+      } | null = null;
+      try {
+        quote = await ctx.db.get(marker["quoteId"] as Id<"quotes">);
+      } catch {
+        return denial("invalid-payload", "extraction marker has no linked quote");
+      }
+      if (
+        quote !== null &&
+        quote.organizationId === args.organizationId &&
+        quote.projectId === args.projectId &&
+        quote.conversationId === args.conversationId &&
+        quote.evidenceRefs.some(
+          (ref) => ref.sourceId === `agentmail:${args.providerMessageId}` && ref.version === args.extractionVersion,
+        )
+      ) {
+        return { ok: true as const, quoteId: quote._id, deduplicated: true, executionMode: quote.executionMode };
+      }
       return denial("invalid-payload", "extraction marker has no linked quote");
     }
     const quoteValue = bounded.payload.value;
