@@ -443,55 +443,31 @@ const CONTEXTUAL_ANAPHORIC_GRAMMAR: ReadonlySet<string> = new Set([
 const RESEARCH_ANCHORS = PURCHASING_INTENT_ANCHORS;
 
 /**
- * Commercial data nouns a purchasing read or comparison question names.
- * `research.read` and `comparison.read` serve durable project records,
- * including quotes, prices, suppliers, delivery terms, and evidence, so a request must
- * reference that data, not merely an object the project happens to
- * mention. An object noun such as "machine" or "equipment" is payload,
- * never read authority: "Explain how a Turing machine solves the halting
- * problem" carries none of these and is refused on both read routes.
+ * Supplier-record nouns a purchasing read or comparison question names.
+ * Generic commercial nouns such as "price", "stock", or "budget" are
+ * intentionally absent: those words can appear in an unrelated question and
+ * cannot establish read authority on their own.
  */
-const PURCHASING_READ_DATA_ANCHORS: ReadonlySet<string> = new Set([
-  "availability",
-  "budget",
+const PURCHASING_READ_RECORD_ANCHORS: ReadonlySet<string> = new Set([
   "candidate",
   "candidates",
-  "cost",
-  "costs",
-  "delivery",
   "evidence",
-  "freight",
-  "lead",
-  "leadtime",
   "offer",
   "offers",
-  "order",
-  "orders",
-  "payment",
-  "payments",
-  "price",
-  "prices",
-  "pricing",
   "quote",
   "quotes",
   "rfq",
-  "savings",
-  "spend",
-  "spent",
-  "stock",
   "supplier",
   "suppliers",
-  "terms",
   "vendor",
   "vendors",
-  "warranty",
 ]);
 
 /**
  * Progress, comparison, and listing cues. They stay weaker than the data
- * anchors: a cue authorizes a read only beside a purchasing anchor or a
- * server-owned project term, so a generic "what is the latest" or an
- * unrelated "lakers vs celtics" cannot reach project records.
+ * anchors: a cue authorizes a read only beside a matching server-owned
+ * project term, so a generic "what is the latest" or an unrelated
+ * "lakers vs celtics" cannot reach project records.
  */
 const PURCHASING_READ_STATE_CUES: ReadonlySet<string> = new Set([
   "cheap",
@@ -769,12 +745,12 @@ function isResearchReadOperation(operationId: string): boolean {
 }
 
 /**
- * `research.read`/`comparison.read` read the project's durable purchasing
- * records, so the request must reference that data: a commercial-data
- * anchor, a progress/comparison cue beside a purchasing anchor or a
- * server-owned term, or a full contextual follow-up. A bare object noun,
- * such as "machine" inside an unrelated question, cannot establish read
- * authority, and unknown product names remain carried data only.
+ * `research.read`/`comparison.read` read the project's durable supplier
+ * records, so the request must reference that data: a supplier-record anchor,
+ * or a read/progress/comparison cue beside a matching server-owned
+ * requirement term, or a full contextual follow-up. Generic commercial nouns
+ * and object nouns remain payload data only, and cannot establish read
+ * authority on their own.
  */
 function isResearchReadTokens(
   tokens: readonly string[],
@@ -782,9 +758,9 @@ function isResearchReadTokens(
   hasStructuredContext: boolean,
 ): boolean {
   if (hasContextualFollowUp(tokens, context, hasStructuredContext)) return true;
-  if (tokens.some((token) => PURCHASING_READ_DATA_ANCHORS.has(token))) return true;
+  if (tokens.some((token) => PURCHASING_READ_RECORD_ANCHORS.has(token))) return true;
   if (!tokens.some((token) => PURCHASING_READ_STATE_CUES.has(token))) return false;
-  return tokens.some((token) => RESEARCH_ANCHORS.has(token) || context.has(token));
+  return tokens.some((token) => context.has(token));
 }
 
 function hasMixedUnsupportedReadClause(input: {

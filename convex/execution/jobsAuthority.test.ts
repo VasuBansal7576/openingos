@@ -76,6 +76,22 @@ const claimOperationRef = makeFunctionReference<
 
 const identity = { tokenIdentifier: "jobs-authority-chain-owner" };
 
+const genericReadPrompts = [
+  "Show the current stock",
+  "Show the current budget",
+  "Show the current order",
+  "Show the current terms",
+  "Show the current price",
+  "Show the current cost",
+  "Show the current delivery",
+  "Show the current warranty",
+  "Show the current payment",
+  "Show the current availability",
+  "Show the current freight",
+  "Show the current savings",
+  "Show the current spend",
+] as const;
+
 async function setup() {
   const t = convexTest(schema, modules);
   const asOwner = t.withIdentity(identity);
@@ -155,6 +171,30 @@ async function issueResearchGrant(
   });
   expect(grant.ok).toBe(true);
   if (!grant.ok) throw new Error("grant setup failed");
+  return grant.grantId;
+}
+
+async function issueReadGrant(
+  fixture: Awaited<ReturnType<typeof setup>>,
+  operationId: "research.read" | "comparison.read",
+  query = "Show the current supplier quotes",
+) {
+  const authority: WorkflowAuthority = { operationId, projectId: fixture.projectId };
+  const grant = await fixture.asOwner.mutation(issueGrantRef, {
+    organizationId: fixture.organizationId,
+    projectId: fixture.projectId,
+    operations: [operationId],
+    communicationProfile: "ownerRoleplay",
+    recipientConfigVersion: 0,
+    inputVersions: { brief: "v1" },
+    payloadJson: JSON.stringify({ query }),
+    costCeilingMicroUsd: 100,
+    roundLimit: 10,
+    expiresAt: Date.now() + 600_000,
+    workflowAuthorities: [authority],
+  });
+  expect(grant.ok).toBe(true);
+  if (!grant.ok) throw new Error(`${operationId} grant setup failed`);
   return grant.grantId;
 }
 
@@ -334,6 +374,65 @@ test("automatic research reads refuse an unrelated explanation before any durabl
     if (denied.ok) throw new Error(`${operationId} unexpectedly accepted an unrelated request`);
     expect(denied.code, operationId).toBe("unrelated-refusal");
     expect(await rowCounts(fixture), operationId).toEqual(before);
+  }
+});
+
+test("automatic research reads refuse generic commercial nouns before any durable row", async () => {
+  const fixture = await setup();
+
+  for (const operationId of ["research.read", "comparison.read"] as const) {
+    for (const text of genericReadPrompts) {
+      const before = await rowCounts(fixture);
+      const denied = await fixture.asOwner.mutation(startJobRef, {
+        organizationId: fixture.organizationId,
+        projectId: fixture.projectId,
+        text,
+        operationId,
+        kind: "research",
+      });
+      expect(denied.ok, `${operationId}: ${text}`).toBe(false);
+      if (denied.ok) throw new Error(`${operationId} unexpectedly accepted ${text}`);
+      expect(denied.code, `${operationId}: ${text}`).toBe("unrelated-refusal");
+      expect(await rowCounts(fixture), `${operationId}: ${text}`).toEqual(before);
+    }
+  }
+});
+
+test("generic commercial nouns cannot bind an existing read grant operation", async () => {
+  for (const operationId of ["research.read", "comparison.read"] as const) {
+    const fixture = await setup();
+    const grantId = await issueReadGrant(fixture, operationId);
+    const text = "Show the current supplier quotes";
+    const started = await fixture.asOwner.mutation(startJobRef, {
+      organizationId: fixture.organizationId,
+      projectId: fixture.projectId,
+      text,
+      operationId,
+      kind: "research",
+      grantId,
+    });
+    expect(started.ok, operationId).toBe(true);
+    if (!started.ok) throw new Error(`${operationId} read job setup failed`);
+
+    const before = await rowCounts(fixture);
+    for (const [index, query] of genericReadPrompts.entries()) {
+      const denied = await fixture.asOwner.mutation(createOperationRef, {
+        organizationId: fixture.organizationId,
+        projectId: fixture.projectId,
+        jobId: started.jobId,
+        grantId,
+        kind: operationId,
+        requestId: `generic-${operationId}-${index}`,
+        payloadJson: JSON.stringify({ query }),
+      });
+      expect(denied.ok, `${operationId}: ${query}`).toBe(false);
+      if (denied.ok) throw new Error(`${operationId} created an unrelated operation for ${query}`);
+      expect(denied.code, `${operationId}: ${query}`).toBe("unrelated-refusal");
+      expect(await rowCounts(fixture), `${operationId}: ${query}`).toEqual(before);
+    }
+
+    const operations = await fixture.t.run((ctx) => ctx.db.query("operations").collect());
+    expect(operations, operationId).toHaveLength(0);
   }
 });
 
