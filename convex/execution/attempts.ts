@@ -266,25 +266,41 @@ export const reviewedResend = f1InternalMutation({
         return { ok: false as const, code: "round-limit-exceeded", message: "grant round limit exhausted" };
       }
     }
-    let resendReservationId: typeof operation.reservationId | undefined;
-    if (operation.reservationId !== undefined) {
-      const prior = await ctx.db.get(operation.reservationId);
-      if (prior !== null && prior.unresolvedMicroUsd > 0) {
-        if (args.newReservationId === undefined) {
-          return { ok: false as const, code: "unknown-charges-reserved", message: "prior unknown exposure remains; supply a fresh reservation" };
-        }
-        const fresh = await ctx.db.get(args.newReservationId);
-        if (
-          fresh === null ||
-          fresh.state !== "open" ||
-          fresh.jobId !== operation.jobId ||
-          fresh.organizationId !== operation.organizationId
-        ) {
-          return { ok: false as const, code: "allowance-exhausted", message: "fresh reservation is not available for this job" };
-        }
-        resendReservationId = args.newReservationId;
-      }
+    // A reviewed resend always carries its own fresh reservation: the
+    // resend never inherits the old reservation, and while prior unknown
+    // exposure remains the old allowance stays locked. The fresh
+    // reservation is fully bound to this job, organization, and budget.
+    if (args.newReservationId === undefined) {
+      return { ok: false as const, code: "unknown-charges-reserved", message: "resend requires its own fresh reservation" };
     }
+    const fresh = await ctx.db.get(args.newReservationId);
+    if (fresh === null || fresh.state !== "open") {
+      return { ok: false as const, code: "allowance-exhausted", message: "fresh reservation is not available for this job" };
+    }
+    if (fresh.jobId !== operation.jobId) {
+      return { ok: false as const, code: "allowance-exhausted", message: "fresh reservation does not belong to this job" };
+    }
+    if (fresh.organizationId !== operation.organizationId) {
+      return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
+    }
+    const freshBudget = await ctx.db.get(fresh.budgetId);
+    if (freshBudget === null || freshBudget.organizationId !== operation.organizationId) {
+      return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
+    }
+    const freshSiblings = await ctx.db
+      .query("operations")
+      .withIndex("by_job", (q) => q.eq("jobId", operation.jobId))
+      .collect();
+    const freshBound = freshSiblings.some(
+      (sibling) =>
+        sibling.reservationId === args.newReservationId &&
+        sibling.state !== "cancelled" &&
+        sibling.state !== "denied",
+    );
+    if (freshBound) {
+      return { ok: false as const, code: "allowance-exhausted", message: "fresh reservation is already bound to another operation" };
+    }
+    const resendReservationId: typeof operation.reservationId = args.newReservationId;
     const freshId = await ctx.db.insert("operations", {
       organizationId: operation.organizationId,
       projectId: operation.projectId,

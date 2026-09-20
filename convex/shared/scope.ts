@@ -168,6 +168,15 @@ const SUPPORTED_HINTS: readonly RegExp[] = Object.freeze([
   /\bcomparison\b/i,
 ]);
 
+// Outbound-communication requests classify to the communication operation
+// (not the generic research fallback) so an explicit job grant must
+// authorize the actual send/clarify effect.
+const COMMUNICATION_SEND_HINTS: readonly RegExp[] = Object.freeze([
+  /\brfq\b/i,
+  /\bdemo supplier\b/i,
+  /\bsend\b.{0,40}\b(supplier|vendor|rfq)\b/i,
+]);
+
 /**
  * Classify a free-text request against the shipped capability catalog.
  * Supplier evidence markers (e.g. "ignore previous instructions") never
@@ -186,19 +195,26 @@ export function classifyScope(input: {
       reason: "supplier-evidence-instructions-cannot-expand-capabilities",
     };
   }
-  if (input.operationId !== undefined) {
-    const entry = lookupCapability(input.operationId);
-    if (entry === undefined || !entry.enabled) {
-      return isUnrelatedText(text)
-        ? { verdict: "unrelatedRefused", reason: "request-outside-product-scope" }
-        : { verdict: "unavailableRefused", reason: `operation-unavailable:${input.operationId}` };
-    }
-    return { verdict: "supported", operationId: entry.operationId };
-  }
+  // A supplied operationId never bypasses clearly unrelated text: the
+  // text refusal is evaluated first, so a valid operation cannot launder
+  // an out-of-scope request into a supported job.
   if (isUnrelatedText(text)) {
     return { verdict: "unrelatedRefused", reason: "request-outside-product-scope" };
   }
+  if (input.operationId !== undefined) {
+    const entry = lookupCapability(input.operationId);
+    if (entry === undefined || !entry.enabled) {
+      return { verdict: "unavailableRefused", reason: `operation-unavailable:${input.operationId}` };
+    }
+    return { verdict: "supported", operationId: entry.operationId };
+  }
   if (isSupportedText(text)) {
+    if (isCommunicationSendText(text)) {
+      const entry = lookupCapability("communication.send");
+      if (entry !== undefined && entry.enabled) {
+        return { verdict: "supported", operationId: "communication.send" };
+      }
+    }
     return { verdict: "supported", operationId: "research.collect" };
   }
   return { verdict: "unavailableRefused", reason: "relevant-capability-not-shipped" };
@@ -210,6 +226,10 @@ function isUnrelatedText(text: string): boolean {
 
 function isSupportedText(text: string): boolean {
   return SUPPORTED_HINTS.some((pattern) => pattern.test(text));
+}
+
+function isCommunicationSendText(text: string): boolean {
+  return COMMUNICATION_SEND_HINTS.some((pattern) => pattern.test(text));
 }
 
 /** Detect prompt-injection directives smuggled inside supplier content. */

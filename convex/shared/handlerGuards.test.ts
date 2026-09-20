@@ -80,6 +80,7 @@ const ALLOWLIST: Record<string, Record<string, Visibility>> = {
   "execution/reconciliation.ts": {
     ingestEvent: "internalMutation",
     recordLateDelivery: "internalMutation",
+    reconcileActualCost: "internalMutation",
   },
   "purchasing/contracts/evidence.ts": {
     list: "query",
@@ -118,7 +119,7 @@ describe("exported-handler audit", () => {
     const internalOnly: Record<string, string[]> = {
       "execution/operations.ts": ["claim"],
       "execution/attempts.ts": ["recordOutcome", "reconcileAfterCrash", "reviewedResend"],
-      "execution/reconciliation.ts": ["ingestEvent", "recordLateDelivery"],
+      "execution/reconciliation.ts": ["ingestEvent", "recordLateDelivery", "reconcileActualCost"],
     };
     for (const [file, names] of Object.entries(internalOnly)) {
       const source = await readOwned(file);

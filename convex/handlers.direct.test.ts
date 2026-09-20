@@ -125,6 +125,21 @@ const configureRecipientInternalRef = makeFunctionReference<
   MutationArgs<typeof recipients.configure>,
   MutationReturn<typeof recipients.configure>
 >("access/recipients:configure");
+const cancelJobRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof jobs.cancel>,
+  MutationReturn<typeof jobs.cancel>
+>("execution/jobs:cancel");
+const revokeGrantRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof grants.revoke>,
+  MutationReturn<typeof grants.revoke>
+>("access/grants:revoke");
+const reconcileActualCostRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof reconciliation.reconcileActualCost>,
+  MutationReturn<typeof reconciliation.reconcileActualCost>
+>("execution/reconciliation:reconcileActualCost");
 const reserveBudgetRef = makeFunctionReference<
   "mutation",
   MutationArgs<typeof import("./execution/reservations.js").reserve>,
@@ -481,6 +496,7 @@ describe("direct handler visibility and absent endpoints", () => {
     expect(flags(attempts.reviewedResend).isInternal).toBe(true);
     expect(flags(reconciliation.ingestEvent).isInternal).toBe(true);
     expect(flags(reconciliation.recordLateDelivery).isInternal).toBe(true);
+    expect(flags(reconciliation.reconcileActualCost).isInternal).toBe(true);
   });
 
   test("product calls stay public while provider ingestion stays internal", () => {
@@ -1150,7 +1166,7 @@ describe("direct checkpoint-2 money, budgets, and reconciliation", () => {
     if (!claim.ok) expect(claim.code).toBe("denied-membership");
   });
 
-  test("late delivery settles unknown allowance exactly once with bindings", async () => {
+  test("late delivery records receipt; actual-cost reconciliation settles exactly once", async () => {
     const t = convexTest(schema, modules);
     const setup = await setupBudgetedProject(t, OWNER_A);
     const asOwner = t.withIdentity(OWNER_A);
@@ -1210,14 +1226,16 @@ describe("direct checkpoint-2 money, budgets, and reconciliation", () => {
     if (!late.ok) throw new Error("late delivery failed");
     expect(late.delivery).toBe("observedSuccess");
     expect(late.deduplicated).toBe(false);
+    // The receipt is recorded but the undetermined charge stays reserved
+    // until authoritative reconciliation.
     const after = await asOwner.query(readLedgerRef, {
       organizationId: setup.orgId,
       projectId: setup.projectId,
       jobId: job.jobId,
     });
     if (!after.ok) throw new Error("ledger failed");
-    expect(after.budget?.unresolvedMicroUsd).toBe(0);
-    expect(after.budget?.spentMicroUsd).toBe(50_000);
+    expect(after.budget?.unresolvedMicroUsd).toBe(50_000);
+    expect(after.budget?.spentMicroUsd).toBe(0);
     const attempts = await asOwner.query(listAttemptsRef, { operationId: created.operationId });
     if (!attempts.ok) throw new Error("attempts failed");
     expect(attempts.attempts[0]?.state).toBe("observedSuccess");
@@ -1228,13 +1246,34 @@ describe("direct checkpoint-2 money, budgets, and reconciliation", () => {
       providerEventId: "evt-direct-late-3",
     });
     expect(repeat.ok).toBe(false);
-    const settled = await asOwner.query(readLedgerRef, {
+    const overspend = await t.mutation(reconcileActualCostRef, {
+      operationId: created.operationId,
+      actualSpentMicroUsd: 60_000,
+    });
+    expect(overspend.ok).toBe(false);
+
+    const settled = await t.mutation(reconcileActualCostRef, {
+      operationId: created.operationId,
+      actualSpentMicroUsd: 30_000,
+    });
+    expect(settled.ok).toBe(true);
+    if (!settled.ok) throw new Error("reconciliation failed");
+    expect(settled.spentMicroUsd).toBe(30_000);
+    expect(settled.releasedMicroUsd).toBe(20_000);
+    const ledger = await asOwner.query(readLedgerRef, {
       organizationId: setup.orgId,
       projectId: setup.projectId,
       jobId: job.jobId,
     });
-    if (!settled.ok) throw new Error("ledger failed");
-    expect(settled.budget?.spentMicroUsd).toBe(50_000);
+    if (!ledger.ok) throw new Error("ledger failed");
+    expect(ledger.budget?.unresolvedMicroUsd).toBe(0);
+    expect(ledger.budget?.spentMicroUsd).toBe(30_000);
+
+    const twice = await t.mutation(reconcileActualCostRef, {
+      operationId: created.operationId,
+      actualSpentMicroUsd: 30_000,
+    });
+    expect(twice.ok).toBe(false);
   });
 
   test("reviewed resends require fresh reservations under exposure", async () => {
@@ -1287,6 +1326,24 @@ describe("direct checkpoint-2 money, budgets, and reconciliation", () => {
     });
     expect(denied.ok).toBe(false);
     if (!denied.ok) expect(denied.code).toBe("unknown-charges-reserved");
+
+    const fresh = await asOwner.mutation(reserveBudgetRef, {
+      jobId: job.jobId,
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      amountMicroUsd: 25_000,
+      pricingBasis: "controlled-direct",
+    });
+    if (!fresh.ok) throw new Error("fresh reserve failed");
+    const resent = await t.mutation(reviewedResendRef, {
+      operationId: created.operationId,
+      identity: OWNER_A.tokenIdentifier,
+      newRequestId: "req-resend-direct-2",
+      newReservationId: fresh.reservationId,
+    });
+    expect(resent.ok).toBe(true);
+    if (!resent.ok) throw new Error("resend failed");
+    expect(resent.warning).toContain("may duplicate");
   });
 
   test("F1-20 duplicate events across operations settle nothing twice", async () => {
@@ -1302,6 +1359,14 @@ describe("direct checkpoint-2 money, budgets, and reconciliation", () => {
         grantId: setup.grantId,
       });
       if (!job.ok) throw new Error("job setup failed");
+      const reservation = await asOwner.mutation(reserveBudgetRef, {
+        jobId: job.jobId,
+        organizationId: setup.orgId,
+        projectId: setup.projectId,
+        amountMicroUsd: 10_000,
+        pricingBasis: "controlled-direct",
+      });
+      if (!reservation.ok) throw new Error("reserve failed");
       const created = await asOwner.mutation(createOperationRef, {
         jobId: job.jobId,
         organizationId: setup.orgId,
@@ -1310,6 +1375,7 @@ describe("direct checkpoint-2 money, budgets, and reconciliation", () => {
         requestId,
         payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
         grantId: setup.grantId,
+        reservationId: reservation.reservationId,
       });
       if (!created.ok) throw new Error("operation setup failed");
       const claim = await t.mutation(claimOperationRef, {
@@ -1350,6 +1416,397 @@ describe("direct checkpoint-2 money, budgets, and reconciliation", () => {
     });
     expect(rejected.ok).toBe(false);
     if (!rejected.ok) expect(rejected.code).toBe("invalid-payload");
+  });
+
+});
+
+describe("direct checkpoint-A authority hardening", () => {
+  async function setupBudgeted(
+    t: ReturnType<typeof convexTest>,
+    owner: { tokenIdentifier: string },
+  ) {
+    const setup = await setupCommsProject(t, owner);
+    await t.run(async (ctx) => {
+      await ctx.db.insert("providerBudgets", {
+        organizationId: setup.orgId,
+        ceilingMicroUsd: 1_000_000,
+        reservedMicroUsd: 0,
+        spentMicroUsd: 0,
+        unresolvedMicroUsd: 0,
+        pricingBasis: "controlled-direct",
+        updatedAt: Date.now(),
+      });
+    });
+    return setup;
+  }
+
+  test("restricted project creation atomically grants the creator a project owner row", async () => {
+    const t = convexTest(schema, modules);
+    const asOwner = t.withIdentity(OWNER_A);
+    const org = await asOwner.mutation(createOrganizationRef, { name: "A1 org", kind: "private" });
+    if (!org.ok) throw new Error("org setup failed");
+    const proj = await asOwner.mutation(createProjectRef, {
+      organizationId: org.organizationId,
+      name: "A1 restricted",
+      visibility: "restricted",
+    });
+    if (!proj.ok) throw new Error("project setup failed");
+    // No separate grant step: the creator already holds project ownership.
+    const role = await asOwner.query(myProjectRoleRef, {
+      organizationId: org.organizationId,
+      projectId: proj.projectId,
+    });
+    expect(role.ok).toBe(true);
+    if (!role.ok) throw new Error("role read failed");
+    expect(role.role).toBe("owner");
+    // An outsider still cannot reach the restricted project.
+    const stranger = await t.withIdentity(ATTACKER).query(myProjectRoleRef, {
+      organizationId: org.organizationId,
+      projectId: proj.projectId,
+    });
+    expect(stranger.ok).toBe(false);
+  });
+
+  test("revocation is exact-project and role-capped", async () => {
+    const t = convexTest(schema, modules);
+    const asOwner = t.withIdentity(OWNER_A);
+    const org = await asOwner.mutation(createOrganizationRef, { name: "A2 org", kind: "private" });
+    if (!org.ok) throw new Error("org setup failed");
+    const proj = await asOwner.mutation(createProjectRef, {
+      organizationId: org.organizationId,
+      name: "A2 project",
+      visibility: "open",
+    });
+    if (!proj.ok) throw new Error("project setup failed");
+    const elevated = await asOwner.mutation(grantProjectAccessRef, {
+      organizationId: org.organizationId,
+      projectId: proj.projectId,
+      targetIdentity: APPROVER_A.tokenIdentifier,
+      role: "approver",
+    });
+    expect(elevated.ok).toBe(true);
+    const ownerMembershipId = await t.run(async (ctx) => {
+      const rows = await ctx.db
+        .query("memberships")
+        .withIndex("by_organization_and_identity", (q) =>
+          q.eq("organizationId", org.organizationId).eq("identity", OWNER_A.tokenIdentifier),
+        )
+        .collect();
+      const scoped = rows.find((row) => row.projectId === proj.projectId);
+      return scoped?._id ?? null;
+    });
+    if (ownerMembershipId === null) throw new Error("owner project membership missing");
+    // An approver cannot revoke the project owner above their own role.
+    const capped = await t.withIdentity(APPROVER_A).mutation(revokeProjectAccessRef, {
+      organizationId: org.organizationId,
+      projectId: proj.projectId,
+      membershipId: ownerMembershipId,
+    });
+    expect(capped.ok).toBe(false);
+    if (!capped.ok) expect(capped.code).toBe("denied-capability");
+    // The owner can still revoke the approver in the same project.
+    if (!elevated.ok) throw new Error("grant setup failed");
+    const bound = await asOwner.mutation(revokeProjectAccessRef, {
+      organizationId: org.organizationId,
+      projectId: proj.projectId,
+      membershipId: elevated.membershipId,
+    });
+    expect(bound.ok).toBe(true);
+  });
+
+  test("a supplied operationId never bypasses clearly unrelated text", async () => {
+    const t = convexTest(schema, modules);
+    const setup = await setupCommsProject(t, OWNER_A);
+    const asOwner = t.withIdentity(OWNER_A);
+    const refused = await asOwner.mutation(startJobRef, {
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      text: "Please do my homework on photosynthesis.",
+      operationId: "research.collect",
+      kind: "research",
+    });
+    expect(refused.ok).toBe(false);
+    if (!refused.ok) expect(refused.code).toBe("unrelated-refusal");
+  });
+
+  test("explicit job grants must match, stay active, and authorize the classified operation", async () => {
+    const t = convexTest(schema, modules);
+    const setup = await setupCommsProject(t, OWNER_A);
+    const asOwner = t.withIdentity(OWNER_A);
+    // A research request under a communication-only grant starts nothing.
+    const mismatched = await asOwner.mutation(startJobRef, {
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      text: "Research suppliers for the espresso machine.",
+      kind: "research",
+      grantId: setup.grantId,
+    });
+    expect(mismatched.ok).toBe(false);
+    if (!mismatched.ok) expect(mismatched.code).toBe("denied-capability");
+    // A grant from another project cannot authorize this job.
+    const other = await asOwner.mutation(createProjectRef, {
+      organizationId: setup.orgId,
+      name: "A4 other",
+      visibility: "open",
+    });
+    if (!other.ok) throw new Error("other project setup failed");
+    const foreignGrant = await asOwner.mutation(issueGrantRef, {
+      organizationId: setup.orgId,
+      projectId: other.projectId,
+      operations: ["communication.send"],
+      communicationProfile: COMMUNICATION_PROFILE_OWNER_ROLEPLAY,
+      recipientConfigVersion: 1,
+      inputVersions: { brief: "v1" },
+      payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
+      costCeilingMicroUsd: 100_000,
+      roundLimit: 2,
+      expiresAt: Date.now() + 3_600_000,
+    });
+    if (!foreignGrant.ok) throw new Error("foreign grant setup failed");
+    const foreign = await asOwner.mutation(startJobRef, {
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      text: "Send the RFQ to the demo supplier.",
+      kind: "communication",
+      grantId: foreignGrant.grantId,
+    });
+    expect(foreign.ok).toBe(false);
+    if (!foreign.ok) expect(foreign.code).toBe("denied-membership");
+    // A revoked grant authorizes nothing further.
+    const revoked = await asOwner.mutation(revokeGrantRef, { grantId: setup.grantId });
+    expect(revoked.ok).toBe(true);
+    const afterRevoke = await asOwner.mutation(startJobRef, {
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      text: "Send the RFQ to the demo supplier.",
+      kind: "communication",
+      grantId: setup.grantId,
+    });
+    expect(afterRevoke.ok).toBe(false);
+    if (!afterRevoke.ok) expect(afterRevoke.code).toBe("revoked-grant");
+  });
+
+  test("cancel releases unclaimed prepared reservations to the org ledger", async () => {
+    const t = convexTest(schema, modules);
+    const setup = await setupBudgeted(t, OWNER_A);
+    const asOwner = t.withIdentity(OWNER_A);
+    const job = await asOwner.mutation(startJobRef, {
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      text: "Send the RFQ to the demo supplier.",
+      kind: "communication",
+      grantId: setup.grantId,
+    });
+    if (!job.ok) throw new Error("job setup failed");
+    const reservation = await asOwner.mutation(reserveBudgetRef, {
+      jobId: job.jobId,
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      amountMicroUsd: 25_000,
+      pricingBasis: "controlled-direct",
+    });
+    if (!reservation.ok) throw new Error("reserve failed");
+    const created = await asOwner.mutation(createOperationRef, {
+      jobId: job.jobId,
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      kind: "communication.send",
+      requestId: "req-cancel-release",
+      payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
+      grantId: setup.grantId,
+      reservationId: reservation.reservationId,
+    });
+    if (!created.ok) throw new Error("operation setup failed");
+    const cancelled = await asOwner.mutation(cancelJobRef, { jobId: job.jobId, reason: "takeover" });
+    expect(cancelled.ok).toBe(true);
+    const ledger = await asOwner.query(readLedgerRef, {
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      jobId: job.jobId,
+    });
+    if (!ledger.ok) throw new Error("ledger failed");
+    expect(ledger.budget?.reservedMicroUsd).toBe(0);
+    expect(ledger.reservations[0]?.state).toBe("closed");
+    const state = await asOwner.query(getOperationRef, { operationId: created.operationId });
+    if (!state.ok) throw new Error("get failed");
+    expect(state.state).toBe("cancelled");
+  });
+
+  test("paid claims require a reservation bound one-to-one; dedupe precedes round limits", async () => {
+    const t = convexTest(schema, modules);
+    const setup = await setupBudgeted(t, OWNER_A);
+    const asOwner = t.withIdentity(OWNER_A);
+    const job = await asOwner.mutation(startJobRef, {
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      text: "Send the RFQ to the demo supplier.",
+      kind: "communication",
+      grantId: setup.grantId,
+    });
+    if (!job.ok) throw new Error("job setup failed");
+    // A provider-effectful claim without bound allowance is denied.
+    const bare = await asOwner.mutation(createOperationRef, {
+      jobId: job.jobId,
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      kind: "communication.send",
+      requestId: "req-bare-claim",
+      payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
+      grantId: setup.grantId,
+    });
+    if (!bare.ok) throw new Error("bare create failed");
+    const bareClaim = await t.mutation(claimOperationRef, {
+      operationId: bare.operationId,
+      identity: OWNER_A.tokenIdentifier,
+    });
+    expect(bareClaim.ok).toBe(false);
+    if (!bareClaim.ok) expect(bareClaim.code).toBe("allowance-exhausted");
+    // One reservation funds one operation: the second attach is denied.
+    // A dedicated multi-round grant keeps the round limit out of the way.
+    const roomy = await asOwner.mutation(issueGrantRef, {
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      operations: ["communication.send"],
+      communicationProfile: COMMUNICATION_PROFILE_OWNER_ROLEPLAY,
+      recipientConfigVersion: 1,
+      inputVersions: { brief: "v1" },
+      payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
+      costCeilingMicroUsd: 100_000,
+      roundLimit: 5,
+      expiresAt: Date.now() + 3_600_000,
+    });
+    if (!roomy.ok) throw new Error("roomy grant setup failed");
+    const job2 = await asOwner.mutation(startJobRef, {
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      text: "Send the RFQ to the demo supplier.",
+      kind: "communication",
+      grantId: roomy.grantId,
+    });
+    if (!job2.ok) throw new Error("job2 setup failed");
+    const reservation = await asOwner.mutation(reserveBudgetRef, {
+      jobId: job2.jobId,
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      amountMicroUsd: 20_000,
+      pricingBasis: "controlled-direct",
+    });
+    if (!reservation.ok) throw new Error("reserve failed");
+    const boundBase = {
+      jobId: job2.jobId,
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      kind: "communication.send",
+      payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
+      grantId: roomy.grantId,
+      reservationId: reservation.reservationId,
+    };
+    const first = await asOwner.mutation(createOperationRef, { ...boundBase, requestId: "req-bound-1" });
+    expect(first.ok).toBe(true);
+    const double = await asOwner.mutation(createOperationRef, { ...boundBase, requestId: "req-bound-2" });
+    expect(double.ok).toBe(false);
+    if (!double.ok) expect(double.code).toBe("allowance-exhausted");
+    // A reservation whose job grant moved away from the operation grant
+    // cannot fund the claim: the operation grant must still match the job
+    // grant at claim time.
+    const grant2 = await asOwner.mutation(issueGrantRef, {
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      operations: ["communication.send"],
+      communicationProfile: COMMUNICATION_PROFILE_OWNER_ROLEPLAY,
+      recipientConfigVersion: 1,
+      inputVersions: { brief: "v1" },
+      payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
+      costCeilingMicroUsd: 100_000,
+      roundLimit: 3,
+      expiresAt: Date.now() + 3_600_000,
+    });
+    if (!grant2.ok) throw new Error("grant2 setup failed");
+    await t.run(async (ctx) => {
+      await ctx.db.patch(job2.jobId, { grantId: grant2.grantId });
+    });
+    if (!first.ok) throw new Error("first create failed");
+    const grantMismatch = await t.mutation(claimOperationRef, {
+      operationId: first.operationId,
+      identity: OWNER_A.tokenIdentifier,
+    });
+    expect(grantMismatch.ok).toBe(false);
+    if (!grantMismatch.ok) expect(grantMismatch.code).toBe("denied-capability");
+  });
+
+  test("identical retries dedupe even when the grant round is exhausted", async () => {
+    const t = convexTest(schema, modules);
+    const setup = await setupCommsProject(t, OWNER_A);
+    const asOwner = t.withIdentity(OWNER_A);
+    const limited = await asOwner.mutation(issueGrantRef, {
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      operations: ["communication.send"],
+      communicationProfile: COMMUNICATION_PROFILE_OWNER_ROLEPLAY,
+      recipientConfigVersion: 1,
+      inputVersions: { brief: "single-round" },
+      payloadJson: JSON.stringify(commsPayload(OWNER_MAILBOX)),
+      costCeilingMicroUsd: 100_000,
+      roundLimit: 1,
+      expiresAt: Date.now() + 3_600_000,
+    });
+    if (!limited.ok) throw new Error("grant setup failed");
+    const job = await asOwner.mutation(startJobRef, {
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      text: "Send the RFQ to the demo supplier.",
+      kind: "communication",
+      grantId: limited.grantId,
+    });
+    if (!job.ok) throw new Error("job setup failed");
+    const payloadJson = JSON.stringify(commsPayload(OWNER_MAILBOX));
+    const base = {
+      jobId: job.jobId,
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+      kind: "communication.send",
+      payloadJson,
+      grantId: limited.grantId,
+    };
+    const first = await asOwner.mutation(createOperationRef, { ...base, requestId: "req-single" });
+    expect(first.ok).toBe(true);
+    // The identical retry dedupes instead of hitting the round limit.
+    const retry = await asOwner.mutation(createOperationRef, { ...base, requestId: "req-single" });
+    expect(retry.ok).toBe(true);
+    if (!retry.ok) throw new Error("dedupe failed");
+    expect(retry.deduped).toBe(true);
+    // A genuinely new request still exhausts the single round.
+    const next = await asOwner.mutation(createOperationRef, { ...base, requestId: "req-next" });
+    expect(next.ok).toBe(false);
+    if (!next.ok) expect(next.code).toBe("round-limit-exceeded");
+  });
+
+  test("auto research authority carries valid positive round semantics", async () => {
+    const t = convexTest(schema, modules);
+    const asOwner = t.withIdentity(OWNER_A);
+    const org = await asOwner.mutation(createOrganizationRef, { name: "A7 org", kind: "private" });
+    if (!org.ok) throw new Error("org setup failed");
+    const proj = await asOwner.mutation(createProjectRef, {
+      organizationId: org.organizationId,
+      name: "A7 project",
+      visibility: "open",
+    });
+    if (!proj.ok) throw new Error("project setup failed");
+    const job = await asOwner.mutation(startJobRef, {
+      organizationId: org.organizationId,
+      projectId: proj.projectId,
+      text: "Research suppliers for the espresso machine.",
+      kind: "research",
+    });
+    expect(job.ok).toBe(true);
+    if (!job.ok) throw new Error("auto job failed");
+    const authority = await t.run(async (ctx) => {
+      const jobRow = await ctx.db.get(job.jobId);
+      if (!jobRow) return null;
+      return await ctx.db.get(jobRow.grantId);
+    });
+    expect(authority?.roundLimit).toBeGreaterThanOrEqual(1);
+    expect(authority?.status).toBe("active");
   });
 
   test("unregistered paths fail to resolve in the test runtime", async () => {

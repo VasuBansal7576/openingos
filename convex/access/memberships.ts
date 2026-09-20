@@ -123,11 +123,26 @@ export const createProject = f1Mutation({
     if (args.name.trim().length === 0) {
       return { ok: false as const, code: "invalid-payload", message: "project name required" };
     }
+    const now2 = Date.now();
     const projectId = await ctx.db.insert("projects", {
       organizationId: args.organizationId,
       name: args.name.trim(),
       visibility: args.visibility,
-      createdAt: Date.now(),
+      createdAt: now2,
+    });
+    // Atomic project-scoped owner grant: restricted projects honor only
+    // project-scoped rows, so the org-owner creator would otherwise be
+    // locked out of their own project. The grant lives in the same
+    // mutation as the project row, so creation never leaves an
+    // inaccessible project behind.
+    await ctx.db.insert("memberships", {
+      organizationId: args.organizationId,
+      projectId,
+      identity,
+      role: "owner",
+      status: "active",
+      version: 1,
+      updatedAt: now2,
     });
     return { ok: true as const, projectId };
   },
@@ -212,6 +227,12 @@ export const revokeProjectAccess = f1Mutation({
     const row = await ctx.db.get(args.membershipId);
     if (row === null || row.organizationId !== args.organizationId) {
       return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
+    }
+    // Role-capped revocation: the revoker's best role in the stated
+    // project must satisfy the target's role, so an approver cannot
+    // remove an owner and a contributor cannot remove an approver.
+    if (!roleSatisfies(access.value, row.role)) {
+      return { ok: false as const, code: "denied-capability", message: "cannot revoke a membership above your own role" };
     }
     // The target membership must belong to the stated project. An org-level
     // row additionally requires org-scoped owner authority to revoke.

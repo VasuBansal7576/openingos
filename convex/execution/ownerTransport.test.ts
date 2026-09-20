@@ -169,9 +169,11 @@ describe("S-22 owner-only transport", () => {
       now,
     );
     if (!job.ok) throw new Error("job failed");
+    const reservation = store.reserve(job.value.id, 50_000, "controlled-fixture", now);
+    if (!reservation.ok) throw new Error("reserve failed");
     // Same approved draft, clarification kind: covered by the brief.
     const created = store.createOperation(
-      { identity: fixture.approverA, jobId: job.value.id, kind: "communication.clarify", requestId: "req-clarify", payload: commsPayload(CONTROLLED_OWNER_MAILBOX), grantId: fixture.grantCommsA },
+      { identity: fixture.approverA, jobId: job.value.id, kind: "communication.clarify", requestId: "req-clarify", payload: commsPayload(CONTROLLED_OWNER_MAILBOX), grantId: fixture.grantCommsA, reservationId: reservation.value.id },
       now,
     );
     expect(created.ok).toBe(true);

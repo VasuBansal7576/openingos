@@ -15,8 +15,10 @@ function claimedComms(fixture: ReturnType<typeof buildControlledFixture>, reques
     fixture.now,
   );
   if (!job.ok) throw new Error("job failed");
+  const reservation = fixture.store.reserve(job.value.id, 50_000, "controlled-fixture", fixture.now);
+  if (!reservation.ok) throw new Error("reserve failed");
   const created = fixture.store.createOperation(
-    { identity: fixture.ownerA, jobId: job.value.id, kind: "communication.send", requestId, payload: commsPayload(CONTROLLED_OWNER_MAILBOX), grantId: fixture.grantCommsA },
+    { identity: fixture.ownerA, jobId: job.value.id, kind: "communication.send", requestId, payload: commsPayload(CONTROLLED_OWNER_MAILBOX), grantId: fixture.grantCommsA, reservationId: reservation.value.id },
     fixture.now,
   );
   if (!created.ok) throw new Error("create failed");
@@ -80,14 +82,20 @@ describe("S-09 crash and replay reconcile without resend", () => {
   test("explicit reviewed resend creates a linked operation with a warning", () => {
     const fixture = buildControlledFixture();
     const { store, now } = fixture;
-    const { op } = claimedComms(fixture, "req-ambiguous");
+    const { job, op } = claimedComms(fixture, "req-ambiguous");
     store.reconcileAfterCrash(op, now + 5);
 
     // Non-approver review is refused.
     const refused = store.reviewedResend(op, "req-resend-1", fixture.contribA, now + 6);
     expect(refused.ok).toBe(false);
 
-    const resent = store.reviewedResend(op, "req-resend-1", fixture.approverA, now + 6);
+    // A resend without its own fresh reservation is denied.
+    const missing = store.reviewedResend(op, "req-resend-1", fixture.approverA, now + 6);
+    expect(missing.ok).toBe(false);
+
+    const fresh = store.reserve(job.id, 50_000, "controlled-fixture", now + 6);
+    if (!fresh.ok) throw new Error("fresh reserve failed");
+    const resent = store.reviewedResend(op, "req-resend-1", fixture.approverA, now + 6, fresh.value.id);
     expect(resent.ok).toBe(true);
     if (!resent.ok) throw new Error("resend failed");
     expect(resent.value.operation.linkedResendOf).toBe(op);

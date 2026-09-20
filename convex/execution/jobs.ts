@@ -93,10 +93,11 @@ export const start = f1Mutation({
     let grantId: Id<"grants"> | undefined = args.grantId;
     let grantVersion = 0;
     let inputVersions: Record<string, string> = {};
-    if (kind === "communication") {
-      if (grantId === undefined) {
-        return { ok: false as const, code: "denied-capability", message: "communication requires a grant" };
-      }
+    if (grantId !== undefined) {
+      // Every explicit job grant is fully validated: same
+      // organization/project, active, unexpired, and authorizing the
+      // classified operation. A foreign, revoked, expired, or
+      // non-authorizing grant starts no job.
       const grant = await ctx.db.get(grantId);
       if (
         grant === null ||
@@ -111,14 +112,13 @@ export const start = f1Mutation({
       if (isExpired(now, grant.expiresAt)) {
         return { ok: false as const, code: "expired-grant", message: "grant expired" };
       }
+      if (!grant.operations.includes(operationId)) {
+        return { ok: false as const, code: "denied-capability", message: `grant does not authorize ${operationId}` };
+      }
       grantVersion = grant.revocationVersion;
       inputVersions = { ...grant.inputVersions };
-    } else if (grantId !== undefined) {
-      const grant = await ctx.db.get(grantId);
-      if (grant !== null) {
-        grantVersion = grant.revocationVersion;
-        inputVersions = { ...grant.inputVersions };
-      }
+    } else if (kind === "communication") {
+      return { ok: false as const, code: "denied-capability", message: "communication requires a grant" };
     } else {
       const recipient = await ctx.db
         .query("recipientConfigs")
@@ -136,8 +136,13 @@ export const start = f1Mutation({
         canonicalPayload: autoCanonical,
         payloadHash: payloadHash(autoPayload),
         payloadSha256: await sha256HexOfCanonical(autoCanonical),
+        // No-spend research authority with valid positive semantics: the
+        // round limit passes the same positive-safe-integer validation as
+        // an issued grant, while the zero cost ceiling permits no
+        // reservation — bounded real research still needs an
+        // owner-funded allowance.
         costCeilingMicroUsd: 0,
-        roundLimit: 0,
+        roundLimit: 3,
         expiresAt: now + 900_000,
         revocationVersion: 1,
         status: "active",
@@ -194,6 +199,27 @@ export const cancel = f1Mutation({
     const unresolved: Id<"operations">[] = [];
     for (const operation of operations) {
       if (operation.state === "prepared") {
+        // Cancellation releases the unclaimed prepared operation's
+        // reservation back to the organization ledger, so a cancelled
+        // job never strands reserved allowance.
+        if (operation.reservationId !== undefined) {
+          const reservation = await ctx.db.get(operation.reservationId);
+          if (reservation !== null && reservation.state === "open" && reservation.reservedMicroUsd > 0) {
+            const released = reservation.reservedMicroUsd;
+            await ctx.db.patch(operation.reservationId, {
+              reservedMicroUsd: 0,
+              state: "closed",
+              updatedAt: now,
+            });
+            const budget = await ctx.db.get(reservation.budgetId);
+            if (budget !== null) {
+              await ctx.db.patch(reservation.budgetId, {
+                reservedMicroUsd: Math.max(0, budget.reservedMicroUsd - released),
+                updatedAt: now,
+              });
+            }
+          }
+        }
         await ctx.db.patch(operation._id, { state: "cancelled", updatedAt: now });
       } else if (operation.state === "dispatching" || operation.state === "outcomeUnknown") {
         unresolved.push(operation._id);

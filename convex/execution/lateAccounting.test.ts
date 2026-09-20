@@ -33,8 +33,8 @@ function reservedComms(fixture: ReturnType<typeof buildControlledFixture>, reque
   return { job: job.value, op: created.value.operation.id, token: claim.value.attemptToken, reservationId: reservation.value.id };
 }
 
-describe("late delivery moves unresolved allowance exactly once", () => {
-  test("unresolved becomes spent with token, event, and attempt binding", () => {
+describe("late delivery records receipt while unresolved stays reserved", () => {
+  test("late delivery updates receipt/attempt; actual-cost reconciliation settles spend exactly once", () => {
     const fixture = buildControlledFixture();
     const { store, now } = fixture;
     const flow = reservedComms(fixture, "req-late-acct");
@@ -50,20 +50,39 @@ describe("late delivery moves unresolved allowance exactly once", () => {
     if (!late.ok) throw new Error("late delivery failed");
     expect(late.value.jobState).not.toBe("cancelled");
     expect(late.value.delivery).toBe("observedSuccess");
-    const ledger = store.getBudgetForOrganization(fixture.orgPrivateA);
-    expect(ledger?.unresolvedMicroUsd).toBe(0);
-    expect(ledger?.spentMicroUsd).toBe(100_000);
-    expect(ledger?.reservedMicroUsd).toBe(0);
+    // The receipt is recorded but the unresolved charge stays unresolved
+    // until separate authoritative reconciliation.
+    const held = store.getBudgetForOrganization(fixture.orgPrivateA);
+    expect(held?.unresolvedMicroUsd).toBe(100_000);
+    expect(held?.spentMicroUsd).toBe(0);
+    expect(held?.reservedMicroUsd).toBe(0);
 
     const attempts = [...store.attempts.values()].filter((attempt) => attempt.operationId === flow.op);
     expect(attempts).toHaveLength(1);
     expect(attempts[0]?.state).toBe("observedSuccess");
     expect(attempts[0]?.providerEventId).toBe("evt-late-acct-2");
 
-    // A second late confirmation cannot move funds again.
+    // A second late confirmation is denied (the operation already shows
+    // the confirmed delivery).
     const repeat = store.recordLateDelivery(flow.op, flow.token, "evt-late-acct-3", now + 2);
     expect(repeat.ok).toBe(false);
-    expect(store.getBudgetForOrganization(fixture.orgPrivateA)?.spentMicroUsd).toBe(100_000);
+    expect(store.getBudgetForOrganization(fixture.orgPrivateA)?.unresolvedMicroUsd).toBe(100_000);
+
+    // Authoritative actual-cost reconciliation settles the held charge
+    // exactly once: partial spend, remainder released.
+    const settled = store.reconcileActualCost(flow.op, 60_000, now + 3);
+    expect(settled.ok).toBe(true);
+    if (!settled.ok) throw new Error("reconciliation failed");
+    expect(settled.value.spentMicroUsd).toBe(60_000);
+    expect(settled.value.releasedMicroUsd).toBe(40_000);
+    const ledger = store.getBudgetForOrganization(fixture.orgPrivateA);
+    expect(ledger?.unresolvedMicroUsd).toBe(0);
+    expect(ledger?.spentMicroUsd).toBe(60_000);
+    expect(ledger?.reservedMicroUsd).toBe(0);
+
+    const twice = store.reconcileActualCost(flow.op, 60_000, now + 4);
+    expect(twice.ok).toBe(false);
+    expect(store.getBudgetForOrganization(fixture.orgPrivateA)?.spentMicroUsd).toBe(60_000);
   });
 
   test("wrong token is denied even from outcomeUnknown", () => {
