@@ -138,6 +138,32 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "transport failed";
 }
 
+/**
+ * One absolute execution cutoff for a dispatch: the earliest of the per-step
+ * timeout budget, the claim expiry, the job expiry, the signed-request lease
+ * expiry, and the 15-minute active ceiling. The deadline timer is scheduled
+ * against this single cutoff, so an early timer wake cannot slip under an
+ * authority deadline. Controlled proof only; all inputs are logical clocks.
+ */
+export function computeExecutionCutoff(input: {
+  readonly nowMs: number;
+  readonly timeoutMs: number | undefined;
+  readonly stepTimeoutMs: number;
+  readonly claimExpiryMs: number;
+  readonly jobExpiryMs: number;
+  readonly requestLeaseExpiryMs: number;
+  readonly ceilingAtMs: number;
+}): number {
+  const stepBudget = Math.max(0, input.timeoutMs ?? input.stepTimeoutMs);
+  return Math.min(
+    input.nowMs + stepBudget,
+    input.claimExpiryMs,
+    input.jobExpiryMs,
+    input.requestLeaseExpiryMs,
+    input.ceilingAtMs,
+  );
+}
+
 export class ControlledDriver {
   private readonly secret: string;
   private readonly sessions: SessionRegistry;
@@ -569,15 +595,22 @@ export class ControlledDriver {
     // wall-clock adjustment cannot conceal an elapsed deadline. The
     // authoritative effective time is the logical dispatch start plus real
     // monotonic elapsed time, covering synchronous event-loop blocking that
-    // no timer callback can observe.
+    // no timer callback can observe. Transport completions and errors that
+    // beat the timer use this clock only and never advance it to the cutoff.
     const monoStart = performance.now();
     const effectiveNow = (): number => options.nowMs + Math.max(0, performance.now() - monoStart);
-    // Absolute step deadline: one bounded execution attempt. Checked after
-    // invocation and every await, not merely via the timer race.
-    const stepDeadlineMs = options.nowMs + Math.max(
-      0,
-      Math.min(options.timeoutMs ?? this.stepTimeoutMs, entry.claim.expiresAtMs - options.nowMs),
-    );
+    // One absolute execution cutoff: the earliest of the per-step timeout,
+    // claim expiry, job expiry, signed-request lease expiry, and the active
+    // ceiling. The deadline timer is scheduled against it.
+    const executionCutoffMs = computeExecutionCutoff({
+      nowMs: options.nowMs,
+      timeoutMs: options.timeoutMs,
+      stepTimeoutMs: this.stepTimeoutMs,
+      claimExpiryMs: entry.claim.expiresAtMs,
+      jobExpiryMs: job.request.expiresAt,
+      requestLeaseExpiryMs: record.request.sessionLease.expiresAtMs,
+      ceilingAtMs: activeCeilingAt(claimed),
+    });
     const isExpiredAt = (atMs: number): boolean => {
       const latest = this.jobs.get(jobId) as BrowserJob;
       const rec = this.requests.get(jobId);
@@ -604,17 +637,14 @@ export class ControlledDriver {
       return current;
     };
     const controller = new AbortController();
-    const budget = Math.max(
-      0,
-      Math.min(options.timeoutMs ?? this.stepTimeoutMs, entry.claim.expiresAtMs - options.nowMs),
-    );
+    const timerDelayMs = Math.max(0, executionCutoffMs - options.nowMs);
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeoutPromise = new Promise<{ readonly timedOut: true }>((resolve) => {
+    const timeoutPromise = new Promise<{ readonly timedOut: true; readonly cutoffMs: number }>((resolve) => {
       timer = setTimeout(() => {
         timer = undefined;
         controller.abort();
-        resolve({ timedOut: true });
-      }, budget);
+        resolve({ timedOut: true, cutoffMs: executionCutoffMs });
+      }, timerDelayMs);
     });
     let transportPromise: Promise<TransportResult>;
     try {
@@ -666,7 +696,11 @@ export class ControlledDriver {
       void this.settleTransportResult(jobId, attemptId, late.envelope, late.signature, Math.max(baseMs, effectiveNow()));
     };
     if ("timedOut" in raced) {
-      const atMs = effectiveNow();
+      // The deadline timer resolved: treat logical time as at least the
+      // scheduled cutoff, even if the monotonic clock reports a
+      // sub-millisecond early wake. This makes authority-deadline fencing
+      // deterministic under timer imprecision.
+      const atMs = Math.max(effectiveNow(), raced.cutoffMs);
       if (isExpiredAt(atMs)) {
         // Reached job/lease/claim/ceiling expiry: fence, release the session,
         // and retain any late outcome on the fenced job.
@@ -714,10 +748,12 @@ export class ControlledDriver {
       // authenticated outcome once on the fenced job without reopening it.
       return this.settleTransportResult(jobId, attemptId, raced.result.envelope, raced.result.signature, arrivedAt);
     }
-    if (arrivedAt >= stepDeadlineMs) {
-      // Past the absolute step deadline but within authority: not an on-time
-      // success. Mark unknown, report timeout, and reconcile the received
-      // evidence once without presenting it as on-time execution.
+    if (arrivedAt >= executionCutoffMs) {
+      // Past the absolute execution cutoff but within authority (so the cutoff
+      // was the per-step budget): not an on-time success. Mark unknown,
+      // report timeout, and reconcile the received evidence once without
+      // presenting it as on-time execution. Logical time is NOT advanced to
+      // the cutoff here — the transport beat the timer, so effectiveNow rules.
       const current = markUnknown(attemptId);
       const late = raced.result;
       void this.settleTransportResult(jobId, attemptId, late.envelope, late.signature, arrivedAt);

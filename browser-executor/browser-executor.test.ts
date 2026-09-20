@@ -61,6 +61,7 @@ import {
   verifyCallback,
   verifyJobRequest,
 } from "./index.ts";
+import { computeExecutionCutoff } from "./driver.ts";
 
 const SECRET = "ts-test-synthetic-secret-0001";
 const OTHER_SECRET = "ts-test-synthetic-secret-0002";
@@ -2248,6 +2249,52 @@ describe("FR05 bounded reconciliation after the execution cutoff", () => {
     expect(fenced.state).toBe("cancelled");
     expect(fenced.lateResults.length).toBe(1);
     expect(fenced.attempts[0]?.observation?.url).toBe(GOOD_URL);
+  });
+});
+
+describe("execution cutoff determinism (early-wake hardening)", () => {
+  it("selects the earliest of step budget, claim, job, lease, and ceiling", () => {
+    const base = {
+      nowMs: 1_000,
+      timeoutMs: undefined as number | undefined,
+      stepTimeoutMs: 30_000,
+      claimExpiryMs: 5_000,
+      jobExpiryMs: 6_000,
+      requestLeaseExpiryMs: 7_000,
+      ceilingAtMs: 8_000,
+    };
+    expect(computeExecutionCutoff(base)).toBe(5_000);
+    expect(computeExecutionCutoff({ ...base, timeoutMs: 5 })).toBe(1_005);
+    expect(computeExecutionCutoff({ ...base, claimExpiryMs: 50_000, jobExpiryMs: 2_000 })).toBe(2_000);
+    expect(computeExecutionCutoff({ ...base, claimExpiryMs: 50_000, jobExpiryMs: 60_000, requestLeaseExpiryMs: 1_500 })).toBe(1_500);
+    expect(computeExecutionCutoff({
+      ...base,
+      claimExpiryMs: 50_000,
+      jobExpiryMs: 60_000,
+      requestLeaseExpiryMs: 70_000,
+      ceilingAtMs: 1_200,
+    })).toBe(1_200);
+  });
+
+  it("fences at exact deadline equality for every deadline kind", () => {
+    const job = createJob(parseJobRequest(requestFixture({ expiresAt: NOW + 1_000 })), NOW);
+    expect(fenceExpired(job, NOW + 1_000).state).toBe("cancelled");
+    expect(fenceExpired(job, NOW + 999).state).toBe("queued");
+    const later = createJob(parseJobRequest(requestFixture({ expiresAt: NOW + 100_000 })), NOW);
+    expect(fenceExpired(later, NOW + 50, { leaseExpiryMs: NOW + 50 }).state).toBe("cancelled");
+    expect(fenceExpired(later, NOW + 50, { claimExpiryMs: NOW + 50 }).state).toBe("cancelled");
+    expect(fenceExpired(later, NOW + 50, { ceilingAtMs: NOW + 50 }).state).toBe("cancelled");
+    expect(fenceExpired(later, NOW + 49, { leaseExpiryMs: NOW + 50, claimExpiryMs: NOW + 50, ceilingAtMs: NOW + 50 }).state).toBe("queued");
+  });
+
+  it("zero-budget dispatch takes the deterministic timer path", async () => {
+    const setup = setupDriver();
+    const result = await setup.driver.dispatch(setup.jobId, issue(setup).claimId, {
+      execute: () => new Promise<TransportResult>(() => undefined),
+    }, { nowMs: NOW, timeoutMs: 0 });
+    expect(result.receipt.outcome).toBe("transport-timeout");
+    expect(result.job.attempts[0]?.state).toBe("outcomeUnknown");
+    expect(result.job.state).toBe("running");
   });
 });
 
