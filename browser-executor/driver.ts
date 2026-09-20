@@ -46,18 +46,28 @@ import {
   createJob,
   fenceExpired,
   prepareAttempt,
+  quarantinePolicyRejection,
   recordLateObservation,
   settleAttempt,
   tryComplete,
 } from "./jobs.ts";
-import { checkTarget } from "./policy.ts";
-import { parseJobRequest } from "./validation.ts";
+import { checkTarget, validateDestination } from "./policy.ts";
+import { parseJobRequest, parseObservation } from "./validation.ts";
 
 /** Default per-step transport deadline for the controlled driver. */
 export const DEFAULT_STEP_TIMEOUT_MS = 30_000;
 
 /** ADR-0004 active-execution ceiling: 15 minutes from job creation. */
 export const ACTIVE_JOB_CEILING_MS = 15 * 60 * 1_000;
+
+/**
+ * Bounded reconciliation horizon after the execution cutoff: an authenticated
+ * in-flight result may still settle once within this window past claim
+ * expiry while the job stays fenced. Execution permission ends at claim
+ * expiry; reconciliation permission ends at claim expiry plus this window.
+ * Controlled proof only; all values are synthetic test clocks.
+ */
+export const RECONCILIATION_WINDOW_MS = 5 * 60 * 1_000;
 
 function activeCeilingAt(job: BrowserJob): number {
   return job.createdAtMs + ACTIVE_JOB_CEILING_MS;
@@ -114,7 +124,10 @@ interface AttemptExpectation {
   readonly nonce: string;
   readonly requestDigest: string;
   readonly version: number;
+  /** Bounded reconciliation horizon (execution cutoff + window). */
   readonly validUntilMs: number;
+  /** Execution cutoff (claim expiry) for fencing decisions. */
+  readonly claimExpiryMs: number;
 }
 
 export interface ControlledDriverOptions {
@@ -271,29 +284,24 @@ export class ControlledDriver {
       return denied("lease-invalid", "lease triple does not match the registered job");
     }
     // Authorized resume path: only a job that previously held its
-    // request-bound lease (and released it on waiting) may present a fresh
-    // lease identity. Queued jobs that never acquired must use acquireLease
-    // with the authorized identity, so a caller cannot bypass it via re-acquire.
-    const isResumeState =
-      job.state === "waitingForSupplier" || job.state === "waitingForUser" || job.state === "running";
+    // request-bound lease may mint a fresh opaque handle, and the handle must
+    // always carry the SAME lease identity authorized by the signed request.
+    // A replacement lease identity requires a recorded authorized
+    // request/version transition (a new registration), never a public
+    // reacquisition call: rotating "authorized" to "replacement" on a running
+    // job without waiting or new authority is denied. Handle rotation (new
+    // sess_* handle, same leaseId) is the only permitted reacquire shape.
     if (!this.everAcquired.has(jobId)) {
       return denied(
         "lease-invalid",
         `job "${jobId}" never held its authorized lease; acquire the authorized request lease first`,
       );
     }
-    if (job.state === "queued") {
-      // Queued re-acquire must still present the authorized identity.
-      if (spec.leaseId !== record.request.sessionLease.leaseId) {
-        return denied(
-          "lease-invalid",
-          `lease "${spec.leaseId}" does not match the authorized request lease; a replacement requires waiting release plus an authorized resume`,
-        );
-      }
-    } else if (isResumeState && spec.leaseId !== record.request.sessionLease.leaseId) {
-      // Waiting/running resume may rotate the opaque handle identity, but the
-      // expiry stays bounded by the authorized request lease below. The fresh
-      // handle is still tracked as the single active session for the triple.
+    if (spec.leaseId !== record.request.sessionLease.leaseId) {
+      return denied(
+        "lease-invalid",
+        `lease "${spec.leaseId}" does not match the authorized request lease "${record.request.sessionLease.leaseId}"; a replacement identity requires a new authorized request/version`,
+      );
     }
     if (spec.expiresAtMs > record.request.sessionLease.expiresAtMs) {
       return denied(
@@ -337,12 +345,23 @@ export class ControlledDriver {
     }
     // Mandatory request-lease freshness at authorize time (authorizeStep also
     // enforces it, but the driver rechecks the authoritative request record).
+    // A reached request-lease deadline uses the same truthful fence/release
+    // transition as dispatch: the job is fenced so no executable session
+    // remains tracked past authority.
     if (input.nowMs >= record.request.sessionLease.expiresAtMs) {
+      this.expire(input.jobId, input.nowMs);
       return denied("lease-invalid", "the authorized request lease reached its expiry");
     }
     const context = this.leaseContext(input.jobId) as LeaseContext;
     const live = this.sessions.resolve(input.sessionHandle, context, input.nowMs);
     if (isDenial(live)) {
+      // Non-active invariant (documented, not fenced): a failed resolve means
+      // no live session exists for this handle — released handles are untracked
+      // via releaseLease, and waiting jobs hold no session by design — so the
+      // denial leaves no executable session tracked. Dispatch-time and
+      // settlement-time checks own actual deadline fencing; authorizing here
+      // must not convert a waiting job into cancelled merely for presenting a
+      // stale handle.
       return denied("lease-invalid", "no live session lease for this organization/project/job");
     }
     const lease: SessionLease = live as SessionLease;
@@ -480,7 +499,7 @@ export class ControlledDriver {
       options.nowMs >= record.request.sessionLease.expiresAtMs ||
       options.nowMs >= activeCeilingAt(job)
     ) {
-      this.expire(jobId, options.nowMs);
+      this.expire(jobId, options.nowMs, entry.claim.expiresAtMs);
       return refused("job reached its expiry; fenced with zero transport calls");
     }
     const context = this.leaseContext(jobId) as LeaseContext;
@@ -523,11 +542,16 @@ export class ControlledDriver {
     }
     const { job: claimed, attemptId } = prepared as { readonly job: BrowserJob; readonly attemptId: string };
     entry.used = true;
+    // Execution permission ends at claim expiry; reconciliation permission
+    // extends a bounded window past it so one authenticated in-flight outcome
+    // can still settle on the fenced job. Nonce markers are retained through
+    // the reconciliation horizon (see signing.ts retention).
     this.expectations.set(`${jobId}\u0000${attemptId}`, {
       nonce: entry.claim.callbackNonce,
       requestDigest: entry.claim.requestDigest,
       version: claimed.nextObservationVersion,
-      validUntilMs: entry.claim.expiresAtMs,
+      validUntilMs: entry.claim.expiresAtMs + RECONCILIATION_WINDOW_MS,
+      claimExpiryMs: entry.claim.expiresAtMs,
     });
     this.jobs.set(jobId, claimed);
 
@@ -541,8 +565,19 @@ export class ControlledDriver {
       callbackNonce: entry.claim.callbackNonce,
       requestDigest: entry.claim.requestDigest,
     };
-    const realStart = Date.now();
-    const effectiveNow = (): number => options.nowMs + Math.max(0, Date.now() - realStart);
+    // Monotonic elapsed time: performance.now() never rolls back, so a
+    // wall-clock adjustment cannot conceal an elapsed deadline. The
+    // authoritative effective time is the logical dispatch start plus real
+    // monotonic elapsed time, covering synchronous event-loop blocking that
+    // no timer callback can observe.
+    const monoStart = performance.now();
+    const effectiveNow = (): number => options.nowMs + Math.max(0, performance.now() - monoStart);
+    // Absolute step deadline: one bounded execution attempt. Checked after
+    // invocation and every await, not merely via the timer race.
+    const stepDeadlineMs = options.nowMs + Math.max(
+      0,
+      Math.min(options.timeoutMs ?? this.stepTimeoutMs, entry.claim.expiresAtMs - options.nowMs),
+    );
     const isExpiredAt = (atMs: number): boolean => {
       const latest = this.jobs.get(jobId) as BrowserJob;
       const rec = this.requests.get(jobId);
@@ -594,7 +629,7 @@ export class ControlledDriver {
       }
       const atMs = effectiveNow();
       if (isExpiredAt(atMs)) {
-        this.expire(jobId, atMs);
+        this.expire(jobId, atMs, entry.claim.expiresAtMs);
         const fenced = this.jobs.get(jobId) as BrowserJob;
         // Preserve the claimed attempt as unknown on the fenced job.
         const stranded = fenced.attempts.find((item) => item.attemptId === attemptId);
@@ -612,6 +647,10 @@ export class ControlledDriver {
       const current = markUnknown(attemptId);
       return { job: current, receipt: { attemptId, outcome: "transport-unknown", detail: errorMessage(error) } };
     }
+    // The absolute step deadline is enforced after every await below
+    // (transport result, rejection, or timer): effectiveNow() covers
+    // synchronous event-loop blocking that no timer callback can observe, so
+    // an overrun is never presented as on-time success.
     const raced = await Promise.race([
       transportPromise.then(
         (result) => ({ result }),
@@ -623,17 +662,18 @@ export class ControlledDriver {
       clearTimeout(timer);
       timer = undefined;
     }
+    const settleLateResult = (late: TransportResult, baseMs: number): void => {
+      void this.settleTransportResult(jobId, attemptId, late.envelope, late.signature, Math.max(baseMs, effectiveNow()));
+    };
     if ("timedOut" in raced) {
       const atMs = effectiveNow();
       if (isExpiredAt(atMs)) {
         // Reached job/lease/claim/ceiling expiry: fence, release the session,
         // and retain any late outcome on the fenced job.
-        this.expire(jobId, atMs);
+        this.expire(jobId, atMs, entry.claim.expiresAtMs);
         const fencedAt = effectiveNow();
         void transportPromise.then(
-          (late) => {
-            void this.settleTransportResult(jobId, attemptId, late.envelope, late.signature, Math.max(atMs, fencedAt, effectiveNow()));
-          },
+          (late) => settleLateResult(late, Math.max(atMs, fencedAt)),
           () => undefined,
         );
         const current = this.jobs.get(jobId) as BrowserJob;
@@ -642,9 +682,7 @@ export class ControlledDriver {
       const current = markUnknown(attemptId);
       const timeoutAt = atMs;
       void transportPromise.then(
-        (late) => {
-          void this.settleTransportResult(jobId, attemptId, late.envelope, late.signature, Math.max(timeoutAt, effectiveNow()));
-        },
+        (late) => settleLateResult(late, timeoutAt),
         () => undefined,
       );
       return { job: current, receipt: { attemptId, outcome: "transport-timeout", detail: "transport deadline elapsed; attempt marked unknown" } };
@@ -652,7 +690,7 @@ export class ControlledDriver {
     if ("transportError" in raced) {
       const atMs = effectiveNow();
       if (isExpiredAt(atMs)) {
-        this.expire(jobId, atMs);
+        this.expire(jobId, atMs, entry.claim.expiresAtMs);
         const fenced = this.jobs.get(jobId) as BrowserJob;
         const stranded = fenced.attempts.find((item) => item.attemptId === attemptId);
         if (stranded !== undefined && (stranded.state === "dispatching" || stranded.state === "outcomeUnknown")) {
@@ -669,7 +707,23 @@ export class ControlledDriver {
       const current = markUnknown(attemptId);
       return { job: current, receipt: { attemptId, outcome: "transport-unknown", detail: raced.transportError } };
     }
-    return this.settleTransportResult(jobId, attemptId, raced.result.envelope, raced.result.signature, effectiveNow());
+    const arrivedAt = effectiveNow();
+    if (isExpiredAt(arrivedAt)) {
+      // Result arrived after an authority deadline (including synchronous
+      // overrun past lease/claim/ceiling): fence first, then reconcile the
+      // authenticated outcome once on the fenced job without reopening it.
+      return this.settleTransportResult(jobId, attemptId, raced.result.envelope, raced.result.signature, arrivedAt);
+    }
+    if (arrivedAt >= stepDeadlineMs) {
+      // Past the absolute step deadline but within authority: not an on-time
+      // success. Mark unknown, report timeout, and reconcile the received
+      // evidence once without presenting it as on-time execution.
+      const current = markUnknown(attemptId);
+      const late = raced.result;
+      void this.settleTransportResult(jobId, attemptId, late.envelope, late.signature, arrivedAt);
+      return { job: current, receipt: { attemptId, outcome: "transport-timeout", detail: "transport exceeded its step deadline; result reconciled separately" } };
+    }
+    return this.settleTransportResult(jobId, attemptId, raced.result.envelope, raced.result.signature, arrivedAt);
   }
 
   private settleTransportResult(
@@ -681,20 +735,53 @@ export class ControlledDriver {
   ): { readonly job: BrowserJob; readonly receipt: DispatchReceipt } {
     let latest = this.jobs.get(jobId) as BrowserJob;
     const rec = this.requests.get(jobId);
+    const expectation = this.expectations.get(`${jobId}\u0000${attemptId}`);
+    const claimExpiryMs = expectation?.claimExpiryMs;
     if (rec !== undefined) {
       if (
         nowMs >= latest.request.expiresAt ||
         nowMs >= rec.request.sessionLease.expiresAtMs ||
-        nowMs >= activeCeilingAt(latest)
+        nowMs >= activeCeilingAt(latest) ||
+        (claimExpiryMs !== undefined && nowMs >= claimExpiryMs)
       ) {
-        this.expire(jobId, nowMs);
+        this.expire(jobId, nowMs, claimExpiryMs);
         latest = this.jobs.get(jobId) as BrowserJob;
       }
     } else if (nowMs >= latest.request.expiresAt) {
-      this.expire(jobId, nowMs);
+      this.expire(jobId, nowMs, claimExpiryMs);
       latest = this.jobs.get(jobId) as BrowserJob;
     }
     if (latest.state === "cancelled") {
+      // Shared late policy check BEFORE replay admission: a forbidden late
+      // destination is quarantined with its explicit policy reason without
+      // consuming the rightful nonce, settling the attempt, or reopening.
+      try {
+        if (typeof envelope === "object" && envelope !== null && !Array.isArray(envelope)) {
+          const fields = envelope as { readonly [key: string]: unknown };
+          try {
+            const parsed = parseObservation(fields.observation);
+            const destCheck = validateDestination(parsed.url, latest.request.allowedOrigins);
+            if (!destCheck.ok) {
+              const quarantined = quarantinePolicyRejection(
+                latest,
+                attemptId,
+                destCheck.reason,
+                destCheck.detail,
+                nowMs,
+              );
+              this.jobs.set(jobId, quarantined);
+              return {
+                job: quarantined,
+                receipt: { attemptId, outcome: "callback-rejected", detail: `${destCheck.reason}: ${destCheck.detail}` },
+              };
+            }
+          } catch {
+            // Unparsable: let recordLateObservation handle it below.
+          }
+        }
+      } catch {
+        // Fall through to recordLateObservation.
+      }
       const late = recordLateObservation(latest, attemptId, envelope, signature, this.verifierFor(jobId, attemptId, nowMs), nowMs);
       if (isDenial(late)) {
         return { job: latest, receipt: { attemptId, outcome: "callback-rejected", detail: `${late.reason}: ${late.detail}` } };
@@ -730,12 +817,25 @@ export class ControlledDriver {
     return cancelled;
   }
 
-  expire(jobId: string, nowMs: number): BrowserJob {
+  /**
+   * Single fencing transition for every enforced deadline: job expiry, the
+   * authoritative signed-request lease expiry, the live/claim expiry and the
+   * active-execution ceiling. Fencing cancels active work (including waiting,
+   * which must not hold a session past a deadline) and releases the tracked
+   * session; unresolved in-flight attempts keep their dispatching state for
+   * truthful reconciliation.
+   */
+  expire(jobId: string, nowMs: number, claimExpiryMs?: number): BrowserJob {
     const job = this.jobs.get(jobId);
     if (job === undefined) {
       throw new Error(`job "${jobId}" is not registered`);
     }
-    const fenced = fenceExpired(job, nowMs);
+    const record = this.requests.get(jobId);
+    const fenced = fenceExpired(job, nowMs, {
+      ...(record === undefined ? {} : { leaseExpiryMs: record.request.sessionLease.expiresAtMs }),
+      ...(claimExpiryMs === undefined ? {} : { claimExpiryMs }),
+      ceilingAtMs: activeCeilingAt(job),
+    });
     this.jobs.set(jobId, fenced);
     this.trackLeaseRelease(fenced);
     return fenced;
@@ -751,6 +851,26 @@ export class ControlledDriver {
     const job = this.jobs.get(jobId);
     if (job === undefined) {
       return denied("unknown-job", `job "${jobId}" is not registered`);
+    }
+    // Shared late policy check before admission: quarantine the forbidden
+    // destination with its explicit reason without consuming the nonce.
+    try {
+      if (typeof envelope === "object" && envelope !== null && !Array.isArray(envelope)) {
+        const fields = envelope as { readonly [key: string]: unknown };
+        try {
+          const parsed = parseObservation(fields.observation);
+          const destCheck = validateDestination(parsed.url, job.request.allowedOrigins);
+          if (!destCheck.ok) {
+            const quarantined = quarantinePolicyRejection(job, attemptId, destCheck.reason, destCheck.detail, nowMs);
+            this.jobs.set(jobId, quarantined);
+            return denied(destCheck.reason, `late observation destination rejected: ${destCheck.detail}`);
+          }
+        } catch {
+          // Unparsable: let recordLateObservation handle it below.
+        }
+      }
+    } catch {
+      // Fall through.
     }
     const result = recordLateObservation(job, attemptId, envelope, signature, this.verifierFor(jobId, attemptId, nowMs), nowMs);
     if ("ok" in result) {
