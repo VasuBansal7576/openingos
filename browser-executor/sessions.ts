@@ -45,6 +45,12 @@ export interface SessionRegistry {
   acquire(spec: LeaseSpec, nowMs: number): SessionLease | Denial;
   resolve(handle: string, context: LeaseContext, nowMs: number): SessionLease | Denial;
   release(handle: string, context: LeaseContext): Decision;
+  /**
+   * Read-only view of one handle's lease record, even when released or
+   * expired; undefined for unknown handles. Used only to expose a reached
+   * acquired-lease deadline to the fence transition — never widens authority.
+   */
+  inspect(handle: string): SessionLease | undefined;
 }
 
 function isDecision(value: SessionLease | Denial): value is Denial {
@@ -116,6 +122,10 @@ export function createSessionRegistry(): SessionRegistry {
         );
       }
       return entry.lease;
+    },
+
+    inspect(handle: string): SessionLease | undefined {
+      return byHandle.get(handle)?.lease;
     },
 
     release(handle: string, context: LeaseContext): Decision {

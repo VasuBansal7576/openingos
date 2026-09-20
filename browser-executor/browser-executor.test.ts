@@ -2348,3 +2348,188 @@ describe("FR06 cancelled policy rejection retains evidence, nonce reusable", () 
     expect(recovered.job.lateResults.length).toBe(1);
   });
 });
+
+describe("admission deadline fencing (FR03)", () => {
+  const CTX = { organizationId: "org-a", projectId: "proj-a", jobId: "job-a" };
+  const FAR = NOW + 5_000_000;
+  const T_JOB = NOW + 1_000;
+  const T_CEIL = NOW + ACTIVE_JOB_CEILING_MS;
+
+  type Authority = "job" | "requestLease" | "acquiredLease" | "ceiling";
+
+  interface AdmissionSetup {
+    readonly driver: ControlledDriver;
+    readonly jobId: string;
+    readonly handle: string;
+    readonly deadline: number;
+    readonly expectedReason: DenialReason;
+  }
+
+  function setupAdmission(authority: Authority, running: boolean): AdmissionSetup {
+    const driver = new ControlledDriver(SECRET);
+    const deadline = authority === "ceiling" ? T_CEIL : T_JOB;
+    const req = parseJobRequest(requestFixture({
+      ...(authority === "job" ? { expiresAt: deadline } : { expiresAt: FAR }),
+      ...(authority === "requestLease"
+        ? { sessionLease: { leaseId: "lease-1", expiresAtMs: deadline } }
+        : { sessionLease: { leaseId: "lease-1", expiresAtMs: FAR } }),
+    }));
+    const jobId = driver.registerJob(req, NOW) as string;
+    const acquireExpiry = authority === "job" || authority === "ceiling" ? FAR : deadline;
+    const lease = driver.acquireLease(jobId, {
+      organizationId: req.organizationId,
+      projectId: req.projectId,
+      leaseId: "lease-1",
+      expiresAtMs: acquireExpiry,
+      guest: false,
+    }, NOW);
+    if (isDenial(lease)) {
+      throw new Error(`acquire failed: ${lease.detail}`);
+    }
+    const handle = (lease as SessionLease).handle;
+    // Running state is seeded by the caller via seedRunning; admission here
+    // never dispatches transport.
+    void running;
+    return {
+      driver,
+      jobId,
+      handle,
+      deadline,
+      expectedReason: authority === "job" || authority === "ceiling" ? "job-expired" : "lease-invalid",
+    };
+  }
+
+  async function seedRunning(setup: AdmissionSetup): Promise<void> {
+    const stub = driverStub(setup.driver);
+    const claim = setup.driver.authorize({
+      jobId: setup.jobId,
+      nowMs: NOW,
+      operationId: "readVisibleText",
+      viaRecovery: false,
+      sessionHandle: setup.handle,
+    });
+    if (isDenial(claim)) {
+      throw new Error(`seed claim failed: ${claim.detail}`);
+    }
+    const result = await setup.driver.dispatch(setup.jobId, (claim as IssuedClaim).claimId, stub.transport, { nowMs: NOW });
+    expect(result.receipt.outcome).toBe("observed-success");
+    expect(stub.calls.length).toBe(1);
+  }
+
+  function authorizeAt(setup: AdmissionSetup, atMs: number): unknown {
+    return setup.driver.authorize({
+      jobId: setup.jobId,
+      nowMs: atMs,
+      operationId: "readVisibleText",
+      viaRecovery: false,
+      sessionHandle: setup.handle,
+    });
+  }
+
+  for (const authority of ["job", "requestLease", "acquiredLease", "ceiling"] as const) {
+    for (const running of [false, true]) {
+      it(`admits ${authority} at exact-1 on a ${running ? "running" : "queued"} job`, async () => {
+        const setup = setupAdmission(authority, false);
+        if (running) {
+          await seedRunning(setup);
+        }
+        const claim: unknown = authorizeAt(setup, setup.deadline - 1);
+        expect(isDenial(claim)).toBe(false);
+        expect(setup.driver.snapshot(setup.jobId)?.state).toBe(running ? "running" : "queued");
+        expect(setup.driver.trackedLease(setup.jobId)).toBe(setup.handle);
+      });
+
+      it(`fences ${authority} at exact on a ${running ? "running" : "queued"} job`, async () => {
+        const setup = setupAdmission(authority, false);
+        if (running) {
+          await seedRunning(setup);
+        }
+        const attemptsBefore = setup.driver.snapshot(setup.jobId)?.attempts.length ?? -1;
+        const denied: unknown = authorizeAt(setup, setup.deadline);
+        mustDenialReason(denied, setup.expectedReason);
+        expect(setup.driver.snapshot(setup.jobId)?.state).toBe("cancelled");
+        expect(setup.driver.trackedLease(setup.jobId)).toBeUndefined();
+        const registry = setup.driver.sessionsForTests().resolve(setup.handle, CTX, setup.deadline);
+        const detail = mustDenialReason(registry, "lease-invalid");
+        expect(detail).toContain("released");
+        // Admission authorizes no transport: no new attempt was created.
+        expect(setup.driver.snapshot(setup.jobId)?.attempts.length).toBe(attemptsBefore);
+      });
+
+      it(`fences ${authority} at exact+1 on a ${running ? "running" : "queued"} job`, async () => {
+        const setup = setupAdmission(authority, false);
+        if (running) {
+          await seedRunning(setup);
+        }
+        const attemptsBefore = setup.driver.snapshot(setup.jobId)?.attempts.length ?? -1;
+        const denied: unknown = authorizeAt(setup, setup.deadline + 1);
+        expect(isDenial(denied)).toBe(true);
+        expect(setup.driver.snapshot(setup.jobId)?.state).toBe("cancelled");
+        expect(setup.driver.trackedLease(setup.jobId)).toBeUndefined();
+        expect(setup.driver.snapshot(setup.jobId)?.attempts.length).toBe(attemptsBefore);
+      });
+    }
+  }
+
+  it("stale untracked handle denies without cancelling a valid job", async () => {
+    const setup = setupAdmission("job", false);
+    await seedRunning(setup);
+    const denied: unknown = setup.driver.authorize({
+      jobId: setup.jobId,
+      nowMs: NOW,
+      operationId: "readVisibleText",
+      viaRecovery: false,
+      sessionHandle: "sess_unknown",
+    });
+    mustDenialReason(denied, "lease-invalid");
+    expect(setup.driver.snapshot(setup.jobId)?.state).toBe("running");
+    expect(setup.driver.trackedLease(setup.jobId)).toBe(setup.handle);
+    expect(isDenial(setup.driver.sessionsForTests().resolve(setup.handle, CTX, NOW))).toBe(false);
+  });
+
+  it("wrong-context handle denies without cancelling either job", async () => {
+    const driver = new ControlledDriver(SECRET);
+    const reqA = parseJobRequest(requestFixture({
+      expiresAt: FAR,
+      sessionLease: { leaseId: "lease-1", expiresAtMs: FAR },
+    }));
+    const jobA = driver.registerJob(reqA, NOW) as string;
+    const leaseA = driver.acquireLease(jobA, {
+      organizationId: reqA.organizationId,
+      projectId: reqA.projectId,
+      leaseId: "lease-1",
+      expiresAtMs: FAR,
+      guest: false,
+    }, NOW);
+    const handleA = (leaseA as SessionLease).handle;
+    const reqB = parseJobRequest(requestFixture({
+      jobId: "job-b",
+      expiresAt: FAR,
+      sessionLease: { leaseId: "lease-1", expiresAtMs: FAR },
+    }));
+    const jobB = driver.registerJob(reqB, NOW) as string;
+    const leaseB = driver.acquireLease(jobB, {
+      organizationId: reqB.organizationId,
+      projectId: reqB.projectId,
+      leaseId: "lease-1",
+      expiresAtMs: FAR,
+      guest: false,
+    }, NOW);
+    const handleB = (leaseB as SessionLease).handle;
+    // Move A to running with its own handle.
+    const claim = driver.authorize({
+      jobId: jobA, nowMs: NOW, operationId: "readVisibleText", viaRecovery: false, sessionHandle: handleA,
+    });
+    if (isDenial(claim)) {
+      throw new Error("seed claim failed");
+    }
+    const denied: unknown = driver.authorize({
+      jobId: jobA, nowMs: NOW, operationId: "readVisibleText", viaRecovery: false, sessionHandle: handleB,
+    });
+    mustDenialReason(denied, "lease-invalid");
+    expect(driver.snapshot(jobA)?.state).toBe("queued");
+    expect(driver.trackedLease(jobA)).toBe(handleA);
+    expect(driver.snapshot(jobB)?.state).toBe("queued");
+    expect(driver.trackedLease(jobB)).toBe(handleB);
+  });
+});
