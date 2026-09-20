@@ -13,6 +13,7 @@ import { v } from "convex/values";
 import { f1Mutation, f1Query } from "../server.js";
 import { denialValidator } from "../access/checks.js";
 import { sha256HexOfCanonical } from "../shared/sha256.js";
+import { decimalCompare, decimalZero, quantity } from "../../proofs/money/decimal.js";
 import {
   approvalInputValidator,
   selectionInputValidator,
@@ -27,7 +28,10 @@ const selectionResultValidator = v.union(
 /**
  * Record a selection. Requirement, candidate, and quote must all live in
  * the caller's project, the quote version must match exactly, and the
- * requirement version must be current.
+ * requirement version must be current. The quantity is a validated
+ * positive decimal, and mixed currencies are refused until an explicit
+ * dated conversion basis is accepted (PRD 17): a requirement currency
+ * that disagrees with the quote currency blocks the selection.
  */
 export const recordSelection = f1Mutation({
   args: selectionInputValidator.fields,
@@ -74,6 +78,20 @@ export const recordSelection = f1Mutation({
     }
     if (requirement.value.version !== args.requirementVersion) {
       return { ok: false as const, code: "invalid-payload", message: "requirement version is stale" };
+    }
+    if (
+      requirement.value.currency !== undefined &&
+      requirement.value.currency !== quote.currency
+    ) {
+      return { ok: false as const, code: "invalid-payload", message: "mixed-currency-requires-accepted-conversion-basis" };
+    }
+    try {
+      const selected = quantity(args.quantity);
+      if (decimalCompare(selected, decimalZero()) <= 0) {
+        return { ok: false as const, code: "invalid-payload", message: "selected quantity must be positive" };
+      }
+    } catch {
+      return { ok: false as const, code: "invalid-payload", message: "selected quantity is not a valid decimal" };
     }
     const selectionId = await ctx.db.insert("selections", {
       organizationId: args.organizationId,

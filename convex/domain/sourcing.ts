@@ -19,10 +19,14 @@ import {
   compatibilityVerificationInputValidator,
   negotiationInputValidator,
   productEvidenceInputValidator,
+  providerProductEvidenceInputValidator,
   rfqInputValidator,
   vendorContactInputValidator,
   vendorInputValidator,
 } from "../shared/domainContracts.js";
+import { f1InternalMutation, type F1MutationCtx } from "../server.js";
+import { decimalCompare, decimalToString, decimalZero, quantity } from "../../proofs/money/decimal.js";
+import type { Id } from "../_generated/dataModel.js";
 import {
   requireDomainAccess,
   requireOrganizationAccess,
@@ -95,40 +99,67 @@ export const getVendor = f1Query({
 });
 
 /**
- * Record an authorized contact channel for one project. The vendor is
- * organization-scoped and must belong to the caller's organization; the
- * contact itself authorizes outreach for the stated project only.
+ * Record a supplier contact channel. Contacts are organization-owned
+ * research data describing how a vendor can be reached; they never
+ * authorize direct vendor delivery, which stays governed by the
+ * communication grant and recipient configuration. The idempotency key
+ * is unique per organization: identical replays return the existing
+ * row, divergent replays conflict.
  */
 export const recordVendorContact = f1Mutation({
   args: vendorContactInputValidator.fields,
   returns: v.union(
-    v.object({ ok: v.literal(true), contactId: v.id("vendorContacts") }),
+    v.object({ ok: v.literal(true), contactId: v.id("vendorContacts"), deduplicated: v.boolean() }),
     denialValidator,
   ),
   handler: async (ctx, args) => {
-    const access = await requireDomainAccess(
+    const access = await requireOrganizationAccess(
       ctx,
       args.organizationId,
-      args.projectId,
       "contributor",
     );
     if (!access.ok) {
       return { ok: false as const, code: access.code, message: access.message };
     }
+    if (args.idempotencyKey.trim().length === 0) {
+      return { ok: false as const, code: "invalid-payload", message: "idempotency key required" };
+    }
+    const existing = await ctx.db
+      .query("vendorContacts")
+      .withIndex("by_organization_and_key", (q) =>
+        q.eq("organizationId", args.organizationId).eq("idempotencyKey", args.idempotencyKey),
+      )
+      .unique();
+    if (existing !== null) {
+      const samePreference =
+        (existing.preference ?? undefined) === args.preference;
+      if (
+        existing.vendorId !== args.vendorId ||
+        existing.channel !== args.channel ||
+        existing.detailHash !== args.detailHash ||
+        !samePreference
+      ) {
+        return { ok: false as const, code: "duplicate-conflict", message: "idempotency key already used with different fields" };
+      }
+      return { ok: true as const, contactId: existing._id, deduplicated: true };
+    }
     const vendor = await ctx.db.get(args.vendorId);
     if (vendor === null || vendor.organizationId !== args.organizationId) {
       return { ok: false as const, code: "denied-project", message: "vendor is not in this organization" };
     }
+    if (args.channel.trim().length === 0 || args.detailHash.trim().length === 0) {
+      return { ok: false as const, code: "invalid-payload", message: "channel and detail hash required" };
+    }
     const contactId = await ctx.db.insert("vendorContacts", {
       organizationId: args.organizationId,
-      projectId: args.projectId,
       vendorId: args.vendorId,
       channel: args.channel,
       detailHash: args.detailHash,
       ...(args.preference === undefined ? {} : { preference: args.preference }),
+      idempotencyKey: args.idempotencyKey,
       createdAt: Date.now(),
     });
-    return { ok: true as const, contactId };
+    return { ok: true as const, contactId, deduplicated: false };
   },
 });
 
@@ -299,17 +330,122 @@ export const listCandidates = f1Query({
   },
 });
 
+type ProductEvidenceFields = {
+  organizationId: Id<"organizations">;
+  projectId: Id<"projects">;
+  requirementId?: Id<"requirements">;
+  candidateId?: Id<"candidates">;
+  field: string;
+  sourceKind: string;
+  sourceUrl?: string;
+  capturedAt: number;
+  originalValue: string;
+  normalizedValue: string;
+  freshness: "fresh" | "stale" | "expired" | "unknown";
+  lastCheckedAt?: number;
+  counterpartyRole: "ownerStandIn" | "vendor";
+  executionMode: "live" | "recorded";
+  origin: "internal" | "ownerImport";
+  idempotencyKey: string;
+};
+
+async function checkProductEvidenceRefs(
+  ctx: F1MutationCtx,
+  organizationId: Id<"organizations">,
+  projectId: Id<"projects">,
+  requirementId: Id<"requirements"> | undefined,
+  candidateId: Id<"candidates"> | undefined,
+): Promise<{ ok: true } | { ok: false; code: string; message: string }> {
+  if (requirementId !== undefined) {
+    const requirement = await requireOwnedRef(
+      await ctx.db.get(requirementId),
+      organizationId,
+      projectId,
+    );
+    if (!requirement.ok) {
+      return { ok: false as const, code: requirement.code, message: requirement.message };
+    }
+  }
+  if (candidateId !== undefined) {
+    const candidate = await requireOwnedRef(
+      await ctx.db.get(candidateId),
+      organizationId,
+      projectId,
+    );
+    if (!candidate.ok) {
+      return { ok: false as const, code: candidate.code, message: candidate.message };
+    }
+  }
+  return { ok: true as const };
+}
+
+function sameProductEvidenceFields(
+  existing: {
+    readonly field: string;
+    readonly sourceKind: string;
+    readonly originalValue: string;
+    readonly normalizedValue: string;
+    readonly counterpartyRole: string;
+    readonly executionMode: string;
+    readonly origin: string;
+  },
+  fields: ProductEvidenceFields,
+): boolean {
+  return (
+    existing.field === fields.field &&
+    existing.sourceKind === fields.sourceKind &&
+    existing.originalValue === fields.originalValue &&
+    existing.normalizedValue === fields.normalizedValue &&
+    existing.counterpartyRole === fields.counterpartyRole &&
+    existing.executionMode === fields.executionMode &&
+    existing.origin === fields.origin
+  );
+}
+
+async function insertProductEvidence(
+  ctx: F1MutationCtx,
+  fields: ProductEvidenceFields,
+  now: number,
+): Promise<Id<"productEvidence">> {
+  return await ctx.db.insert("productEvidence", {
+    organizationId: fields.organizationId,
+    projectId: fields.projectId,
+    ...(fields.requirementId === undefined ? {} : { requirementId: fields.requirementId }),
+    ...(fields.candidateId === undefined ? {} : { candidateId: fields.candidateId }),
+    field: fields.field,
+    sourceKind: fields.sourceKind,
+    ...(fields.sourceUrl === undefined ? {} : { sourceUrl: fields.sourceUrl }),
+    capturedAt: fields.capturedAt,
+    originalValue: fields.originalValue,
+    normalizedValue: fields.normalizedValue,
+    verification: "unverified",
+    freshness: fields.freshness,
+    ...(fields.lastCheckedAt === undefined ? {} : { lastCheckedAt: fields.lastCheckedAt }),
+    counterpartyRole: fields.counterpartyRole,
+    executionMode: fields.executionMode,
+    origin: fields.origin,
+    conflictEvidenceIds: [],
+    idempotencyKey: fields.idempotencyKey,
+    createdAt: now,
+  });
+}
+
+const productEvidenceResultValidator = v.union(
+  v.object({ ok: v.literal(true), evidenceId: v.id("productEvidence"), deduplicated: v.boolean() }),
+  denialValidator,
+);
+
 /**
- * Record field-level product evidence. The caller is a user import, so
- * provenance is fixed server-side to `userImport`/`recorded`; the
- * verified provider pipeline writes through its own internal path.
+ * Explicit owner-import product evidence (public path). The caller states
+ * whose counterparty terms these are from the closed ownerStandIn/vendor
+ * union; the row is labeled `ownerImport`/`recorded` so it can never
+ * masquerade as a live vendor record. Collection reruns replay through
+ * the idempotency key: identical fields deduplicate, divergent fields
+ * conflict.
  */
 export const recordProductEvidence = f1Mutation({
   args: productEvidenceInputValidator.fields,
-  returns: v.union(
-    v.object({ ok: v.literal(true), evidenceId: v.id("productEvidence") }),
-    denialValidator,
-  ),
+  returns: productEvidenceResultValidator,
   handler: async (ctx, args) => {
     const access = await requireDomainAccess(
       ctx,
@@ -320,30 +456,13 @@ export const recordProductEvidence = f1Mutation({
     if (!access.ok) {
       return { ok: false as const, code: access.code, message: access.message };
     }
-    if (args.requirementId !== undefined) {
-      const requirement = await requireOwnedRef(
-        await ctx.db.get(args.requirementId),
-        args.organizationId,
-        args.projectId,
-      );
-      if (!requirement.ok) {
-        return { ok: false as const, code: requirement.code, message: requirement.message };
-      }
-    }
-    if (args.candidateId !== undefined) {
-      const candidate = await requireOwnedRef(
-        await ctx.db.get(args.candidateId),
-        args.organizationId,
-        args.projectId,
-      );
-      if (!candidate.ok) {
-        return { ok: false as const, code: candidate.code, message: candidate.message };
-      }
+    if (args.idempotencyKey.trim().length === 0) {
+      return { ok: false as const, code: "invalid-payload", message: "idempotency key required" };
     }
     if (args.field.trim().length === 0 || args.normalizedValue.trim().length === 0) {
       return { ok: false as const, code: "invalid-payload", message: "field and normalized value required" };
     }
-    const evidenceId = await ctx.db.insert("productEvidence", {
+    const fields: ProductEvidenceFields = {
       organizationId: args.organizationId,
       projectId: args.projectId,
       ...(args.requirementId === undefined ? {} : { requirementId: args.requirementId }),
@@ -354,14 +473,204 @@ export const recordProductEvidence = f1Mutation({
       capturedAt: args.capturedAt,
       originalValue: args.originalValue,
       normalizedValue: args.normalizedValue,
-      verification: "unverified",
       freshness: args.freshness,
       ...(args.lastCheckedAt === undefined ? {} : { lastCheckedAt: args.lastCheckedAt }),
-      counterpartyRole: "userImport",
+      counterpartyRole: args.counterpartyRole,
       executionMode: "recorded",
-      createdAt: Date.now(),
+      origin: "ownerImport",
+      idempotencyKey: args.idempotencyKey,
+    };
+    const existing = await ctx.db
+      .query("productEvidence")
+      .withIndex("by_project_and_key", (q) =>
+        q.eq("projectId", args.projectId).eq("idempotencyKey", args.idempotencyKey),
+      )
+      .unique();
+    if (existing !== null) {
+      if (existing.organizationId !== args.organizationId) {
+        return { ok: false as const, code: "denied-project", message: "reference is not in this project" };
+      }
+      if (!sameProductEvidenceFields(existing, fields)) {
+        return { ok: false as const, code: "duplicate-conflict", message: "idempotency key already used with different fields" };
+      }
+      return { ok: true as const, evidenceId: existing._id, deduplicated: true };
+    }
+    const refs = await checkProductEvidenceRefs(
+      ctx,
+      args.organizationId,
+      args.projectId,
+      args.requirementId,
+      args.candidateId,
+    );
+    if (!refs.ok) {
+      return { ok: false as const, code: refs.code, message: refs.message };
+    }
+    const evidenceId = await insertProductEvidence(ctx, fields, Date.now());
+    return { ok: true as const, evidenceId, deduplicated: false };
+  },
+});
+
+/**
+ * Internal pipeline product evidence (R1/C1 ingestion only): same closed
+ * counterparty union, transport-accurate execution mode, `internal`
+ * origin. No client can reach this path.
+ */
+export const ingestProductEvidence = f1InternalMutation({
+  args: providerProductEvidenceInputValidator.fields,
+  returns: productEvidenceResultValidator,
+  handler: async (ctx, args) => {
+    const project = await ctx.db.get(args.projectId);
+    if (project === null || project.organizationId !== args.organizationId) {
+      return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
+    }
+    if (args.field.trim().length === 0 || args.normalizedValue.trim().length === 0) {
+      return { ok: false as const, code: "invalid-payload", message: "field and normalized value required" };
+    }
+    const fields: ProductEvidenceFields = {
+      organizationId: args.organizationId,
+      projectId: args.projectId,
+      ...(args.requirementId === undefined ? {} : { requirementId: args.requirementId }),
+      ...(args.candidateId === undefined ? {} : { candidateId: args.candidateId }),
+      field: args.field,
+      sourceKind: args.sourceKind,
+      ...(args.sourceUrl === undefined ? {} : { sourceUrl: args.sourceUrl }),
+      capturedAt: args.capturedAt,
+      originalValue: args.originalValue,
+      normalizedValue: args.normalizedValue,
+      freshness: args.freshness,
+      ...(args.lastCheckedAt === undefined ? {} : { lastCheckedAt: args.lastCheckedAt }),
+      counterpartyRole: args.counterpartyRole,
+      executionMode: args.executionMode,
+      origin: "internal",
+      idempotencyKey: args.idempotencyKey,
+    };
+    const existing = await ctx.db
+      .query("productEvidence")
+      .withIndex("by_project_and_key", (q) =>
+        q.eq("projectId", args.projectId).eq("idempotencyKey", args.idempotencyKey),
+      )
+      .unique();
+    if (existing !== null) {
+      if (existing.organizationId !== args.organizationId) {
+        return { ok: false as const, code: "denied-project", message: "reference is not in this project" };
+      }
+      if (!sameProductEvidenceFields(existing, fields)) {
+        return { ok: false as const, code: "duplicate-conflict", message: "idempotency key already used with different fields" };
+      }
+      return { ok: true as const, evidenceId: existing._id, deduplicated: true };
+    }
+    const refs = await checkProductEvidenceRefs(
+      ctx,
+      args.organizationId,
+      args.projectId,
+      args.requirementId,
+      args.candidateId,
+    );
+    if (!refs.ok) {
+      return { ok: false as const, code: refs.code, message: refs.message };
+    }
+    const evidenceId = await insertProductEvidence(ctx, fields, Date.now());
+    return { ok: true as const, evidenceId, deduplicated: false };
+  },
+});
+
+/**
+ * Link conflicting field evidence. Every conflicting row must live in
+ * the caller's project; the link moves verification to `conflicted`
+ * from `unverified` only, so verified findings are never silently
+ * disputed and self-links are rejected.
+ */
+export const linkEvidenceConflict = f1Mutation({
+  args: {
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    evidenceId: v.id("productEvidence"),
+    conflictingIds: v.array(v.id("productEvidence")),
+  },
+  returns: v.union(v.object({ ok: v.literal(true) }), denialValidator),
+  handler: async (ctx, args) => {
+    const access = await requireDomainAccess(
+      ctx,
+      args.organizationId,
+      args.projectId,
+      "contributor",
+    );
+    if (!access.ok) {
+      return { ok: false as const, code: access.code, message: access.message };
+    }
+    const evidence = await requireOwnedRef(
+      await ctx.db.get(args.evidenceId),
+      args.organizationId,
+      args.projectId,
+    );
+    if (!evidence.ok) {
+      return { ok: false as const, code: evidence.code, message: evidence.message };
+    }
+    if (evidence.value.verification !== "unverified") {
+      return { ok: false as const, code: "invalid-payload", message: "only unverified evidence can gain conflicts" };
+    }
+    if (args.conflictingIds.length === 0) {
+      return { ok: false as const, code: "invalid-payload", message: "at least one conflicting row required" };
+    }
+    for (const conflictingId of args.conflictingIds) {
+      if (conflictingId === args.evidenceId) {
+        return { ok: false as const, code: "invalid-payload", message: "evidence cannot conflict with itself" };
+      }
+      const conflicting = await requireOwnedRef(
+        await ctx.db.get(conflictingId),
+        args.organizationId,
+        args.projectId,
+      );
+      if (!conflicting.ok) {
+        return { ok: false as const, code: conflicting.code, message: conflicting.message };
+      }
+    }
+    await ctx.db.patch(args.evidenceId, {
+      verification: "conflicted",
+      conflictEvidenceIds: [...args.conflictingIds],
     });
-    return { ok: true as const, evidenceId };
+    return { ok: true as const };
+  },
+});
+
+/**
+ * Resolve field evidence to verified or superseded. Approver authority
+ * or above; terminal states never move again.
+ */
+export const verifyProductEvidence = f1Mutation({
+  args: {
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    evidenceId: v.id("productEvidence"),
+    verdict: v.union(v.literal("verified"), v.literal("superseded")),
+  },
+  returns: v.union(v.object({ ok: v.literal(true) }), denialValidator),
+  handler: async (ctx, args) => {
+    const access = await requireDomainAccess(
+      ctx,
+      args.organizationId,
+      args.projectId,
+      "approver",
+    );
+    if (!access.ok) {
+      return { ok: false as const, code: access.code, message: access.message };
+    }
+    const evidence = await requireOwnedRef(
+      await ctx.db.get(args.evidenceId),
+      args.organizationId,
+      args.projectId,
+    );
+    if (!evidence.ok) {
+      return { ok: false as const, code: evidence.code, message: evidence.message };
+    }
+    if (evidence.value.verification !== "unverified" && evidence.value.verification !== "conflicted") {
+      return { ok: false as const, code: "invalid-payload", message: "evidence already resolved" };
+    }
+    await ctx.db.patch(args.evidenceId, {
+      verification: args.verdict,
+      lastCheckedAt: Date.now(),
+    });
+    return { ok: true as const };
   },
 });
 
@@ -371,13 +680,15 @@ const rfqResultValidator = v.union(
 );
 
 /**
- * Create an RFQ. Every recipient vendor must belong to the caller's
- * organization AND hold an authorized contact channel for this project:
- * a known vendor without an authorized channel is a `recipient-mismatch`,
- * never a silent send. The idempotency key is unique per project: a
- * replayed key with identical material fields returns the existing row,
- * while a replay with different fields is a `duplicate-conflict` so a
- * collision can never silently swap recipients or scope.
+ * Create an RFQ. `scenarioVendorIds` names researched vendors as scenario
+ * context only: the list can neither imply nor authorize direct vendor
+ * delivery. Owner-only transport stays governed by the communication
+ * grant and recipient configuration (ADR-0004/0007), never by this
+ * record. Line items state the requested scope with validated positive
+ * decimal quantities; an optional conversation binding must resolve
+ * in-project. The idempotency key is unique per project: a replayed key
+ * with identical material fields returns the existing row, while a
+ * replay with different fields is a `duplicate-conflict`.
  */
 export const createRfq = f1Mutation({
   args: rfqInputValidator.fields,
@@ -395,8 +706,33 @@ export const createRfq = f1Mutation({
     if (args.idempotencyKey.trim().length === 0) {
       return { ok: false as const, code: "invalid-payload", message: "idempotency key required" };
     }
-    if (args.recipientVendorIds.length === 0) {
-      return { ok: false as const, code: "invalid-payload", message: "at least one recipient required" };
+    if (args.scenarioVendorIds.length === 0) {
+      return { ok: false as const, code: "invalid-payload", message: "at least one scenario vendor required" };
+    }
+    if (args.lineItems.length === 0) {
+      return { ok: false as const, code: "invalid-payload", message: "at least one line item required" };
+    }
+    const normalizedLines: { itemId: string; description: string; quantity: string; unit: string }[] = [];
+    for (const item of args.lineItems) {
+      if (item.itemId.trim().length === 0 || item.description.trim().length === 0 || item.unit.trim().length === 0) {
+        return { ok: false as const, code: "invalid-payload", message: "line items require id, description, and unit" };
+      }
+      let normalizedQuantity: string;
+      try {
+        const parsed = quantity(item.quantity);
+        if (decimalCompare(parsed, decimalZero()) <= 0) {
+          return { ok: false as const, code: "invalid-payload", message: "line item quantity must be positive" };
+        }
+        normalizedQuantity = decimalToString(parsed);
+      } catch {
+        return { ok: false as const, code: "invalid-payload", message: "line item quantity is not a valid decimal" };
+      }
+      normalizedLines.push({
+        itemId: item.itemId,
+        description: item.description,
+        quantity: normalizedQuantity,
+        unit: item.unit,
+      });
     }
     const existing = await ctx.db
       .query("rfqs")
@@ -408,12 +744,28 @@ export const createRfq = f1Mutation({
       if (existing.organizationId !== args.organizationId) {
         return { ok: false as const, code: "denied-project", message: "reference is not in this project" };
       }
-      const sameRecipients =
-        existing.recipientVendorIds.length === args.recipientVendorIds.length &&
-        existing.recipientVendorIds.every((id) => args.recipientVendorIds.includes(id));
+      const sameVendors =
+        existing.scenarioVendorIds.length === args.scenarioVendorIds.length &&
+        existing.scenarioVendorIds.every((id) => args.scenarioVendorIds.includes(id));
+      const sameLines =
+        existing.lineItems.length === normalizedLines.length &&
+        existing.lineItems.every((line, index) => {
+          const wanted = normalizedLines[index];
+          return (
+            wanted !== undefined &&
+            line.itemId === wanted.itemId &&
+            line.description === wanted.description &&
+            line.quantity === wanted.quantity &&
+            line.unit === wanted.unit
+          );
+        });
+      const sameConversation =
+        (existing.conversationId ?? undefined) === args.conversationId;
       if (
         existing.requirementId !== args.requirementId ||
-        !sameRecipients ||
+        !sameVendors ||
+        !sameLines ||
+        !sameConversation ||
         existing.briefHash !== args.briefHash ||
         existing.conversationState !== args.conversationState
       ) {
@@ -429,28 +781,20 @@ export const createRfq = f1Mutation({
     if (!requirement.ok) {
       return { ok: false as const, code: requirement.code, message: requirement.message };
     }
-    for (const vendorId of args.recipientVendorIds) {
+    for (const vendorId of args.scenarioVendorIds) {
       const vendor = await ctx.db.get(vendorId);
       if (vendor === null || vendor.organizationId !== args.organizationId) {
         return { ok: false as const, code: "denied-project", message: "vendor is not in this organization" };
       }
-      // Compound lookup for an authorized channel. Several channels
-      // may exist per vendor/project, so existence (not uniqueness) is
-      // the check, short-circuiting on the first organization-matching
-      // row: exact, with no cap and no silent truncation.
-      let authorized = false;
-      for await (const contact of ctx.db
-        .query("vendorContacts")
-        .withIndex("by_vendor_and_project", (q) =>
-          q.eq("vendorId", vendorId).eq("projectId", args.projectId),
-        )) {
-        if (contact.organizationId === args.organizationId) {
-          authorized = true;
-          break;
-        }
-      }
-      if (!authorized) {
-        return { ok: false as const, code: "recipient-mismatch", message: "vendor has no authorized contact in this project" };
+    }
+    if (args.conversationId !== undefined) {
+      const conversation = await ctx.db.get(args.conversationId);
+      if (
+        conversation === null ||
+        conversation.organizationId !== args.organizationId ||
+        conversation.projectId !== args.projectId
+      ) {
+        return { ok: false as const, code: "denied-project", message: "conversation is not in this project" };
       }
     }
     const rfqId = await ctx.db.insert("rfqs", {
@@ -458,7 +802,9 @@ export const createRfq = f1Mutation({
       projectId: args.projectId,
       requirementId: args.requirementId,
       idempotencyKey: args.idempotencyKey,
-      recipientVendorIds: [...args.recipientVendorIds],
+      scenarioVendorIds: [...args.scenarioVendorIds],
+      lineItems: normalizedLines.map((line) => ({ ...line })),
+      ...(args.conversationId === undefined ? {} : { conversationId: args.conversationId }),
       briefHash: args.briefHash,
       conversationState: args.conversationState,
       createdAt: Date.now(),
@@ -474,8 +820,10 @@ const negotiationResultValidator = v.union(
 
 /**
  * Open a negotiation mandate against one exact quote version. The quote
- * must live in the caller's project; round limits and expiry are stored
- * on the mandate itself (PRD 24).
+ * must live in the caller's project; the mandate pins the quote's exact
+ * version, currency, and conversation binding server-side (read from the
+ * row, never caller-supplied), plus mandate limits, round budget, and
+ * expiry (PRD 24).
  */
 export const openNegotiation = f1Mutation({
   args: negotiationInputValidator.fields,
@@ -501,6 +849,9 @@ export const openNegotiation = f1Mutation({
     if (args.roundLimit < 1) {
       return { ok: false as const, code: "invalid-payload", message: "round limit must be positive" };
     }
+    if (args.mandateHash.trim().length === 0) {
+      return { ok: false as const, code: "invalid-payload", message: "mandate hash required" };
+    }
     const now = Date.now();
     if (args.expiresAt <= now) {
       return { ok: false as const, code: "invalid-payload", message: "mandate already expired" };
@@ -509,6 +860,9 @@ export const openNegotiation = f1Mutation({
       organizationId: args.organizationId,
       projectId: args.projectId,
       quoteId: args.quoteId,
+      quoteVersion: quote.version,
+      currency: quote.currency,
+      ...(quote.conversationId === undefined ? {} : { conversationId: quote.conversationId }),
       mandateHash: args.mandateHash,
       ...(args.targetMinorUnits === undefined ? {} : { targetMinorUnits: args.targetMinorUnits }),
       roundLimit: args.roundLimit,
