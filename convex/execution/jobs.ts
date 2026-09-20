@@ -485,10 +485,73 @@ export const start = f1Mutation({
       return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
     }
 
+    let context = routingContext;
+    let grantAuthority: WorkflowAuthority | null = null;
+    let authorityBound = false;
+    const grantOperationHint =
+      args.operationId ??
+      (suppliedGrant !== null && suppliedGrant.operations.length === 1
+        ? suppliedGrant.operations[0]
+        : undefined);
+    if (
+      args.grantId !== undefined &&
+      suppliedGrant !== null &&
+      grantOperationHint !== undefined &&
+      suppliedGrant.operations.includes(grantOperationHint)
+    ) {
+      if (suppliedGrant.status !== "active") {
+        return { ok: false as const, code: "revoked-grant", message: "grant is not active" };
+      }
+      if (isExpired(now, suppliedGrant.expiresAt)) {
+        return { ok: false as const, code: "expired-grant", message: "grant expired" };
+      }
+      const candidateAuthority = workflowAuthorityForOperation(
+        suppliedGrant.workflowAuthorities,
+        grantOperationHint,
+      );
+      if (
+        candidateAuthority !== null &&
+        workflowAuthorityMatchesProject(candidateAuthority, grantOperationHint, args.projectId) &&
+        (await validateWorkflowAuthority(
+          ctx,
+          candidateAuthority,
+          args.organizationId,
+          args.projectId,
+          grantOperationHint,
+          args.grantId,
+        ))
+      ) {
+        const routingRequirementId = routingContext.matchedRequirementId;
+        const authorityRequirementId =
+          "requirementId" in candidateAuthority ? candidateAuthority.requirementId : undefined;
+        if (
+          routingRequirementId !== undefined &&
+          authorityRequirementId !== undefined &&
+          routingRequirementId !== authorityRequirementId
+        ) {
+          return { ok: false as const, code: "unrelated-refusal", message: "request requirement does not match the grant authority" };
+        }
+        const boundContext = await projectWorkflowContext(
+          ctx,
+          args.organizationId,
+          args.projectId,
+          args.text,
+          args.grantId,
+          candidateAuthority,
+        );
+        if (boundContext === null) {
+          return { ok: false as const, code: "unrelated-refusal", message: "workflow authority is not current for this project" };
+        }
+        grantAuthority = candidateAuthority;
+        context = boundContext;
+        authorityBound = true;
+      }
+    }
+
     const classified = classifyScope({
       text: args.text,
       ...(args.operationId === undefined ? {} : { operationId: args.operationId }),
-      projectContext: routingContext,
+      projectContext: context,
     });
     if (classified.verdict === "unrelatedRefused") {
       return { ok: false as const, code: "unrelated-refusal", message: classified.reason };
@@ -510,8 +573,6 @@ export const start = f1Mutation({
     let grantId: Id<"grants"> | undefined = args.grantId;
     let grantVersion = 0;
     let inputVersions: Record<string, string> = {};
-    let context = routingContext;
-    let grantAuthority: WorkflowAuthority | null = null;
     if (grantId !== undefined) {
       // Every explicit job grant is fully validated: same
       // organization/project, active, unexpired, and authorizing the
@@ -534,18 +595,19 @@ export const start = f1Mutation({
       if (!grant.operations.includes(operationId)) {
         return { ok: false as const, code: "denied-capability", message: `grant does not authorize ${operationId}` };
       }
-      grantAuthority = workflowAuthorityForOperation(grant.workflowAuthorities, operationId);
+      grantAuthority =
+        grantAuthority ?? workflowAuthorityForOperation(grant.workflowAuthorities, operationId);
       if (
         grantAuthority === null ||
         !workflowAuthorityMatchesProject(grantAuthority, operationId, args.projectId) ||
-        !(await validateWorkflowAuthority(
+        (!authorityBound && !(await validateWorkflowAuthority(
           ctx,
           grantAuthority,
           args.organizationId,
           args.projectId,
           operationId,
           grantId,
-        ))
+        )))
       ) {
         return { ok: false as const, code: "unrelated-refusal", message: "workflow authority is not current for this project" };
       }
@@ -559,18 +621,21 @@ export const start = f1Mutation({
       ) {
         return { ok: false as const, code: "unrelated-refusal", message: "request requirement does not match the grant authority" };
       }
-      const boundContext = await projectWorkflowContext(
-        ctx,
-        args.organizationId,
-        args.projectId,
-        args.text,
-        grantId,
-        grantAuthority,
-      );
-      if (boundContext === null) {
-        return { ok: false as const, code: "unrelated-refusal", message: "workflow authority is not current for this project" };
+      if (!authorityBound) {
+        const boundContext = await projectWorkflowContext(
+          ctx,
+          args.organizationId,
+          args.projectId,
+          args.text,
+          grantId,
+          grantAuthority,
+        );
+        if (boundContext === null) {
+          return { ok: false as const, code: "unrelated-refusal", message: "workflow authority is not current for this project" };
+        }
+        context = boundContext;
+        authorityBound = true;
       }
-      context = boundContext;
       // Reclassify against the authority-bound context before any job write.
       // The initial routing context may have matched a different textual
       // requirement; it must not pivot a supplied grant away from its exact

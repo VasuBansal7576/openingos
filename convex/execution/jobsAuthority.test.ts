@@ -133,6 +133,7 @@ async function insertRequirement(
 async function issueResearchGrant(
   fixture: Awaited<ReturnType<typeof setup>>,
   workflowAuthorities: WorkflowAuthority[],
+  query = "Research suppliers for Quasar",
 ) {
   const grant = await fixture.asOwner.mutation(issueGrantRef, {
     organizationId: fixture.organizationId,
@@ -141,7 +142,7 @@ async function issueResearchGrant(
     communicationProfile: "ownerRoleplay",
     recipientConfigVersion: 0,
     inputVersions: { brief: "v1" },
-    payloadJson: JSON.stringify({ query: "Research suppliers for Quasar" }),
+    payloadJson: JSON.stringify({ query }),
     costCeilingMicroUsd: 100,
     roundLimit: 10,
     expiresAt: Date.now() + 600_000,
@@ -253,6 +254,36 @@ test("supplied grant rejects an anchored text pivot from its bound requirement",
   if (denied.ok) throw new Error("text pivot unexpectedly created a job");
   expect(denied.code).toBe("unrelated-refusal");
   expect(await rowCounts(fixture)).toEqual(before);
+});
+
+test("supplied grant preserves anaphoric text under its exact requirement authority", async () => {
+  const fixture = await setup();
+  const boundRequirementId = await insertRequirement(fixture, "Quasar");
+  const text = "What changes if they choose another option?";
+  const grantId = await issueResearchGrant(
+    fixture,
+    [
+      { operationId: "research.collect", projectId: fixture.projectId, requirementId: boundRequirementId },
+      { operationId: "comparison.read", projectId: fixture.projectId, requirementId: boundRequirementId },
+    ],
+    text,
+  );
+  const started = await fixture.asOwner.mutation(startJobRef, {
+    organizationId: fixture.organizationId,
+    projectId: fixture.projectId,
+    text,
+    operationId: "research.collect",
+    kind: "research",
+    grantId,
+  });
+  expect(started.ok).toBe(true);
+  if (!started.ok) throw new Error("anaphoric job setup failed");
+  const job = await fixture.t.run((ctx) => ctx.db.get(started.jobId));
+  expect(job?.workflowAuthority).toEqual({
+    operationId: "research.collect",
+    projectId: fixture.projectId,
+    requirementId: boundRequirementId,
+  });
 });
 
 test("automatic research creates exact query payload and operation authority", async () => {
