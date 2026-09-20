@@ -1394,3 +1394,177 @@ describe("F1R-13 financial evidence and linked adjustments", () => {
     expect(counts).toEqual({ selections: 1, orders: 1, events: 0, entries: 0 });
   });
 });
+
+describe("cost-entry exclusive pairing over the link index", () => {
+  test("pairing holds beside many unrelated entries; conflicting siblings write nothing", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, "link-index");
+    const graph = await setupTwoLineGraph(t, project, "link-index");
+    const asOwner = t.withIdentity(OWNER);
+
+    const selection = await asOwner.mutation(recordSelectionRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      requirementId: graph.requirementId,
+      candidateId: graph.candidateId,
+      quoteId: graph.quoteId,
+      quoteVersion: "v-link-index",
+      selectionLines: [
+        { quoteLineId: "machine", quantity: "2", unit: "piece" },
+        { quoteLineId: "chair", quantity: "10", unit: "piece" },
+      ],
+      requirementVersion: 1,
+      idempotencyKey: "sel-link-index",
+    });
+    if (!selection.ok) throw new Error("selection setup failed");
+    const order = await asOwner.mutation(recordOrderRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      selectionId: selection.selectionId,
+      idempotencyKey: "ord-link-index",
+      orderLines: [
+        { quoteLineId: "machine", quantity: "1", unit: "piece" },
+        { quoteLineId: "chair", quantity: "8", unit: "piece" },
+      ],
+    });
+    if (!order.ok) throw new Error("order setup failed");
+
+    // Twelve unrelated order-level payments: the pairing probe must
+    // resolve through the link index, never by scanning this history.
+    for (let i = 0; i < 12; i += 1) {
+      const payment = await asOwner.mutation(recordCostEntryRef, {
+        organizationId: project.orgId,
+        projectId: project.projectId,
+        orderId: order.orderId,
+        kind: "payment",
+        amount: { currency: "EUR", minorUnits: 1000 + i },
+        idempotencyKey: `pay-link-index-${i}`,
+      });
+      if (!payment.ok) throw new Error(`payment ${i} setup failed`);
+    }
+
+    const noteHash = await sha256Hex("link-index-credit-note");
+    const note = await asOwner.mutation(recordEvidenceRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      sourceKind: "supplier-credit-note",
+      contentHash: noteHash,
+      completeness: "complete",
+    });
+    if (!note.ok) throw new Error("evidence setup failed");
+    const refs = [{ evidenceId: note.evidenceId, contentHash: noteHash }];
+
+    const chairCredit = await asOwner.mutation(recordCostEntryRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      orderId: order.orderId,
+      kind: "credit",
+      amount: { currency: "EUR", minorUnits: 5000 },
+      idempotencyKey: "credit-link-index",
+      quoteLineId: "chair",
+      affectedQuantity: "1",
+      affectedUnit: "piece",
+      evidenceRefs: refs,
+    });
+    if (!chairCredit.ok) throw new Error(`chair credit failed: ${JSON.stringify(chairCredit)}`);
+    const chairRefund = await asOwner.mutation(recordCostEntryRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      orderId: order.orderId,
+      kind: "refund",
+      amount: { currency: "EUR", minorUnits: 5000 },
+      idempotencyKey: "refund-link-index",
+      linkedEntryId: chairCredit.entryId,
+      quoteLineId: "chair",
+      affectedQuantity: "1",
+      affectedUnit: "piece",
+      evidenceRefs: refs,
+    });
+    if (!chairRefund.ok) throw new Error(`chair refund failed: ${JSON.stringify(chairRefund)}`);
+
+    // A second pair on another line coexists: the probe finds the exact
+    // sibling, never a neighboring link.
+    const machineCredit = await asOwner.mutation(recordCostEntryRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      orderId: order.orderId,
+      kind: "credit",
+      amount: { currency: "EUR", minorUnits: 10000 },
+      idempotencyKey: "credit-link-index-machine",
+      quoteLineId: "machine",
+      affectedQuantity: "1",
+      affectedUnit: "piece",
+      evidenceRefs: refs,
+    });
+    if (!machineCredit.ok) throw new Error("machine credit setup failed");
+    const machineRefund = await asOwner.mutation(recordCostEntryRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      orderId: order.orderId,
+      kind: "refund",
+      amount: { currency: "EUR", minorUnits: 10000 },
+      idempotencyKey: "refund-link-index-machine",
+      linkedEntryId: machineCredit.entryId,
+      quoteLineId: "machine",
+      affectedQuantity: "1",
+      affectedUnit: "piece",
+      evidenceRefs: refs,
+    });
+    if (!machineRefund.ok) throw new Error("machine refund failed");
+
+    // A conflicting sibling reusing the chair credit's link is rejected
+    // with no write: one credit absorbs exactly one refund.
+    const conflictingSibling = await asOwner.mutation(recordCostEntryRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      orderId: order.orderId,
+      kind: "refund",
+      amount: { currency: "EUR", minorUnits: 5000 },
+      idempotencyKey: "refund-link-index-conflict",
+      linkedEntryId: chairCredit.entryId,
+      quoteLineId: "chair",
+      affectedQuantity: "1",
+      affectedUnit: "piece",
+      evidenceRefs: refs,
+    });
+    expect(conflictingSibling.ok).toBe(false);
+
+    // The reverse direction conflicts too: the chair refund is already
+    // paired, so no new credit may claim it.
+    const reverseSibling = await asOwner.mutation(recordCostEntryRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      orderId: order.orderId,
+      kind: "credit",
+      amount: { currency: "EUR", minorUnits: 5000 },
+      idempotencyKey: "credit-link-index-reverse",
+      linkedEntryId: chairRefund.entryId,
+      quoteLineId: "chair",
+      affectedQuantity: "1",
+      affectedUnit: "piece",
+      evidenceRefs: refs,
+    });
+    expect(reverseSibling.ok).toBe(false);
+
+    // Exact replay of the paired refund still deduplicates.
+    const replayRefund = await asOwner.mutation(recordCostEntryRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      orderId: order.orderId,
+      kind: "refund",
+      amount: { currency: "EUR", minorUnits: 5000 },
+      idempotencyKey: "refund-link-index",
+      linkedEntryId: chairCredit.entryId,
+      quoteLineId: "chair",
+      affectedQuantity: "1",
+      affectedUnit: "piece",
+      evidenceRefs: refs,
+    });
+    if (!replayRefund.ok) throw new Error("refund replay failed");
+    expect(replayRefund.deduplicated).toBe(true);
+    expect(replayRefund.entryId).toBe(chairRefund.entryId);
+
+    const counts = await tableCounts(t, project);
+    expect(counts.entries).toBe(16);
+  });
+});

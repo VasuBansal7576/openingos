@@ -434,7 +434,11 @@ export default defineSchema({
     .index("by_project", ["projectId"])
     .index("by_order", ["orderId"])
     .index("by_project_and_key", ["projectId", "idempotencyKey"])
-    .index("by_project_and_kind", ["projectId", "kind"]),
+    .index("by_project_and_kind", ["projectId", "kind"])
+    // Link repair: bounded existence lookup for exclusive credit/refund
+    // pairing. Rows without a link carry no `linkedEntryId` and never
+    // enter this index; only paired rows are scanned, one at most.
+    .index("by_linked_entry", ["linkedEntryId"]),
 
   assets: defineTable({
     organizationId: v.id("organizations"),
