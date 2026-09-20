@@ -16,6 +16,7 @@ import { approved, denial, type AuthorityResult } from "../shared/denials.js";
 import {
   checkProjectAccess,
   identityOf,
+  membershipScopeKey,
   type DbRole,
 } from "../access/checks.js";
 import { roleSatisfies } from "../shared/scope.js";
@@ -23,6 +24,70 @@ import { roleSatisfies } from "../shared/scope.js";
 export interface DomainAccess {
   readonly identity: string;
   readonly role: DbRole;
+}
+
+const ORGANIZATION_ROLE_ORDER: readonly DbRole[] = [
+  "owner",
+  "approver",
+  "contributor",
+  "viewer",
+];
+
+/**
+ * Read one current organization role through exact projection and legacy
+ * ranges. Project-scoped history is never part of any of these ranges, and
+ * expired rows are excluded by the indexed deadline predicate.
+ */
+async function hasCurrentOrganizationRole(
+  ctx: F1QueryCtx | F1MutationCtx,
+  organizationId: Id<"organizations">,
+  identity: string,
+  role: DbRole,
+  now: number,
+): Promise<boolean> {
+  const projected = await ctx.db
+    .query("membershipAuthorities")
+    .withIndex("by_organization_and_identity_and_scope_and_role_and_authority_until", (q) =>
+      q
+        .eq("organizationId", organizationId)
+        .eq("identity", identity)
+        .eq("scopeKey", membershipScopeKey(undefined))
+        .eq("role", role)
+        .gt("authorityUntil", now),
+    )
+    .order("desc")
+    .first();
+  if (projected !== null) return true;
+
+  const legacyPermanent = await ctx.db
+    .query("memberships")
+    .withIndex("by_organization_and_identity_and_project_and_status_and_role_and_expires_at", (q) =>
+      q
+        .eq("organizationId", organizationId)
+        .eq("identity", identity)
+        .eq("projectId", undefined)
+        .eq("status", "active")
+        .eq("role", role)
+        .eq("expiresAt", undefined),
+    )
+    .order("desc")
+    .first();
+  if (legacyPermanent !== null) return true;
+
+  const legacyCurrentTemporary = await ctx.db
+    .query("memberships")
+    .withIndex("by_organization_and_identity_and_project_and_status_and_role_and_expires_at", (q) =>
+      q
+        .eq("organizationId", organizationId)
+        .eq("identity", identity)
+        .eq("projectId", undefined)
+        .eq("status", "active")
+        .eq("role", role)
+        .gt("expiresAt", now),
+    )
+    .order("desc")
+    .first();
+  return legacyCurrentTemporary !== null;
 }
 
 /**
@@ -70,28 +135,16 @@ export async function requireOrganizationAccess(
   }
   const now = Date.now();
   const organization = await ctx.db.get(organizationId);
-  const rows = await ctx.db
-    .query("memberships")
-    .withIndex("by_organization_and_identity", (q) =>
-      q.eq("organizationId", organizationId).eq("identity", identity),
-    )
-    .take(25);
-  if (organization === null || rows.length === 0) {
+  if (organization === null) {
     return denial("denied-membership", "not authorized for this organization");
   }
-  const current = rows.filter(
-    (row) =>
-      row.status === "active" &&
-      row.projectId === undefined &&
-      (row.expiresAt === undefined || row.expiresAt > now),
-  );
-  if (current.length === 0) {
-    return denial("denied-membership", "not authorized for this organization");
+  let best: DbRole | undefined;
+  for (const role of ORGANIZATION_ROLE_ORDER) {
+    if (await hasCurrentOrganizationRole(ctx, organizationId, identity, role, now)) {
+      best = role;
+      break;
+    }
   }
-  const ordered = current
-    .map((row) => row.role)
-    .sort((left, right) => rank(right) - rank(left));
-  const best = ordered[0];
   if (best === undefined) {
     return denial("denied-membership", "not authorized for this organization");
   }
@@ -102,13 +155,6 @@ export async function requireOrganizationAccess(
     );
   }
   return approved({ identity, role: best });
-}
-
-function rank(role: DbRole): number {
-  if (role === "owner") return 3;
-  if (role === "approver") return 2;
-  if (role === "contributor") return 1;
-  return 0;
 }
 
 export interface OwnedRef {

@@ -20,7 +20,6 @@ import {
   resolveProjectAccess,
 } from "./checks.js";
 import { roleSatisfies } from "../shared/scope.js";
-import { isExpired } from "../shared/time.js";
 
 const roleValidator = v.union(
   v.literal("owner"),
@@ -62,7 +61,8 @@ async function hasCurrentOrganizationOwner(
   organizationId: Id<"organizations">,
   identity: string,
   now: number,
-): Promise<boolean> {
+): Promise<number | null> {
+  const authorityHorizons: number[] = [];
   const projected = await ctx.db
     .query("membershipAuthorities")
     .withIndex("by_organization_and_identity_and_scope_and_role_and_authority_until", (q) =>
@@ -70,10 +70,12 @@ async function hasCurrentOrganizationOwner(
         .eq("organizationId", organizationId)
         .eq("identity", identity)
         .eq("scopeKey", membershipScopeKey(undefined))
-        .eq("role", "owner"),
+        .eq("role", "owner")
+        .gt("authorityUntil", now),
     )
     .order("desc")
     .first();
+  if (projected !== null) authorityHorizons.push(projected.authorityUntil);
   const legacyPermanent = await ctx.db
     .query("memberships")
     .withIndex("by_organization_and_identity_and_project_and_status_and_role_and_expires_at", (q) =>
@@ -87,6 +89,7 @@ async function hasCurrentOrganizationOwner(
     )
     .order("desc")
     .first();
+  if (legacyPermanent !== null) authorityHorizons.push(PERMANENT_AUTHORITY_UNTIL);
   const legacyCurrentTemporary = await ctx.db
     .query("memberships")
     .withIndex("by_organization_and_identity_and_project_and_status_and_role_and_expires_at", (q) =>
@@ -100,11 +103,10 @@ async function hasCurrentOrganizationOwner(
     )
     .order("desc")
     .first();
-  return [
-    ...(projected === null ? [] : [projected.expiresAt]),
-    ...(legacyPermanent === null ? [] : [legacyPermanent.expiresAt]),
-    ...(legacyCurrentTemporary === null ? [] : [legacyCurrentTemporary.expiresAt]),
-  ].some((expiresAt) => expiresAt === undefined || !isExpired(now, expiresAt));
+  if (legacyCurrentTemporary?.expiresAt !== undefined) {
+    authorityHorizons.push(legacyCurrentTemporary.expiresAt);
+  }
+  return authorityHorizons.length === 0 ? null : Math.max(...authorityHorizons);
 }
 
 /** Caller's own role for a project (proves isolation on direct calls). */
@@ -196,14 +198,19 @@ export const createProject = f1Mutation({
     // Organization administration requires current ORG-SCOPED owner
     // authority: a project-scoped owner row administers nothing outside
     // its own project.
-    const owner = await hasCurrentOrganizationOwner(ctx, args.organizationId, identity, now);
-    if (!owner) {
+    const ownerAuthorityUntil = await hasCurrentOrganizationOwner(ctx, args.organizationId, identity, now);
+    if (ownerAuthorityUntil === null) {
       return { ok: false as const, code: "denied-capability", message: "only an owner creates projects" };
     }
     if (args.name.trim().length === 0) {
       return { ok: false as const, code: "invalid-payload", message: "project name required" };
     }
     const now2 = Date.now();
+    const ownerExpiresAt =
+      ownerAuthorityUntil === PERMANENT_AUTHORITY_UNTIL ? undefined : ownerAuthorityUntil;
+    if (ownerExpiresAt !== undefined && ownerExpiresAt <= now2) {
+      return { ok: false as const, code: "denied-capability", message: "organization owner authority expired" };
+    }
     const projectId = await ctx.db.insert("projects", {
       organizationId: args.organizationId,
       name: args.name.trim(),
@@ -222,6 +229,7 @@ export const createProject = f1Mutation({
       role: "owner",
       status: "active",
       version: 1,
+      ...(ownerExpiresAt === undefined ? {} : { expiresAt: ownerExpiresAt }),
       updatedAt: now2,
     });
     await recordCurrentAuthority(
@@ -231,7 +239,7 @@ export const createProject = f1Mutation({
       identity,
       "owner",
       membershipId,
-      undefined,
+      ownerExpiresAt,
       now2,
     );
     return { ok: true as const, projectId };
@@ -291,8 +299,10 @@ export const grantProjectAccess = f1Mutation({
     // permanent approver therefore remains able to delegate an approver role
     // even while a shorter temporary owner row is also present, while an
     // owner grant is still bounded by the temporary owner row itself.
-    const authorityRows = resolution.value.authorities.filter((authority) =>
-      roleSatisfies(authority.role, args.role),
+    const authorityRows = resolution.value.authorities.filter(
+      (authority) =>
+        roleSatisfies(authority.role, "approver") &&
+        roleSatisfies(authority.role, args.role),
     );
     if (authorityRows.length === 0) {
       return { ok: false as const, code: "denied-capability", message: "granting authority is no longer current" };
@@ -373,7 +383,7 @@ export const revokeProjectAccess = f1Mutation({
     // cross-organization IDs.
     if (
       row.projectId === undefined &&
-      !(await hasCurrentOrganizationOwner(ctx, args.organizationId, identity, now))
+      (await hasCurrentOrganizationOwner(ctx, args.organizationId, identity, now)) === null
     ) {
       return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
     }

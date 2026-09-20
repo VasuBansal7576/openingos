@@ -297,6 +297,154 @@ test("open and restricted scope precedence preserves permanent approver delegati
   }
 });
 
+test("permanent lower roles cannot extend a temporary approver delegation", async () => {
+  const t = convexTest(schema, modules);
+  const asOwner = t.withIdentity(OWNER);
+  const organization = await asOwner.mutation(createOrganizationRef, {
+    name: "Membership mixed-role horizon organization",
+    kind: "private",
+  });
+  if (!organization.ok) throw new Error("organization setup failed");
+  const open = await asOwner.mutation(createProjectRef, {
+    organizationId: organization.organizationId,
+    name: "Mixed-role open project",
+    visibility: "open",
+  });
+  if (!open.ok) throw new Error("open project setup failed");
+  const restricted = await asOwner.mutation(createProjectRef, {
+    organizationId: organization.organizationId,
+    name: "Mixed-role restricted project",
+    visibility: "restricted",
+  });
+  if (!restricted.ok) throw new Error("restricted project setup failed");
+
+  const delegate = "membership-regression-mixed-role-delegate";
+  const authorityExpiry = Date.now() + 3_600_000;
+  for (const [projectId, projectScoped] of [
+    [open.projectId, false],
+    [restricted.projectId, true],
+  ] as const) {
+    for (const role of ["viewer", "contributor"] as const) {
+      await insertMembershipWithAuthority(t, {
+        organizationId: organization.organizationId,
+        ...(projectScoped ? { projectId } : {}),
+        identity: delegate,
+        role,
+      });
+    }
+    await insertMembershipWithAuthority(t, {
+      organizationId: organization.organizationId,
+      projectId,
+      identity: delegate,
+      role: "approver",
+      expiresAt: authorityExpiry,
+    });
+  }
+
+  const asDelegate = t.withIdentity({ tokenIdentifier: delegate });
+  for (const [label, projectId] of [
+    ["open", open.projectId],
+    ["restricted", restricted.projectId],
+  ] as const) {
+    for (const role of ["viewer", "contributor"] as const) {
+      const unbounded = await asDelegate.mutation(grantProjectAccessRef, {
+        organizationId: organization.organizationId,
+        projectId,
+        targetIdentity: `membership-regression-${label}-${role}-unbounded`,
+        role,
+      });
+      expect(unbounded, `${label} ${role}`).toMatchObject({
+        ok: false,
+        code: "invalid-payload",
+      });
+
+      const bounded = await asDelegate.mutation(grantProjectAccessRef, {
+        organizationId: organization.organizationId,
+        projectId,
+        targetIdentity: `membership-regression-${label}-${role}-bounded`,
+        role,
+        expiresAt: authorityExpiry,
+      });
+      expect(bounded, `${label} ${role}`).toMatchObject({ ok: true });
+    }
+  }
+});
+
+test("temporary organization-owner authority bounds project creation membership and projection", async () => {
+  const t = convexTest(schema, modules);
+  const asOwner = t.withIdentity(OWNER);
+  const organization = await asOwner.mutation(createOrganizationRef, {
+    name: "Membership temporary organization owner",
+    kind: "private",
+  });
+  if (!organization.ok) throw new Error("organization setup failed");
+
+  const temporaryOwner = "membership-regression-temporary-organization-owner";
+  const authorityExpiry = Date.now() + 3_600_000;
+  await insertMembershipWithAuthority(t, {
+    organizationId: organization.organizationId,
+    identity: temporaryOwner,
+    role: "owner",
+    expiresAt: authorityExpiry,
+  });
+
+  const created = await t.withIdentity({ tokenIdentifier: temporaryOwner }).mutation(createProjectRef, {
+    organizationId: organization.organizationId,
+    name: "Temporary organization owner project",
+    visibility: "restricted",
+  });
+  expect(created).toMatchObject({ ok: true });
+  if (!created.ok) throw new Error("temporary owner project creation failed");
+
+  const stored = await t.run(async (ctx) => {
+    const membership = await ctx.db
+      .query("memberships")
+      .withIndex("by_project_and_identity", (q) =>
+        q.eq("projectId", created.projectId).eq("identity", temporaryOwner),
+      )
+      .unique();
+    if (membership === null) throw new Error("project owner membership missing");
+    const authority = await ctx.db
+      .query("membershipAuthorities")
+      .withIndex("by_membership", (q) => q.eq("membershipId", membership._id))
+      .unique();
+    if (authority === null) throw new Error("project owner authority projection missing");
+    return {
+      membershipId: membership._id,
+      authorityId: authority._id,
+      membershipExpiresAt: membership.expiresAt,
+      authorityExpiresAt: authority.expiresAt,
+      authorityUntil: authority.authorityUntil,
+    };
+  });
+  expect(stored.membershipExpiresAt).toBe(authorityExpiry);
+  expect(stored.authorityExpiresAt).toBe(authorityExpiry);
+  expect(stored.authorityUntil).toBe(authorityExpiry);
+
+  const beforeExpiry = await t.withIdentity({ tokenIdentifier: temporaryOwner }).query(myProjectRoleRef, {
+    organizationId: organization.organizationId,
+    projectId: created.projectId,
+  });
+  expect(beforeExpiry).toMatchObject({ ok: true, role: "owner" });
+
+  // Move both propagated rows past the server clock so the public role query
+  // proves the created project does not retain permanent access.
+  await t.run(async (ctx) => {
+    const expiredAt = Date.now() - 1;
+    await ctx.db.patch(stored.membershipId, { expiresAt: expiredAt, updatedAt: expiredAt });
+    await ctx.db.patch(stored.authorityId, {
+      expiresAt: expiredAt,
+      authorityUntil: expiredAt,
+      updatedAt: expiredAt,
+    });
+  });
+  const afterExpiry = await t.withIdentity({ tokenIdentifier: temporaryOwner }).query(myProjectRoleRef, {
+    organizationId: organization.organizationId,
+    projectId: created.projectId,
+  });
+  expect(afterExpiry).toMatchObject({ ok: false, code: "expired-membership" });
+});
+
 test("legacy permanent authority wins over temporary and expired projections", async () => {
   const t = convexTest(schema, modules);
   const asOwner = t.withIdentity(OWNER);
@@ -391,6 +539,56 @@ test("organization owner resolution merges legacy and projected authority", asyn
     visibility: "restricted",
   });
   expect(created).toMatchObject({ ok: true });
+});
+
+test("repeated revocation leaves project access revoked and projection removed", async () => {
+  const t = convexTest(schema, modules);
+  const asOwner = t.withIdentity(OWNER);
+  const organization = await asOwner.mutation(createOrganizationRef, {
+    name: "Membership repeated revocation organization",
+    kind: "private",
+  });
+  if (!organization.ok) throw new Error("organization setup failed");
+  const project = await asOwner.mutation(createProjectRef, {
+    organizationId: organization.organizationId,
+    name: "Repeated revocation project",
+    visibility: "restricted",
+  });
+  if (!project.ok) throw new Error("project setup failed");
+  const granted = await asOwner.mutation(grantProjectAccessRef, {
+    organizationId: organization.organizationId,
+    projectId: project.projectId,
+    targetIdentity: "membership-regression-repeated-revoke",
+    role: "viewer",
+  });
+  if (!granted.ok) throw new Error("grant setup failed");
+
+  const first = await asOwner.mutation(revokeProjectAccessRef, {
+    organizationId: organization.organizationId,
+    projectId: project.projectId,
+    membershipId: granted.membershipId,
+  });
+  const second = await asOwner.mutation(revokeProjectAccessRef, {
+    organizationId: organization.organizationId,
+    projectId: project.projectId,
+    membershipId: granted.membershipId,
+  });
+  expect(first).toMatchObject({ ok: true, revoked: true });
+  expect(second).toMatchObject({ ok: true, revoked: true });
+
+  const role = await t.withIdentity({ tokenIdentifier: "membership-regression-repeated-revoke" }).query(myProjectRoleRef, {
+    organizationId: organization.organizationId,
+    projectId: project.projectId,
+  });
+  expect(role).toMatchObject({ ok: false, code: "revoked-membership" });
+  const projectionCount = await t.run(async (ctx) => {
+    const rows = await ctx.db
+      .query("membershipAuthorities")
+      .withIndex("by_membership", (q) => q.eq("membershipId", granted.membershipId))
+      .take(2);
+    return rows.length;
+  });
+  expect(projectionCount).toBe(0);
 });
 
 test("actual access handlers stay bounded with 300 revoked unrelated memberships", async () => {
