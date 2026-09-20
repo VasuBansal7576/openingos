@@ -1,8 +1,11 @@
 import type { BackendStatus } from "./backend-state";
+import WorkbenchView, { type WorkbenchViewProps } from "./Workbench";
+import type { WorkbenchLoadState } from "./workbench-state";
 
-export interface AppProps {
-  backendStatus?: BackendStatus;
-  onRetry?: () => void;
+export interface AppProps extends Pick<WorkbenchViewProps, "onAction" | "onLoadMore"> {
+  readonly backendStatus?: BackendStatus;
+  readonly onRetry?: () => void;
+  readonly workbench?: WorkbenchLoadState | undefined;
 }
 
 type StatusCopy = {
@@ -39,9 +42,9 @@ function statusCopy(status: BackendStatus): StatusCopy {
     case "connected":
       return {
         eyebrow: "BACKEND CONNECTED",
-        title: "The purchasing workbench can stay in sync.",
-        message: "Convex has reported a live connection. Customer workflows remain governed by backend identity, capability, and current authority checks.",
-        tone: "success",
+        title: "Waiting for the project projection.",
+        message: "Convex has reported a live connection, but no authorized project projection is attached to this browser yet. No vendors, quotes or provider outcomes are shown.",
+        tone: "pending",
       };
     case "reconnecting":
       return {
@@ -62,55 +65,29 @@ function statusCopy(status: BackendStatus): StatusCopy {
   }
 }
 
-export default function App({ backendStatus = "unconfigured", onRetry }: AppProps) {
-  const copy = statusCopy(backendStatus);
+function FoundationStatus({ status, onRetry }: { readonly status: BackendStatus; readonly onRetry?: (() => void) | undefined }) {
+  const copy = statusCopy(status);
 
   return (
-    <main className="shell">
-      <section className="hero" aria-labelledby="page-title">
-        <div className="eyebrow">OPENINGOS / PURCHASING WORKBENCH</div>
+    <main className="foundation-shell">
+      <section className="foundation-hero" aria-labelledby="page-title">
+        <div className="foundation-brand"><span className="foundation-mark">O<span>.</span></span><span>OpeningOS</span></div>
+        <div className="foundation-eyebrow">PURCHASING WORKBENCH / PRODUCTION FOUNDATION</div>
         <h1 id="page-title">Turn supplier uncertainty into a clear next move.</h1>
-        <p className="lede">
-          A production foundation for bounded research, evidence review, and owner-approved purchasing work.
-        </p>
-        <div className={`status-card ${copy.tone}`} role="status" aria-live="polite">
-          <span className={`status-dot ${copy.tone}`} aria-hidden="true" />
-          <div>
-            <div className="status-eyebrow">{copy.eyebrow}</div>
-            <strong>{copy.title}</strong>
-            <p>{copy.message}</p>
-            {copy.action !== undefined && onRetry !== undefined ? (
-              <button type="button" className="retry-button" onClick={onRetry}>
-                {copy.action}
-              </button>
-            ) : null}
-          </div>
+        <p className="foundation-lede">Evidence, authority and honest waiting for every purchasing decision that matters to opening day.</p>
+        <div className={`foundation-status ${copy.tone}`} role="status" aria-live="polite">
+          <span className={`foundation-status-dot ${copy.tone}`} aria-hidden="true" />
+          <div><div className="foundation-status-eyebrow">{copy.eyebrow}</div><strong>{copy.title}</strong><p>{copy.message}</p>{copy.action !== undefined && onRetry !== undefined ? <button type="button" className="foundation-retry retry-button" onClick={onRetry}>{copy.action}</button> : null}</div>
         </div>
       </section>
-
-      <section className="principles" aria-labelledby="principles-title">
-        <div>
-          <div className="eyebrow">FOUNDATION STATUS</div>
-          <h2 id="principles-title">Built for evidence, authority, and honest waiting.</h2>
-        </div>
-        <div className="principle-grid">
-          <article>
-            <span>01</span>
-            <h3>Evidence first</h3>
-            <p>Every later decision can point back to a bounded source and a reviewable state.</p>
-          </article>
-          <article>
-            <span>02</span>
-            <h3>Authority enforced</h3>
-            <p>Server-side capabilities and grants remain the source of truth for external effects.</p>
-          </article>
-          <article>
-            <span>03</span>
-            <h3>Waiting is visible</h3>
-            <p>Unavailable providers stay unavailable until real credentials and allowances exist.</p>
-          </article>
-        </div>
-      </section>
+      <section className="foundation-principles" aria-labelledby="principles-title"><div><div className="foundation-eyebrow">WORKBENCH PRINCIPLES</div><h2 id="principles-title">Built for evidence, authority, and honest waiting.</h2></div><div className="foundation-principle-grid"><article><span>01</span><h3>Evidence first</h3><p>Every comparison can point back to a bounded source and a reviewable state.</p></article><article><span>02</span><h3>Authority enforced</h3><p>Server-side capabilities and grants remain the source of truth for external effects.</p></article><article><span>03</span><h3>Waiting is visible</h3><p>Unavailable providers stay unavailable until real credentials and allowances exist.</p></article></div></section>
     </main>
   );
+}
+
+export default function App({ backendStatus = "unconfigured", onRetry, workbench, onAction, onLoadMore }: AppProps) {
+  if (workbench !== undefined && (backendStatus === "connected" || backendStatus === "reconnecting")) {
+    return <WorkbenchView loadState={workbench} onRetry={onRetry} onAction={onAction} onLoadMore={onLoadMore} />;
+  }
+  return <FoundationStatus status={backendStatus} onRetry={onRetry} />;
 }
