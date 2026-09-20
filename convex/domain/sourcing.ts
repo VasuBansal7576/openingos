@@ -30,6 +30,7 @@ import {
   type F1MutationCtx,
 } from "../server.js";
 import { decimalCompare, decimalToString, decimalZero, quantity } from "../../proofs/money/decimal.js";
+import { money as makeMoney } from "../../proofs/money/money.js";
 import { canonicalJson } from "../shared/hashing.js";
 import type { Id } from "../_generated/dataModel.js";
 import {
@@ -382,11 +383,23 @@ export const verifyCompatibility = f1Mutation({
     // candidate row remains the authoritative finding payload; these child
     // rows only make sparse invalidation addressable when the requirement
     // itself has more candidates than one transaction may scan or patch.
+    // F1R-06 residual: preflight the complete bounded mutation before any
+    // write. Every per-evidence binding count is resolved first, so an
+    // over-bound set denies with zero writes instead of denying after an
+    // earlier evidence row's bindings were already deleted.
     const bindingEvidenceIds = new Set<string>();
     for (const ref of candidate.value.compatibilityEvidenceRefs ?? []) {
       bindingEvidenceIds.add(ref.sourceId);
     }
     for (const ref of args.evidenceRefs) bindingEvidenceIds.add(ref.sourceId);
+    if (bindingEvidenceIds.size > MAX_COMPATIBILITY_FANOUT) {
+      return {
+        ok: false as const,
+        code: "invalid-payload",
+        message: `compatibility evidence binding fanout exceeds the supported bound of ${MAX_COMPATIBILITY_FANOUT}`,
+      };
+    }
+    const doomedBindingIds: Id<"compatibilityEvidenceBindings">[] = [];
     for (const sourceId of bindingEvidenceIds) {
       const bindings = await ctx.db
         .query("compatibilityEvidenceBindings")
@@ -403,8 +416,9 @@ export const verifyCompatibility = f1Mutation({
           message: `compatibility evidence binding fanout exceeds the supported bound of ${MAX_COMPATIBILITY_FANOUT}`,
         };
       }
-      for (const binding of bindings) await ctx.db.delete(binding._id);
+      for (const binding of bindings) doomedBindingIds.push(binding._id);
     }
+    for (const bindingId of doomedBindingIds) await ctx.db.delete(bindingId);
     await ctx.db.patch(args.candidateId, {
       compatibility: args.result,
       compatibilityEvidenceRefs: [...args.evidenceRefs],
@@ -744,6 +758,13 @@ function bumpEvidenceVersion(version: string): string {
  * just changed meaningfully (conflicted or superseded). Findings that
  * cited the evidence row return to `unknown` with their basis pins
  * cleared; findings on other evidence are untouched.
+ *
+ * F1R-06 residual: a current-captured row with zero bindings is a
+ * complete empty dependent set (no requirement scan); a historical row
+ * without ingestion identity keeps the bounded legacy scan. Clearing a
+ * candidate removes every basis's binding for that candidate and the
+ * full plan is preflighted before any write, keeping the accepted
+ * four-reference and 256-dependent bounds with atomic zero-write denial.
  */
 async function invalidateDependentCompatibility(
   ctx: F1MutationCtx,
@@ -753,6 +774,7 @@ async function invalidateDependentCompatibility(
     readonly projectId: Id<"projects">;
     readonly requirementId?: Id<"requirements">;
     readonly candidateId?: Id<"candidates">;
+    readonly ingestionIdentity?: string;
   },
 ): Promise<{ ok: true } | { ok: false; code: "invalid-payload"; message: string }> {
   type CandidateRow = {
@@ -828,6 +850,12 @@ async function invalidateDependentCompatibility(
   // Historical rows predate the child index. Keep their migration path
   // bounded; once any current binding exists, the indexed set is complete
   // for current writes and public reads derive stale status for old rows.
+  // F1R-06 residual: a complete current reverse index containing zero
+  // dependents is distinct from uncertain historical migration. Every
+  // compatibility write maintains bindings, so a current-captured evidence
+  // row (stored ingestion identity) with zero bindings has no dependents
+  // and needs no requirement scan. Rows without that identity predate the
+  // guarantee and keep the bounded legacy fallback below.
   if (bindings.length === 0 && evidence.candidateId !== undefined) {
     const direct = await ctx.db.get(evidence.candidateId);
     if (
@@ -841,7 +869,8 @@ async function invalidateDependentCompatibility(
   } else if (
     bindings.length === 0 &&
     evidence.candidateId === undefined &&
-    evidence.requirementId !== undefined
+    evidence.requirementId !== undefined &&
+    evidence.ingestionIdentity === undefined
   ) {
     const scoped = await ctx.db
       .query("candidates")
@@ -865,8 +894,71 @@ async function invalidateDependentCompatibility(
     }
   }
 
-  for (const bindingId of staleBindingIds) await ctx.db.delete(bindingId);
-  for (const { row, bindingIds } of rows.values()) {
+  // F1R-06 residual: clearing a candidate wipes its entire compatibility
+  // evidence list, so every basis's reverse-index row for that candidate
+  // goes stale — not just the triggering evidence's row. Leaving the other
+  // basis's bindings behind would strand its fanout capacity against
+  // candidates that no longer cite it. Preflight the complete bounded
+  // mutation (all affected candidates plus every binding row to delete)
+  // before any write, so an over-bound set denies with zero writes.
+  const plannedBindingDeletes = new Set<string>();
+  for (const bindingId of staleBindingIds) plannedBindingDeletes.add(bindingId);
+  for (const { bindingIds } of rows.values()) {
+    for (const bindingId of bindingIds) plannedBindingDeletes.add(bindingId);
+  }
+  for (const { row } of rows.values()) {
+    const refs = row.compatibilityEvidenceRefs ?? [];
+    if (refs.length > MAX_COMPATIBILITY_EVIDENCE_REFS) {
+      return {
+        ok: false,
+        code: "invalid-payload",
+        message: `compatibility evidence references exceed the supported bound of ${MAX_COMPATIBILITY_EVIDENCE_REFS}`,
+      };
+    }
+    for (const ref of refs) {
+      if (ref.sourceId === evidence._id) continue;
+      const found = await ctx.db
+        .query("compatibilityEvidenceBindings")
+        .withIndex("by_candidate_and_evidence", (q) =>
+          q
+            .eq("candidateId", row._id)
+            .eq("evidenceId", ref.sourceId as Id<"productEvidence">),
+        )
+        .take(2);
+      if (found.length > 1) {
+        return {
+          ok: false,
+          code: "invalid-payload",
+          message: `compatibility evidence binding fanout exceeds the supported bound of ${MAX_COMPATIBILITY_FANOUT}`,
+        };
+      }
+      for (const binding of found) {
+        if (
+          binding.organizationId !== evidence.organizationId ||
+          binding.projectId !== evidence.projectId
+        ) {
+          return {
+            ok: false,
+            code: "invalid-payload",
+            message: "compatibility evidence binding scope is inconsistent",
+          };
+        }
+        plannedBindingDeletes.add(binding._id);
+      }
+    }
+  }
+  if (rows.size > MAX_COMPATIBILITY_FANOUT) {
+    return {
+      ok: false,
+      code: "invalid-payload",
+      message: `compatibility fanout exceeds the supported bound of ${MAX_COMPATIBILITY_FANOUT}`,
+    };
+  }
+
+  for (const bindingId of plannedBindingDeletes) {
+    await ctx.db.delete(bindingId as Id<"compatibilityEvidenceBindings">);
+  }
+  for (const { row } of rows.values()) {
     await ctx.db.patch(row._id, {
       compatibility: "unknown",
       compatibilityEvidenceRefs: [],
@@ -874,7 +966,6 @@ async function invalidateDependentCompatibility(
       compatibilityRuleVersion: undefined,
       compatibilityEvidenceIndexComplete: false,
     });
-    for (const bindingId of bindingIds) await ctx.db.delete(bindingId);
   }
   return { ok: true };
 }
@@ -1292,11 +1383,52 @@ const negotiationResultValidator = v.union(
 );
 
 /**
+ * F1R-21: a stored negotiation row without finite mandate limits is never
+ * usable authority. Rows predating finite-limit validation fail
+ * `isUsableNegotiationMandate` and must be treated as expired by every
+ * future send path: revoke or expire them through the normal lifecycle,
+ * never authorize a send from them, and never repair them by inventing a
+ * limit the approver did not set.
+ */
+export function isUsableNegotiationMandate(
+  row: {
+    readonly roundLimit: number;
+    readonly expiresAt: number;
+    readonly targetMinorUnits?: number;
+    readonly currency: string;
+    readonly state: string;
+    readonly roundsUsed: number;
+  },
+  now: number,
+): boolean {
+  if (row.state !== "active") return false;
+  if (!Number.isSafeInteger(row.roundLimit) || row.roundLimit < 1) return false;
+  if (!Number.isSafeInteger(row.expiresAt) || row.expiresAt <= now) return false;
+  if (!Number.isSafeInteger(row.roundsUsed) || row.roundsUsed < 0) return false;
+  if (row.roundsUsed >= row.roundLimit) return false;
+  if (row.targetMinorUnits !== undefined) {
+    try {
+      makeMoney(row.currency, row.targetMinorUnits);
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
  * Open a negotiation mandate against one exact quote version. The quote
  * must live in the caller's project; the mandate pins the quote's exact
  * version, currency, and conversation binding server-side (read from the
  * row, never caller-supplied), plus mandate limits, round budget, and
  * expiry (PRD 24).
+ *
+ * F1R-21: Convex numbers admit NaN and infinity, and neither comparison
+ * below rejects them, so every numeric mandate limit is validated as a
+ * finite value before any insert: a finite positive safe-integer round
+ * limit, a finite safe-integer future expiry, and exact finite
+ * nonnegative integer minor units checked through the accepted money
+ * constructor against the quote currency.
  */
 export const openNegotiation = f1Mutation({
   args: negotiationInputValidator.fields,
@@ -1319,15 +1451,46 @@ export const openNegotiation = f1Mutation({
     ) {
       return { ok: false as const, code: "denied-project", message: "quote is not in this project" };
     }
-    if (args.roundLimit < 1) {
-      return { ok: false as const, code: "invalid-payload", message: "round limit must be positive" };
+    if (
+      typeof args.roundLimit !== "number" ||
+      !Number.isSafeInteger(args.roundLimit) ||
+      args.roundLimit < 1
+    ) {
+      return { ok: false as const, code: "invalid-payload", message: "round limit must be a finite positive safe integer" };
     }
     if (args.mandateHash.trim().length === 0) {
       return { ok: false as const, code: "invalid-payload", message: "mandate hash required" };
     }
     const now = Date.now();
-    if (args.expiresAt <= now) {
-      return { ok: false as const, code: "invalid-payload", message: "mandate already expired" };
+    if (
+      typeof args.expiresAt !== "number" ||
+      !Number.isFinite(args.expiresAt) ||
+      !Number.isSafeInteger(args.expiresAt) ||
+      args.expiresAt <= now
+    ) {
+      const finite =
+        typeof args.expiresAt === "number" && Number.isFinite(args.expiresAt);
+      return {
+        ok: false as const,
+        code: "invalid-payload",
+        message: finite
+          ? "mandate already expired"
+          : "mandate expiry must be a finite future timestamp",
+      };
+    }
+    if (args.targetMinorUnits !== undefined) {
+      if (
+        typeof args.targetMinorUnits !== "number" ||
+        !Number.isSafeInteger(args.targetMinorUnits) ||
+        args.targetMinorUnits < 0
+      ) {
+        return { ok: false as const, code: "invalid-payload", message: "negotiation target must be finite nonnegative integer minor units" };
+      }
+      try {
+        makeMoney(quote.currency, args.targetMinorUnits);
+      } catch {
+        return { ok: false as const, code: "invalid-payload", message: "negotiation target money is invalid" };
+      }
     }
     const negotiationId = await ctx.db.insert("negotiations", {
       organizationId: args.organizationId,
