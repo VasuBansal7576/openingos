@@ -648,6 +648,13 @@ export default defineSchema({
     expiresAt: v.optional(v.number()),
     updatedAt: v.number(),
   })
+    // S1/U1 projection pages one identity's authority horizons without
+    // scanning other identities; organization and project remain in the key
+    // for consumer-side tenant and project rechecks on each returned row.
+    .index(
+      "by_identity_and_authority_until_and_organization_and_project",
+      ["identity", "authorityUntil", "organizationId", "projectId"],
+    )
     .index(
       "by_organization_and_identity_and_scope_and_role_and_authority_until",
       ["organizationId", "identity", "scopeKey", "role", "authorityUntil"],
@@ -945,6 +952,12 @@ export default defineSchema({
     supersedes: v.optional(v.string()),
     createdAt: v.number(),
   })
+    // S1/U1 candidate projection lookup: latest matching quote selection is
+    // bounded to one project, requirement, and vendor tuple by createdAt.
+    .index(
+      "by_project_and_requirement_and_vendor_and_created_at",
+      ["projectId", "requirementId", "vendorId", "createdAt"],
+    )
     .index("by_project", ["projectId"])
     .index("by_contentHash", ["contentHash"])
     .index("by_project_and_version", ["projectId", "version"])
