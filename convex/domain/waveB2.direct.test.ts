@@ -589,6 +589,7 @@ describe("F1R-07 replays compare the full material snapshot", () => {
     const foreignProject = await setupProject(t, "watch-target-b");
     const asOwner = t.withIdentity(OWNER);
     const local = await setupGraph(t, project, "local");
+    const sameProjectOther = await setupGraph(t, project, "same-project-other");
     const foreign = await setupGraph(t, foreignProject, "foreign");
     const localEvidence = await recordFieldEvidence(
       t,
@@ -597,6 +598,13 @@ describe("F1R-07 replays compare the full material snapshot", () => {
       "watch-target-local-evidence",
     );
     if (!localEvidence.ok) throw new Error("local watch evidence setup failed");
+    const sameProjectOtherEvidence = await recordFieldEvidence(
+      t,
+      project,
+      { candidateId: sameProjectOther.candidateId },
+      "watch-target-same-project-other-evidence",
+    );
+    if (!sameProjectOtherEvidence.ok) throw new Error("same-project watch evidence setup failed");
     const foreignEvidence = await recordFieldEvidence(
       t,
       foreignProject,
@@ -604,6 +612,17 @@ describe("F1R-07 replays compare the full material snapshot", () => {
       "watch-target-foreign-evidence",
     );
     if (!foreignEvidence.ok) throw new Error("foreign watch evidence setup failed");
+    const restrictedProjectResult = await asOwner.mutation(createProjectRef, {
+      organizationId: project.orgId,
+      name: "watch-target-restricted",
+      visibility: "restricted",
+    });
+    if (!restrictedProjectResult.ok) throw new Error("restricted watch project setup failed");
+    const restrictedProject = {
+      orgId: project.orgId,
+      projectId: restrictedProjectResult.projectId,
+    };
+    const restricted = await setupGraph(t, restrictedProject, "restricted");
     const before = await t.run(async (ctx) => ({
       watches: (await ctx.db.query("watches").collect()).length,
       events: (await ctx.db.query("projectEvents").collect()).length,
@@ -642,6 +661,19 @@ describe("F1R-07 replays compare the full material snapshot", () => {
     expect(missingEvidence.ok).toBe(false);
     await assertNoRows();
 
+    const sameProjectWrongCandidate = await asOwner.mutation(createWatchRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      targetKind: "candidate",
+      targetId: local.candidateId,
+      cadenceMs: 1000,
+      counterpartyRole: "vendor",
+      evidenceRefs: [{ sourceId: sameProjectOtherEvidence.evidenceId, version: "1" }],
+      idempotencyKey: "watch-target-same-project-wrong-candidate",
+    });
+    expect(sameProjectWrongCandidate).toMatchObject({ ok: false, code: "unrelated-evidence" });
+    await assertNoRows();
+
     const foreignEvidenceRef = await asOwner.mutation(createWatchRef, {
       organizationId: project.orgId,
       projectId: project.projectId,
@@ -666,6 +698,19 @@ describe("F1R-07 replays compare the full material snapshot", () => {
       idempotencyKey: "watch-target-stale-evidence",
     });
     expect(staleEvidence.ok).toBe(false);
+    await assertNoRows();
+
+    const restrictedTarget = await asOwner.mutation(createWatchRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      targetKind: "candidate",
+      targetId: restricted.candidateId,
+      cadenceMs: 1000,
+      counterpartyRole: "vendor",
+      evidenceRefs: [{ sourceId: localEvidence.evidenceId, version: "1" }],
+      idempotencyKey: "watch-target-restricted-project",
+    });
+    expect(restrictedTarget).toMatchObject({ ok: false, code: "denied-project" });
     await assertNoRows();
 
     const valid = await asOwner.mutation(createWatchRef, {
