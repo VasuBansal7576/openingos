@@ -129,8 +129,9 @@ export function AdapterAwareApp({
   backendStatusRef.current = backendStatus;
   // Monotonic fence: every head load, load-more page, and live update takes a
   // request generation at dispatch/event time; appliedGeneration only moves
-  // forward so an older response can add unseen items but never regress
-  // continueCursor/isDone.
+  // forward so a stale page can add unseen items but never regress
+  // continueCursor/isDone. Stale head responses and failures are discarded
+  // entirely against the latest requested generation.
   const activityFence = useRef({ requested: 0, applied: 0 });
 
   useEffect(() => {
@@ -176,21 +177,26 @@ export function AdapterAwareApp({
       try {
         const response = await workbenchAdapter.load(resolvedProjectId, cursor);
         if (disposed || backendStatusRef.current !== "connected") return;
+        // A newer request, page, or live update was dispatched after this
+        // head load: discard the stale response entirely so it cannot replace
+        // newer head fields or move the activity cursor.
+        if (loadGeneration < activityFence.current.requested) return;
         const snapshot = response === null ? null : parseWorkbenchSnapshot(response, resolvedProjectId);
         if (snapshot === null) {
-          if (loadGeneration >= activityFence.current.applied) {
-            activityFence.current.applied = loadGeneration;
-            setWorkbench({ state: "empty", message: "No authorized project projection is available yet." });
-          }
+          activityFence.current.applied = loadGeneration;
+          setWorkbench({ state: "empty", message: "No authorized project projection is available yet." });
           return;
         }
-        if (loadGeneration >= activityFence.current.applied) activityFence.current.applied = loadGeneration;
+        activityFence.current.applied = loadGeneration;
         setWorkbench((current) => {
           if (current?.state !== "ready" || current.snapshot.project.id !== resolvedProjectId) return { state: "ready", snapshot };
           return { state: "ready", snapshot: applyLiveWorkbenchSnapshot(current.snapshot, snapshot) };
         });
       } catch (error) {
         if (disposed || backendStatusRef.current !== "connected") return;
+        // A newer request superseded this head load: a stale failure must not
+        // overwrite a newer successful projection with an error.
+        if (loadGeneration < activityFence.current.requested) return;
         setWorkbench({ state: "error", message: error instanceof Error ? error.message : "The project projection could not be read." });
       }
     };
