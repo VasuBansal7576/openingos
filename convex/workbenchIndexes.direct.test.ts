@@ -268,10 +268,10 @@ test("identity-first authority pages stay bounded and fail closed for stale scop
 
   await insertUnrelatedAuthorities(t, workspace);
 
-  // A project-wide scan cannot fit this budget once the 300 unrelated rows
-  // exist, while the identity-first index can return both paged rows.
+  // Even this explicitly bounded negative control exceeds the read budget,
+  // while the identity-first index can return both paged rows.
   await expect(
-    t.run((ctx) => ctx.db.query("membershipAuthorities").collect()),
+    t.run((ctx) => ctx.db.query("membershipAuthorities").take(BOUNDED_DOCUMENT_BUDGET + 1)),
   ).rejects.toThrow(/too many documents/i);
   const firstPage = await authorityPage(t, PAGED_IDENTITY, null);
   expect(firstPage.page).toHaveLength(1);
@@ -435,14 +435,14 @@ test("candidate quote lookup and successor fencing stay bounded by the tuple ind
   );
   if (!successor.ok) throw new Error("successor quote setup failed");
 
-  // The old project-history scan cannot fit this budget, while the tuple
-  // index returns the newest matching revision directly.
+  // Even this explicitly bounded negative control exceeds the read budget,
+  // while the tuple index returns the newest matching revision directly.
   await expect(
     t.run((ctx) =>
       ctx.db
         .query("quotes")
         .withIndex("by_project", (q) => q.eq("projectId", workspace.projectId))
-        .collect(),
+        .take(BOUNDED_DOCUMENT_BUDGET + 1),
     ),
   ).rejects.toThrow(/too many documents/i);
   const latest = await t.run((ctx) =>
