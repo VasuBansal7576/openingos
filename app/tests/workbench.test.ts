@@ -1,9 +1,13 @@
 import { expect, test } from "bun:test";
+import { Window as HappyWindow } from "happy-dom";
 import { createElement } from "react";
+import { act } from "react";
+import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import App from "../App";
 import WorkbenchView from "../Workbench";
-import { formatMoney, parseWorkbenchSnapshot } from "../workbench-state";
+import { appendWorkbenchActivity } from "../main";
+import { formatMoney, parseWorkbenchSnapshot, type WorkbenchAction, type WorkbenchActionResult } from "../workbench-state";
 
 const projection = {
   ok: true,
@@ -151,4 +155,149 @@ test("rejects the obsolete top-level access fixture", () => {
 test("formats unknown money without turning missing charges into zero", () => {
   expect(formatMoney(null, "EUR")).toBe("Unknown");
   expect(formatMoney(795000, "EUR")).toContain("7,950");
+});
+
+test("appends later activity pages without replacing the latest snapshot", () => {
+  const current = parseWorkbenchSnapshot({
+    ...projection,
+    project: { ...projection.project, name: "Latest project snapshot" },
+    activity: {
+      page: [
+        { id: "event-first", kind: "quoteRecorded", createdAt: Date.UTC(2026, 8, 22) },
+        { id: "event-overlap", kind: "researchStarted", createdAt: Date.UTC(2026, 8, 21) },
+      ],
+      continueCursor: "activity-cursor-2",
+      isDone: false,
+    },
+  }, projection.project.id);
+  const next = parseWorkbenchSnapshot({
+    ...projection,
+    project: { ...projection.project, name: "Stale page snapshot" },
+    activity: {
+      page: [
+        { id: "event-overlap", kind: "researchStarted", createdAt: Date.UTC(2026, 8, 21) },
+        { id: "event-last", kind: "decisionRequested", createdAt: Date.UTC(2026, 8, 20) },
+      ],
+      continueCursor: null,
+      isDone: true,
+    },
+  }, projection.project.id);
+  if (current === null || next === null) throw new Error("activity page fixtures should parse");
+
+  const merged = appendWorkbenchActivity(current, next);
+  expect(merged.project.name).toBe("Latest project snapshot");
+  expect(merged.offers).toEqual(current.offers);
+  expect(merged.jobs).toEqual(current.jobs);
+  expect(merged.activity.items.map((item) => item.id)).toEqual(["event-first", "event-overlap", "event-last"]);
+  expect(merged.activity.continueCursor).toBeNull();
+  expect(merged.activity.isDone).toBe(true);
+});
+
+test("places activity pagination in the activity area instead of supplier results", () => {
+  const snapshot = parseWorkbenchSnapshot({
+    ...projection,
+    activity: {
+      ...projection.activity,
+      continueCursor: "activity-cursor-2",
+      isDone: false,
+    },
+  }, projection.project.id);
+  if (snapshot === null) throw new Error("W1 projection should parse");
+  const html = renderToStaticMarkup(createElement(WorkbenchView, {
+    loadState: { state: "ready", snapshot },
+    onLoadMore: () => undefined,
+  }));
+  expect(html).toContain("Load older activity");
+  expect(html).not.toContain("Load more results");
+  expect(html.indexOf("Load older activity")).toBeGreaterThan(html.indexOf("Activity with evidence."));
+});
+
+test("disables every mutation control while reconnecting and resumes after a fresh snapshot", async () => {
+  const parsed = parseWorkbenchSnapshot(projection, projection.project.id);
+  if (parsed === null) throw new Error("W1 projection should parse");
+  const snapshot = {
+    ...parsed,
+    access: {
+      ...parsed.access,
+      capabilities: {
+        ...parsed.access.capabilities,
+        canApprove: true,
+        canResolveRisk: true,
+      },
+    },
+    decisions: parsed.decisions.map((decision) => ({ ...decision, evidenceIds: ["product-evidence-w1-1"] })),
+    jobs: parsed.jobs.map((job, index) => index === 0 ? { ...job, state: "queued" } : job),
+  };
+  const dom = new HappyWindow({ url: "https://openingos.test/" });
+  const previousWindow = globalThis.window;
+  const previousDocument = globalThis.document;
+  const previousNavigator = globalThis.navigator;
+  const actEnvironment = globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean };
+  const previousActEnvironment = actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+  const browserGlobals = globalThis as unknown as { window: unknown; document: unknown; navigator: unknown };
+  browserGlobals.window = dom as unknown as globalThis.Window;
+  browserGlobals.document = dom.document as unknown as globalThis.Document;
+  browserGlobals.navigator = dom.navigator as unknown as globalThis.Navigator;
+  actEnvironment.IS_REACT_ACT_ENVIRONMENT = true;
+  const container = dom.document.createElement("div");
+  dom.document.body.append(container);
+  const actionCalls: string[] = [];
+  const onAction = (action: WorkbenchAction): WorkbenchActionResult => {
+    actionCalls.push(action.type);
+    return { ok: false, message: "controlled test refusal" };
+  };
+  const root = createRoot(container as unknown as globalThis.Element);
+  const findButton = (label: string): HTMLButtonElement => {
+    const button = Array.from(container.querySelectorAll("button")).find((candidate) => candidate.textContent?.includes(label));
+    if (!(button instanceof dom.window.HTMLButtonElement)) throw new Error(`Button not found: ${label}`);
+    return button as unknown as HTMLButtonElement;
+  };
+  const clickTab = async (label: string) => {
+    await act(async () => {
+      findButton(label).click();
+    });
+  };
+
+  try {
+    await act(async () => {
+      root.render(createElement(WorkbenchView, { loadState: { state: "reconnecting", lastKnown: snapshot }, onAction }));
+    });
+    expect(findButton("Start bounded research").disabled).toBe(true);
+    await act(async () => {
+      findButton("Review quote").click();
+    });
+    expect(findButton("Select exact quote").disabled).toBe(true);
+    expect(actionCalls).toEqual([]);
+    await act(async () => {
+      const closeButton = container.querySelector('button[aria-label="Close decision review"]') as unknown as HTMLButtonElement | null;
+      if (closeButton === null) throw new Error("Decision review close button not found");
+      closeButton.click();
+    });
+    await clickTab("Inbox");
+    expect(findButton("Approve this decision").disabled).toBe(true);
+    expect(findButton("Retry bounded branch").disabled).toBe(true);
+    expect(findButton("Cancel").disabled).toBe(true);
+    await clickTab("Recovery");
+    expect(findButton("Retry bounded branch").disabled).toBe(true);
+    expect(actionCalls).toEqual([]);
+
+    await act(async () => {
+      root.render(createElement(WorkbenchView, { loadState: { state: "ready", snapshot }, onAction }));
+    });
+    await clickTab("Project");
+    expect(findButton("Start bounded research").disabled).toBe(false);
+    await act(async () => {
+      findButton("Start bounded research").click();
+    });
+    expect(actionCalls).toEqual(["startResearch"]);
+  } finally {
+    await act(async () => {
+      root.unmount();
+    });
+    browserGlobals.window = previousWindow;
+    browserGlobals.document = previousDocument;
+    browserGlobals.navigator = previousNavigator;
+    if (previousActEnvironment === undefined) delete actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+    else actEnvironment.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment;
+  }
 });
