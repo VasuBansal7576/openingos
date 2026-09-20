@@ -302,6 +302,17 @@ export const reviewedResend = f1InternalMutation({
       now,
     );
     if (!access.ok) return { ok: false as const, code: access.code, message: access.message };
+    const job = await ctx.db.get(operation.jobId);
+    if (
+      job === null ||
+      job.organizationId !== operation.organizationId ||
+      job.projectId !== operation.projectId
+    ) {
+      return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
+    }
+    if (job.state === "cancelling" || job.state === "cancelled") {
+      return { ok: false as const, code: "cancelled-before-claim", message: "job is fenced for cancellation" };
+    }
     if (operation.state !== "outcomeUnknown") {
       return { ok: false as const, code: "already-claimed", message: "only an ambiguous operation may be resent after review" };
     }

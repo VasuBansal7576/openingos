@@ -13,8 +13,10 @@ import {
 } from "convex/server";
 import { describe, expect, test } from "bun:test";
 import schema from "../schema.js";
+import type { Id } from "../_generated/dataModel.js";
 import * as memberships from "../access/memberships.js";
 import * as grants from "../access/grants.js";
+import * as attempts from "./attempts.js";
 import * as jobs from "./jobs.js";
 import * as operations from "./operations.js";
 import * as reservations from "./reservations.js";
@@ -29,6 +31,7 @@ const modules = {
   "./access/memberships.ts": async () => await import("../access/memberships.js"),
   "./access/grants.ts": async () => await import("../access/grants.js"),
   "./execution/jobs.ts": async () => await import("./jobs.js"),
+  "./execution/attempts.ts": async () => await import("./attempts.js"),
   "./execution/operations.ts": async () => await import("./operations.js"),
   "./execution/reservations.ts": async () => await import("./reservations.js"),
   "./shared/scope.ts": async () => await import("../shared/scope.js"),
@@ -85,6 +88,16 @@ const cancelRef = makeFunctionReference<
   MutationArgs<typeof jobs.cancel>,
   MutationReturn<typeof jobs.cancel>
 >("execution/jobs:cancel");
+const reconcileAfterCrashRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof attempts.reconcileAfterCrash>,
+  MutationReturn<typeof attempts.reconcileAfterCrash>
+>("execution/attempts:reconcileAfterCrash");
+const reviewedResendRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof attempts.reviewedResend>,
+  MutationReturn<typeof attempts.reviewedResend>
+>("execution/attempts:reviewedResend");
 
 async function setupResearch() {
   const t = convexTest(schema, modules);
@@ -175,6 +188,10 @@ async function setupCommunication() {
     recipientConfigVersion: 1,
     inputVersions: { brief: "v1" },
     payloadJson: JSON.stringify({
+      profile: "ownerRoleplay",
+      to: "owner-supplier@example.test",
+      cc: [],
+      bcc: [],
       subject: "Controlled RFQ fixture",
       body: "Controlled fixture body for the owner playing supplier.",
     }),
@@ -207,6 +224,202 @@ async function startPurchasingJob(setup: Awaited<ReturnType<typeof setupResearch
   });
   if (!result.ok) throw new Error(`job setup failed: ${result.message}`);
   return result.jobId;
+}
+
+async function drainCancellation(
+  setup: Awaited<ReturnType<typeof setupResearch>>,
+  jobId: Awaited<ReturnType<typeof startPurchasingJob>>,
+): Promise<Array<Awaited<MutationReturn<typeof jobs.cancel>>>> {
+  const pages: Array<Awaited<MutationReturn<typeof jobs.cancel>>> = [];
+  for (let index = 0; index < 100; index += 1) {
+    const page = await setup.asOwner.mutation(cancelRef, {
+      jobId,
+      reason: "controlled cancellation continuation",
+    });
+    pages.push(page);
+    if (page.ok && page.complete) return pages;
+  }
+  throw new Error("cancellation did not finish within the bounded continuation budget");
+}
+
+async function drainReconciliation(
+  setup: Awaited<ReturnType<typeof setupResearch>>,
+  jobId: Awaited<ReturnType<typeof startPurchasingJob>>,
+): Promise<Awaited<MutationReturn<typeof jobs.cancel>>> {
+  let last: Awaited<MutationReturn<typeof jobs.cancel>> = await setup.asOwner.mutation(cancelRef, {
+    jobId,
+    reason: "controlled reconciliation continuation",
+  });
+  for (let index = 0; index < 100; index += 1) {
+    if (!last.ok || last.reconciliationComplete) return last;
+    last = await setup.asOwner.mutation(cancelRef, {
+      jobId,
+      reason: "controlled reconciliation continuation",
+    });
+  }
+  throw new Error("reconciliation did not finish within the bounded continuation budget");
+}
+
+async function seedProjectRequirements(
+  setup: Awaited<ReturnType<typeof setupResearch>>,
+  fillerCount: number,
+): Promise<void> {
+  await setup.t.run(async (ctx) => {
+    const now = Date.now();
+    for (let index = 0; index < fillerCount; index += 1) {
+      await ctx.db.insert("requirements", {
+        organizationId: setup.organizationId,
+        projectId: setup.projectId,
+        key: `old-requirement-${index}`,
+        title: "Older requirement",
+        category: "other",
+        quantity: "1",
+        unit: "piece",
+        priority: "P1",
+        state: "draft",
+        fulfillment: "notOrdered",
+        version: 1,
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+    await ctx.db.insert("requirements", {
+      organizationId: setup.organizationId,
+      projectId: setup.projectId,
+      key: "distinct",
+      title: "Quasar",
+      category: "coffee",
+      quantity: "1",
+      unit: "piece",
+      priority: "P0",
+      state: "draft",
+      fulfillment: "notOrdered",
+      version: 1,
+      createdAt: now,
+      updatedAt: now,
+    });
+  });
+}
+
+async function seedProjectConversations(
+  setup: Awaited<ReturnType<typeof setupCommunication>>,
+  fillerCount: number,
+): Promise<void> {
+  await setup.t.run(async (ctx) => {
+    const now = Date.now();
+    for (let index = 0; index < fillerCount; index += 1) {
+      await ctx.db.insert("conversations", {
+        organizationId: setup.organizationId,
+        projectId: setup.projectId,
+        grantId: setup.grantId,
+        version: 1,
+        state: "cancelled",
+        recipientConfigVersion: 1,
+        cancelledAt: now,
+        updatedAt: now,
+      });
+    }
+    await ctx.db.insert("conversations", {
+      organizationId: setup.organizationId,
+      projectId: setup.projectId,
+      grantId: setup.grantId,
+      version: 1,
+      state: "replyReceived",
+      recipientConfigVersion: 1,
+      updatedAt: now,
+    });
+  });
+}
+
+async function seedPagedCancellationOperations(
+  setup: Awaited<ReturnType<typeof setupResearch>>,
+  jobId: Awaited<ReturnType<typeof startPurchasingJob>>,
+  count: number,
+): Promise<Id<"operations">> {
+  return await setup.t.run(async (ctx) => {
+    const now = Date.now();
+    const unresolvedOperationId = await ctx.db.insert("operations", {
+      organizationId: setup.organizationId,
+      projectId: setup.projectId,
+      jobId,
+      kind: "research.collect",
+      requestId: "paged-unresolved",
+      requestKey: "paged-unresolved",
+      normalizedPayload: JSON.stringify({ query: "Research suppliers for espresso equipment" }),
+      normalizedPayloadHash: "paged-unresolved",
+      inputVersions: { brief: "v1" },
+      grantId: setup.grantId,
+      grantVersion: 1,
+      state: "outcomeUnknown",
+      createdAt: now,
+      updatedAt: now,
+    });
+    for (let index = 0; index < count; index += 1) {
+      await ctx.db.insert("operations", {
+        organizationId: setup.organizationId,
+        projectId: setup.projectId,
+        jobId,
+        kind: "research.collect",
+        requestId: `paged-prepared-${index}`,
+        requestKey: `paged-prepared-${index}`,
+        normalizedPayload: JSON.stringify({ query: "Research suppliers for espresso equipment" }),
+        normalizedPayloadHash: `paged-prepared-${index}`,
+        inputVersions: { brief: "v1" },
+        grantId: setup.grantId,
+        grantVersion: 1,
+        state: "prepared",
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+    return unresolvedOperationId;
+  });
+}
+
+async function setupUnknownCancellation() {
+  const setup = await setupResearch();
+  const jobId = await startPurchasingJob(setup);
+  const reserved = await setup.asOwner.mutation(reserveRef, {
+    jobId,
+    organizationId: setup.organizationId,
+    projectId: setup.projectId,
+    amountMicroUsd: 30,
+    pricingBasis: "controlled-f1r20r22",
+  });
+  if (!reserved.ok) throw new Error("unknown-operation reservation setup failed");
+  const operation = await setup.asOwner.mutation(createOperationRef, {
+    jobId,
+    organizationId: setup.organizationId,
+    projectId: setup.projectId,
+    kind: "research.collect",
+    requestId: "unknown-before-cancel",
+    payloadJson: JSON.stringify({ query: "Research suppliers for espresso equipment" }),
+    grantId: setup.grantId,
+    reservationId: reserved.reservationId,
+  });
+  if (!operation.ok) throw new Error("unknown-operation setup failed");
+  const claim = await setup.t.mutation(claimRef, {
+    operationId: operation.operationId,
+    identity: setup.identity.tokenIdentifier,
+  });
+  if (!claim.ok) throw new Error("unknown-operation claim setup failed");
+  const reconciled = await setup.t.mutation(reconcileAfterCrashRef, {
+    operationId: operation.operationId,
+  });
+  if (!reconciled.ok) throw new Error("unknown-operation reconciliation setup failed");
+  const unusedReservations: Id<"reservations">[] = [];
+  for (let index = 0; index < 17; index += 1) {
+    const unused = await setup.asOwner.mutation(reserveRef, {
+      jobId,
+      organizationId: setup.organizationId,
+      projectId: setup.projectId,
+      amountMicroUsd: 1,
+      pricingBasis: "controlled-f1r20r22",
+    });
+    if (!unused.ok) throw new Error("unused reservation setup failed");
+    unusedReservations.push(unused.reservationId);
+  }
+  return { setup, jobId, operationId: operation.operationId, unusedReservations };
 }
 
 describe("F1R-20 allowlisted workflow purpose", () => {
@@ -424,6 +637,10 @@ describe("F1R-20 allowlisted workflow purpose", () => {
       kind: "communication.send",
       requestId: "f1r20-communication-claim",
       payloadJson: JSON.stringify({
+        profile: "ownerRoleplay",
+        to: "owner-supplier@example.test",
+        cc: [],
+        bcc: [],
         subject: "Controlled RFQ fixture",
         body: "Controlled fixture body for the owner playing supplier.",
       }),
@@ -445,6 +662,132 @@ describe("F1R-20 allowlisted workflow purpose", () => {
     if (deniedClaim.ok) throw new Error("unrelated communication claim unexpectedly succeeded");
     expect(deniedClaim.code).toBe("unrelated-refusal");
     expect(await countRows(setup.t)).toEqual(beforeClaim);
+  });
+
+  for (const fillerCount of [31, 32]) {
+    test(`server-owned requirement context survives position ${fillerCount + 1}`, async () => {
+      const setup = await setupResearch();
+      await seedProjectRequirements(setup, fillerCount);
+      const result = await setup.asOwner.mutation(startJobRef, {
+        organizationId: setup.organizationId,
+        projectId: setup.projectId,
+        text: "Latest Quasar status",
+        operationId: "research.collect",
+        kind: "research",
+        grantId: setup.grantId,
+      });
+      expect(result.ok).toBe(true);
+      const unrelated = await setup.asOwner.mutation(startJobRef, {
+        organizationId: setup.organizationId,
+        projectId: setup.projectId,
+        text: "What changes if they choose another football option?",
+        operationId: "research.collect",
+        kind: "research",
+        grantId: setup.grantId,
+      });
+      expect(unrelated.ok).toBe(false);
+    });
+  }
+
+  for (const fillerCount of [31, 32]) {
+    test(`server-owned active conversation survives position ${fillerCount + 1}`, async () => {
+      const setup = await setupCommunication();
+      await seedProjectConversations(setup, fillerCount);
+      const result = await setup.asOwner.mutation(startJobRef, {
+        organizationId: setup.organizationId,
+        projectId: setup.projectId,
+        text: "Reply to the latest supplier message",
+        operationId: "communication.send",
+        kind: "communication",
+        grantId: setup.grantId,
+      });
+      expect(result.ok).toBe(true);
+    });
+  }
+
+  test("a later active conversation remains authoritative for create and claim", async () => {
+    for (const stage of ["create", "claim"] as const) {
+      const setup = await setupCommunication();
+      const firstConversation = await setup.t.run(async (ctx) => {
+        const id = await ctx.db.insert("conversations", {
+          organizationId: setup.organizationId,
+          projectId: setup.projectId,
+          grantId: setup.grantId,
+          version: 1,
+          state: "replyReceived",
+          recipientConfigVersion: 1,
+          updatedAt: Date.now(),
+        });
+        for (let index = 0; index < 31; index += 1) {
+          await ctx.db.insert("conversations", {
+            organizationId: setup.organizationId,
+            projectId: setup.projectId,
+            grantId: setup.grantId,
+            version: 1,
+            state: "cancelled",
+            recipientConfigVersion: 1,
+            cancelledAt: Date.now(),
+            updatedAt: Date.now(),
+          });
+        }
+        return id;
+      });
+      const started = await setup.asOwner.mutation(startJobRef, {
+        organizationId: setup.organizationId,
+        projectId: setup.projectId,
+        text: "Reply to the latest supplier message",
+        operationId: "communication.send",
+        kind: "communication",
+        grantId: setup.grantId,
+      });
+      if (!started.ok) throw new Error("communication job setup failed");
+      await setup.t.run(async (ctx) => {
+        await ctx.db.patch(firstConversation, { state: "cancelled", cancelledAt: Date.now() });
+        await ctx.db.insert("conversations", {
+          organizationId: setup.organizationId,
+          projectId: setup.projectId,
+          grantId: setup.grantId,
+          version: 1,
+          state: "replyReceived",
+          recipientConfigVersion: 1,
+          updatedAt: Date.now(),
+        });
+      });
+      const reserved = await setup.asOwner.mutation(reserveRef, {
+        jobId: started.jobId,
+        organizationId: setup.organizationId,
+        projectId: setup.projectId,
+        amountMicroUsd: 10,
+        pricingBasis: "controlled-f1r20r22",
+      });
+      if (!reserved.ok) throw new Error("communication reservation setup failed");
+      const created = await setup.asOwner.mutation(createOperationRef, {
+        jobId: started.jobId,
+        organizationId: setup.organizationId,
+        projectId: setup.projectId,
+        kind: "communication.send",
+        requestId: `later-thread-context-${stage}`,
+        payloadJson: JSON.stringify({
+          profile: "ownerRoleplay",
+          to: "owner-supplier@example.test",
+          cc: [],
+          bcc: [],
+          subject: "Controlled RFQ fixture",
+          body: "Controlled fixture body for the owner playing supplier.",
+        }),
+        grantId: setup.grantId,
+        reservationId: reserved.reservationId,
+      });
+      expect(created.ok).toBe(true);
+      if (!created.ok) throw new Error("communication operation setup failed");
+      if (stage === "claim") {
+        const claimed = await setup.t.mutation(claimRef, {
+          operationId: created.operationId,
+          identity: setup.identity.tokenIdentifier,
+        });
+        expect(claimed.ok).toBe(true);
+      }
+    }
   });
 });
 
@@ -638,5 +981,96 @@ describe("F1R-22 finite admission and cancellation boundaries", () => {
       budgetReserved: 0,
       budgetUnknown: 11,
     });
+  });
+
+  test("multi-page cancellation retains earlier unresolved operations in durable reconciliation state", async () => {
+    const setup = await setupResearch();
+    const jobId = await startPurchasingJob(setup);
+    const unresolvedOperationId = await seedPagedCancellationOperations(setup, jobId, 33);
+    const pages = await drainCancellation(setup, jobId);
+    const final = pages.at(-1);
+    if (final === undefined || !final.ok) throw new Error("cancellation did not return a result");
+    expect(final.complete).toBe(true);
+    expect(final.reconciliationComplete).toBe(false);
+    expect(final.unresolvedOperationCount).toBe(1);
+    expect(final.unresolvedOperationIds).toContain(unresolvedOperationId);
+    const durable = await setup.t.run(async (ctx) => await ctx.db.get(jobId));
+    expect(durable?.state).toBe("cancelled");
+    expect(durable?.cancellationReconciliationComplete).toBe(false);
+    expect(durable?.cancellationUnresolvedOperationCount).toBe(1);
+    expect(durable?.cancellationUnresolvedOperationIds).toContain(unresolvedOperationId);
+
+    await setup.t.run(async (ctx) => {
+      await ctx.db.patch(unresolvedOperationId, {
+        state: "observedFailure",
+        updatedAt: Date.now(),
+      });
+    });
+    const reconciled = await drainReconciliation(setup, jobId);
+    expect(reconciled.ok).toBe(true);
+    if (!reconciled.ok) throw new Error("reconciliation failed");
+    expect(reconciled.complete).toBe(true);
+    expect(reconciled.reconciliationComplete).toBe(true);
+    expect(reconciled.unresolvedOperationCount).toBe(0);
+    expect(reconciled.unresolvedOperationIds).toEqual([]);
+  });
+
+  test("completed cancellation still exposes unresolved work on repeat", async () => {
+    const { setup, jobId, operationId } = await setupUnknownCancellation();
+    const pages = await drainCancellation(setup, jobId);
+    const final = pages.at(-1);
+    expect(final?.ok).toBe(true);
+    if (final === undefined || !final.ok) throw new Error("cancellation did not return a result");
+    expect(final.complete).toBe(true);
+    expect(final.reconciliationComplete).toBe(false);
+    expect(final.unresolvedOperationIds).toContain(operationId);
+    const repeat = await setup.asOwner.mutation(cancelRef, {
+      jobId,
+      reason: "reload reconciliation",
+    });
+    expect(repeat.ok).toBe(true);
+    if (!repeat.ok) throw new Error("repeat cancellation did not return a result");
+    expect(repeat.unresolvedOperationIds).toContain(operationId);
+    expect(repeat.unresolvedOperationCount).toBe(1);
+    expect(repeat.reconciliationComplete).toBe(false);
+  });
+
+  test("reviewed resend is fenced after cancellation begins", async () => {
+    const { setup, jobId, operationId, unusedReservations } = await setupUnknownCancellation();
+    const first = await setup.asOwner.mutation(cancelRef, { jobId, reason: "stop" });
+    expect(first).toMatchObject({ ok: true, state: "cancelling", complete: false });
+    const freshReservationId = unusedReservations.at(-1);
+    if (freshReservationId === undefined) throw new Error("fresh reservation setup failed");
+    const resend = await setup.t.mutation(reviewedResendRef, {
+      operationId,
+      identity: setup.identity.tokenIdentifier,
+      newRequestId: "resend-after-fence",
+      newReservationId: freshReservationId,
+    });
+    expect(resend).toMatchObject({ ok: false, code: "cancelled-before-claim" });
+  });
+
+  test("reviewed resend cannot create prepared work between cancellation phases", async () => {
+    const { setup, jobId, operationId, unusedReservations } = await setupUnknownCancellation();
+    const first = await setup.asOwner.mutation(cancelRef, { jobId, reason: "stop" });
+    expect(first).toMatchObject({ ok: true, state: "cancelling", complete: false });
+    const phase = await setup.asOwner.mutation(cancelRef, { jobId, reason: "advance" });
+    expect(phase).toMatchObject({ ok: true, phase: "reservations", complete: false });
+    const freshReservationId = unusedReservations.at(-1);
+    if (freshReservationId === undefined) throw new Error("fresh reservation setup failed");
+    const resend = await setup.t.mutation(reviewedResendRef, {
+      operationId,
+      identity: setup.identity.tokenIdentifier,
+      newRequestId: "resend-between-phases",
+      newReservationId: freshReservationId,
+    });
+    expect(resend).toMatchObject({ ok: false, code: "cancelled-before-claim" });
+    await drainCancellation(setup, jobId);
+    const state = await setup.t.run(async (ctx) => ({
+      operations: await ctx.db.query("operations").withIndex("by_job", (q) => q.eq("jobId", jobId)).collect(),
+      budget: (await ctx.db.query("providerBudgets").withIndex("by_organization", (q) => q.eq("organizationId", setup.organizationId)).unique()),
+    }));
+    expect(state.operations.filter((operation) => operation.state === "prepared")).toHaveLength(0);
+    expect(state.budget?.reservedMicroUsd).toBe(30);
   });
 });
