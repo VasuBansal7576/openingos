@@ -8,8 +8,10 @@ import { createConvexWorkbenchAdapter } from "./convex-workbench-adapter";
 import {
   parseWorkbenchSnapshot,
   type WorkbenchActionResult,
+  type WorkbenchActivityItem,
   type WorkbenchLoadState,
   type WorkbenchServerAdapter,
+  type WorkbenchSnapshot,
 } from "./workbench-state";
 import "./styles.css";
 
@@ -17,6 +19,28 @@ type RuntimeWorkbenchAdapter = WorkbenchServerAdapter & {
   readonly discoverProject?: () => Promise<string | null>;
   readonly dispose?: () => void;
 };
+
+/**
+ * Append a validated activity page to the latest snapshot without replacing
+ * the other W1 fields with the page response's partial snapshot.
+ */
+export function appendWorkbenchActivity(current: WorkbenchSnapshot, next: WorkbenchSnapshot): WorkbenchSnapshot {
+  const seen = new Set<string>();
+  const items: WorkbenchActivityItem[] = [];
+  for (const item of [...current.activity.items, ...next.activity.items]) {
+    if (seen.has(item.id)) continue;
+    seen.add(item.id);
+    items.push(item);
+  }
+  return {
+    ...current,
+    activity: {
+      items,
+      continueCursor: next.activity.continueCursor,
+      isDone: next.activity.isDone,
+    },
+  };
+}
 
 function ConnectionAwareApp({ onRetry, projectId, workbenchAdapter }: { readonly onRetry: () => void; readonly projectId?: string | undefined; readonly workbenchAdapter?: RuntimeWorkbenchAdapter | undefined }) {
   const connection = useConvexConnectionState();
@@ -46,6 +70,8 @@ function AdapterAwareApp({
   const [actionError, setActionError] = useState<string | null>(null);
   const [resolvedProjectId, setResolvedProjectId] = useState<string | undefined>(normaliseProjectId(projectId));
   const previousContext = useRef<{ readonly projectId: string | undefined; readonly adapter: RuntimeWorkbenchAdapter | undefined }>({ projectId: undefined, adapter: undefined });
+  const backendStatusRef = useRef(backendStatus);
+  backendStatusRef.current = backendStatus;
 
   useEffect(() => {
     let disposed = false;
@@ -87,11 +113,11 @@ function AdapterAwareApp({
       }
       try {
         const response = await workbenchAdapter.load(resolvedProjectId, cursor);
-        if (disposed) return;
+        if (disposed || backendStatusRef.current !== "connected") return;
         const snapshot = response === null ? null : parseWorkbenchSnapshot(response, resolvedProjectId);
         setWorkbench(snapshot === null ? { state: "empty", message: "No authorized project projection is available yet." } : { state: "ready", snapshot });
       } catch (error) {
-        if (disposed) return;
+        if (disposed || backendStatusRef.current !== "connected") return;
         setWorkbench({ state: "error", message: error instanceof Error ? error.message : "The project projection could not be read." });
       }
     };
@@ -99,12 +125,12 @@ function AdapterAwareApp({
     const unsubscribe = workbenchAdapter.subscribe?.(
       resolvedProjectId,
       (response) => {
-        if (disposed) return;
+        if (disposed || backendStatusRef.current !== "connected") return;
         const snapshot = response === null ? null : parseWorkbenchSnapshot(response, resolvedProjectId);
         setWorkbench(snapshot === null ? { state: "empty", message: "No authorized project projection is available yet." } : { state: "ready", snapshot });
       },
       (error: unknown) => {
-        if (disposed) return;
+        if (disposed || backendStatusRef.current !== "connected") return;
         setWorkbench({ state: "error", message: error instanceof Error ? error.message : "The project projection could not be refreshed." });
       },
     );
@@ -115,6 +141,7 @@ function AdapterAwareApp({
   }, [backendStatus, resolvedProjectId, workbenchAdapter]);
 
   const handleAction = async (action: Parameters<NonNullable<typeof workbenchAdapter>["act"]>[0]): Promise<WorkbenchActionResult> => {
+    if (backendStatusRef.current !== "connected" || workbench?.state !== "ready") return { ok: false, message: "Actions wait for a fresh connected projection. Nothing was sent." };
     if (workbenchAdapter === undefined) return { ok: false, message: "No server action route is configured. Nothing was sent." };
     try {
       const result = await workbenchAdapter.act(action);
@@ -128,16 +155,29 @@ function AdapterAwareApp({
   };
 
   const handleLoadMore = () => {
+    if (backendStatusRef.current !== "connected") return;
     const cursor = workbench?.state === "ready" ? workbench.snapshot.activity.continueCursor : null;
     if (cursor === null || cursor === undefined || workbenchAdapter === undefined || resolvedProjectId === undefined) return;
     void workbenchAdapter.load(resolvedProjectId, cursor).then((response) => {
-      if (response === null) return;
+      if (response === null || backendStatusRef.current !== "connected") return;
       const snapshot = parseWorkbenchSnapshot(response, resolvedProjectId);
-      if (snapshot !== null) setWorkbench({ state: "ready", snapshot });
-    }).catch((error: unknown) => setWorkbench({ state: "error", message: error instanceof Error ? error.message : "More project activity could not be loaded." }));
+      if (snapshot === null || backendStatusRef.current !== "connected") return;
+      setWorkbench((current) => {
+        if (backendStatusRef.current !== "connected") return current;
+        if (current?.state !== "ready" || current.snapshot.project.id !== resolvedProjectId) return { state: "ready", snapshot };
+        return { state: "ready", snapshot: appendWorkbenchActivity(current.snapshot, snapshot) };
+      });
+    }).catch((error: unknown) => {
+      if (backendStatusRef.current !== "connected") return;
+      setWorkbench({ state: "error", message: error instanceof Error ? error.message : "More project activity could not be loaded." });
+    });
   };
 
-  return <><App backendStatus={backendStatus} onRetry={onRetry} workbench={workbench} onAction={handleAction} onLoadMore={handleLoadMore} />{actionError ? <span className="wb-visually-hidden" role="alert">{actionError}</span> : null}</>;
+  const connectedLoadMore = workbench?.state === "ready" && backendStatus === "connected" ? handleLoadMore : undefined;
+  const appWorkbench = backendStatus === "reconnecting" && workbench?.state === "ready"
+    ? { state: "reconnecting" as const, lastKnown: workbench.snapshot }
+    : workbench;
+  return <><App backendStatus={backendStatus} onRetry={onRetry} workbench={appWorkbench} onAction={handleAction} onLoadMore={connectedLoadMore} />{actionError ? <span className="wb-visually-hidden" role="alert">{actionError}</span> : null}</>;
 }
 
 function normaliseProjectId(value: string | undefined): string | undefined {
