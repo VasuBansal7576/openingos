@@ -206,3 +206,14 @@ The PR has not yet been updated to this local checkpoint, and the fresh separate
 All results are controlled local evidence only; no hosted deployment, provider call, supplier contact, genuine quote or realized saving is claimed.
 This checkpoint contains controlled local evidence only.
 No hosted Convex state, live provider call, owner-mailbox exchange, public site or commercial outcome was observed.
+
+### 2026-09-20 - 540d4a5 local checkpoint
+
+Integrated the two owner-isolated F1 repair packages without conflicts.
+The combined implementation addresses Astra findings F1R-06 and F1R-07 through bounded all-or-nothing compatibility invalidation and immutable ingestion identity, and addresses F1R-12 by separating receipt identity, binding facts and application state while retaining historical replay.
+It addresses F1R-14 through F1R-17 through cumulative split-order caps, order-bound quantity and unit checks, explicit incomplete-lineage responses and pre-F1R-13 replay compatibility.
+The exact local head passes both TypeScript checks, production build, 23 repository tests, 77 money and Jev proofs, 191 F1 tests, 148 direct Convex tests, 155 browser-executor tests, 2 application tests, 19 provider-contract tests and 5 mounted user-path tests.
+All 48 unchanged probes from Astra's rejected `8fedeb7` review pass against the combined head.
+PR #1 remains open and ready for review; this revision still requires a push, exact-head GitHub Actions, exact-head Greptile follow-through and a fresh independent Astra verdict before F1 can be checked complete or merged.
+All results are controlled evidence only.
+No hosted Convex state, live provider call, owner-mailbox exchange, public site or commercial outcome was observed.
