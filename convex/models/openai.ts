@@ -37,6 +37,16 @@ export const OPENAI_MAX_OUTPUT_BYTES = 32 * 1024;
 export const OPENAI_MAX_SOURCE_COUNT = 16 as const;
 export const OPENAI_MAX_FIELDS = 32 as const;
 export const OPENAI_MAX_TOKEN_CEILING = 1_000_000 as const;
+/**
+ * No pinned tokenizer is available in the application dependency graph.
+ * Until one is pinned, admission uses one token per UTF-8 byte of the
+ * serialized billable input components, plus fixed provider framing room.
+ * This is intentionally conservative: it may reject work that the provider
+ * would accept, but it cannot under-admit a request because of `/4` math or
+ * omitted Structured Outputs schema bytes.
+ */
+export const OPENAI_INPUT_TOKEN_BOUND_VERSION = "utf8-byte-upper-bound-v1" as const;
+export const OPENAI_INPUT_TOKEN_FRAMING_OVERHEAD = 256 as const;
 export const OPENAI_WORKLOAD_INPUT_VERSION_KEY = "openaiWorkloadSha256" as const;
 
 export const OPENAI_PRICING_ENV_VARS = {
@@ -243,6 +253,7 @@ function reservationPricingBasis(
   return canonicalJson({
     basis: pricingBasis,
     inputMicroUsdPerMillion,
+    inputTokenBound: OPENAI_INPUT_TOKEN_BOUND_VERSION,
     maxInputTokens,
     maxOutputTokens,
     model: OPENAI_PINNED_MODEL,
@@ -552,6 +563,61 @@ function requestInput(workload: ParsedWorkload): string {
     workload.brief,
     sourceText,
   ].join("\n");
+}
+
+interface PreparedOpenAIRequest {
+  readonly body: string;
+  readonly inputTokenUpperBound: number;
+}
+
+/**
+ * Build the exact request and calculate its pre-dispatch input bound.
+ *
+ * Responses input billing includes the user input and Structured Outputs
+ * format/schema material. The accounting JSON below serializes both of those
+ * billable components, so its UTF-8 byte count includes the schema's 1,430
+ * bytes as well as every adversarial Unicode byte in the workload. A byte is
+ * a safe upper bound for a token from a byte-based tokenizer; the additional
+ * fixed allowance covers provider framing/special tokens that are not visible
+ * in the request JSON. This remains conservative until a pinned tokenizer is
+ * intentionally added to the dependency graph.
+ */
+function prepareOpenAIRequest(
+  workload: ParsedWorkload,
+  maxOutputTokens: number,
+): Valid<PreparedOpenAIRequest> | Invalid {
+  const requestInputText = requestInput(workload);
+  const format = {
+    type: "json_schema" as const,
+    name: workload.kind === "commercialExtraction"
+      ? "openings_commercial_extraction"
+      : "openings_supplier_draft",
+    strict: true as const,
+    schema: OUTPUT_SCHEMA,
+  };
+  const request = {
+    model: OPENAI_PINNED_MODEL,
+    input: requestInputText,
+    store: false as const,
+    tools: [] as const,
+    truncation: "disabled" as const,
+    max_output_tokens: maxOutputTokens,
+    reasoning: { effort: "none" as const },
+    text: { format },
+  };
+  try {
+    const body = JSON.stringify(request);
+    const billableInput = JSON.stringify({ input: requestInputText, text: { format } });
+    if (typeof body !== "string" || typeof billableInput !== "string") {
+      return { ok: false, reason: "request-serialize-failed" };
+    }
+    const billableBytes = new TextEncoder().encode(billableInput).byteLength;
+    const inputTokenUpperBound = safeAdd(billableBytes, OPENAI_INPUT_TOKEN_FRAMING_OVERHEAD);
+    if (inputTokenUpperBound === null) return { ok: false, reason: "input-token-bound-overflow" };
+    return { ok: true, value: { body, inputTokenUpperBound } };
+  } catch {
+    return { ok: false, reason: "request-serialize-failed" };
+  }
 }
 
 function outputSourceMatches(source: SourceRefRecord, expected: readonly SourceRefRecord[]): boolean {
@@ -916,35 +982,14 @@ export async function runOpenAIWorkload(options: OpenAIWorkloadOptions): Promise
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || !Number.isSafeInteger(maxResponseBytes) || maxResponseBytes <= 0) {
     return rejectedResult(inputVersion, "invalid-transport-config", null, Date.now() - started);
   }
-  const requestInputText = requestInput(workload.value);
-  const estimatedInputTokens = Math.ceil(new TextEncoder().encode(requestInputText).byteLength / 4);
-  if (estimatedInputTokens > options.pricing.maxInputTokens) {
+  const preparedRequest = prepareOpenAIRequest(workload.value, options.pricing.maxOutputTokens);
+  if (!preparedRequest.ok) {
+    return rejectedResult(inputVersion, preparedRequest.reason, null, Date.now() - started);
+  }
+  if (preparedRequest.value.inputTokenUpperBound > options.pricing.maxInputTokens) {
     return rejectedResult(inputVersion, "input-token-ceiling", null, Date.now() - started);
   }
-  let body: string;
-  try {
-    body = JSON.stringify({
-      model: OPENAI_PINNED_MODEL,
-      input: requestInputText,
-      store: false,
-      tools: [],
-      truncation: "disabled",
-      max_output_tokens: options.pricing.maxOutputTokens,
-      reasoning: { effort: "none" },
-      text: {
-        format: {
-          type: "json_schema",
-          name: workload.value.kind === "commercialExtraction"
-            ? "openings_commercial_extraction"
-            : "openings_supplier_draft",
-          strict: true,
-          schema: OUTPUT_SCHEMA,
-        },
-      },
-    });
-  } catch {
-    return rejectedResult(inputVersion, "request-serialize-failed", null, Date.now() - started);
-  }
+  const body = preparedRequest.value.body;
   if (new TextEncoder().encode(body).byteLength > OPENAI_MAX_REQUEST_BYTES) {
     return rejectedResult(inputVersion, "request-too-large", null, Date.now() - started);
   }
@@ -1431,8 +1476,11 @@ export const generate = internalAction({
     }
     // Build and size the workload before claim. The pure helper repeats these
     // checks from its immutable parsed snapshot before any provider call.
-    const estimatedInputTokens = Math.ceil(new TextEncoder().encode(requestInput(workload.value)).byteLength / 4);
-    if (estimatedInputTokens > pricing.policy.maxInputTokens) {
+    const preparedRequest = prepareOpenAIRequest(workload.value, pricing.policy.maxOutputTokens);
+    if (!preparedRequest.ok) {
+      return { ok: false as const, code: "invalid-payload", message: preparedRequest.reason };
+    }
+    if (preparedRequest.value.inputTokenUpperBound > pricing.policy.maxInputTokens) {
       return { ok: false as const, code: "invalid-payload", message: "input exceeds configured token ceiling" };
     }
     const preClaim = await ctx.runQuery(preClaimFenceRef, {
