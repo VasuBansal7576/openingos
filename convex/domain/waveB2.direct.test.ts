@@ -519,30 +519,44 @@ describe("F1R-07 replays compare the full material snapshot", () => {
     const project = await setupProject(t, "replay-watch");
     const asOwner = t.withIdentity(OWNER);
     const graph = await setupGraph(t, project, "main");
+    const originalEvidence = await recordFieldEvidence(
+      t,
+      project,
+      { candidateId: graph.candidateId },
+      "watch-original",
+    );
+    if (!originalEvidence.ok) throw new Error("original watch evidence setup failed");
+    const replacementEvidence = await recordFieldEvidence(
+      t,
+      project,
+      { candidateId: graph.candidateId },
+      "watch-replacement",
+    );
+    if (!replacementEvidence.ok) throw new Error("replacement watch evidence setup failed");
     const base = {
       organizationId: project.orgId,
       projectId: project.projectId,
-      targetKind: "candidate",
+      targetKind: "candidate" as const,
       targetId: graph.candidateId,
       cadenceMs: 1000,
       counterpartyRole: "vendor" as const,
     };
     const first = await asOwner.mutation(createWatchRef, {
       ...base,
-      evidenceRefs: [{ sourceId: "original", version: "1" }],
+      evidenceRefs: [{ sourceId: originalEvidence.evidenceId, version: "1" }],
       idempotencyKey: "watch-evidence",
     });
     if (!first.ok) throw new Error("watch setup failed");
     const changed = await asOwner.mutation(createWatchRef, {
       ...base,
-      evidenceRefs: [{ sourceId: "replacement", version: "2" }],
+      evidenceRefs: [{ sourceId: replacementEvidence.evidenceId, version: "1" }],
       idempotencyKey: "watch-evidence",
     });
     expect(changed.ok).toBe(false);
     if (!changed.ok) expect(changed.code).toBe("duplicate-conflict");
     const exact = await asOwner.mutation(createWatchRef, {
       ...base,
-      evidenceRefs: [{ sourceId: "original", version: "1" }],
+      evidenceRefs: [{ sourceId: originalEvidence.evidenceId, version: "1" }],
       idempotencyKey: "watch-evidence",
     });
     if (!exact.ok) throw new Error("watch replay failed");
@@ -550,8 +564,8 @@ describe("F1R-07 replays compare the full material snapshot", () => {
     const pair = await asOwner.mutation(createWatchRef, {
       ...base,
       evidenceRefs: [
-        { sourceId: "a", version: "1" },
-        { sourceId: "b", version: "1" },
+        { sourceId: originalEvidence.evidenceId, version: "1" },
+        { sourceId: replacementEvidence.evidenceId, version: "1" },
       ],
       idempotencyKey: "watch-evidence-order",
     });
@@ -559,14 +573,117 @@ describe("F1R-07 replays compare the full material snapshot", () => {
     const reordered = await asOwner.mutation(createWatchRef, {
       ...base,
       evidenceRefs: [
-        { sourceId: "b", version: "1" },
-        { sourceId: "a", version: "1" },
+        { sourceId: replacementEvidence.evidenceId, version: "1" },
+        { sourceId: originalEvidence.evidenceId, version: "1" },
       ],
       idempotencyKey: "watch-evidence-order",
     });
     if (!reordered.ok) throw new Error("reordered replay failed");
     expect(reordered.deduplicated).toBe(true);
     expect(reordered.watchId).toBe(pair.watchId);
+  });
+
+  test("candidate watches resolve project-owned evidence before any write", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, "watch-target-a");
+    const foreignProject = await setupProject(t, "watch-target-b");
+    const asOwner = t.withIdentity(OWNER);
+    const local = await setupGraph(t, project, "local");
+    const foreign = await setupGraph(t, foreignProject, "foreign");
+    const localEvidence = await recordFieldEvidence(
+      t,
+      project,
+      { candidateId: local.candidateId },
+      "watch-target-local-evidence",
+    );
+    if (!localEvidence.ok) throw new Error("local watch evidence setup failed");
+    const foreignEvidence = await recordFieldEvidence(
+      t,
+      foreignProject,
+      { candidateId: foreign.candidateId },
+      "watch-target-foreign-evidence",
+    );
+    if (!foreignEvidence.ok) throw new Error("foreign watch evidence setup failed");
+    const before = await t.run(async (ctx) => ({
+      watches: (await ctx.db.query("watches").collect()).length,
+      events: (await ctx.db.query("projectEvents").collect()).length,
+    }));
+    const assertNoRows = async () => {
+      const after = await t.run(async (ctx) => ({
+        watches: (await ctx.db.query("watches").collect()).length,
+        events: (await ctx.db.query("projectEvents").collect()).length,
+      }));
+      expect(after).toEqual(before);
+    };
+
+    const foreignTarget = await asOwner.mutation(createWatchRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      targetKind: "candidate",
+      targetId: foreign.candidateId,
+      cadenceMs: 1000,
+      counterpartyRole: "vendor",
+      evidenceRefs: [{ sourceId: "missing-evidence", version: "1" }],
+      idempotencyKey: "watch-target-foreign",
+    });
+    expect(foreignTarget.ok).toBe(false);
+    await assertNoRows();
+
+    const missingEvidence = await asOwner.mutation(createWatchRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      targetKind: "candidate",
+      targetId: local.candidateId,
+      cadenceMs: 1000,
+      counterpartyRole: "vendor",
+      evidenceRefs: [{ sourceId: "missing-evidence", version: "1" }],
+      idempotencyKey: "watch-target-missing-evidence",
+    });
+    expect(missingEvidence.ok).toBe(false);
+    await assertNoRows();
+
+    const foreignEvidenceRef = await asOwner.mutation(createWatchRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      targetKind: "candidate",
+      targetId: local.candidateId,
+      cadenceMs: 1000,
+      counterpartyRole: "vendor",
+      evidenceRefs: [{ sourceId: foreignEvidence.evidenceId, version: "1" }],
+      idempotencyKey: "watch-target-foreign-evidence",
+    });
+    expect(foreignEvidenceRef.ok).toBe(false);
+    await assertNoRows();
+
+    const staleEvidence = await asOwner.mutation(createWatchRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      targetKind: "candidate",
+      targetId: local.candidateId,
+      cadenceMs: 1000,
+      counterpartyRole: "vendor",
+      evidenceRefs: [{ sourceId: localEvidence.evidenceId, version: "2" }],
+      idempotencyKey: "watch-target-stale-evidence",
+    });
+    expect(staleEvidence.ok).toBe(false);
+    await assertNoRows();
+
+    const valid = await asOwner.mutation(createWatchRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      targetKind: "candidate",
+      targetId: local.candidateId,
+      cadenceMs: 1000,
+      counterpartyRole: "vendor",
+      evidenceRefs: [{ sourceId: localEvidence.evidenceId, version: "1" }],
+      idempotencyKey: "watch-target-valid",
+    });
+    expect(valid.ok).toBe(true);
+    const afterValid = await t.run(async (ctx) => ({
+      watches: (await ctx.db.query("watches").collect()).length,
+      events: (await ctx.db.query("projectEvents").collect()).length,
+    }));
+    expect(afterValid).toEqual({ watches: before.watches + 1, events: before.events });
   });
 
   test("RFQ vendor sets compare normalized", async () => {
