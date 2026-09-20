@@ -326,6 +326,9 @@ export class ControlledBackend {
       if (entry === undefined) return denial("unknown-operation", `unknown operation ${operationId}`);
       if (!entry.enabled) return denial("unavailable-capability", `operation ${operationId} unavailable`);
     }
+    if (!Number.isSafeInteger(input.expiresAt) || input.expiresAt <= now) {
+      return denial("invalid-payload", "grant expiry must be in the future");
+    }
     const canonical = canonicalJson(input.payload);
     const grant: Grant = {
       id: this.next("grant"),
@@ -365,7 +368,7 @@ export class ControlledBackend {
 
   amendGrantDraft(grantId: string, issuerIdentity: string, payload: unknown, now: number): AuthorityResult<Grant> {
     const current = this.grants.get(grantId);
-    if (!current) return denial("denied-project", "unknown grant");
+    if (!current) return denial("denied-membership", "not authorized for this project");
     const access = this.checkProjectAccess(
       issuerIdentity,
       current.organizationId,
@@ -454,22 +457,27 @@ export class ControlledBackend {
     if (typeof identity !== "string" || identity.trim().length === 0) {
       return denial("forged-identity", "missing identity proof");
     }
+    // No existence oracles: unknown organizations, unknown projects, missing
+    // memberships, cross-organization IDs, and restricted projects without an
+    // explicit membership share one denial. Caller-owned membership states
+    // (revoked/expired) stay distinguishable.
     const organization = this.organizations.get(organizationId);
-    if (!organization) return denial("denied-project", "unknown organization");
-    const project = this.projects.get(projectId);
-    if (!project || project.organizationId !== organizationId) {
-      return denial("denied-project", "project is not in this organization");
-    }
     const orgRows = [...this.memberships.values()].filter(
       (entry) => entry.organizationId === organizationId && entry.identity === identity,
     );
-    if (orgRows.length === 0) return denial("denied-membership", "no membership in this organization");
+    if (!organization || orgRows.length === 0) {
+      return denial("denied-membership", "not authorized for this project");
+    }
     const activeOrg = orgRows.filter((entry) => entry.status === "active");
     if (activeOrg.length === 0) return denial("revoked-membership", "membership revoked");
     const currentOrg = activeOrg.filter(
       (entry) => entry.expiresAt === null || !isExpired(now, entry.expiresAt),
     );
     if (currentOrg.length === 0) return denial("expired-membership", "membership expired");
+    const project = this.projects.get(projectId);
+    if (!project || project.organizationId !== organizationId) {
+      return denial("denied-membership", "not authorized for this project");
+    }
     let role: MembershipRole = currentOrg
       .map((entry) => entry.role)
       .sort((left, right) => ROLE_RANK[right] - ROLE_RANK[left])[0] ?? "viewer";
@@ -477,7 +485,7 @@ export class ControlledBackend {
     if (project.visibility === "restricted") {
       const projectRows = currentOrg.filter((entry) => entry.projectId === projectId);
       if (projectRows.length === 0) {
-        return denial("denied-project", "restricted project requires explicit membership");
+        return denial("denied-membership", "not authorized for this project");
       }
       role =
         projectRows.map((entry) => entry.role).sort((left, right) => ROLE_RANK[right] - ROLE_RANK[left])[0] ??
@@ -543,7 +551,7 @@ export class ControlledBackend {
     if (kind === "communication") {
       if (grantId === null) return denial("denied-capability", "communication requires a grant");
       const grant = this.grants.get(grantId);
-      if (!grant) return denial("denied-project", "unknown grant");
+      if (!grant) return denial("denied-membership", "not authorized for this project");
       if (grant.status !== "active") return denial("revoked-grant", "grant is not active");
       if (isExpired(now, grant.expiresAt)) return denial("expired-grant", "grant expired");
       grantVersion = grant.revocationVersion;
@@ -626,26 +634,10 @@ export class ControlledBackend {
   // -- Idempotent operations --------------------------------------------
 
   createOperation(input: CreateOperationInput, now: number): AuthorityResult<{ operation: Operation; deduped: boolean }> {
+    // Authorization precedes the idempotency lookup: foreign request keys
+    // can neither reveal existence nor conflict.
     const job = this.jobs.get(input.jobId);
-    if (!job) return denial("denied-project", "unknown job");
-    const key = requestKey(job.organizationId, input.kind, input.requestId);
-    const canonical = canonicalJson(input.payload);
-    const hash = payloadHash(input.payload);
-
-    const existingId = this.operationsByKey.get(key);
-    if (existingId !== undefined) {
-      const existing = this.operations.get(existingId);
-      if (existing) {
-        if (
-          sameCanonicalPayload(existing.canonicalPayload, canonical) &&
-          sha256BindingOk(existing.payloadSha256, input.payloadSha256)
-        ) {
-          return approved({ operation: existing, deduped: true });
-        }
-        return denial("duplicate-conflict", "requestId reused with a different payload");
-      }
-    }
-
+    if (!job) return denial("denied-membership", "not authorized for this project");
     const access = this.checkProjectAccess(
       input.identity,
       job.organizationId,
@@ -659,7 +651,7 @@ export class ControlledBackend {
     if (job.state === "cancelled") return denial("cancelled-before-claim", "job is cancelled");
 
     const grant = this.grants.get(input.grantId);
-    if (!grant) return denial("denied-project", "unknown grant");
+    if (!grant) return denial("denied-membership", "not authorized for this project");
     if (grant.organizationId !== job.organizationId || grant.projectId !== job.projectId) {
       return denial("denied-project", "grant belongs to another project");
     }
@@ -668,6 +660,25 @@ export class ControlledBackend {
     }
     if (grant.status !== "active") return denial("revoked-grant", "grant is not active");
     if (isExpired(now, grant.expiresAt)) return denial("expired-grant", "grant expired");
+
+    const key = requestKey(job.organizationId, input.kind, input.requestId);
+    const canonical = canonicalJson(input.payload);
+    const hash = payloadHash(input.payload);
+
+    const existingId = this.operationsByKey.get(key);
+    if (existingId !== undefined) {
+      const existing = this.operations.get(existingId);
+      if (existing) {
+        if (
+          existing.jobId === job.id &&
+          sameCanonicalPayload(existing.canonicalPayload, canonical) &&
+          sha256BindingOk(existing.payloadSha256, input.payloadSha256)
+        ) {
+          return approved({ operation: existing, deduped: true });
+        }
+        return denial("duplicate-conflict", "requestId reused with a different payload");
+      }
+    }
 
     let conversationVersion: number | null = null;
     if (COMMUNICATION_KINDS.has(input.kind)) {
@@ -722,7 +733,7 @@ export class ControlledBackend {
 
   claimOperation(input: ClaimInput, now: number): AuthorityResult<{ operation: Operation; attemptToken: string }> {
     const operation = this.operations.get(input.operationId);
-    if (!operation) return denial("denied-project", "unknown operation");
+    if (!operation) return denial("denied-membership", "not authorized for this project");
     if (operation.state !== "prepared") {
       if (operation.state === "cancelled") {
         return denial("cancelled-before-claim", "operation was cancelled before claim");
@@ -732,7 +743,7 @@ export class ControlledBackend {
 
     // Decide everything before mutating: any denial below leaves zero effect.
     const job = this.jobs.get(operation.jobId);
-    if (!job) return denial("denied-project", "unknown job");
+    if (!job) return denial("denied-membership", "not authorized for this project");
     if (job.state === "cancelled") return denial("cancelled-before-claim", "job is cancelled");
 
     const capabilityEntry = lookupCapability(operation.kind);
@@ -754,7 +765,7 @@ export class ControlledBackend {
     if (!capability.ok) return capability;
 
     const grant = this.grants.get(operation.grantId);
-    if (!grant) return denial("denied-project", "unknown grant");
+    if (!grant) return denial("denied-membership", "not authorized for this project");
     if (grant.status !== "active") return denial("revoked-grant", "grant was revoked");
     if (grant.revocationVersion !== operation.grantVersion) {
       return denial("stale-grant-version", "grant was re-issued after this operation was prepared");
@@ -848,7 +859,7 @@ export class ControlledBackend {
 
   dispatchControlledSend(operationId: string, token: string, now: number): AuthorityResult<ControlledSentMessage> {
     const operation = this.operations.get(operationId);
-    if (!operation) return denial("denied-project", "unknown operation");
+    if (!operation) return denial("denied-membership", "not authorized for this project");
     if (operation.state !== "dispatching" || operation.attemptToken !== token) {
       return denial("already-claimed", "attempt token is not valid for dispatch");
     }
@@ -897,7 +908,7 @@ export class ControlledBackend {
 
   recordOutcome(input: OutcomeInput, now: number): AuthorityResult<Operation> {
     const operation = this.operations.get(input.operationId);
-    if (!operation) return denial("denied-project", "unknown operation");
+    if (!operation) return denial("denied-membership", "not authorized for this project");
     if (operation.state !== "dispatching" || operation.attemptToken !== input.token) {
       return denial("already-claimed", "attempt token is not valid for this operation");
     }
@@ -957,7 +968,7 @@ export class ControlledBackend {
     now: number,
   ): AuthorityResult<{ operation: Operation; warning: string }> {
     const operation = this.operations.get(operationId);
-    if (!operation) return denial("denied-project", "unknown operation");
+    if (!operation) return denial("denied-membership", "not authorized for this project");
     if (operation.state !== "outcomeUnknown") {
       return denial("already-claimed", "only an ambiguous operation may be resent after review");
     }
@@ -999,7 +1010,7 @@ export class ControlledBackend {
     reason: string,
   ): AuthorityResult<{ job: Job; unresolvedOperationIds: string[] }> {
     const job = this.jobs.get(jobId);
-    if (!job) return denial("denied-project", "unknown job");
+    if (!job) return denial("denied-membership", "not authorized for this project");
     const access = this.checkProjectAccess(
       identity,
       job.organizationId,
@@ -1035,9 +1046,9 @@ export class ControlledBackend {
     now: number,
   ): AuthorityResult<{ jobState: JobState; delivery: OperationState }> {
     const operation = this.operations.get(operationId);
-    if (!operation) return denial("denied-project", "unknown operation");
+    if (!operation) return denial("denied-membership", "not authorized for this project");
     const job = this.jobs.get(operation.jobId);
-    if (!job) return denial("denied-project", "unknown job");
+    if (!job) return denial("denied-membership", "not authorized for this project");
     const outcome = this.recordOutcome(
       { operationId, token, outcome: "success", providerEventId, detail: "late-confirmation" },
       now,
@@ -1057,7 +1068,7 @@ export class ControlledBackend {
     now: number,
   ): AuthorityResult<Reservation> {
     const job = this.jobs.get(jobId);
-    if (!job) return denial("denied-project", "unknown job");
+    if (!job) return denial("denied-membership", "not authorized for this project");
     if (!Number.isSafeInteger(amountMicroUsd) || amountMicroUsd <= 0) {
       return denial("invalid-payload", "reservation amount must be a positive safe integer");
     }
@@ -1221,7 +1232,7 @@ export class ControlledBackend {
     now: number,
   ): AuthorityResult<EvidenceFile> {
     const evidence = this.evidenceRecords.get(evidenceId);
-    if (!evidence) return denial("denied-project", "unknown evidence");
+    if (!evidence) return denial("denied-membership", "not authorized for this project");
     const access = this.checkProjectAccess(
       identity,
       evidence.organizationId,

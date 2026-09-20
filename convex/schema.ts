@@ -80,7 +80,9 @@ export default defineSchema({
     active: v.boolean(),
     configuredAt: v.number(),
     configuredBy: v.string(),
-  }).index("by_version", ["version"]),
+  })
+    .index("by_version", ["version"])
+    .index("by_active", ["active"]),
 
   providerBudgets: defineTable({
     organizationId: v.id("organizations"),
@@ -107,7 +109,7 @@ export default defineSchema({
     expiresAt: v.number(),
     revocationVersion: v.number(),
     status: v.union(v.literal("active"), v.literal("revoked"), v.literal("expired")),
-    conversationId: v.optional(v.string()),
+    conversationId: v.optional(v.id("conversations")),
     createdAt: v.number(),
   })
     .index("by_project_and_status", ["projectId", "status"])
@@ -288,7 +290,7 @@ export default defineSchema({
   quotes: defineTable({
     organizationId: v.id("organizations"),
     projectId: v.id("projects"),
-    conversationId: v.optional(v.string()),
+    conversationId: v.optional(v.id("conversations")),
     version: v.string(),
     contentHash: v.string(),
     currency: v.string(),

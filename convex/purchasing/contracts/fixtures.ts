@@ -11,9 +11,6 @@
  * against this fixture.
  */
 
-import { mutation } from "../../_generated/server";
-import { v } from "convex/values";
-import { denialValidator, identityOf } from "../../access/checks.js";
 import { COMMUNICATION_PROFILE_OWNER_ROLEPLAY } from "../../shared/provenance.js";
 import { ControlledBackend } from "../../shared/store.js";
 
@@ -152,60 +149,9 @@ export function buildControlledFixture(now = 1_700_000_000_000): ControlledFixtu
 }
 
 /**
- * Callable Convex seed: provisions a private organization, an open project,
- * owner membership, and a zero-spend controlled budget for the caller.
- * Identity derives from `ctx.auth`; nothing is copied from another session.
+ * Test-only provisioning note: production seeding flows through
+ * `access/memberships.createOrganization` + `createProject` (authenticated,
+ * server time). This module intentionally exports no Convex functions so
+ * no fixture path can become a production mutation.
  */
-export const seed = mutation({
-  args: { name: v.string(), projectName: v.string(), now: v.number() },
-  returns: v.union(
-    v.object({
-      ok: v.literal(true),
-      organizationId: v.string(),
-      projectId: v.string(),
-    }),
-    denialValidator,
-  ),
-  handler: async (ctx, args) => {
-    const identity = await identityOf(ctx);
-    if (identity === null) {
-      return { ok: false as const, code: "forged-identity", message: "unauthenticated" };
-    }
-    if (args.name.trim().length === 0 || args.projectName.trim().length === 0) {
-      return { ok: false as const, code: "invalid-payload", message: "names required" };
-    }
-    const organizationId = await ctx.db.insert("organizations", {
-      name: args.name.trim(),
-      kind: "private",
-      createdAt: args.now,
-    });
-    const projectId = await ctx.db.insert("projects", {
-      organizationId,
-      name: args.projectName.trim(),
-      visibility: "open",
-      createdAt: args.now,
-    });
-    await ctx.db.insert("memberships", {
-      organizationId,
-      identity,
-      role: "owner",
-      status: "active",
-      version: 1,
-      updatedAt: args.now,
-    });
-    await ctx.db.insert("providerBudgets", {
-      organizationId,
-      ceilingMicroUsd: 0,
-      reservedMicroUsd: 0,
-      spentMicroUsd: 0,
-      unresolvedMicroUsd: 0,
-      pricingBasis: "controlled-seed:live-disabled",
-      updatedAt: args.now,
-    });
-    return {
-      ok: true as const,
-      organizationId: organizationId as unknown as string,
-      projectId: projectId as unknown as string,
-    };
-  },
-});
+export const FIXTURE_MODULE_HAS_NO_CONVEX_FUNCTIONS = true as const;

@@ -4,12 +4,19 @@
  * Every callable Convex query/mutation derives identity from `ctx.auth`
  * (`tokenIdentifier`) — never from a client-supplied user ID. These helpers
  * implement the three independent checks (capability shipped + enabled,
- * project access, current grant) against `ctx.db` with the same semantics
- * as `ControlledBackend` in `convex/shared/store.ts`.
+ * project access, current grant) against the typed `F1DataModel` with the
+ * same semantics as `ControlledBackend` in `convex/shared/store.ts`.
+ *
+ * No existence oracles: unknown organizations, unknown projects, missing
+ * memberships, cross-organization IDs, and restricted projects without an
+ * explicit membership all share one `denied-membership` denial with a
+ * generic message. `denied-project` is reserved for sub-resource mismatches
+ * observed after project authorization already passed.
  */
 
 import { v } from "convex/values";
-import type { DatabaseReader, MutationCtx, QueryCtx } from "../_generated/server";
+import type { Id } from "../_generated/dataModel.js";
+import type { F1MutationCtx, F1QueryCtx } from "../server.js";
 import { isExpired } from "../shared/time.js";
 import {
   lookupCapability,
@@ -33,82 +40,71 @@ const ROLE_RANK: Record<DbRole, number> = {
   owner: 3,
 };
 
-export interface MembershipRow {
-  _id: string;
-  organizationId: string;
-  projectId?: string;
-  identity: string;
-  role: DbRole;
-  status: "active" | "revoked";
-  expiresAt?: number;
+function bestRole(roles: readonly DbRole[]): DbRole {
+  return (
+    [...roles].sort((left, right) => ROLE_RANK[right] - ROLE_RANK[left])[0] ?? "viewer"
+  );
+}
+
+/** Minimal auth surface: queries, mutations, and actions all qualify. */
+export interface AuthContext {
+  readonly auth: {
+    getUserIdentity: () => Promise<{ readonly tokenIdentifier: string } | null>;
+  };
 }
 
 /** Identity from the authenticated session; null when unauthenticated. */
-export async function identityOf(ctx: QueryCtx | MutationCtx): Promise<string | null> {
+export async function identityOf(ctx: AuthContext): Promise<string | null> {
   const identity = await ctx.auth.getUserIdentity();
   return identity?.tokenIdentifier ?? null;
 }
 
-async function loadMemberships(
-  db: DatabaseReader,
-  organizationId: string,
-  identity: string,
-): Promise<MembershipRow[]> {
-  // Filtered read until official codegen emits schema indexes (F0-owned
-  // deployment step); semantics match `by_organization_and_identity`.
-  const rows = await db
-    .query("memberships")
-    .filter((q) =>
-      q.and(
-        q.eq(q.field("organizationId"), organizationId),
-        q.eq(q.field("identity"), identity),
-      ),
-    )
-    .collect();
-  return rows as unknown as MembershipRow[];
-}
-
 /**
- * Project access from stored memberships. Restricted projects require an
- * explicit project membership; cross-organization and guest/private
- * boundaries hold because memberships are per-organization.
+ * Project access from stored memberships. Organization membership is proven
+ * before any project document is trusted; every failure below shares one
+ * denial so callers cannot probe for organization, project, or membership
+ * existence.
  */
 export async function checkProjectAccess(
-  ctx: QueryCtx | MutationCtx,
+  ctx: F1QueryCtx | F1MutationCtx,
   identity: string,
-  organizationId: string,
-  projectId: string,
+  organizationId: Id<"organizations">,
+  projectId: Id<"projects">,
   minRole: DbRole,
   now: number,
 ): Promise<AuthorityResult<DbRole>> {
   if (identity.trim().length === 0) return denial("forged-identity", "missing identity proof");
-  const project = (await ctx.db.get(projectId as never)) as unknown as {
-    organizationId?: string;
-    visibility?: string;
-  } | null;
-  if (!project || project.organizationId !== organizationId) {
-    return denial("denied-project", "project is not in this organization");
+  const organization = await ctx.db.get(organizationId);
+  const rows = await ctx.db
+    .query("memberships")
+    .withIndex("by_organization_and_identity", (q) =>
+      q.eq("organizationId", organizationId).eq("identity", identity),
+    )
+    .collect();
+  if (organization === null || rows.length === 0) {
+    return denial("denied-membership", "not authorized for this project");
   }
-  const rows = await loadMemberships(ctx.db, organizationId, identity);
-  if (rows.length === 0) return denial("denied-membership", "no membership in this organization");
   const active = rows.filter((row) => row.status === "active");
-  if (active.length === 0) return denial("revoked-membership", "membership revoked");
   const current = active.filter(
     (row) => row.expiresAt === undefined || !isExpired(now, row.expiresAt),
   );
-  if (current.length === 0) return denial("expired-membership", "membership expired");
-
-  let role: DbRole =
-    current.map((row) => row.role).sort((left, right) => ROLE_RANK[right] - ROLE_RANK[left])[0] ??
-    "viewer";
+  if (current.length === 0) {
+    if (rows.every((row) => row.status === "revoked")) {
+      return denial("revoked-membership", "membership revoked");
+    }
+    return denial("expired-membership", "membership expired");
+  }
+  const project = await ctx.db.get(projectId);
+  if (project === null || project.organizationId !== organizationId) {
+    return denial("denied-membership", "not authorized for this project");
+  }
+  let role = bestRole(current.map((row) => row.role));
   if (project.visibility === "restricted") {
     const scoped = current.filter((row) => row.projectId === projectId);
     if (scoped.length === 0) {
-      return denial("denied-project", "restricted project requires explicit membership");
+      return denial("denied-membership", "not authorized for this project");
     }
-    role =
-      scoped.map((row) => row.role).sort((left, right) => ROLE_RANK[right] - ROLE_RANK[left])[0] ??
-      "viewer";
+    role = bestRole(scoped.map((row) => row.role));
   }
   if (!roleSatisfies(role, minRole)) {
     return denial("denied-capability", `role ${role} cannot perform ${minRole}-level work`);

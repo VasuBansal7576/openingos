@@ -6,11 +6,14 @@
  * suspend work rather than keeping a provider loop alive. Cancellation
  * before the dispatch claim prevents the send; cancellation after the
  * claim prevents subsequent work but cannot unsend — reconciliation
- * exposes that outcome honestly.
+ * exposes that outcome honestly. Identity and time are server-derived;
+ * callers supply neither.
  */
 
-import { mutation, query } from "../_generated/server";
 import { v } from "convex/values";
+import type { Id } from "../_generated/dataModel.js";
+import { f1Mutation, f1Query } from "../server.js";
+import { canonicalJson, payloadHash } from "../shared/hashing.js";
 import { isExpired } from "../shared/time.js";
 import { classifyScope, containsInstructionOverride } from "../shared/scope.js";
 import { checkProjectAccess, denialValidator, identityOf, requireCapability } from "../access/checks.js";
@@ -22,9 +25,9 @@ const jobKindValidator = v.union(
 );
 
 const jobViewValidator = v.object({
-  id: v.string(),
-  organizationId: v.string(),
-  projectId: v.string(),
+  id: v.id("jobs"),
+  organizationId: v.id("organizations"),
+  projectId: v.id("projects"),
   kind: v.string(),
   state: v.string(),
   grantVersion: v.number(),
@@ -35,19 +38,20 @@ const jobViewValidator = v.object({
 /**
  * Start a scope-gated job. Unrelated/unavailable requests are refused with
  * no job; supplier-evidence instructions cannot expand capabilities.
+ * Research jobs without an explicit grant receive a server-bound
+ * no-spend grant so the job always carries a versioned authority.
  */
-export const start = mutation({
+export const start = f1Mutation({
   args: {
-    organizationId: v.string(),
-    projectId: v.string(),
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
     text: v.string(),
     operationId: v.optional(v.string()),
     kind: v.optional(jobKindValidator),
-    grantId: v.optional(v.string()),
-    now: v.number(),
+    grantId: v.optional(v.id("grants")),
   },
   returns: v.union(
-    v.object({ ok: v.literal(true), jobId: v.string(), state: v.string() }),
+    v.object({ ok: v.literal(true), jobId: v.id("jobs"), state: v.string() }),
     denialValidator,
   ),
   handler: async (ctx, args) => {
@@ -55,6 +59,7 @@ export const start = mutation({
     if (identity === null) {
       return { ok: false as const, code: "forged-identity", message: "unauthenticated" };
     }
+    const now = Date.now();
     if (containsInstructionOverride(args.text)) {
       return { ok: false as const, code: "prompt-injection-denied", message: "supplier evidence cannot expand capabilities" };
     }
@@ -75,7 +80,7 @@ export const start = mutation({
       args.organizationId,
       args.projectId,
       "contributor",
-      args.now,
+      now,
     );
     if (!access.ok) return { ok: false as const, code: access.code, message: access.message };
     const capability = requireCapability(operationId, access.value);
@@ -84,69 +89,80 @@ export const start = mutation({
     }
 
     const kind = args.kind ?? "research";
-    let grantId = args.grantId;
+    let grantId: Id<"grants"> | undefined = args.grantId;
     let grantVersion = 0;
     let inputVersions: Record<string, string> = {};
     if (kind === "communication") {
       if (grantId === undefined) {
         return { ok: false as const, code: "denied-capability", message: "communication requires a grant" };
       }
-      const grant = (await ctx.db.get(grantId as never)) as unknown as {
-        organizationId?: string;
-        projectId?: string;
-        status?: string;
-        expiresAt?: number;
-        revocationVersion?: number;
-        inputVersions?: Record<string, string>;
-      } | null;
-      if (!grant || grant.organizationId !== args.organizationId || grant.projectId !== args.projectId) {
-        return { ok: false as const, code: "denied-project", message: "grant is not in this project" };
+      const grant = await ctx.db.get(grantId);
+      if (
+        grant === null ||
+        grant.organizationId !== args.organizationId ||
+        grant.projectId !== args.projectId
+      ) {
+        return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
       }
       if (grant.status !== "active") {
         return { ok: false as const, code: "revoked-grant", message: "grant is not active" };
       }
-      if (grant.expiresAt !== undefined && isExpired(args.now, grant.expiresAt)) {
+      if (isExpired(now, grant.expiresAt)) {
         return { ok: false as const, code: "expired-grant", message: "grant expired" };
       }
-      grantVersion = grant.revocationVersion ?? 1;
-      inputVersions = { ...(grant.inputVersions ?? {}) };
+      grantVersion = grant.revocationVersion;
+      inputVersions = { ...grant.inputVersions };
     } else if (grantId !== undefined) {
-      const grant = (await ctx.db.get(grantId as never)) as unknown as {
-        revocationVersion?: number;
-        inputVersions?: Record<string, string>;
-      } | null;
-      if (grant) {
-        grantVersion = grant.revocationVersion ?? 1;
-        inputVersions = { ...(grant.inputVersions ?? {}) };
+      const grant = await ctx.db.get(grantId);
+      if (grant !== null) {
+        grantVersion = grant.revocationVersion;
+        inputVersions = { ...grant.inputVersions };
       }
+    } else {
+      const recipient = await ctx.db
+        .query("recipientConfigs")
+        .withIndex("by_active", (q) => q.eq("active", true))
+        .unique();
+      const autoPayload = { research: "bounded-server-grant" };
+      grantId = await ctx.db.insert("grants", {
+        organizationId: args.organizationId,
+        projectId: args.projectId,
+        operations: [operationId],
+        communicationProfile: "ownerRoleplay",
+        recipientConfigVersion: recipient?.version ?? 0,
+        inputVersions: {},
+        canonicalPayload: canonicalJson(autoPayload),
+        payloadHash: payloadHash(autoPayload),
+        costCeilingMicroUsd: 0,
+        roundLimit: 0,
+        expiresAt: now + 900_000,
+        revocationVersion: 1,
+        status: "active",
+        createdAt: now,
+      });
+      grantVersion = 1;
     }
 
     const jobId = await ctx.db.insert("jobs", {
       organizationId: args.organizationId,
       projectId: args.projectId,
-      grantId: (grantId ?? "") as never,
+      grantId,
       grantVersion,
       kind,
       state: "queued",
       inputVersions,
-      createdAt: args.now,
-      updatedAt: args.now,
+      createdAt: now,
+      updatedAt: now,
     });
-    return { ok: true as const, jobId: jobId as unknown as string, state: "queued" };
+    return { ok: true as const, jobId, state: "queued" };
   },
 });
 
 /** Cancel a job: undispatched work stops; in-flight work reconciles. */
-export const cancel = mutation({
-  args: {
-    jobId: v.string(),
-    organizationId: v.string(),
-    projectId: v.string(),
-    reason: v.string(),
-    now: v.number(),
-  },
+export const cancel = f1Mutation({
+  args: { jobId: v.id("jobs"), reason: v.string() },
   returns: v.union(
-    v.object({ ok: v.literal(true), state: v.string(), unresolvedOperationIds: v.array(v.string()) }),
+    v.object({ ok: v.literal(true), state: v.string(), unresolvedOperationIds: v.array(v.id("operations")) }),
     denialValidator,
   ),
   handler: async (ctx, args) => {
@@ -154,87 +170,72 @@ export const cancel = mutation({
     if (identity === null) {
       return { ok: false as const, code: "forged-identity", message: "unauthenticated" };
     }
+    const job = await ctx.db.get(args.jobId);
+    if (job === null) {
+      return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
+    }
+    const now = Date.now();
     const access = await checkProjectAccess(
       ctx,
       identity,
-      args.organizationId,
-      args.projectId,
+      job.organizationId,
+      job.projectId,
       "contributor",
-      args.now,
+      now,
     );
     if (!access.ok) return { ok: false as const, code: access.code, message: access.message };
-    const job = (await ctx.db.get(args.jobId as never)) as unknown as {
-      organizationId?: string;
-      projectId?: string;
-    } | null;
-    if (!job || job.organizationId !== args.organizationId || job.projectId !== args.projectId) {
-      return { ok: false as const, code: "denied-project", message: "job is not in this project" };
-    }
-    const operations = (await ctx.db
+    const operations = await ctx.db
       .query("operations")
-      .filter((q) => q.eq(q.field("jobId"), args.jobId))
-      .collect()) as unknown as { _id: string; state: string }[];
-    const unresolved: string[] = [];
+      .withIndex("by_job", (q) => q.eq("jobId", args.jobId))
+      .collect();
+    const unresolved: Id<"operations">[] = [];
     for (const operation of operations) {
       if (operation.state === "prepared") {
-        await ctx.db.patch(operation._id as never, { state: "cancelled", updatedAt: args.now });
+        await ctx.db.patch(operation._id, { state: "cancelled", updatedAt: now });
       } else if (operation.state === "dispatching" || operation.state === "outcomeUnknown") {
         unresolved.push(operation._id);
       }
     }
-    await ctx.db.patch(args.jobId as never, {
+    await ctx.db.patch(args.jobId, {
       state: "cancelled",
-      cancelledAt: args.now,
+      cancelledAt: now,
       cancelReason: args.reason,
-      updatedAt: args.now,
+      updatedAt: now,
     });
     return { ok: true as const, state: "cancelled", unresolvedOperationIds: unresolved };
   },
 });
 
 /** Read one authorized job. */
-export const get = query({
-  args: {
-    jobId: v.string(),
-    organizationId: v.string(),
-    projectId: v.string(),
-    now: v.number(),
-  },
+export const get = f1Query({
+  args: { jobId: v.id("jobs") },
   returns: v.union(jobViewValidator.extend({ ok: v.literal(true) }), denialValidator),
   handler: async (ctx, args) => {
     const identity = await identityOf(ctx);
     if (identity === null) {
       return { ok: false as const, code: "forged-identity", message: "unauthenticated" };
     }
+    const job = await ctx.db.get(args.jobId);
+    if (job === null) {
+      return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
+    }
     const access = await checkProjectAccess(
       ctx,
       identity,
-      args.organizationId,
-      args.projectId,
+      job.organizationId,
+      job.projectId,
       "viewer",
-      args.now,
+      Date.now(),
     );
     if (!access.ok) return { ok: false as const, code: access.code, message: access.message };
-    const job = (await ctx.db.get(args.jobId as never)) as unknown as {
-      organizationId?: string;
-      projectId?: string;
-      kind?: string;
-      state?: string;
-      grantVersion?: number;
-      cancelledAt?: number;
-      cancelReason?: string;
-    } | null;
-    if (!job || job.organizationId !== args.organizationId || job.projectId !== args.projectId) {
-      return { ok: false as const, code: "denied-project", message: "job is not in this project" };
-    }
     return {
       ok: true as const,
       id: args.jobId,
-      organizationId: args.organizationId,
-      projectId: args.projectId,
-      kind: job.kind ?? "research",
-      state: job.state ?? "queued",
-      grantVersion: job.grantVersion ?? 0,
+      organizationId: job.organizationId,
+      projectId: job.projectId,
+      kind: job.kind,
+      state: job.state,
+      grantVersion: job.grantVersion,
       ...(job.cancelledAt === undefined ? {} : { cancelledAt: job.cancelledAt }),
       ...(job.cancelReason === undefined ? {} : { cancelReason: job.cancelReason }),
     };

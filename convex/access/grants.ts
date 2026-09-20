@@ -5,20 +5,20 @@
  * disclosure fields, purpose, cost ceiling, round limit, expiry, and
  * revocation version. Changed recipients, specifications, quantities, or
  * limits invalidate affected queued approvals; the dispatch claim rechecks
- * all of it atomically.
+ * all of it atomically. Identity and time are server-derived.
  */
 
-import { mutation, query } from "../_generated/server";
 import { v } from "convex/values";
+import { f1Mutation, f1Query } from "../server.js";
 import { canonicalJson, payloadHash } from "../shared/hashing.js";
 import { lookupCapability } from "../shared/scope.js";
 import { COMMUNICATION_PROFILE_OWNER_ROLEPLAY } from "../shared/provenance.js";
 import { checkProjectAccess, denialValidator, identityOf } from "./checks.js";
 
 const grantViewValidator = v.object({
-  id: v.string(),
-  organizationId: v.string(),
-  projectId: v.string(),
+  id: v.id("grants"),
+  organizationId: v.id("organizations"),
+  projectId: v.id("projects"),
   operations: v.array(v.string()),
   communicationProfile: v.string(),
   recipientConfigVersion: v.number(),
@@ -28,15 +28,15 @@ const grantViewValidator = v.object({
 });
 
 const issueResultValidator = v.union(
-  v.object({ ok: v.literal(true), grantId: v.string(), revocationVersion: v.number() }),
+  v.object({ ok: v.literal(true), grantId: v.id("grants"), revocationVersion: v.number() }),
   denialValidator,
 );
 
 /** Issue a version-bound grant (approver role or above). */
-export const issue = mutation({
+export const issue = f1Mutation({
   args: {
-    organizationId: v.string(),
-    projectId: v.string(),
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
     operations: v.array(v.string()),
     communicationProfile: v.string(),
     recipientConfigVersion: v.number(),
@@ -45,8 +45,7 @@ export const issue = mutation({
     costCeilingMicroUsd: v.number(),
     roundLimit: v.number(),
     expiresAt: v.number(),
-    conversationId: v.optional(v.string()),
-    now: v.number(),
+    conversationId: v.optional(v.id("conversations")),
   },
   returns: issueResultValidator,
   handler: async (ctx, args) => {
@@ -54,13 +53,14 @@ export const issue = mutation({
     if (identity === null) {
       return { ok: false as const, code: "forged-identity", message: "unauthenticated" };
     }
+    const now = Date.now();
     const access = await checkProjectAccess(
       ctx,
       identity,
       args.organizationId,
       args.projectId,
       "approver",
-      args.now,
+      now,
     );
     if (!access.ok) return { ok: false as const, code: access.code, message: access.message };
     if (args.operations.length === 0) {
@@ -84,7 +84,7 @@ export const issue = mutation({
     if (!Number.isSafeInteger(args.costCeilingMicroUsd) || args.costCeilingMicroUsd < 0) {
       return { ok: false as const, code: "invalid-payload", message: "cost ceiling must be a non-negative safe integer" };
     }
-    if (!Number.isSafeInteger(args.expiresAt) || args.expiresAt <= args.now) {
+    if (!Number.isSafeInteger(args.expiresAt) || args.expiresAt <= now) {
       return { ok: false as const, code: "invalid-payload", message: "grant expiry must be in the future" };
     }
     const canonical = canonicalJson(args.payload);
@@ -103,19 +103,15 @@ export const issue = mutation({
       revocationVersion: 1,
       status: "active",
       ...(args.conversationId === undefined ? {} : { conversationId: args.conversationId }),
-      createdAt: args.now,
+      createdAt: now,
     });
-    return {
-      ok: true as const,
-      grantId: grantId as unknown as string,
-      revocationVersion: 1,
-    };
+    return { ok: true as const, grantId, revocationVersion: 1 };
   },
 });
 
 /** Revoke a grant; queued operations under it stop at claim time. */
-export const revoke = mutation({
-  args: { grantId: v.string(), organizationId: v.string(), projectId: v.string(), now: v.number() },
+export const revoke = f1Mutation({
+  args: { grantId: v.id("grants") },
   returns: v.union(
     v.object({ ok: v.literal(true), revocationVersion: v.number() }),
     denialValidator,
@@ -125,70 +121,58 @@ export const revoke = mutation({
     if (identity === null) {
       return { ok: false as const, code: "forged-identity", message: "unauthenticated" };
     }
+    const grant = await ctx.db.get(args.grantId);
+    if (grant === null) {
+      return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
+    }
     const access = await checkProjectAccess(
       ctx,
       identity,
-      args.organizationId,
-      args.projectId,
+      grant.organizationId,
+      grant.projectId,
       "approver",
-      args.now,
+      Date.now(),
     );
     if (!access.ok) return { ok: false as const, code: access.code, message: access.message };
-    const grant = (await ctx.db.get(args.grantId as never)) as unknown as {
-      organizationId?: string;
-      revocationVersion?: number;
-    } | null;
-    if (!grant || grant.organizationId !== args.organizationId) {
-      return { ok: false as const, code: "denied-project", message: "grant is not in this organization" };
-    }
-    const nextVersion = (grant.revocationVersion ?? 1) + 1;
-    await ctx.db.patch(args.grantId as never, { status: "revoked", revocationVersion: nextVersion });
+    const nextVersion = grant.revocationVersion + 1;
+    await ctx.db.patch(args.grantId, { status: "revoked", revocationVersion: nextVersion });
     return { ok: true as const, revocationVersion: nextVersion };
   },
 });
 
 /** Read one grant the caller may access (same project isolation). */
-export const get = query({
-  args: { grantId: v.string(), organizationId: v.string(), projectId: v.string(), now: v.number() },
+export const get = f1Query({
+  args: { grantId: v.id("grants") },
   returns: v.union(grantViewValidator.extend({ ok: v.literal(true) }), denialValidator),
   handler: async (ctx, args) => {
     const identity = await identityOf(ctx);
     if (identity === null) {
       return { ok: false as const, code: "forged-identity", message: "unauthenticated" };
     }
+    const grant = await ctx.db.get(args.grantId);
+    if (grant === null) {
+      return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
+    }
     const access = await checkProjectAccess(
       ctx,
       identity,
-      args.organizationId,
-      args.projectId,
+      grant.organizationId,
+      grant.projectId,
       "viewer",
-      args.now,
+      Date.now(),
     );
     if (!access.ok) return { ok: false as const, code: access.code, message: access.message };
-    const grant = (await ctx.db.get(args.grantId as never)) as unknown as {
-      organizationId?: string;
-      projectId?: string;
-      operations?: string[];
-      communicationProfile?: string;
-      recipientConfigVersion?: number;
-      expiresAt?: number;
-      revocationVersion?: number;
-      status?: string;
-    } | null;
-    if (!grant || grant.organizationId !== args.organizationId || grant.projectId !== args.projectId) {
-      return { ok: false as const, code: "denied-project", message: "grant is not in this project" };
-    }
     return {
       ok: true as const,
       id: args.grantId,
-      organizationId: args.organizationId,
-      projectId: args.projectId,
-      operations: grant.operations ?? [],
-      communicationProfile: grant.communicationProfile ?? "",
-      recipientConfigVersion: grant.recipientConfigVersion ?? 0,
-      expiresAt: grant.expiresAt ?? 0,
-      revocationVersion: grant.revocationVersion ?? 1,
-      status: grant.status ?? "active",
+      organizationId: grant.organizationId,
+      projectId: grant.projectId,
+      operations: [...grant.operations],
+      communicationProfile: grant.communicationProfile,
+      recipientConfigVersion: grant.recipientConfigVersion,
+      expiresAt: grant.expiresAt,
+      revocationVersion: grant.revocationVersion,
+      status: grant.status,
     };
   },
 });
