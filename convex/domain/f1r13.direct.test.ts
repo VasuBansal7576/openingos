@@ -2748,6 +2748,83 @@ describe("Greptile r4056517362: paginated history stays reloadable", () => {
     expect(tight.isDone).toBe(false);
   });
 
+  test("native split metadata survives page calls on both branches", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, "page-split");
+    const graph = await setupTwoLineGraph(t, project, "page-split");
+    const asOwner = t.withIdentity(OWNER);
+    const selection = await asOwner.mutation(recordSelectionRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      requirementId: graph.requirementId,
+      candidateId: graph.candidateId,
+      quoteId: graph.quoteId,
+      quoteVersion: "v-page-split",
+      selectionLines: [
+        { quoteLineId: "machine", quantity: "2", unit: "piece" },
+        { quoteLineId: "chair", quantity: "10", unit: "piece" },
+      ],
+      requirementVersion: 1,
+      idempotencyKey: "sel-page-split",
+    });
+    if (!selection.ok) throw new Error("selection setup failed");
+    const order = await asOwner.mutation(recordOrderRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      selectionId: selection.selectionId,
+      idempotencyKey: "ord-page-split",
+      orderLines: [
+        { quoteLineId: "machine", quantity: "2", unit: "piece" },
+        { quoteLineId: "chair", quantity: "8", unit: "piece" },
+      ],
+    });
+    if (!order.ok) throw new Error("order setup failed");
+    for (let i = 0; i < 3; i += 1) {
+      const event = await asOwner.mutation(appendOrderEventRef, {
+        organizationId: project.orgId,
+        projectId: project.projectId,
+        orderId: order.orderId,
+        kind: "acceptance",
+        acceptanceLines: [{ quoteLineId: "chair", acceptedQuantity: "1", unit: "piece" }],
+        idempotencyKey: `evt-split-${i}`,
+      });
+      if (!event.ok) throw new Error(`event ${i} failed`);
+      const payment = await asOwner.mutation(recordCostEntryRef, {
+        organizationId: project.orgId,
+        projectId: project.projectId,
+        orderId: order.orderId,
+        kind: "payment",
+        amount: { currency: "EUR", minorUnits: 100 + i },
+        idempotencyKey: `pay-split-${i}`,
+      });
+      if (!payment.ok) throw new Error(`payment ${i} failed`);
+    }
+    // A tight caller byte budget forces the native paginator to report a
+    // split instead of silently returning a partial page. The endpoint
+    // must preserve both split fields while keeping every clamp.
+    for (const kind of ["events", "entries"] as const) {
+      const args: QueryArgs<typeof fulfillment.listOrderHistoryPage> = {
+        organizationId: project.orgId,
+        projectId: project.projectId,
+        orderId: order.orderId,
+        kind,
+        paginationOpts: { numItems: 10000, cursor: null, maximumBytesRead: 500 },
+      };
+      const page = await asOwner.query(listOrderHistoryPageRef, args);
+      if (!page.ok) throw new Error(`${kind} split page failed`);
+      expect(page.kind).toBe(kind);
+      expect(page.pageStatus === "SplitRequired" || page.pageStatus === "SplitRecommended").toBe(true);
+      expect(typeof page.splitCursor).toBe("string");
+      // The split cursor continues the range it describes.
+      const continued = await asOwner.query(listOrderHistoryPageRef, {
+        ...args,
+        paginationOpts: { numItems: 10000, cursor: page.splitCursor as string },
+      });
+      if (!continued.ok) throw new Error(`${kind} split continuation failed`);
+      expect(continued.page.length).toBeGreaterThan(0);
+    }
+  });
+
   test("201 entries page through with links and evidence intact", async () => {
     const t = convexTest(schema, modules);
     const project = await setupProject(t, "pages-entries");
