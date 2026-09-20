@@ -51,14 +51,94 @@ function sameWatchEvidenceRefs(
   return left.length === right.length && left.every((entry, index) => entry === right[index]);
 }
 
+type WatchCandidate = {
+  readonly _id: Id<"candidates">;
+  readonly organizationId: Id<"organizations">;
+  readonly projectId: Id<"projects">;
+  readonly requirementId: Id<"requirements">;
+  readonly vendorId: Id<"vendors">;
+};
+
+type WatchRequirement = {
+  readonly _id: Id<"requirements">;
+  readonly organizationId: Id<"organizations">;
+  readonly projectId: Id<"projects">;
+};
+
 /**
- * Create an evidence watch on a named target (explicit owner-import
- * path). The caller declares the watched counterparty from the closed
- * union and an optional job allowance linkage; the source is fixed to
+ * Resolve every watch relationship before any replay lookup or write. A
+ * watch is currently candidate-only, and its evidence refs must identify
+ * exact productEvidence revisions owned by this project and related either
+ * directly to that candidate or to its requirement.
+ */
+async function validateWatchTarget(
+  ctx: Parameters<typeof requireDomainAccess>[0],
+  organizationId: Id<"organizations">,
+  projectId: Id<"projects">,
+  candidateId: Id<"candidates">,
+  evidenceRefs:
+    | readonly { readonly sourceId: string; readonly version: string; readonly locator?: string }[]
+    | undefined,
+): Promise<{ ok: true } | { ok: false; code: string; message: string }> {
+  const candidate = await requireOwnedRef(
+    await ctx.db.get(candidateId),
+    organizationId,
+    projectId,
+  );
+  if (!candidate.ok) {
+    return { ok: false as const, code: candidate.code, message: candidate.message };
+  }
+  const candidateValue: WatchCandidate = candidate.value;
+  const requirement = await requireOwnedRef(
+    await ctx.db.get(candidateValue.requirementId),
+    organizationId,
+    projectId,
+  );
+  if (!requirement.ok) {
+    return { ok: false as const, code: requirement.code, message: requirement.message };
+  }
+  const requirementValue: WatchRequirement = requirement.value;
+  const vendor = await ctx.db.get(candidateValue.vendorId);
+  if (vendor === null || vendor.organizationId !== organizationId) {
+    return { ok: false as const, code: "denied-project", message: "candidate vendor is not in this organization" };
+  }
+  for (const ref of evidenceRefs ?? []) {
+    const evidenceId = ctx.db.normalizeId("productEvidence", ref.sourceId);
+    if (evidenceId === null) {
+      return { ok: false as const, code: "unknown-evidence", message: "watch evidence does not resolve" };
+    }
+    const evidence = await ctx.db.get(evidenceId);
+    if (evidence === null) {
+      return { ok: false as const, code: "unknown-evidence", message: "watch evidence does not resolve" };
+    }
+    if (
+      evidence.organizationId !== organizationId ||
+      evidence.projectId !== projectId
+    ) {
+      return { ok: false as const, code: "denied-project", message: "watch evidence is not in this project" };
+    }
+    if (evidence.version !== ref.version) {
+      return { ok: false as const, code: "stale-evidence", message: "watch evidence version changed" };
+    }
+    if (evidence.candidateId !== undefined) {
+      if (evidence.candidateId !== candidateValue._id) {
+        return { ok: false as const, code: "unrelated-evidence", message: "watch evidence concerns another candidate" };
+      }
+    } else if (evidence.requirementId !== requirementValue._id) {
+      return { ok: false as const, code: "unrelated-evidence", message: "watch evidence concerns another requirement" };
+    }
+  }
+  return { ok: true as const };
+}
+
+/**
+ * Create an evidence watch on a candidate (explicit owner-import path).
+ * The target and every evidence revision are resolved inside the authorized
+ * project before replay handling or insertion; the source is fixed to
  * `ownerImport` so a public caller can never claim internal pipeline
  * verification. The next check time derives server-side from cadence.
- * Replays through the idempotency key return the existing watch or
- * conflict on divergence.
+ * Replays through the idempotency key return the existing watch or conflict
+ * on divergence.
  */
 export const createWatch = f1Mutation({
   args: watchInputValidator.fields,
@@ -79,12 +159,21 @@ export const createWatch = f1Mutation({
     if (args.idempotencyKey.trim().length === 0) {
       return { ok: false as const, code: "invalid-payload", message: "idempotency key required" };
     }
-    if (args.targetKind.trim().length === 0 || args.targetId.trim().length === 0) {
-      return { ok: false as const, code: "invalid-payload", message: "watch target required" };
-    }
     if (!Number.isInteger(args.cadenceMs) || args.cadenceMs <= 0) {
       return { ok: false as const, code: "invalid-payload", message: "cadence must be positive" };
     }
+    // Resolve the complete target graph, including evidence provenance,
+    // before consulting the replay key. This keeps a malformed or foreign
+    // retry from being accepted as an existing watch and guarantees that a
+    // failed request cannot create a watch or any related append-only row.
+    const target = await validateWatchTarget(
+      ctx,
+      args.organizationId,
+      args.projectId,
+      args.targetId,
+      args.evidenceRefs,
+    );
+    if (!target.ok) return target;
     const existing = await ctx.db
       .query("watches")
       .withIndex("by_project_and_key", (q) =>

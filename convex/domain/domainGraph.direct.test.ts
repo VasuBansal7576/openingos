@@ -704,8 +704,8 @@ describe("direct full graph journey through required indexes", () => {
     const watch = await asOwner.mutation(createWatchRef, {
       organizationId: project.orgId,
       projectId: project.projectId,
-      targetKind: "vendor-price",
-      targetId: "vendor-1:linea-mini",
+      targetKind: "candidate",
+      targetId: graph.candidateId,
       cadenceMs: 86_400_000,
       counterpartyRole: "vendor",
       idempotencyKey: "watch-journey-1",
@@ -975,8 +975,8 @@ describe("direct cross-project reference rejection", () => {
     const watchB = await asB.mutation(createWatchRef, {
       organizationId: projectB.orgId,
       projectId: projectB.projectId,
-      targetKind: "vendor-price",
-      targetId: "vendor-b:linea-mini",
+      targetKind: "candidate",
+      targetId: graphB.candidateId,
       cadenceMs: 86_400_000,
       counterpartyRole: "vendor",
       idempotencyKey: "watch-foreign-b",
@@ -2148,6 +2148,7 @@ describe("direct second-round repairs: bindings, pins, replay, lineage", () => {
     const t = convexTest(schema, modules);
     const project = await setupProject(t, OWNER_A, "watch-src");
     const asOwner = t.withIdentity(OWNER_A);
+    const graph = await setupSourcingGraph(t, OWNER_A, project);
     const { grantId } = await setupGrantAndConversation(t, project.orgId, project.projectId);
     const jobId = await t.run(async (ctx) => {
       const now = Date.now();
@@ -2167,8 +2168,8 @@ describe("direct second-round repairs: bindings, pins, replay, lineage", () => {
       organizationId: project.orgId,
       projectId: project.projectId,
       jobId,
-      targetKind: "vendor-price",
-      targetId: "v:1",
+      targetKind: "candidate",
+      targetId: graph.candidateId,
       cadenceMs: 3_600_000,
       counterpartyRole: "ownerStandIn",
       idempotencyKey: "watch-src-1",
@@ -2208,8 +2209,8 @@ describe("direct second-round repairs: bindings, pins, replay, lineage", () => {
       organizationId: project.orgId,
       projectId: project.projectId,
       jobId: foreignJob,
-      targetKind: "vendor-price",
-      targetId: "v:2",
+      targetKind: "candidate",
+      targetId: graph.candidateId,
       cadenceMs: 3_600_000,
       counterpartyRole: "vendor",
       idempotencyKey: "watch-src-2",

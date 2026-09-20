@@ -543,8 +543,11 @@ export const watchInputValidator = v.object({
   organizationId: v.id("organizations"),
   projectId: v.id("projects"),
   jobId: v.optional(v.id("jobs")),
-  targetKind: v.string(),
-  targetId: v.string(),
+  // F1R-10 intentionally freezes the first watch target to a candidate.
+  // A future target kind needs its own validated relationship contract; a
+  // free-form string cannot establish project ownership at the boundary.
+  targetKind: v.literal("candidate"),
+  targetId: v.id("candidates"),
   cadenceMs: v.number(),
   counterpartyRole: v.union(v.literal("ownerStandIn"), v.literal("vendor")),
   evidenceRefs: v.optional(v.array(domainEvidenceRefValidator)),
