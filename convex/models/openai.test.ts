@@ -239,7 +239,10 @@ async function createFixture(
     visibility: "open",
   });
   if (!project.ok) throw new Error(`project setup failed: ${project.message}`);
-  const payloadJson = canonicalJson({ query: "Research suppliers for the espresso machine" });
+  const payloadJson = await openai.bindOpenAIWorkloadPayload(
+    extractionWorkload(),
+    "Research suppliers for the espresso machine",
+  );
   const grant = await asOwner.mutation(issueGrantRef, {
     organizationId: organization.organizationId,
     projectId: project.projectId,
@@ -380,6 +383,30 @@ describe("OpenAI Responses transport boundary", () => {
       fetchImpl: async () => providerResponse(draftOutput()),
     });
     expect(result).toMatchObject({ outcome: "completed", output: draftOutput() });
+  });
+
+  test("binds a supplier draft's brief and sources into the approved communication payload", async () => {
+    const payload = await openai.bindOpenAIWorkloadPayload(draftWorkload(), {
+      profile: "ownerRoleplay",
+      to: "owner@example.test",
+      cc: [],
+      bcc: [],
+      subject: "Clarification request",
+      body: "Please send a clarification about installation and delivery.",
+    });
+    expect(payload).toContain("openingos-openai-workload:v1");
+    const changed = await openai.bindOpenAIWorkloadPayload(
+      { ...draftWorkload(), brief: "Ask for a confirmed installation date." },
+      {
+        profile: "ownerRoleplay",
+        to: "owner@example.test",
+        cc: [],
+        bcc: [],
+        subject: "Clarification request",
+        body: "Please send a clarification about installation and delivery.",
+      },
+    );
+    expect(changed).not.toBe(payload);
   });
 
   test("rejects malformed, incomplete, model-drifted, schema-invalid, and invalid-usage responses", async () => {
@@ -630,8 +657,17 @@ describe("OpenAI pricing and shared execution boundary", () => {
       payloadJson: canonicalJson({ query: "tampered payload" }),
       workload: extractionWorkload(),
     });
-    expect(payloadResult).toMatchObject({ outcome: "stale", reason: "changed-draft" });
+    expect(payloadResult).toMatchObject({ ok: false, code: "changed-draft" });
     expect(fetchImpl).not.toHaveBeenCalled();
+    const payloadState = await operationState(payload, payloadFixture);
+    expect(payloadState.operation?.state).toBe("prepared");
+    expect(payloadState.attempts).toHaveLength(0);
+    expect(payloadState.reservation).toMatchObject({
+      state: "open",
+      reservedMicroUsd: payloadFixture.pricing.maxReservationMicroUsd,
+      spentMicroUsd: 0,
+      unresolvedMicroUsd: 0,
+    });
 
     const cancelled = init();
     const cancelledFixture = await createFixture(cancelled, "openai-cancel-fence");
@@ -651,6 +687,39 @@ describe("OpenAI pricing and shared execution boundary", () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
+  test("same-kind changed workload is blocked before claim with zero provider calls", async () => {
+    const t = init();
+    const fixture = await createFixture(t, "openai-changed-workload");
+    const fetchImpl = vi.fn(async () => providerResponse());
+    vi.stubGlobal("fetch", fetchImpl);
+    const changedWorkload: openai.CommercialExtractionWorkload = {
+      ...extractionWorkload(),
+      source: {
+        ...extractionWorkload().source,
+        content: "Commercial espresso machine. Price EUR 4,999. Delivery in 8 weeks.",
+      },
+      fields: ["price", "delivery", "installation"],
+    };
+    const result = await t.withIdentity(OWNER).action(generateRef, {
+      operationId: fixture.operationId,
+      identity: OWNER.tokenIdentifier,
+      inputVersion: "openai-v1",
+      payloadJson: fixture.payloadJson,
+      workload: changedWorkload,
+    });
+    expect(result).toMatchObject({ ok: false, code: "changed-draft" });
+    expect(fetchImpl).not.toHaveBeenCalled();
+    const state = await operationState(t, fixture);
+    expect(state.operation?.state).toBe("prepared");
+    expect(state.attempts).toHaveLength(0);
+    expect(state.reservation).toMatchObject({
+      state: "open",
+      reservedMicroUsd: fixture.pricing.maxReservationMicroUsd,
+      spentMicroUsd: 0,
+      unresolvedMicroUsd: 0,
+    });
+  });
+
   test("successful usage records a completed outcome and spends the full reservation", async () => {
     const t = init();
     const fixture = await createFixture(t, "openai-success");
@@ -667,6 +736,60 @@ describe("OpenAI pricing and shared execution boundary", () => {
     expect(state.operation?.state).toBe("observedSuccess");
     expect(state.reservation).toMatchObject({ state: "closed", reservedMicroUsd: 0, spentMicroUsd: fixture.pricing.maxReservationMicroUsd, unresolvedMicroUsd: 0 });
     expect(state.budget).toMatchObject({ reservedMicroUsd: 0, spentMicroUsd: fixture.pricing.maxReservationMicroUsd, unresolvedMicroUsd: 0 });
+  });
+
+  test("successful HTTP with malformed or schema-invalid output remains unresolved", async () => {
+    const cases: Array<{ readonly name: string; readonly response: () => Response }> = [
+      {
+        name: "malformed",
+        response: () => new Response("not-json", { status: 200 }),
+      },
+      {
+        name: "schema-invalid",
+        response: () => providerResponse({
+          ...extractionOutput(),
+          source: { ...extractionOutput().source, version: "source:other" },
+        }),
+      },
+      {
+        name: "model-drift",
+        response: () => providerResponse(extractionOutput(), { model: "gpt-5.4-mini" }),
+      },
+      {
+        name: "missing-usage",
+        response: () => providerResponse(extractionOutput(), { usage: undefined }),
+      },
+    ];
+    for (const entry of cases) {
+      const t = init();
+      const fixture = await createFixture(t, `openai-${entry.name}-http`);
+      const fetchImpl = vi.fn(async () => entry.response());
+      vi.stubGlobal("fetch", fetchImpl);
+      const result = await t.withIdentity(OWNER).action(generateRef, {
+        operationId: fixture.operationId,
+        identity: OWNER.tokenIdentifier,
+        inputVersion: "openai-v1",
+        payloadJson: fixture.payloadJson,
+        workload: extractionWorkload(),
+      });
+      expect(result, entry.name).toMatchObject({ outcome: "rejected", attempts: 1 });
+      expect(fetchImpl, entry.name).toHaveBeenCalledTimes(1);
+      const state = await operationState(t, fixture);
+      expect(state.operation?.state, entry.name).toBe("outcomeUnknown");
+      expect(state.attempts, entry.name).toHaveLength(1);
+      expect((state.attempts[0] as { readonly state?: string } | undefined)?.state, entry.name).toBe("outcomeUnknown");
+      expect(state.reservation, entry.name).toMatchObject({
+        state: "open",
+        reservedMicroUsd: 0,
+        spentMicroUsd: 0,
+        unresolvedMicroUsd: fixture.pricing.maxReservationMicroUsd,
+      });
+      expect(state.budget, entry.name).toMatchObject({
+        reservedMicroUsd: 0,
+        spentMicroUsd: 0,
+        unresolvedMicroUsd: fixture.pricing.maxReservationMicroUsd,
+      });
+    }
   });
 
   test("ambiguous transport records unresolved exposure instead of freeing it", async () => {
