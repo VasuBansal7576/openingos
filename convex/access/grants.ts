@@ -10,7 +10,8 @@
 
 import { v } from "convex/values";
 import { f1Mutation, f1Query } from "../server.js";
-import { canonicalJson, payloadHash } from "../shared/hashing.js";
+import { parseBoundedPayloadJson } from "../shared/hashing.js";
+import { sha256HexOfCanonical } from "../shared/sha256.js";
 import { lookupCapability } from "../shared/scope.js";
 import { COMMUNICATION_PROFILE_OWNER_ROLEPLAY } from "../shared/provenance.js";
 import { checkProjectAccess, denialValidator, identityOf } from "./checks.js";
@@ -41,7 +42,7 @@ export const issue = f1Mutation({
     communicationProfile: v.string(),
     recipientConfigVersion: v.number(),
     inputVersions: v.record(v.string(), v.string()),
-    payload: v.any(),
+    payloadJson: v.string(),
     costCeilingMicroUsd: v.number(),
     roundLimit: v.number(),
     expiresAt: v.number(),
@@ -87,7 +88,10 @@ export const issue = f1Mutation({
     if (!Number.isSafeInteger(args.expiresAt) || args.expiresAt <= now) {
       return { ok: false as const, code: "invalid-payload", message: "grant expiry must be in the future" };
     }
-    const canonical = canonicalJson(args.payload);
+    const parsed = parseBoundedPayloadJson(args.payloadJson);
+    if (!parsed.ok) return { ok: false as const, code: parsed.code, message: parsed.message };
+    const canonical = parsed.payload.canonical;
+    const payloadSha256 = await sha256HexOfCanonical(canonical);
     const grantId = await ctx.db.insert("grants", {
       organizationId: args.organizationId,
       projectId: args.projectId,
@@ -96,7 +100,8 @@ export const issue = f1Mutation({
       recipientConfigVersion: args.recipientConfigVersion,
       inputVersions: { ...args.inputVersions },
       canonicalPayload: canonical,
-      payloadHash: payloadHash(args.payload),
+      payloadHash: parsed.payload.hash,
+      payloadSha256,
       costCeilingMicroUsd: args.costCeilingMicroUsd,
       roundLimit: args.roundLimit,
       expiresAt: args.expiresAt,

@@ -10,6 +10,12 @@
  * the hash is a compact index key for that string.
  */
 
+/** Maximum accepted payload JSON size at any public boundary. */
+export const MAX_PAYLOAD_JSON_BYTES = 65_536;
+
+/** Maximum accepted nesting depth for payload JSON values. */
+export const MAX_PAYLOAD_JSON_DEPTH = 64;
+
 function canonicalize(value: unknown): string {
   if (value === null) return "null";
   if (value === undefined) return "null";
@@ -62,4 +68,67 @@ export function requestKey(organizationId: string, operationKind: string, reques
 /** Normalize an email mailbox for exact comparison (no dot/plus folding). */
 export function normalizeMailbox(mailbox: string): string {
   return mailbox.trim().toLowerCase();
+}
+
+export interface BoundedPayload {
+  readonly canonical: string;
+  readonly hash: string;
+  readonly value: unknown;
+}
+
+function jsonDepth(value: unknown): number {
+  let deepest = 0;
+  const stack: { entry: unknown; depth: number }[] = [{ entry: value, depth: 1 }];
+  const seen = new Set<object>();
+  while (stack.length > 0) {
+    const frame = stack.pop();
+    if (frame === undefined) continue;
+    if (frame.depth > deepest) deepest = frame.depth;
+    if (frame.depth > MAX_PAYLOAD_JSON_DEPTH) return frame.depth;
+    const entry = frame.entry;
+    if (typeof entry !== "object" || entry === null) continue;
+    if (seen.has(entry)) continue;
+    seen.add(entry);
+    if (Array.isArray(entry)) {
+      for (const child of entry) stack.push({ entry: child, depth: frame.depth + 1 });
+    } else {
+      for (const key of Object.keys(entry)) {
+        stack.push({ entry: (entry as Record<string, unknown>)[key], depth: frame.depth + 1 });
+      }
+    }
+  }
+  return deepest;
+}
+
+/**
+ * Validate a public `payloadJson` boundary value: string input, byte-size
+ * bound, well-formed JSON, supported depth, canonical form. Returns the
+ * canonical string plus its index hash; callers compute the SHA-256 digest
+ * on the server and never trust client digests.
+ */
+export function parseBoundedPayloadJson(raw: unknown):
+  | { readonly ok: true; readonly payload: BoundedPayload }
+  | { readonly ok: false; readonly code: "invalid-payload"; readonly message: string } {
+  if (typeof raw !== "string") {
+    return { ok: false, code: "invalid-payload", message: "payload must be a JSON string" };
+  }
+  if (new TextEncoder().encode(raw).byteLength > MAX_PAYLOAD_JSON_BYTES) {
+    return { ok: false, code: "invalid-payload", message: "payload exceeds the size bound" };
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    return { ok: false, code: "invalid-payload", message: "payload is not valid JSON" };
+  }
+  if (jsonDepth(value) > MAX_PAYLOAD_JSON_DEPTH) {
+    return { ok: false, code: "invalid-payload", message: "payload nesting exceeds the depth bound" };
+  }
+  let canonical: string;
+  try {
+    canonical = canonicalJson(value);
+  } catch {
+    return { ok: false, code: "invalid-payload", message: "payload shape is not supported" };
+  }
+  return { ok: true, payload: { canonical, hash: payloadHash(value), value } };
 }

@@ -112,7 +112,6 @@ export interface IssueGrantInput {
   readonly recipientConfigVersion: number;
   readonly inputVersions: Readonly<Record<string, string>>;
   readonly payload: unknown;
-  readonly payloadSha256?: string;
   readonly costCeilingMicroUsd: number;
   readonly roundLimit: number;
   readonly expiresAt: number;
@@ -125,7 +124,6 @@ export interface CreateOperationInput {
   readonly kind: string;
   readonly requestId: string;
   readonly payload: unknown;
-  readonly payloadSha256?: string;
   readonly grantId: string;
   readonly reservationId?: string;
 }
@@ -340,7 +338,7 @@ export class ControlledBackend {
       inputVersions: Object.freeze({ ...input.inputVersions }),
       canonicalPayload: canonical,
       payloadHash: payloadHash(input.payload),
-      payloadSha256: input.payloadSha256 ?? null,
+      payloadSha256: null,
       costCeilingMicroUsd: input.costCeilingMicroUsd,
       roundLimit: input.roundLimit,
       expiresAt: input.expiresAt,
@@ -672,7 +670,7 @@ export class ControlledBackend {
         if (
           existing.jobId === job.id &&
           sameCanonicalPayload(existing.canonicalPayload, canonical) &&
-          sha256BindingOk(existing.payloadSha256, input.payloadSha256)
+          sha256BindingOk(existing.payloadSha256, null)
         ) {
           return approved({ operation: existing, deduped: true });
         }
@@ -710,7 +708,7 @@ export class ControlledBackend {
       requestKey: key,
       canonicalPayload: canonical,
       normalizedPayloadHash: hash,
-      payloadSha256: input.payloadSha256 ?? null,
+      payloadSha256: null,
       grantId: grant.id,
       grantVersion: grant.revocationVersion,
       recipientConfigVersion: COMMUNICATION_KINDS.has(input.kind)

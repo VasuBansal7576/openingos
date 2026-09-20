@@ -17,8 +17,6 @@ const HANDLERS = [
   "access/memberships.ts",
   "access/recipients.ts",
   "execution/attempts.ts",
-  "execution/communication.ts",
-  "execution/dispatch.ts",
   "execution/jobs.ts",
   "execution/operations.ts",
   "execution/reconciliation.ts",
@@ -83,8 +81,6 @@ const ALLOWLIST: Record<string, Record<string, Visibility>> = {
     ingestEvent: "internalMutation",
     recordLateDelivery: "internalMutation",
   },
-  "execution/communication.ts": { recordControlledSend: "internalMutation" },
-  "execution/dispatch.ts": { dispatchCommunication: "action", requestResend: "action" },
   "purchasing/contracts/evidence.ts": {
     list: "query",
     record: "mutation",
@@ -123,7 +119,6 @@ describe("exported-handler audit", () => {
       "execution/operations.ts": ["claim"],
       "execution/attempts.ts": ["recordOutcome", "reconcileAfterCrash", "reviewedResend"],
       "execution/reconciliation.ts": ["ingestEvent", "recordLateDelivery"],
-      "execution/communication.ts": ["recordControlledSend"],
     };
     for (const [file, names] of Object.entries(internalOnly)) {
       const source = await readOwned(file);
@@ -134,8 +129,39 @@ describe("exported-handler audit", () => {
     }
   });
 
+  test("no fake-send endpoint exists (no public mark-sent without AgentMail)", async () => {
+    for (const file of FUNCTION_MODULES) {
+      const source = await readOwned(file);
+      expect(source.includes("dispatchCommunication")).toBe(false);
+      expect(source.includes("recordControlledSend")).toBe(false);
+    }
+    for (const deleted of [
+      "execution/dispatch.ts",
+      "execution/communication.ts",
+      "f1api.ts",
+      "internalRefs.ts",
+    ]) {
+      const exists = await Bun.file(new URL(`../${deleted}`, import.meta.url)).exists();
+      expect({ deleted, exists }).toEqual({ deleted, exists: false });
+    }
+  });
+
+  test("no untyped boundaries: no v.any, no explicit any, no client digests", async () => {
+    for (const file of FUNCTION_MODULES) {
+      const source = await readOwned(file);
+      expect({ file, vAny: source.includes("v.any()") }).toEqual({ file, vAny: false });
+      expect({ file, anyAnnotation: /:\s*any\b/.test(source) }).toEqual({ file, anyAnnotation: false });
+    }
+    for (const file of ["execution/operations.ts", "access/grants.ts"]) {
+      const source = await readOwned(file);
+      expect(source).toContain("payloadJson: v.string()");
+      expect(source.includes("payload: v.any()")).toBe(false);
+      expect(source.includes("payloadSha256: v.")).toBe(false);
+    }
+  });
+
   test("no unsafe assertions in production handlers", async () => {
-    for (const file of [...HANDLERS, "server.ts", "internalRefs.ts", "f1api.ts"]) {
+    for (const file of [...HANDLERS, "server.ts"]) {
       const source = await readOwned(file);
       expect({ file, asNever: source.includes("as never") }).toEqual({ file, asNever: false });
       expect({ file, asUnknown: source.includes("as unknown") }).toEqual({ file, asUnknown: false });
@@ -149,7 +175,6 @@ describe("exported-handler audit", () => {
       "execution/jobs.ts": ['v.id("organizations")', 'v.id("projects")', 'v.id("jobs")'],
       "execution/operations.ts": ['v.id("operations")', 'v.id("jobs")', 'v.id("grants")'],
       "execution/reservations.ts": ['v.id("jobs")', 'v.id("organizations")'],
-      "execution/dispatch.ts": ['v.id("operations")'],
       "purchasing/contracts/evidence.ts": ['v.id("organizations")', 'v.id("projects")', 'v.id("evidence")'],
       "purchasing/contracts/quotes.ts": ['v.id("quotes")'],
     };
@@ -197,7 +222,6 @@ describe("exported-handler audit", () => {
       "execution/reservations.ts",
       "execution/attempts.ts",
       "execution/reconciliation.ts",
-      "execution/communication.ts",
       "purchasing/contracts/evidence.ts",
       "purchasing/contracts/quotes.ts",
     ];
@@ -207,14 +231,12 @@ describe("exported-handler audit", () => {
     }
   });
 
-  test("only the owned typing helpers touch the stale generated api proxy", async () => {
-    for (const file of FUNCTION_MODULES) {
+  test("no handler touches the stale generated api proxy", async () => {
+    for (const file of [...FUNCTION_MODULES, "server.ts"]) {
       const source = await readOwned(file);
       expect(source.includes("_generated/api")).toBe(false);
     }
-    for (const helper of ["server.ts", "internalRefs.ts", "f1api.ts"]) {
-      const source = await readOwned(helper);
-      expect(source.includes("hand-written")).toBe(true);
-    }
+    const server = await readOwned("server.ts");
+    expect(server.includes("hand-written")).toBe(true);
   });
 });
