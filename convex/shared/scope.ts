@@ -295,6 +295,12 @@ const CONTEXTUAL_PROGRESS_CUES: ReadonlySet<string> = new Set([
 
 const CONTEXTUAL_OPTION_CUES: ReadonlySet<string> = new Set(["option", "options"]);
 
+const CONTEXTUAL_ANAPHORIC_GRAMMAR: ReadonlySet<string> = new Set([
+  ...CONTEXTUAL_PROGRESS_CUES,
+  ...CONTEXTUAL_REFERENCE_CUES,
+  ...CONTEXTUAL_OPTION_CUES,
+]);
+
 const RESEARCH_ANCHORS = PURCHASING_INTENT_ANCHORS;
 
 const STOP_WORDS: ReadonlySet<string> = new Set([
@@ -393,7 +399,10 @@ function hasContextualFollowUp(
   return (
     tokens.some((token) => CONTEXTUAL_PROGRESS_CUES.has(token)) &&
     tokens.some((token) => CONTEXTUAL_REFERENCE_CUES.has(token)) &&
-    tokens.some((token) => CONTEXTUAL_OPTION_CUES.has(token))
+    tokens.some((token) => CONTEXTUAL_OPTION_CUES.has(token)) &&
+    tokens.every(
+      (token) => CONTEXTUAL_ANAPHORIC_GRAMMAR.has(token) || context.has(token),
+    )
   );
 }
 
