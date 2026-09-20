@@ -130,6 +130,7 @@ interface Fixture {
   readonly jobId: Id<"jobs">;
   readonly operationId: Id<"operations">;
   readonly reservationId: Id<"reservations">;
+  readonly payloadJson: string;
 }
 
 function init(): TestConvex<typeof schema> {
@@ -161,14 +162,22 @@ async function createFixture(
   });
   if (!project.ok) throw new Error(`project setup failed: ${project.message}`);
   const query = "Research suppliers for the espresso machine";
+  const inputVersion = "jev-v1";
+  const workload: jev.JevWorkload = {
+    state: STATE,
+    questions: QUESTIONS,
+    inputVersion,
+  };
+  const workloadSha256 = await jev.jevWorkloadSha256(workload);
+  const payloadJson = await jev.bindJevWorkloadPayload(workload, query);
   const grant = await asOwner.mutation(issueGrantRef, {
     organizationId: organization.organizationId,
     projectId: project.projectId,
     operations: ["research.collect"],
     communicationProfile: "ownerRoleplay",
     recipientConfigVersion: 0,
-    inputVersions: { brief: "jev-v1" },
-    payloadJson: canonicalJson({ query }),
+    inputVersions: { brief: inputVersion, [jev.JEV_WORKLOAD_INPUT_VERSION_KEY]: workloadSha256 },
+    payloadJson,
     costCeilingMicroUsd: 10_000,
     roundLimit: 8,
     expiresAt: Date.now() + 60 * 60 * 1000,
@@ -208,7 +217,7 @@ async function createFixture(
     projectId: project.projectId,
     kind: "research.collect",
     requestId,
-    payloadJson: canonicalJson({ query }),
+    payloadJson,
     grantId: grant.grantId,
     reservationId: reservation.reservationId,
   });
@@ -223,6 +232,7 @@ async function createFixture(
     jobId: started.jobId,
     operationId: operation.operationId,
     reservationId: reservation.reservationId,
+    payloadJson,
   };
 }
 
@@ -278,6 +288,35 @@ async function expectNoClaim(t: TestConvex<typeof schema>, fixture: Fixture): Pr
     reservedMicroUsd: fixture.pricing.maxReservationMicroUsd,
     spentMicroUsd: 0,
     unresolvedMicroUsd: 0,
+  });
+}
+
+async function expectUnknownAccounting(t: TestConvex<typeof schema>, fixture: Fixture): Promise<void> {
+  const state = await t.run(async (ctx) => ({
+    operation: await ctx.db.get(fixture.operationId),
+    attempts: await ctx.db
+      .query("attempts")
+      .withIndex("by_operation", (q) => q.eq("operationId", fixture.operationId))
+      .collect(),
+    reservation: await ctx.db.get(fixture.reservationId),
+    budget: await ctx.db
+      .query("providerBudgets")
+      .withIndex("by_organization", (q) => q.eq("organizationId", fixture.organizationId))
+      .unique(),
+  }));
+  expect(state.operation?.state).toBe("outcomeUnknown");
+  expect(state.attempts).toHaveLength(1);
+  expect(state.attempts[0]?.state).toBe("outcomeUnknown");
+  expect(state.reservation).toMatchObject({
+    state: "open",
+    reservedMicroUsd: 0,
+    spentMicroUsd: 0,
+    unresolvedMicroUsd: fixture.pricing.maxReservationMicroUsd,
+  });
+  expect(state.budget).toMatchObject({
+    reservedMicroUsd: 0,
+    spentMicroUsd: 0,
+    unresolvedMicroUsd: fixture.pricing.maxReservationMicroUsd,
   });
 }
 
@@ -432,7 +471,7 @@ describe("J-03 Jev shared allowance and durable authority", () => {
       projectId: first.projectId,
       kind: "research.collect",
       requestId: "jev-concurrent-second",
-      payloadJson: canonicalJson({ query: "Research suppliers for the espresso machine" }),
+      payloadJson: first.payloadJson,
       grantId: first.grantId,
     });
     if (!secondOperation.ok) throw new Error(`second operation setup failed: ${secondOperation.message}`);
@@ -595,6 +634,93 @@ describe("J-03 Jev shared allowance and durable authority", () => {
       spentMicroUsd: 0,
       unresolvedMicroUsd: fixture.pricing.maxReservationMicroUsd,
     });
+  });
+
+  test("retains unknown exposure for a malformed successful response", async () => {
+    const t = init();
+    const fixture = await createFixture(t, "jev-unknown-response-shape");
+    const calls: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      calls.push("response-shape");
+      return new Response("{}", {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }));
+
+    const result = await t.withIdentity(OWNER).action(classifyRef, {
+      operationId: fixture.operationId,
+      identity: fixture.identity,
+      state: STATE,
+      questions: QUESTIONS,
+      inputVersion: "jev-v1",
+    });
+    expect(result).toMatchObject({ outcome: "needsReview", reason: "response-keys", attempts: 1 });
+    expect(calls).toHaveLength(1);
+    await expectUnknownAccounting(t, fixture);
+  });
+
+  test("retains an earlier lost response when a later attempt is definitively rejected", async () => {
+    const t = init();
+    const fixture = await createFixture(t, "jev-unknown-then-401");
+    const calls: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      calls.push("attempt");
+      if (calls.length === 1) throw new Error("controlled response loss");
+      return new Response("unauthorized", { status: 401 });
+    }));
+
+    const result = await t.withIdentity(OWNER).action(classifyRef, {
+      operationId: fixture.operationId,
+      identity: fixture.identity,
+      state: STATE,
+      questions: QUESTIONS,
+      inputVersion: "jev-v1",
+    });
+    expect(result).toMatchObject({ outcome: "needsReview", reason: "http-401", attempts: 2 });
+    expect(calls).toHaveLength(2);
+    await expectUnknownAccounting(t, fixture);
+  });
+
+  test("rejects changed Jev state or questions before claiming an operation", async () => {
+    const cases = [
+      {
+        state: { ...STATE, supplier: "Changed" },
+        questions: QUESTIONS,
+      },
+      {
+        state: STATE,
+        questions: {
+          ...QUESTIONS,
+          urgency: {
+            ...QUESTIONS.urgency,
+            instructions: "A changed approved question",
+          },
+        },
+      },
+    ] as const;
+
+    for (const [index, workload] of cases.entries()) {
+      const t = init();
+      const fixture = await createFixture(t, `jev-workload-drift-${index}`);
+      const calls: string[] = [];
+      vi.stubGlobal("fetch", vi.fn(async () => {
+        calls.push("unexpected-provider-call");
+        return response();
+      }));
+
+      const result = await t.withIdentity(OWNER).action(classifyRef, {
+        operationId: fixture.operationId,
+        identity: fixture.identity,
+        state: workload.state,
+        questions: workload.questions,
+        inputVersion: "jev-v1",
+      });
+      expect(result).toMatchObject({ outcome: "stale", reason: "stale-input-version", attempts: 0 });
+      expect(calls).toHaveLength(0);
+      await expectNoClaim(t, fixture);
+      vi.unstubAllGlobals();
+    }
   });
 
   test("cancellation during retry backoff makes zero next provider calls", async () => {

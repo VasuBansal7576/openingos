@@ -2,12 +2,15 @@ import {
   applyIfCurrent,
   JEV_DEFAULT_TIMEOUT_MS,
   JEV_MAX_RETRY_AFTER_MS,
+  JEV_MAX_REQUEST_BYTES,
   JEV_MAX_RESPONSE_BYTES,
+  JEV_PINNED_MODEL,
   jevAttemptOnce,
   validChoiceQuestion,
   validNoulQuestion,
   validScoreQuestion,
   type JevAnswer,
+  type JevAttemptResult,
   type JevFetch,
   type JevAttemptOptions,
   type JevQuestion,
@@ -24,11 +27,14 @@ import * as attempts from "../execution/attempts.js";
 import * as operations from "../execution/operations.js";
 import { checkProjectAccess, denialValidator } from "../access/checks.js";
 import { lookupCapability } from "../shared/scope.js";
-import { canonicalJson } from "../shared/hashing.js";
-import { sha256BindingOk } from "../shared/sha256.js";
+import { canonicalJson, parseBoundedPayloadJson } from "../shared/hashing.js";
+import { sha256BindingOk, sha256Hex } from "../shared/sha256.js";
 import { isExpired } from "../shared/time.js";
 
 export const JEV_MAX_ATTEMPTS = 3;
+export const JEV_WORKLOAD_BINDING_VERSION = "jev-workload-v1" as const;
+export const JEV_WORKLOAD_INPUT_VERSION_KEY = "jevWorkloadSha256" as const;
+export const JEV_WORKLOAD_BINDING_PREFIX = "[openingos-jev-workload:v1" as const;
 export const JEV_PRICING_ENV_VARS = {
   attemptMaxCostMicroUsd: "JEV_ATTEMPT_MAX_COST_MICRO_USD",
   pricingVersion: "JEV_PRICING_VERSION",
@@ -46,6 +52,12 @@ export interface JevPricingPolicy {
 export type JevPricingPolicyResult =
   | { readonly ok: true; readonly policy: JevPricingPolicy }
   | { readonly ok: false; readonly code: "invalid-pricing-config"; readonly message: string };
+
+export interface JevWorkload {
+  readonly state: unknown;
+  readonly questions: Record<string, JevQuestion>;
+  readonly inputVersion: string;
+}
 
 function invalidJevPricingPolicy(): JevPricingPolicyResult {
   return {
@@ -306,6 +318,20 @@ function parseQuestions(value: unknown): Record<string, JevQuestion> | null {
   return result;
 }
 
+function isBoundedNonEmptyString(value: unknown, maxBytes: number): value is string {
+  return (
+    typeof value === "string" &&
+    value.trim().length > 0 &&
+    new TextEncoder().encode(value).byteLength <= maxBytes
+  );
+}
+
+function validJevState(value: unknown): boolean {
+  if (typeof value === "string") return value.length > 0;
+  if (Array.isArray(value)) return value.length > 0;
+  return isPlainRecord(value) && Object.keys(value).length > 0;
+}
+
 type RetrySnapshot = { ok: true; value: unknown } | { ok: false };
 
 function copyRetryInput(value: unknown, depth: number, ancestors: Set<object>): RetrySnapshot {
@@ -400,19 +426,119 @@ type RetryRequest = {
   inputVersion: string;
 };
 
-function freezeRetryRequest(options: JevClassificationOptions): RetryRequest | null {
-  const state = immutableRetryInput(options.state);
-  const questions = immutableRetryInput(options.questions);
-  if (!state.ok || !questions.ok) return null;
-  const parsedQuestions = parseQuestions(questions.value);
-  if (parsedQuestions === null) return null;
-  Object.freeze(parsedQuestions);
+type ParsedJevWorkload =
+  | { readonly ok: true; readonly value: RetryRequest }
+  | { readonly ok: false; readonly reason: string };
+
+function parseJevWorkload(
+  state: unknown,
+  questions: unknown,
+  inputVersion: string,
+): ParsedJevWorkload {
+  if (!isBoundedNonEmptyString(inputVersion, 256)) {
+    return { ok: false, reason: "missing-input-version" };
+  }
+  const stateSnapshot = immutableRetryInput(state);
+  const questionSnapshot = immutableRetryInput(questions);
+  if (!stateSnapshot.ok || !questionSnapshot.ok) {
+    return { ok: false, reason: "non-json-workload" };
+  }
+  if (!validJevState(stateSnapshot.value)) {
+    return { ok: false, reason: "invalid-state" };
+  }
+  const parsedQuestions = parseQuestions(questionSnapshot.value);
+  if (parsedQuestions === null) {
+    return { ok: false, reason: "invalid-questions" };
+  }
   const request: RetryRequest = {
-    state: state.value,
+    state: stateSnapshot.value,
     questions: parsedQuestions,
-    inputVersion: options.inputVersion,
+    inputVersion,
   };
-  return Object.freeze(request);
+  try {
+    const body = JSON.stringify({
+      model: JEV_PINNED_MODEL,
+      state: request.state,
+      questions: request.questions,
+    });
+    if (new TextEncoder().encode(body).byteLength > JEV_MAX_REQUEST_BYTES) {
+      return { ok: false, reason: "request-too-large" };
+    }
+  } catch {
+    return { ok: false, reason: "request-serialize-failed" };
+  }
+  Object.freeze(request);
+  Object.freeze(parsedQuestions);
+  return { ok: true, value: request };
+}
+
+function freezeRetryRequest(options: JevClassificationOptions): RetryRequest | null {
+  const parsed = parseJevWorkload(options.state, options.questions, options.inputVersion);
+  return parsed.ok ? parsed.value : null;
+}
+
+function workloadBindingText(workloadSha256: string): string {
+  return `${JEV_WORKLOAD_BINDING_PREFIX} sha256=${workloadSha256}]`;
+}
+
+function parseJevWorkloadBinding(
+  payload: unknown,
+): { readonly ok: true; readonly workloadSha256: string } | { readonly ok: false; readonly reason: string } {
+  if (!isPlainRecord(payload) || Object.keys(payload).length !== 1 || !Object.hasOwn(payload, "query")) {
+    return { ok: false, reason: "jev-workload-binding-shape" };
+  }
+  const query = payload["query"];
+  if (!isBoundedNonEmptyString(query, 65_536)) {
+    return { ok: false, reason: "jev-workload-binding-query" };
+  }
+  const markerIndex = query.indexOf(JEV_WORKLOAD_BINDING_PREFIX);
+  if (
+    markerIndex <= 0 ||
+    markerIndex !== query.lastIndexOf(JEV_WORKLOAD_BINDING_PREFIX) ||
+    query.slice(0, markerIndex).trim().length === 0
+  ) {
+    return { ok: false, reason: "jev-workload-binding-missing" };
+  }
+  const marker = query.slice(markerIndex);
+  const match = /^\[openingos-jev-workload:v1 sha256=([0-9a-f]{64})\]$/.exec(marker);
+  if (match === null || match[1] === undefined) {
+    return { ok: false, reason: "jev-workload-binding-shape" };
+  }
+  return { ok: true, workloadSha256: match[1] };
+}
+
+function workloadBindingMatches(payload: unknown, workloadSha256: string): boolean {
+  const binding = parseJevWorkloadBinding(payload);
+  return binding.ok && binding.workloadSha256 === workloadSha256;
+}
+
+/** Compute the digest bound into the approved workflow payload. */
+export async function jevWorkloadSha256(workload: JevWorkload): Promise<string> {
+  const parsed = parseJevWorkload(workload.state, workload.questions, workload.inputVersion);
+  if (!parsed.ok) throw new Error(`invalid Jev workload: ${parsed.reason}`);
+  return sha256Hex({ version: JEV_WORKLOAD_BINDING_VERSION, workload: parsed.value });
+}
+
+/**
+ * Add the complete Jev workload digest to the generic research query carrier.
+ * The provider request remains the ADR-0005 `{ model, state, questions }`
+ * boundary; this marker binds that request to the approved operation without
+ * placing state or question instructions in the generic workflow payload.
+ */
+export async function bindJevWorkloadPayload(
+  workload: JevWorkload,
+  workflowQuery: string,
+): Promise<string> {
+  const parsed = parseJevWorkload(workload.state, workload.questions, workload.inputVersion);
+  if (!parsed.ok) throw new Error(`invalid Jev workload: ${parsed.reason}`);
+  if (
+    !isBoundedNonEmptyString(workflowQuery, 8_192) ||
+    workflowQuery.includes(JEV_WORKLOAD_BINDING_PREFIX)
+  ) {
+    throw new Error("Jev workload requires an unbound workflow query");
+  }
+  const workloadSha256 = await sha256Hex({ version: JEV_WORKLOAD_BINDING_VERSION, workload: parsed.value });
+  return canonicalJson({ query: `${workflowQuery.trim()} ${workloadBindingText(workloadSha256)}` });
 }
 
 async function waitForRetry(
@@ -487,33 +613,81 @@ async function currentRequestFence(
   return { ok: true };
 }
 
+type JevClassificationRun = {
+  readonly result: JevClassificationResult;
+  readonly ambiguousAttempt: boolean;
+};
+
+function isAmbiguousProviderResult(result: JevAttemptResult | JevClassificationResult): boolean {
+  if (result.outcome === "stale") return true;
+  if (result.outcome === "unavailable") {
+    return result.reason === "timeout" ||
+      result.reason === "transport-error" ||
+      result.reason === "body-error";
+  }
+  if (result.outcome !== "needsReview") return false;
+  // A valid HTTP response with malformed, incomplete, or unclassifiable
+  // output does not establish that the provider did not process the request.
+  // Explicit HTTP rejection statuses remain definitive failures unless an
+  // earlier attempt already left the charge unresolved.
+  return result.reason.startsWith("response-") ||
+    result.reason === "model-mismatch" ||
+    result.reason === "answers-shape" ||
+    result.reason === "answers-mismatch" ||
+    result.reason === "answer-reserved-id" ||
+    result.reason.startsWith("answer-invalid:") ||
+    result.reason.startsWith("usage-");
+}
+
 /**
  * Server-only Jev transport adapter. The imported proof owns unknown response
  * parsing and one-attempt transport bounds; this wrapper owns only the bounded
  * three-attempt retry and cancellation composition required by ADR-0005.
  */
-export async function runJevClassification(
+async function runJevClassificationWithAccounting(
   options: JevClassificationOptions,
-): Promise<JevClassificationResult> {
-  if (isAborted(options.signal)) return staleResult(options.inputVersion, "cancelled-before-start", 0);
+): Promise<JevClassificationRun> {
+  if (isAborted(options.signal)) {
+    return {
+      result: staleResult(options.inputVersion, "cancelled-before-start", 0),
+      ambiguousAttempt: false,
+    };
+  }
   if (options.apiKey === undefined || options.apiKey.length === 0) {
-    return unavailableResult(options.inputVersion, "provider-unconfigured", 0);
+    return {
+      result: unavailableResult(options.inputVersion, "provider-unconfigured", 0),
+      ambiguousAttempt: false,
+    };
   }
 
   const timeoutMs = options.timeoutMs ?? JEV_DEFAULT_TIMEOUT_MS;
   const request = freezeRetryRequest(options);
   if (request === null) {
-    return unavailableResult(options.inputVersion, "invalid-input", 0);
+    return {
+      result: unavailableResult(options.inputVersion, "invalid-input", 0),
+      ambiguousAttempt: false,
+    };
   }
 
   const beforeStart = await currentRequestFence(options, request);
-  if (!beforeStart.ok) return staleResult(request.inputVersion, beforeStart.reason, 0);
+  if (!beforeStart.ok) {
+    return {
+      result: staleResult(request.inputVersion, beforeStart.reason, 0),
+      ambiguousAttempt: false,
+    };
+  }
 
   let lastResult: JevClassificationResult = unavailableResult(request.inputVersion, "no-attempt", 0);
+  let ambiguousAttempt = false;
 
   for (let attempt = 0; attempt < JEV_MAX_ATTEMPTS; attempt += 1) {
     const beforeAttempt = await currentRequestFence(options, request);
-    if (!beforeAttempt.ok) return staleResult(request.inputVersion, beforeAttempt.reason, attempt);
+    if (!beforeAttempt.ok) {
+      return {
+        result: staleResult(request.inputVersion, beforeAttempt.reason, attempt),
+        ambiguousAttempt,
+      };
+    }
     const attemptOptions: JevAttemptOptions = {
       apiKey: options.apiKey,
       state: request.state,
@@ -525,15 +699,26 @@ export async function runJevClassification(
     if (options.fetchImpl !== undefined) attemptOptions.fetchImpl = options.fetchImpl;
     if (options.signal !== undefined) attemptOptions.signal = options.signal;
     const result = await jevAttemptOnce(attemptOptions);
+    ambiguousAttempt = ambiguousAttempt || isAmbiguousProviderResult(result);
     const afterAttempt = await currentRequestFence(options, request);
-    if (!afterAttempt.ok) return staleResult(request.inputVersion, afterAttempt.reason, attempt + 1);
+    if (!afterAttempt.ok) {
+      return {
+        result: staleResult(request.inputVersion, afterAttempt.reason, attempt + 1),
+        // A provider response was already observed, but authority changed
+        // before it could be applied. Keep the charge unresolved.
+        ambiguousAttempt: true,
+      };
+    }
     const freshResult = options.currentInputVersion === undefined
       ? result
       : applyIfCurrent(result, request.inputVersion);
     lastResult = { ...freshResult, attempts: attempt + 1 };
+    if (freshResult.outcome === "stale") ambiguousAttempt = true;
 
-    if (freshResult.outcome !== "unavailable" || freshResult.retry.kind !== "retryable") return lastResult;
-    if (attempt + 1 >= JEV_MAX_ATTEMPTS) return lastResult;
+    if (freshResult.outcome !== "unavailable" || freshResult.retry.kind !== "retryable") {
+      return { result: lastResult, ambiguousAttempt };
+    }
+    if (attempt + 1 >= JEV_MAX_ATTEMPTS) return { result: lastResult, ambiguousAttempt };
 
     const retryAfter = freshResult.retry.retryAfterMs;
     if (retryAfter !== null && retryAfter > JEV_MAX_RETRY_AFTER_MS) {
@@ -541,31 +726,165 @@ export async function runJevClassification(
       // preserves the exact server minimum, so over-policy advice becomes an
       // explicit review result instead of an automatic retry.
       return {
-        outcome: "needsReview",
-        reason: `${freshResult.reason}:manual-review-required`,
-        retry: { ...freshResult.retry, kind: "nonretryable" },
-        latencyMs: freshResult.latencyMs,
-        inputVersion: freshResult.inputVersion,
-        attempts: attempt + 1,
+        result: {
+          outcome: "needsReview",
+          reason: `${freshResult.reason}:manual-review-required`,
+          retry: { ...freshResult.retry, kind: "nonretryable" },
+          latencyMs: freshResult.latencyMs,
+          inputVersion: freshResult.inputVersion,
+          attempts: attempt + 1,
+        },
+        ambiguousAttempt,
       };
     }
     const delay = retryAfter === null
       ? attempt === 0 ? JEV_RETRY_BACKOFF_MS[0] : JEV_RETRY_BACKOFF_MS[1]
       : retryAfter;
     if (await waitForRetry(delay, options.signal, options.sleepImpl)) {
-      return staleResult(request.inputVersion, "cancelled-during-retry-backoff", attempt + 1);
+      return {
+        result: staleResult(request.inputVersion, "cancelled-during-retry-backoff", attempt + 1),
+        ambiguousAttempt: true,
+      };
     }
     const afterWait = await currentRequestFence(options, request);
-    if (!afterWait.ok) return staleResult(request.inputVersion, afterWait.reason, attempt + 1);
+    if (!afterWait.ok) {
+      return {
+        result: staleResult(request.inputVersion, afterWait.reason, attempt + 1),
+        ambiguousAttempt,
+      };
+    }
   }
 
-  return lastResult;
+  return { result: lastResult, ambiguousAttempt };
+}
+
+export async function runJevClassification(
+  options: JevClassificationOptions,
+): Promise<JevClassificationResult> {
+  const run = await runJevClassificationWithAccounting(options);
+  return run.result;
 }
 
 const attemptFenceResultValidator = v.union(
   v.object({ ok: v.literal(true) }),
   denialValidator,
 );
+
+/**
+ * Pre-claim authority fence. The workload digest is copied by F1 from the
+ * approved grant into the job and operation input-version snapshots. The
+ * exact marker in the approved payload prevents a caller from pairing a
+ * fresh state/question set with an older generic research operation.
+ */
+export const preClaimFence = f1InternalQuery({
+  args: {
+    operationId: v.id("operations"),
+    identity: v.string(),
+    inputVersion: v.string(),
+    workloadSha256: v.string(),
+  },
+  returns: attemptFenceResultValidator,
+  handler: async (ctx, args) => {
+    if (args.identity.trim().length === 0) {
+      return { ok: false as const, code: "forged-identity", message: "missing operation identity" };
+    }
+    const operation = await ctx.db.get(args.operationId);
+    if (operation === null) {
+      return { ok: false as const, code: "denied-membership", message: "operation is not authorized" };
+    }
+    if (operation.state !== "prepared") {
+      return operation.state === "cancelled"
+        ? { ok: false as const, code: "cancelled-before-claim", message: "operation was cancelled before claim" }
+        : { ok: false as const, code: "already-claimed", message: "operation is no longer prepared" };
+    }
+    if (operation.kind !== "research.collect") {
+      return { ok: false as const, code: "unavailable-capability", message: "Jev is not authorized for this operation" };
+    }
+    const operationPayload = parseBoundedPayloadJson(operation.normalizedPayload);
+    if (!operationPayload.ok || operationPayload.payload.canonical !== operation.normalizedPayload) {
+      return { ok: false as const, code: "invalid-payload", message: "payload must be canonical bounded JSON" };
+    }
+    const job = await ctx.db.get(operation.jobId);
+    if (
+      job === null ||
+      job.organizationId !== operation.organizationId ||
+      job.projectId !== operation.projectId ||
+      job.grantId !== operation.grantId
+    ) {
+      return { ok: false as const, code: "denied-membership", message: "operation authority is unavailable" };
+    }
+    if (job.state === "cancelled" || job.state === "cancelling") {
+      return { ok: false as const, code: "cancelled-before-claim", message: "job is fenced for cancellation" };
+    }
+    const capability = lookupCapability(operation.kind);
+    if (capability === undefined) {
+      return { ok: false as const, code: "unknown-operation", message: `unknown operation ${operation.kind}` };
+    }
+    const access = await checkProjectAccess(
+      ctx,
+      args.identity,
+      operation.organizationId,
+      operation.projectId,
+      capability.requiredRole,
+      Date.now(),
+    );
+    if (!access.ok) return { ok: false as const, code: access.code, message: access.message };
+
+    const grant = await ctx.db.get(operation.grantId);
+    if (
+      grant === null ||
+      grant.organizationId !== operation.organizationId ||
+      grant.projectId !== operation.projectId
+    ) {
+      return { ok: false as const, code: "denied-membership", message: "operation authority is unavailable" };
+    }
+    if (!grant.operations.includes(operation.kind)) {
+      return { ok: false as const, code: "denied-capability", message: "grant no longer authorizes Jev" };
+    }
+    if (grant.status !== "active") {
+      return { ok: false as const, code: "revoked-grant", message: "grant is no longer active" };
+    }
+    if (grant.revocationVersion !== operation.grantVersion || grant.revocationVersion !== job.grantVersion) {
+      return { ok: false as const, code: "stale-grant-version", message: "grant was re-issued before claim" };
+    }
+    if (isExpired(Date.now(), grant.expiresAt)) {
+      return { ok: false as const, code: "grant-expired-at-claim", message: "grant expired before claim" };
+    }
+    if (
+      canonicalJson(operation.inputVersions) !== canonicalJson(grant.inputVersions) ||
+      canonicalJson(job.inputVersions) !== canonicalJson(grant.inputVersions) ||
+      !Object.values(grant.inputVersions).includes(args.inputVersion)
+    ) {
+      return { ok: false as const, code: "stale-input-version", message: "inputs changed before claim" };
+    }
+    if (
+      grant.inputVersions[JEV_WORKLOAD_INPUT_VERSION_KEY] !== args.workloadSha256 ||
+      operation.inputVersions[JEV_WORKLOAD_INPUT_VERSION_KEY] !== args.workloadSha256 ||
+      job.inputVersions[JEV_WORKLOAD_INPUT_VERSION_KEY] !== args.workloadSha256
+    ) {
+      return { ok: false as const, code: "stale-input-version", message: "Jev workload binding is not approved" };
+    }
+    const grantPayload = parseBoundedPayloadJson(grant.canonicalPayload);
+    if (!grantPayload.ok || grantPayload.payload.canonical !== grant.canonicalPayload) {
+      return { ok: false as const, code: "invalid-payload", message: "grant payload must be canonical bounded JSON" };
+    }
+    if (
+      grant.canonicalPayload !== operation.normalizedPayload ||
+      !sha256BindingOk(operation.payloadSha256, grant.payloadSha256) ||
+      !workloadBindingMatches(operationPayload.payload.value, args.workloadSha256) ||
+      !workloadBindingMatches(grantPayload.payload.value, args.workloadSha256)
+    ) {
+      return { ok: false as const, code: "changed-draft", message: "approved Jev workload does not match the operation" };
+    }
+    return { ok: true as const };
+  },
+});
+
+const preClaimFenceRef = makeFunctionReference<
+  "query",
+  QueryArgs<typeof preClaimFence>,
+  QueryReturn<typeof preClaimFence>
+>("models/jev:preClaimFence");
 
 /**
  * Recheck the durable authority chain between bounded Jev transport attempts.
@@ -579,6 +898,7 @@ export const attemptFence = f1InternalQuery({
     operationId: v.id("operations"),
     identity: v.string(),
     inputVersion: v.string(),
+    workloadSha256: v.string(),
   },
   returns: attemptFenceResultValidator,
   handler: async (ctx, args) => {
@@ -646,8 +966,30 @@ export const attemptFence = f1InternalQuery({
     if (!Object.values(grant.inputVersions).includes(args.inputVersion)) {
       return { ok: false as const, code: "stale-input-version", message: "Jev input version is not current for this grant" };
     }
-    if (operation.normalizedPayload !== grant.canonicalPayload || !sha256BindingOk(operation.payloadSha256, grant.payloadSha256)) {
-      return { ok: false as const, code: "changed-draft", message: "approved payload changed during dispatch" };
+    if (
+      grant.inputVersions[JEV_WORKLOAD_INPUT_VERSION_KEY] !== args.workloadSha256 ||
+      operation.inputVersions[JEV_WORKLOAD_INPUT_VERSION_KEY] !== args.workloadSha256 ||
+      job.inputVersions[JEV_WORKLOAD_INPUT_VERSION_KEY] !== args.workloadSha256
+    ) {
+      return { ok: false as const, code: "stale-input-version", message: "Jev workload binding changed during dispatch" };
+    }
+    const operationPayload = parseBoundedPayloadJson(operation.normalizedPayload);
+    const grantPayload = parseBoundedPayloadJson(grant.canonicalPayload);
+    if (
+      !operationPayload.ok ||
+      operationPayload.payload.canonical !== operation.normalizedPayload ||
+      !grantPayload.ok ||
+      grantPayload.payload.canonical !== grant.canonicalPayload
+    ) {
+      return { ok: false as const, code: "invalid-payload", message: "approved payload is not canonical bounded JSON" };
+    }
+    if (
+      operation.normalizedPayload !== grant.canonicalPayload ||
+      !sha256BindingOk(operation.payloadSha256, grant.payloadSha256) ||
+      !workloadBindingMatches(operationPayload.payload.value, args.workloadSha256) ||
+      !workloadBindingMatches(grantPayload.payload.value, args.workloadSha256)
+    ) {
+      return { ok: false as const, code: "changed-draft", message: "approved Jev workload changed during dispatch" };
     }
 
     if (operation.reservationId === undefined) {
@@ -667,8 +1009,12 @@ export const attemptFence = f1InternalQuery({
       return { ok: false as const, code: "stale-pricing-basis", message: "Jev reservation pricing policy is stale" };
     }
     const budget = await ctx.db.get(reservation.budgetId);
-    if (budget === null || budget.organizationId !== operation.organizationId) {
-      return { ok: false as const, code: "denied-membership", message: "operation allowance is unavailable" };
+    if (
+      budget === null ||
+      budget.organizationId !== operation.organizationId ||
+      budget.pricingBasis !== pricing.policy.reservationPricingBasis
+    ) {
+      return { ok: false as const, code: "stale-pricing-basis", message: "operation allowance pricing policy is stale" };
     }
     return { ok: true as const };
   },
@@ -681,12 +1027,7 @@ const attemptFenceRef = makeFunctionReference<
 >("models/jev:attemptFence");
 
 function isAmbiguousJevResult(result: JevClassificationResult): boolean {
-  if (result.attempts === 0) return false;
-  if (result.outcome === "stale") return true;
-  if (result.outcome !== "unavailable") return false;
-  return result.reason === "timeout" ||
-    result.reason === "transport-error" ||
-    result.reason === "body-error";
+  return result.attempts > 0 && isAmbiguousProviderResult(result);
 }
 
 export const classify = internalAction({
@@ -704,31 +1045,56 @@ export const classify = internalAction({
     if (args.identity.trim().length === 0) {
       return { ok: false as const, code: "forged-identity", message: "missing operation identity" };
     }
+    const workload = parseJevWorkload(args.state, args.questions, args.inputVersion);
+    if (!workload.ok) {
+      return { ok: false as const, code: "invalid-payload", message: workload.reason };
+    }
+    let workloadSha256: string;
+    try {
+      workloadSha256 = await sha256Hex({
+        version: JEV_WORKLOAD_BINDING_VERSION,
+        workload: workload.value,
+      });
+    } catch {
+      return { ok: false as const, code: "invalid-payload", message: "Jev workload binding could not be computed" };
+    }
+    const preClaim = await ctx.runQuery(preClaimFenceRef, {
+      operationId: args.operationId,
+      identity: args.identity,
+      inputVersion: args.inputVersion,
+      workloadSha256,
+    });
+    if (!preClaim.ok) {
+      // Preserve the ADR-0005 classification boundary for a caller-selected
+      // stale version while refusing the operation before it can claim.
+      if (preClaim.code === "stale-input-version") {
+        return staleResult(args.inputVersion, preClaim.code, 0);
+      }
+      return preClaim;
+    }
     const claim = await ctx.runMutation(claimRef, {
       operationId: args.operationId,
       identity: args.identity,
     });
     if (!claim.ok) return claim;
 
-    const questions = parseQuestions(args.questions);
-    const result = questions === null
-      ? unavailableResult(args.inputVersion, "invalid-questions", 0)
-      : await runJevClassification({
-          apiKey: env.TYPESAFE_API_KEY,
-          state: args.state,
-          questions,
+    const run = await runJevClassificationWithAccounting({
+      apiKey: env.TYPESAFE_API_KEY,
+      state: workload.value.state,
+      questions: workload.value.questions,
+      inputVersion: workload.value.inputVersion,
+      beforeAttempt: async () => {
+        const fence = await ctx.runQuery(attemptFenceRef, {
+          operationId: args.operationId,
+          identity: args.identity,
           inputVersion: args.inputVersion,
-          beforeAttempt: async () => {
-            const fence = await ctx.runQuery(attemptFenceRef, {
-              operationId: args.operationId,
-              identity: args.identity,
-              inputVersion: args.inputVersion,
-            });
-            return fence.ok ? fence : { ok: false as const, reason: fence.code };
-          },
+          workloadSha256,
         });
-
-    const ambiguous = isAmbiguousJevResult(result);
+        return fence.ok ? fence : { ok: false as const, reason: fence.code };
+      },
+    });
+    const result = run.result;
+    const ambiguous = run.ambiguousAttempt || isAmbiguousJevResult(result);
     const recorded = await ctx.runMutation(recordOutcomeRef, {
       operationId: args.operationId,
       token: claim.attemptToken,
