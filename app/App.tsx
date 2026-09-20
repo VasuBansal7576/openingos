@@ -1,3 +1,4 @@
+import type { KeyboardEvent } from "react";
 import type { BackendStatus } from "./backend-state";
 
 export interface AppProps {
@@ -64,6 +65,11 @@ function statusCopy(status: BackendStatus): StatusCopy {
 
 export default function App({ backendStatus = "unconfigured", onRetry }: AppProps) {
   const copy = statusCopy(backendStatus);
+  const handleRetryKeyDown = (event: KeyboardEvent<HTMLButtonElement>) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    onRetry?.();
+  };
 
   return (
     <main className="shell">
@@ -80,7 +86,7 @@ export default function App({ backendStatus = "unconfigured", onRetry }: AppProp
             <strong>{copy.title}</strong>
             <p>{copy.message}</p>
             {copy.action !== undefined && onRetry !== undefined ? (
-              <button type="button" className="retry-button" onClick={onRetry}>
+              <button type="button" className="retry-button" onClick={onRetry} onKeyDown={handleRetryKeyDown}>
                 {copy.action}
               </button>
             ) : null}
