@@ -13,6 +13,7 @@
  */
 
 import { v } from "convex/values";
+import { paginationOptsValidator } from "convex/server";
 import type { Id } from "../_generated/dataModel.js";
 import { f1Mutation, f1Query } from "../server.js";
 import { denialValidator } from "../access/checks.js";
@@ -56,6 +57,28 @@ const orderResultValidator = v.union(
  * aggregates labeled complete.
  */
 const ORDER_LINEAGE_HISTORY_BOUND = 200;
+
+/**
+ * Greptile r4056517360: the prior-order commitment scan is bounded.
+ * At most this many orders on one selection are read inside a single
+ * commitment mutation, so the read set can never approach Convex
+ * transaction limits no matter how long the selection history grows.
+ * A selection breaching the bound denies new commitments with explicit
+ * incompleteness instead of undercounting them; exact replays return
+ * before this scan and are unaffected.
+ */
+const SELECTION_ORDER_SCAN_BOUND = 100;
+
+/**
+ * Coordinator broaden-behind-r4056517360: the per-line acceptance
+ * accumulation scan is bounded the same way. At most this many prior
+ * events on one order are read inside a single acceptance mutation —
+ * two orders of magnitude above demonstrated histories and far below
+ * transaction limits. An order breaching the bound denies new
+ * acceptances with explicit incompleteness instead of undercounting
+ * them; exact replays return before this scan and are unaffected.
+ */
+const ORDER_EVENT_SCAN_BOUND = 1000;
 
 // -- F1R-13 effective-line helpers (no I/O) ----------------------------------
 
@@ -407,22 +430,42 @@ export const recordOrder = f1Mutation({
     // selection. Prior orders count toward each selected line, so a new
     // idempotency key can never reset the allowance: split orders may
     // cover the selected quantity together, but their combined lines can
-    // never exceed it. The scan and the insert below execute in one
-    // atomic mutation transaction, so concurrent excess attempts
+    // never exceed it. The bounded scan and the insert below execute in
+    // one atomic mutation transaction, so concurrent excess attempts
     // conflict on the shared selection range and the loser rechecks on
     // retry instead of double-committing. Exact replays return above,
     // before this cap is enforced.
     const committedByLine = new Map<string, Decimal>();
-    for await (const prior of ctx.db
+    const priors = await ctx.db
       .query("orders")
-      .withIndex("by_selection", (q) => q.eq("selectionId", args.selectionId))) {
+      .withIndex("by_selection", (q) => q.eq("selectionId", args.selectionId))
+      .take(SELECTION_ORDER_SCAN_BOUND + 1);
+    if (priors.length > SELECTION_ORDER_SCAN_BOUND) {
+      return {
+        ok: false as const,
+        code: "incomplete-history",
+        message: "selection carries more orders than the commitment scan bound; new commitments are unavailable until history is reconciled",
+      };
+    }
+    let ambiguousHistory = false;
+    for (const prior of priors) {
       if (
         prior.organizationId !== args.organizationId ||
         prior.projectId !== args.projectId
       ) {
         continue;
       }
-      for (const priorLine of effectiveOrderLines(prior, selectionLines)) {
+      // Greptile r4056517364: a prior scalar commitment that cannot be
+      // resolved to lines (legacy row behind a multi-line selection, or
+      // a row with no quantity at all) must never contribute zero
+      // silently. It flags the history ambiguous so the new commitment
+      // is denied below instead of undercounting toward over-ordering.
+      const priorLines = effectiveOrderLines(prior, selectionLines);
+      if (priorLines.length === 0 && prior.orderLines === undefined) {
+        ambiguousHistory = true;
+        continue;
+      }
+      for (const priorLine of priorLines) {
         try {
           const priorQuantity = quantity(priorLine.quantity);
           const running = committedByLine.get(priorLine.quoteLineId);
@@ -434,6 +477,13 @@ export const recordOrder = f1Mutation({
           return { ok: false as const, code: "invalid-payload", message: "stored ordered quantity is invalid" };
         }
       }
+    }
+    if (ambiguousHistory) {
+      return {
+        ok: false as const,
+        code: "incomplete-history",
+        message: "selection carries ambiguous historical commitments that cannot be capped per line; new commitments are unavailable until history is reconciled",
+      };
     }
     for (const line of effectiveLines) {
       const selected = selectedByLine.get(line.quoteLineId);
@@ -699,7 +749,12 @@ export const appendOrderEvent = f1Mutation({
       // Per-line accumulation: every prior acceptance for the same line
       // counts toward that line's ordered cap. A line that would exceed
       // its own ordered quantity is rejected even when the order total
-      // would still fit.
+      // would still fit. Greptile r4056517364: a prior scalar acceptance
+      // that cannot be resolved to lines (legacy mirror behind a
+      // multi-line order) must never contribute zero silently. It flags
+      // the history ambiguous so the new acceptance is denied below
+      // instead of undercounting toward over-acceptance. Exact replays
+      // return above, before this accumulation.
       const cumulativeByLine = new Map<string, Decimal>();
       for (const line of effectiveAcceptances) {
         try {
@@ -708,14 +763,34 @@ export const appendOrderEvent = f1Mutation({
           return { ok: false as const, code: "invalid-payload", message: "accepted quantity is not a valid decimal" };
         }
       }
-      for await (const prior of ctx.db
+      const priorEvents = await ctx.db
         .query("orderEvents")
-        .withIndex("by_order", (q) => q.eq("orderId", args.orderId))) {
+        .withIndex("by_order", (q) => q.eq("orderId", args.orderId))
+        .take(ORDER_EVENT_SCAN_BOUND + 1);
+      if (priorEvents.length > ORDER_EVENT_SCAN_BOUND) {
+        return {
+          ok: false as const,
+          code: "incomplete-history",
+          message: "order carries more events than the acceptance scan bound; new acceptances are unavailable until history is reconciled",
+        };
+      }
+      for (const prior of priorEvents) {
         if (
           prior.organizationId !== args.organizationId ||
           prior.projectId !== args.projectId
         ) {
           continue;
+        }
+        if (
+          prior.acceptedQuantity !== undefined &&
+          prior.acceptanceLines === undefined &&
+          orderLines.length !== 1
+        ) {
+          return {
+            ok: false as const,
+            code: "incomplete-history",
+            message: "order carries ambiguous historical acceptances that cannot be capped per line; new acceptances are unavailable until history is reconciled",
+          };
         }
         for (const priorLine of effectiveEventAcceptances(prior, orderLines)) {
           const running = cumulativeByLine.get(priorLine.quoteLineId);
@@ -1160,6 +1235,32 @@ export const recordAsset = f1Mutation({
   },
 });
 
+const orderHistoryEventValidator = v.object({
+  id: v.id("orderEvents"),
+  kind: v.string(),
+  acceptanceLines: v.array(
+    v.object({
+      quoteLineId: v.string(),
+      acceptedQuantity: v.string(),
+      unit: v.string(),
+    }),
+  ),
+  note: v.optional(v.string()),
+});
+
+const orderHistoryEntryValidator = v.object({
+  id: v.id("costEntries"),
+  kind: v.string(),
+  amount: v.object({ currency: v.string(), minorUnits: v.number() }),
+  quoteLineId: v.optional(v.string()),
+  affectedQuantity: v.optional(v.string()),
+  affectedUnit: v.optional(v.string()),
+  evidenceRefs: v.array(
+    v.object({ evidenceId: v.id("evidence"), contentHash: v.string() }),
+  ),
+  linkedEntryId: v.optional(v.id("costEntries")),
+});
+
 const orderLineageValidator = v.object({
   ok: v.literal(true),
   order: v.object({
@@ -1202,34 +1303,8 @@ const orderLineageValidator = v.object({
       unit: v.string(),
     }),
   ),
-  events: v.array(
-    v.object({
-      id: v.id("orderEvents"),
-      kind: v.string(),
-      acceptanceLines: v.array(
-        v.object({
-          quoteLineId: v.string(),
-          acceptedQuantity: v.string(),
-          unit: v.string(),
-        }),
-      ),
-      note: v.optional(v.string()),
-    }),
-  ),
-  costEntries: v.array(
-    v.object({
-      id: v.id("costEntries"),
-      kind: v.string(),
-      amount: v.object({ currency: v.string(), minorUnits: v.number() }),
-      quoteLineId: v.optional(v.string()),
-      affectedQuantity: v.optional(v.string()),
-      affectedUnit: v.optional(v.string()),
-      evidenceRefs: v.array(
-        v.object({ evidenceId: v.id("evidence"), contentHash: v.string() }),
-      ),
-      linkedEntryId: v.optional(v.id("costEntries")),
-    }),
-  ),
+  events: v.array(orderHistoryEventValidator),
+  costEntries: v.array(orderHistoryEntryValidator),
 });
 
 /**
@@ -1391,6 +1466,126 @@ export const getOrderLineage = f1Query({
           evidenceRefs: entry.evidenceRefs !== undefined ? [...entry.evidenceRefs] : [],
           ...(entry.linkedEntryId === undefined ? {} : { linkedEntryId: entry.linkedEntryId }),
         })),
+    };
+  },
+});
+
+/**
+ * Paged order history (Greptile r4056517362). When an order's history
+ * exceeds the lineage summary bound, every row stays reloadable and
+ * reconcilable through this bounded cursor path: each call reads one
+ * page over the order's own index with the caller's page size, so no
+ * call can approach transaction limits however long the history grows.
+ * The existing `getOrderLineage` summary response is unchanged for
+ * under-bound histories. Authorization matches the summary on every
+ * page: viewer role plus order, selection, and quote ownership in the
+ * caller's project.
+ */
+export const listOrderHistoryPage = f1Query({
+  args: {
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    orderId: v.id("orders"),
+    kind: v.union(v.literal("events"), v.literal("entries")),
+    paginationOpts: paginationOptsValidator,
+  },
+  returns: v.union(
+    v.object({
+      ok: v.literal(true),
+      kind: v.string(),
+      page: v.array(v.union(orderHistoryEventValidator, orderHistoryEntryValidator)),
+      isDone: v.boolean(),
+      continueCursor: v.string(),
+    }),
+    denialValidator,
+  ),
+  handler: async (ctx, args) => {
+    const access = await requireDomainAccess(
+      ctx,
+      args.organizationId,
+      args.projectId,
+      "viewer",
+    );
+    if (!access.ok) {
+      return { ok: false as const, code: access.code, message: access.message };
+    }
+    const order = await requireOwnedRef(
+      await ctx.db.get(args.orderId),
+      args.organizationId,
+      args.projectId,
+    );
+    if (!order.ok) {
+      return { ok: false as const, code: order.code, message: order.message };
+    }
+    const selection = await requireOwnedRef(
+      await ctx.db.get(order.value.selectionId),
+      args.organizationId,
+      args.projectId,
+    );
+    if (!selection.ok) {
+      return { ok: false as const, code: selection.code, message: selection.message };
+    }
+    const quote = await ctx.db.get(selection.value.quoteId);
+    if (
+      quote === null ||
+      quote.organizationId !== args.organizationId ||
+      quote.projectId !== args.projectId
+    ) {
+      return { ok: false as const, code: "denied-project", message: "quote is not in this project" };
+    }
+    const orderLines = effectiveOrderLines(
+      order.value,
+      effectiveSelectionLines(selection.value, quote),
+    );
+    if (args.kind === "events") {
+      const result = await ctx.db
+        .query("orderEvents")
+        .withIndex("by_order", (q) => q.eq("orderId", args.orderId))
+        .paginate(args.paginationOpts);
+      return {
+        ok: true as const,
+        kind: args.kind,
+        page: result.page
+          .filter(
+            (event) =>
+              event.organizationId === args.organizationId &&
+              event.projectId === args.projectId,
+          )
+          .map((event) => ({
+            id: event._id,
+            kind: event.kind,
+            acceptanceLines: [...effectiveEventAcceptances(event, orderLines)],
+            ...(event.note === undefined ? {} : { note: event.note }),
+          })),
+        isDone: result.isDone,
+        continueCursor: result.continueCursor,
+      };
+    }
+    const result = await ctx.db
+      .query("costEntries")
+      .withIndex("by_order", (q) => q.eq("orderId", args.orderId))
+      .paginate(args.paginationOpts);
+    return {
+      ok: true as const,
+      kind: args.kind,
+      page: result.page
+        .filter(
+          (entry) =>
+            entry.organizationId === args.organizationId &&
+            entry.projectId === args.projectId,
+        )
+        .map((entry) => ({
+          id: entry._id,
+          kind: entry.kind,
+          amount: { currency: entry.amount.currency, minorUnits: entry.amount.minorUnits },
+          ...(entry.quoteLineId === undefined ? {} : { quoteLineId: entry.quoteLineId }),
+          ...(entry.affectedQuantity === undefined ? {} : { affectedQuantity: entry.affectedQuantity }),
+          ...(entry.affectedUnit === undefined ? {} : { affectedUnit: entry.affectedUnit }),
+          evidenceRefs: entry.evidenceRefs !== undefined ? [...entry.evidenceRefs] : [],
+          ...(entry.linkedEntryId === undefined ? {} : { linkedEntryId: entry.linkedEntryId }),
+        })),
+      isDone: result.isDone,
+      continueCursor: result.continueCursor,
     };
   },
 });

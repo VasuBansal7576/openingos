@@ -33,6 +33,7 @@ import {
 import type { Id } from "../_generated/dataModel.js";
 import schema from "../schema.js";
 import { canonicalJson } from "../shared/hashing.js";
+import { decimalAdd, decimalToString, decimalZero, quantity } from "../../proofs/money/decimal.js";
 import * as memberships from "../access/memberships.js";
 import * as quotes from "../purchasing/contracts/quotes.js";
 import * as evidence from "../purchasing/contracts/evidence.js";
@@ -141,6 +142,11 @@ const getOrderLineageRef = makeFunctionReference<
   QueryArgs<typeof fulfillment.getOrderLineage>,
   QueryReturn<typeof fulfillment.getOrderLineage>
 >("domain/fulfillment:getOrderLineage");
+const listOrderHistoryPageRef = makeFunctionReference<
+  "query",
+  QueryArgs<typeof fulfillment.listOrderHistoryPage>,
+  QueryReturn<typeof fulfillment.listOrderHistoryPage>
+>("domain/fulfillment:listOrderHistoryPage");
 
 const OWNER = { tokenIdentifier: "f1r13-owner" };
 const OTHER_ACTOR = { tokenIdentifier: "f1r13-other-actor" };
@@ -2269,6 +2275,410 @@ describe("F1R-17 historical pre-F1R13 commands replay before new-write validatio
     const before = await tableCounts(t, project);
     const freshCredit = await asOwner.mutation(recordCostEntryRef, { ...historicCredit, idempotencyKey: "fresh-credit" });
     expect(freshCredit).toMatchObject({ ok: false, code: "invalid-payload" });
+    expect(await tableCounts(t, project)).toEqual(before);
+  });
+});
+
+describe("Greptile r4056517360: bounded commitment scans", () => {
+  test("100 seeded priors still cap exactly; the 101st forces explicit incompleteness", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, "scan-bound");
+    const graph = await setupTwoLineGraph(t, project, "scan-bound");
+    const asOwner = t.withIdentity(OWNER);
+    const selection = await asOwner.mutation(recordSelectionRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      requirementId: graph.requirementId,
+      candidateId: graph.candidateId,
+      quoteId: graph.quoteId,
+      quoteVersion: "v-scan-bound",
+      selectionLines: [
+        { quoteLineId: "machine", quantity: "2", unit: "piece" },
+        { quoteLineId: "chair", quantity: "10", unit: "piece" },
+      ],
+      requirementVersion: 1,
+      idempotencyKey: "sel-scan-bound",
+    });
+    if (!selection.ok) throw new Error("selection setup failed");
+    const seedOrder = (i: number) =>
+      t.run((ctx) =>
+        ctx.db.insert("orders", {
+          organizationId: project.orgId,
+          projectId: project.projectId,
+          selectionId: selection.selectionId,
+          requirementId: graph.requirementId,
+          quoteId: graph.quoteId,
+          quoteVersion: "v-scan-bound",
+          requirementVersion: 1,
+          idempotencyKey: `seed-scan-${i}`,
+          orderLines: [{ quoteLineId: "machine", quantity: "0.01", unit: "piece" }],
+          state: "recorded" as const,
+          amendmentCount: 0,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        }),
+      );
+    for (let i = 0; i < 100; i += 1) await seedOrder(i);
+    const order = (key: string, qty: string) =>
+      asOwner.mutation(recordOrderRef, {
+        organizationId: project.orgId,
+        projectId: project.projectId,
+        selectionId: selection.selectionId,
+        idempotencyKey: key,
+        orderLines: [{ quoteLineId: "machine", quantity: qty, unit: "piece" }],
+      });
+    // 1.00 committed + 1.00 new fits the selected pair exactly.
+    const fitting = await order("ord-scan-fit", "1");
+    if (!fitting.ok) throw new Error(`fitting order failed: ${JSON.stringify(fitting)}`);
+    // The 101st prior pushes the scan past its bound: the next
+    // commitment is denied as incomplete rather than undercounted.
+    await seedOrder(100);
+    const before = await tableCounts(t, project);
+    expect(before.orders).toBe(102);
+    const overBound = await order("ord-scan-over", "0.01");
+    expect(overBound).toMatchObject({ ok: false, code: "incomplete-history" });
+    expect(await tableCounts(t, project)).toEqual(before);
+    // Exact replay still returns its row without touching the scan.
+    const replay = await order("ord-scan-fit", "1.0");
+    if (!replay.ok) throw new Error("bounded replay failed");
+    expect(replay.deduplicated).toBe(true);
+    expect(replay.orderId).toBe(fitting.orderId);
+  });
+});
+
+describe("Greptile r4056517362: paginated history stays reloadable", () => {
+  test("201 events and a boundary-spanning linked pair page through exactly once", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, "pages");
+    const graph = await setupTwoLineGraph(t, project, "pages");
+    const asOwner = t.withIdentity(OWNER);
+    const single = await recordMachineQuote(t, project, graph, "v-pages-single", "1", "pages");
+    if (!single.ok) throw new Error("quote setup failed");
+    const selection = await asOwner.mutation(recordSelectionRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      requirementId: graph.requirementId,
+      candidateId: graph.candidateId,
+      quoteId: single.quoteId,
+      quoteVersion: "v-pages-single",
+      quantity: "1",
+      requirementVersion: 1,
+      idempotencyKey: "sel-pages",
+    });
+    if (!selection.ok) throw new Error("selection setup failed");
+    const order = await asOwner.mutation(recordOrderRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      selectionId: selection.selectionId,
+      idempotencyKey: "ord-pages",
+      orderedQuantity: "1",
+    });
+    if (!order.ok) throw new Error("order setup failed");
+    for (let i = 0; i < 201; i += 1) {
+      const event = await asOwner.mutation(appendOrderEventRef, {
+        organizationId: project.orgId,
+        projectId: project.projectId,
+        orderId: order.orderId,
+        kind: "acceptance",
+        acceptedQuantity: "0.001",
+        idempotencyKey: `evt-pages-${i}`,
+      });
+      if (!event.ok) throw new Error(`event ${i} failed`);
+    }
+    // The summary stays explicitly incomplete past the bound.
+    const summary = await asOwner.query(getOrderLineageRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      orderId: order.orderId,
+    });
+    expect(summary).toMatchObject({ ok: false, code: "incomplete-history" });
+
+    // Cursor pages recover every acceptance exactly once and reconcile
+    // the true total without trusting the summary.
+    const seen = new Set<string>();
+    let accepted = decimalZero();
+    let cursor: string | null = null;
+    let isDone = false;
+    let guard = 0;
+    while (!isDone) {
+      guard += 1;
+      if (guard > 10) throw new Error("event pagination did not terminate");
+      const eventPageArgs: QueryArgs<typeof fulfillment.listOrderHistoryPage> = {
+        organizationId: project.orgId,
+        projectId: project.projectId,
+        orderId: order.orderId,
+        kind: "events",
+        paginationOpts: { numItems: 100, cursor },
+      };
+      const page = await asOwner.query(listOrderHistoryPageRef, eventPageArgs);
+      if (!page.ok) throw new Error(`event page failed: ${JSON.stringify(page)}`);
+      expect(page.kind).toBe("events");
+      for (const row of page.page) {
+        if (seen.has(row.id as string)) throw new Error("event row repeated across pages");
+        seen.add(row.id as string);
+        if ("acceptanceLines" in row) {
+          for (const line of row.acceptanceLines ?? []) {
+            accepted = decimalAdd(accepted, quantity(line.acceptedQuantity));
+          }
+        }
+      }
+      isDone = page.isDone;
+      cursor = page.continueCursor;
+    }
+    expect(seen.size).toBe(201);
+    expect(decimalToString(accepted)).toBe("0.201");
+
+    // Pages enforce the same access controls as the summary.
+    const stranger = await t.withIdentity(STRANGER).query(listOrderHistoryPageRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      orderId: order.orderId,
+      kind: "events",
+      paginationOpts: { numItems: 100, cursor: null },
+    });
+    expect(stranger.ok).toBe(false);
+  });
+
+  test("201 entries page through with links and evidence intact", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, "pages-entries");
+    const graph = await setupTwoLineGraph(t, project, "pages-entries");
+    const asOwner = t.withIdentity(OWNER);
+    const selection = await asOwner.mutation(recordSelectionRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      requirementId: graph.requirementId,
+      candidateId: graph.candidateId,
+      quoteId: graph.quoteId,
+      quoteVersion: "v-pages-entries",
+      selectionLines: [
+        { quoteLineId: "machine", quantity: "2", unit: "piece" },
+        { quoteLineId: "chair", quantity: "10", unit: "piece" },
+      ],
+      requirementVersion: 1,
+      idempotencyKey: "sel-pages-entries",
+    });
+    if (!selection.ok) throw new Error("selection setup failed");
+    const order = await asOwner.mutation(recordOrderRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      selectionId: selection.selectionId,
+      idempotencyKey: "ord-pages-entries",
+      orderLines: [
+        { quoteLineId: "machine", quantity: "2", unit: "piece" },
+        { quoteLineId: "chair", quantity: "8", unit: "piece" },
+      ],
+    });
+    if (!order.ok) throw new Error("order setup failed");
+    for (let i = 0; i < 199; i += 1) {
+      const payment = await asOwner.mutation(recordCostEntryRef, {
+        organizationId: project.orgId,
+        projectId: project.projectId,
+        orderId: order.orderId,
+        kind: "payment",
+        amount: { currency: "EUR", minorUnits: 1 },
+        idempotencyKey: `pay-pages-${i}`,
+      });
+      if (!payment.ok) throw new Error(`payment ${i} failed`);
+    }
+    const noteHash = await sha256Hex("pages-boundary-note");
+    const note = await asOwner.mutation(recordEvidenceRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      sourceKind: "supplier-credit-note",
+      contentHash: noteHash,
+      completeness: "complete",
+    });
+    if (!note.ok) throw new Error("evidence setup failed");
+    const refs = [{ evidenceId: note.evidenceId, contentHash: noteHash }];
+    const credit = await asOwner.mutation(recordCostEntryRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      orderId: order.orderId,
+      kind: "credit",
+      amount: { currency: "EUR", minorUnits: 5000 },
+      idempotencyKey: "credit-pages",
+      quoteLineId: "chair",
+      affectedQuantity: "1",
+      affectedUnit: "piece",
+      evidenceRefs: refs,
+    });
+    if (!credit.ok) throw new Error("boundary credit failed");
+    const refund = await asOwner.mutation(recordCostEntryRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      orderId: order.orderId,
+      kind: "refund",
+      amount: { currency: "EUR", minorUnits: 5000 },
+      idempotencyKey: "refund-pages",
+      linkedEntryId: credit.entryId,
+      quoteLineId: "chair",
+      affectedQuantity: "1",
+      affectedUnit: "piece",
+      evidenceRefs: refs,
+    });
+    if (!refund.ok) throw new Error("boundary refund failed");
+
+    const seen = new Set<string>();
+    let cursor: string | null = null;
+    let isDone = false;
+    let guard = 0;
+    while (!isDone) {
+      guard += 1;
+      if (guard > 10) throw new Error("entry pagination did not terminate");
+      const entryPageArgs: QueryArgs<typeof fulfillment.listOrderHistoryPage> = {
+        organizationId: project.orgId,
+        projectId: project.projectId,
+        orderId: order.orderId,
+        kind: "entries",
+        paginationOpts: { numItems: 150, cursor },
+      };
+      const page = await asOwner.query(listOrderHistoryPageRef, entryPageArgs);
+      if (!page.ok) throw new Error(`entry page failed: ${JSON.stringify(page)}`);
+      for (const row of page.page) {
+        if (seen.has(row.id as string)) throw new Error("entry row repeated across pages");
+        seen.add(row.id as string);
+      }
+      isDone = page.isDone;
+      cursor = page.continueCursor;
+    }
+    expect(seen.size).toBe(201);
+    expect(seen.has(credit.entryId as string)).toBe(true);
+    expect(seen.has(refund.entryId as string)).toBe(true);
+    // The boundary-spanning linked pair reconciles from pages with its
+    // evidence hash and link intact.
+    const linked = await t.run((ctx) => ctx.db.get(refund.entryId));
+    expect(linked?.linkedEntryId).toBe(credit.entryId);
+    expect(linked?.evidenceRefs).toEqual(refs);
+  });
+});
+
+describe("Greptile r4056517364: ambiguous legacy histories never undercount", () => {
+  test("a scalar order behind a multi-line selection blocks new orders but replays exactly", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, "ambiguous-order");
+    const graph = await setupTwoLineGraph(t, project, "ambiguous-order");
+    const asOwner = t.withIdentity(OWNER);
+    const selection = await asOwner.mutation(recordSelectionRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      requirementId: graph.requirementId,
+      candidateId: graph.candidateId,
+      quoteId: graph.quoteId,
+      quoteVersion: "v-ambiguous-order",
+      selectionLines: [
+        { quoteLineId: "machine", quantity: "2", unit: "piece" },
+        { quoteLineId: "chair", quantity: "10", unit: "piece" },
+      ],
+      requirementVersion: 1,
+      idempotencyKey: "sel-ambiguous-order",
+    });
+    if (!selection.ok) throw new Error("selection setup failed");
+    // A genuine historical scalar commitment with no line mapping.
+    const historic = {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      selectionId: selection.selectionId,
+      orderedQuantity: "1",
+      idempotencyKey: "historic-scalar-order",
+    };
+    const seededId = await t.run((ctx) =>
+      ctx.db.insert("orders", {
+        ...historic,
+        requirementId: graph.requirementId,
+        quoteId: graph.quoteId,
+        quoteVersion: "v-ambiguous-order",
+        requirementVersion: 1,
+        state: "recorded" as const,
+        amendmentCount: 0,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      }),
+    );
+    // Its exact replay still returns the stored row.
+    const replay = await asOwner.mutation(recordOrderRef, historic);
+    if (!replay.ok) throw new Error(`ambiguous replay failed: ${JSON.stringify(replay)}`);
+    expect(replay.deduplicated).toBe(true);
+    expect(replay.orderId).toBe(seededId);
+    // A new commitment cannot be capped against the unmappable scalar,
+    // so it is denied instead of silently undercounting it.
+    const before = await tableCounts(t, project);
+    expect(before.orders).toBe(1);
+    const fresh = await asOwner.mutation(recordOrderRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      selectionId: selection.selectionId,
+      idempotencyKey: "ord-after-ambiguous",
+      orderLines: [{ quoteLineId: "machine", quantity: "1", unit: "piece" }],
+    });
+    expect(fresh).toMatchObject({ ok: false, code: "incomplete-history" });
+    expect(await tableCounts(t, project)).toEqual(before);
+  });
+
+  test("a scalar acceptance behind a multi-line order blocks new acceptances but replays exactly", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, "ambiguous-event");
+    const graph = await setupTwoLineGraph(t, project, "ambiguous-event");
+    const asOwner = t.withIdentity(OWNER);
+    const selection = await asOwner.mutation(recordSelectionRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      requirementId: graph.requirementId,
+      candidateId: graph.candidateId,
+      quoteId: graph.quoteId,
+      quoteVersion: "v-ambiguous-event",
+      selectionLines: [
+        { quoteLineId: "machine", quantity: "2", unit: "piece" },
+        { quoteLineId: "chair", quantity: "10", unit: "piece" },
+      ],
+      requirementVersion: 1,
+      idempotencyKey: "sel-ambiguous-event",
+    });
+    if (!selection.ok) throw new Error("selection setup failed");
+    const order = await asOwner.mutation(recordOrderRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      selectionId: selection.selectionId,
+      idempotencyKey: "ord-ambiguous-event",
+      orderLines: [
+        { quoteLineId: "machine", quantity: "1", unit: "piece" },
+        { quoteLineId: "chair", quantity: "8", unit: "piece" },
+      ],
+    });
+    if (!order.ok) throw new Error("order setup failed");
+    // A genuine historical scalar acceptance with no line mapping.
+    const historic = {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      orderId: order.orderId,
+      kind: "partialDelivery" as const,
+      acceptedQuantity: "1",
+      idempotencyKey: "historic-scalar-event",
+    };
+    const seededId = await t.run((ctx) =>
+      ctx.db.insert("orderEvents", {
+        ...historic,
+        recordedBy: OWNER.tokenIdentifier,
+        createdAt: Date.now(),
+      }),
+    );
+    const replay = await asOwner.mutation(appendOrderEventRef, historic);
+    if (!replay.ok) throw new Error(`ambiguous event replay failed: ${JSON.stringify(replay)}`);
+    expect(replay.deduplicated).toBe(true);
+    expect(replay.eventId).toBe(seededId);
+    // A new acceptance cannot be capped against the unmappable scalar,
+    // so it is denied instead of silently undercounting it.
+    const before = await tableCounts(t, project);
+    expect(before.events).toBe(1);
+    const fresh = await asOwner.mutation(appendOrderEventRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      orderId: order.orderId,
+      kind: "acceptance",
+      acceptanceLines: [{ quoteLineId: "chair", acceptedQuantity: "1", unit: "piece" }],
+      idempotencyKey: "evt-after-ambiguous",
+    });
+    expect(fresh).toMatchObject({ ok: false, code: "incomplete-history" });
     expect(await tableCounts(t, project)).toEqual(before);
   });
 });
