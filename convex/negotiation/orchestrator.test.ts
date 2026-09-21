@@ -42,8 +42,13 @@ import * as orchestrator from "./orchestrator.js";
 import {
   buildNegotiationDraftWorkload,
   buildNegotiationJevWorkload,
+  checkDraftBindings,
   draftCarrierPayloadJson,
+  mandateContextSummary,
+  missingTermsOf,
+  replyDigestOf,
   sendEnvelope,
+  summarizeQuoteTerms,
 } from "./orchestrator.js";
 import { canonicalJson, payloadHash } from "../shared/hashing.js";
 
@@ -123,6 +128,11 @@ const dispatchRef = makeFunctionReference<
   ActionArgs<typeof orchestrator.dispatchApprovedDraft>,
   ActionReturn<typeof orchestrator.dispatchApprovedDraft>
 >("negotiation/orchestrator:dispatchApprovedDraft");
+const approveRef = makeFunctionReference<
+  "query",
+  QueryArgs<typeof orchestrator.approveNegotiationDraft>,
+  QueryReturn<typeof orchestrator.approveNegotiationDraft>
+>("negotiation/orchestrator:approveNegotiationDraft");
 
 const OWNER = { tokenIdentifier: "e12-owner" };
 const GUEST = { tokenIdentifier: "e12-guest" };
@@ -384,10 +394,31 @@ async function createFixture(
   });
 
   // Jev move-classification chain (research.collect operation).
+  const fixtureQuoteTerms = summarizeQuoteTerms({
+    version: "qv-1",
+    contentHash: "hash-qv-1",
+    currency: "EUR",
+    lines: [
+      {
+        lineId: "l1",
+        description: "Espresso machine",
+        quantity: "1 unit",
+        unitPrice: { currency: "EUR", minorUnits: 750000 },
+        evidenceRefs: [],
+      },
+    ],
+    charges: [],
+    taxBasis: { kind: "inclusive", basisId: "vat-included", evidenceRefs: [] },
+  });
+  const fixtureMissingTerms = missingTermsOf([]);
   const jevWorkload = buildNegotiationJevWorkload({
     negotiationId: String(negotiationId),
     quoteId: String(quoteId),
     quoteVersion: "qv-1",
+    quoteContentHash: "hash-qv-1",
+    quoteTerms: fixtureQuoteTerms,
+    missingTerms: fixtureMissingTerms,
+    replyDigest: "no-reply",
     conversationVersion: overrides.conversation?.version,
     roundsUsed: 0,
     roundLimit: 3,
@@ -450,9 +481,16 @@ async function createFixture(
       negotiationId: String(negotiationId),
       quoteId: String(quoteId),
       quoteVersion: "qv-1",
+      quoteContentHash: "hash-qv-1",
+      quoteTerms: fixtureQuoteTerms,
+      missingTerms: fixtureMissingTerms,
+      mandateState: "active",
+      conversationId: undefined,
       conversationVersion: overrides.conversation?.version,
+      replyExcerpt: undefined,
+      replyVersion: undefined,
       roundsUsed: 0,
-      quoteExcerpt: "Espresso machine: 1 unit",
+      roundLimit: 3,
     },
     move,
   );
@@ -1342,6 +1380,13 @@ async function insertDirectDraft(
   const hash = payloadHash(JSON.parse(envelopeCanonical) as Record<string, unknown>);
   const negotiation = await fixture.t.run(async (ctx) => await ctx.db.get(fixture.negotiationId));
   if (negotiation === null) throw new Error("missing negotiation for direct draft");
+  // Direct drafts pin the LIVE round and conversation version exactly like
+  // prepare would, so dispatch accounting tests exercise the claim path
+  // rather than the stale-draft denial.
+  const live = negotiation as unknown as {
+    roundsUsed: number;
+    conversationVersion?: number;
+  };
   return await fixture.t.run(async (ctx) => {
     return await ctx.db.insert("evidence", {
       organizationId: fixture.organizationId,
@@ -1350,15 +1395,17 @@ async function insertDirectDraft(
       capturedAt: Date.now(),
       contentHash: hash,
       protectedSourceText: canonicalJson({
-        conversationVersion: null,
+        conversationVersion: live.conversationVersion ?? null,
         envelopeCanonical,
         move: "clarify",
         negotiationId: String(fixture.negotiationId),
         payloadHash: hash,
+        projectId: String(fixture.projectId),
         quoteContentHash: "hash-qv-1",
         quoteId: String(fixture.quoteId),
         quoteVersion: "qv-1",
-        roundsUsed: 0,
+        replyVersion: null,
+        roundsUsed: live.roundsUsed,
       }),
       completeness: "complete",
       counterpartyRole: "ownerStandIn",
@@ -1457,9 +1504,11 @@ describe("E12 Devin 4060796714: two-phase prepare and dispatch", () => {
           move: "clarify",
           negotiationId: String(fixture.negotiationId),
           payloadHash: tamperedHash,
+          projectId: String(fixture.projectId),
           quoteContentHash: "hash-qv-1",
           quoteId: String(fixture.quoteId),
           quoteVersion: "qv-1",
+          replyVersion: null,
           roundsUsed: 0,
         }),
         completeness: "complete",
@@ -1493,7 +1542,9 @@ describe("E12 Devin 4060796714: two-phase prepare and dispatch", () => {
     const fixture = await createFixture(t);
     const draftId = await prepareValidDraftId(fixture);
     const { result, log } = await runDispatch(fixture, "req-e12-dsent", draftId, {});
-    expect(result).toMatchObject({ ok: true, outcome: "sent", move: "none" });
+    // The approved move and its redacted preview travel through dispatch:
+    // the approval is never opaque about what was sent.
+    expect(result).toMatchObject({ ok: true, outcome: "sent", move: "clarify" });
     expect(log.jev).toHaveLength(0);
     expect(log.openai).toHaveLength(0);
     expect(log.agentmail).toHaveLength(1);
@@ -1967,14 +2018,16 @@ describe("E12 Astra F3: exact-replay idempotency", () => {
       content: fixture.draftBody,
     });
     // The request key is organization-scoped, so this reaches the stored
-    // operation from the first project and must conflict on project scope.
+    // draft's project check first: a cross-project draft id fails closed
+    // with the generic denial (no oracle) and zero sends rather than
+    // reaching the replay inspection.
     const second = await t.withIdentity(OWNER).action(dispatchRef, {
       negotiationId: negotiationB,
       requestId: "req-e12-f3-proj",
       draftId,
       inboxId: INBOX_ID,
     });
-    expect(second).toMatchObject({ ok: false, code: "duplicate-conflict" });
+    expect(second).toMatchObject({ ok: false, code: "denied-membership" });
     expect(log.agentmail).toHaveLength(0);
   });
 
@@ -2090,5 +2143,525 @@ describe("E17 mailbox privacy: guest-visible prepare carries no private recipien
     expect(dispatched).toMatchObject({ ok: true, outcome: "sent" });
     expect(dispatchLog.agentmail).toHaveLength(1);
     expect(dispatchLog.agentmail[0]?.body).toContain(OWNER_MAILBOX);
+  });
+});
+
+
+describe("Astra: exact saved-draft bindings before first dispatch", () => {
+  async function insertSiblingNegotiation(fixture: Fixture): Promise<Id<"negotiations">> {
+    return await fixture.t.run(async (ctx) => {
+      const negotiation = await ctx.db.get(fixture.negotiationId);
+      if (negotiation === null) throw new Error("missing negotiation");
+      return await ctx.db.insert("negotiations", {
+        organizationId: negotiation.organizationId,
+        projectId: negotiation.projectId,
+        quoteId: negotiation.quoteId,
+        quoteVersion: negotiation.quoteVersion,
+        currency: negotiation.currency,
+        mandateHash: negotiation.mandateHash,
+        ...(negotiation.targetMinorUnits === undefined ? {} : { targetMinorUnits: negotiation.targetMinorUnits }),
+        roundLimit: negotiation.roundLimit,
+        roundsUsed: 0,
+        state: "active",
+        expiresAt: Date.now() + 60 * 60 * 1000,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      });
+    });
+  }
+
+  test("cross-negotiation first dispatch denies with zero sends and no round consumed", async () => {
+    const t = init();
+    const fixture = await createFixture(t);
+    const draftId = await prepareValidDraftId(fixture);
+    const negotiationId2 = await insertSiblingNegotiation(fixture);
+    const log = installFetchStub({}, {
+      draftKind: "clarify",
+      sources: fixture.expectedDraftSources,
+      content: fixture.draftBody,
+    });
+    const result = await t.withIdentity(OWNER).action(dispatchRef, {
+      negotiationId: negotiationId2,
+      requestId: "req-astra-cross-first",
+      draftId,
+      inboxId: INBOX_ID,
+    });
+    expect(result).toMatchObject({ ok: false, code: "draft-negotiation-mismatch" });
+    expect(log.jev).toHaveLength(0);
+    expect(log.openai).toHaveLength(0);
+    expect(log.agentmail).toHaveLength(0);
+    const rounds = await t.run(async (ctx) => ({
+      first: (await ctx.db.get(fixture.negotiationId))?.roundsUsed,
+      second: (await ctx.db.get(negotiationId2))?.roundsUsed,
+    }));
+    expect(rounds).toEqual({ first: 0, second: 0 });
+  });
+
+  test("stale-round first dispatch denies with zero sends", async () => {
+    const t = init();
+    const fixture = await createFixture(t);
+    const draftId = await prepareValidDraftId(fixture);
+    await t.run(async (ctx) => {
+      await ctx.db.patch(fixture.negotiationId, { roundsUsed: 1, updatedAt: Date.now() });
+    });
+    const { result, log } = await runDispatch(fixture, "req-astra-stale-round", draftId, {});
+    expect(result).toMatchObject({ ok: false, code: "draft-round-stale" });
+    expect(log.jev).toHaveLength(0);
+    expect(log.openai).toHaveLength(0);
+    expect(log.agentmail).toHaveLength(0);
+    const rounds = await t.run(async (ctx) => (await ctx.db.get(fixture.negotiationId))?.roundsUsed);
+    expect(rounds).toBe(1);
+  });
+
+  test("tampered stored envelope denies on payload binding with zero sends", async () => {
+    const t = init();
+    const fixture = await createFixture(t);
+    const draftId = await prepareValidDraftId(fixture);
+    await t.run(async (ctx) => {
+      const row = await ctx.db.get(draftId);
+      if (row === null || typeof row.protectedSourceText !== "string") {
+        throw new Error("missing prepared draft");
+      }
+      const bundle = JSON.parse(row.protectedSourceText) as Record<string, unknown>;
+      const swapped = canonicalJson(sendEnvelope(OWNER_MAILBOX, COUNTER_BODY));
+      await ctx.db.patch(draftId, {
+        protectedSourceText: canonicalJson({ ...bundle, envelopeCanonical: swapped }),
+      });
+    });
+    const { result, log } = await runDispatch(fixture, "req-astra-tampered", draftId, {});
+    expect(result).toMatchObject({ ok: false, code: "draft-payload-mismatch" });
+    expect(log.agentmail).toHaveLength(0);
+    const rounds = await t.run(async (ctx) => (await ctx.db.get(fixture.negotiationId))?.roundsUsed);
+    expect(rounds).toBe(0);
+  });
+
+  test("checkDraftBindings pins every binding dimension", () => {
+    const live = {
+      projectId: "p1",
+      negotiationId: "n1",
+      quoteId: "q1",
+      quoteVersion: "qv-1",
+      quoteContentHash: "hash-qv-1",
+      conversationVersion: undefined as number | undefined,
+      replyVersion: undefined as string | undefined,
+      roundsUsed: 0,
+    };
+    const envelope = canonicalJson(sendEnvelope(OWNER_MAILBOX, CLARIFY_BODY));
+    const base = {
+      projectId: "p1",
+      negotiationId: "n1",
+      quoteId: "q1",
+      quoteVersion: "qv-1",
+      quoteContentHash: "hash-qv-1",
+      conversationVersion: undefined as number | undefined,
+      replyVersion: undefined as string | undefined,
+      roundsUsed: 0,
+      move: "clarify",
+      payloadHash: payloadHash(JSON.parse(envelope) as Record<string, unknown>),
+    };
+    expect(checkDraftBindings(base, live, envelope)).toEqual({ ok: true });
+    expect(checkDraftBindings({ ...base, negotiationId: "n2" }, live, envelope))
+      .toMatchObject({ ok: false, code: "draft-negotiation-mismatch" });
+    expect(checkDraftBindings({ ...base, quoteVersion: "qv-2" }, live, envelope))
+      .toMatchObject({ ok: false, code: "draft-quote-stale" });
+    expect(checkDraftBindings({ ...base, roundsUsed: 1 }, live, envelope))
+      .toMatchObject({ ok: false, code: "draft-round-stale" });
+    expect(checkDraftBindings({ ...base, move: "hold" }, live, envelope))
+      .toMatchObject({ ok: false, code: "draft-move-unknown" });
+    expect(checkDraftBindings({ ...base, conversationVersion: 2 }, live, envelope))
+      .toMatchObject({ ok: false, code: "draft-conversation-changed" });
+    expect(checkDraftBindings({ ...base, replyVersion: "v2@9" }, live, envelope))
+      .toMatchObject({ ok: false, code: "draft-reply-changed" });
+    expect(checkDraftBindings({ ...base, payloadHash: "0".repeat(16) }, live, envelope))
+      .toMatchObject({ ok: false, code: "draft-payload-mismatch" });
+  });
+});
+
+describe("Astra: public draftId approval boundary", () => {
+  test("approve resolves the private envelope server-side without mailbox or canonical text", async () => {
+    const t = init();
+    const fixture = await createFixture(t);
+    const prepared = await (async () => {
+      const log = installFetchStub({}, {
+        draftKind: "clarify",
+        sources: fixture.expectedDraftSources,
+        content: fixture.draftBody,
+      });
+      void log;
+      return await t.withIdentity(OWNER).action(prepareRef, {
+        negotiationId: fixture.negotiationId,
+        jevOperationId: fixture.jevOperationId,
+        draftOperationId: fixture.draftOperationId,
+      });
+    })();
+    if (!prepared.ok || prepared.outcome !== "prepared") {
+      throw new Error(`valid draft preparation failed: ${JSON.stringify(prepared)}`);
+    }
+    const approved = await t.withIdentity(OWNER).query(approveRef, {
+      negotiationId: fixture.negotiationId,
+      draftId: prepared.draftId,
+    });
+    expect(approved).toMatchObject({
+      ok: true,
+      outcome: "approved",
+      move: "clarify",
+      quoteVersion: "qv-1",
+      quoteContentHash: "hash-qv-1",
+      roundsUsed: 0,
+      payloadHash: prepared.payloadHash,
+    });
+    if (!approved.ok || approved.outcome !== "approved") {
+      throw new Error(`expected approved draft: ${JSON.stringify(approved)}`);
+    }
+    expect(approved.redactedPreview).toBe(prepared.redactedPreview);
+    // No private mailbox, no canonical envelope, no raw draft body beyond
+    // the redacted advance preview the approver needs.
+    const serialized = JSON.stringify(approved);
+    expect(serialized).not.toContain(OWNER_MAILBOX);
+    expect(serialized).not.toContain("envelopeCanonical");
+    expect(serialized).not.toContain("owner-negotiation");
+    expect("envelopeCanonical" in (approved as Record<string, unknown>)).toBe(false);
+  });
+
+  test("approve of a cross-negotiation draft denies with zero effect", async () => {
+    const t = init();
+    const fixture = await createFixture(t);
+    const draftId = await prepareValidDraftId(fixture);
+    const before = await tableCounts(t);
+    const negotiationId2 = await t.run(async (ctx) => {
+      const negotiation = await ctx.db.get(fixture.negotiationId);
+      if (negotiation === null) throw new Error("missing negotiation");
+      return await ctx.db.insert("negotiations", {
+        organizationId: negotiation.organizationId,
+        projectId: negotiation.projectId,
+        quoteId: negotiation.quoteId,
+        quoteVersion: negotiation.quoteVersion,
+        currency: negotiation.currency,
+        mandateHash: negotiation.mandateHash,
+        roundLimit: negotiation.roundLimit,
+        roundsUsed: 0,
+        state: "active",
+        expiresAt: Date.now() + 60 * 60 * 1000,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      });
+    });
+    const approved = await t.withIdentity(OWNER).query(approveRef, {
+      negotiationId: negotiationId2,
+      draftId,
+    });
+    expect(approved).toMatchObject({ ok: false, code: "draft-negotiation-mismatch" });
+    const after = await tableCounts(t);
+    expect(after.operations).toBe(before.operations);
+    expect(after.outboundSnapshots).toBe(before.outboundSnapshots);
+  });
+
+  test("approve after the round advances denies as stale", async () => {
+    const t = init();
+    const fixture = await createFixture(t);
+    const draftId = await prepareValidDraftId(fixture);
+    await t.run(async (ctx) => {
+      await ctx.db.patch(fixture.negotiationId, { roundsUsed: 1, updatedAt: Date.now() });
+    });
+    const approved = await t.withIdentity(OWNER).query(approveRef, {
+      negotiationId: fixture.negotiationId,
+      draftId,
+    });
+    expect(approved).toMatchObject({ ok: false, code: "draft-round-stale" });
+  });
+});
+
+describe("Astra: versioned quote terms and reply workloads", () => {
+  const lineBase = {
+    lineId: "l1",
+    description: "Espresso machine",
+    quantity: "1 unit",
+    unitPrice: { currency: "EUR", minorUnits: 750000 },
+    evidenceRefs: [],
+  };
+  const taxBase = { kind: "inclusive", basisId: "vat-included", evidenceRefs: [] } as const;
+
+  test("missingTermsOf reports only blocking charges", () => {
+    expect(missingTermsOf([])).toBe("none-complete");
+    expect(missingTermsOf([
+      { chargeId: "c1", label: "Freight", scope: { kind: "quote" }, state: { kind: "unknown", reason: "ask supplier" }, evidenceRefs: [] },
+    ])).toBe("unknown:Freight");
+    expect(missingTermsOf([
+      { chargeId: "c1", label: "Freight", scope: { kind: "quote" }, state: { kind: "included", coveringId: "l1" }, evidenceRefs: [] },
+      { chargeId: "c2", label: "Installation", scope: { kind: "quote" }, state: { kind: "known", amount: { currency: "EUR", minorUnits: 5000 } }, evidenceRefs: [] },
+    ])).toBe("none-complete");
+  });
+
+  test("summarizeQuoteTerms versions terms and stays bounded", () => {
+    const terms = summarizeQuoteTerms({
+      version: "qv-1",
+      contentHash: "hash-qv-1",
+      currency: "EUR",
+      lines: [lineBase],
+      charges: [
+        { chargeId: "c1", label: "Freight", scope: { kind: "quote" }, state: { kind: "included", coveringId: "l1" }, evidenceRefs: [] },
+      ],
+      taxBasis: { ...taxBase },
+    });
+    expect(terms).toContain("qv-1");
+    expect(terms).toContain("Freight");
+    expect(terms).toContain("included in l1");
+    const rehashed = summarizeQuoteTerms({
+      version: "qv-1",
+      contentHash: "zzz-top-2",
+      currency: "EUR",
+      lines: [lineBase],
+      charges: [
+        { chargeId: "c1", label: "Freight", scope: { kind: "quote" }, state: { kind: "included", coveringId: "l1" }, evidenceRefs: [] },
+      ],
+      taxBasis: { ...taxBase },
+    });
+    expect(rehashed).not.toBe(terms);
+    const manyLines = Array.from({ length: 30 }, (_, index) => ({ ...lineBase, lineId: `l${index}` }));
+    const bounded = summarizeQuoteTerms({
+      version: "qv-1",
+      contentHash: "hash-qv-1",
+      currency: "EUR",
+      lines: manyLines,
+      charges: [],
+      taxBasis: { ...taxBase },
+    });
+    expect(bounded.length).toBeLessThanOrEqual(2000);
+    expect(bounded).toContain("[truncated]");
+  });
+
+  test("complete terms alter the Jev workload", () => {
+    const incompleteTerms = summarizeQuoteTerms({
+      version: "qv-1",
+      contentHash: "hash-qv-1",
+      currency: "EUR",
+      lines: [lineBase],
+      charges: [
+        { chargeId: "c1", label: "Freight", scope: { kind: "quote" }, state: { kind: "unknown", reason: "ask supplier" }, evidenceRefs: [] },
+      ],
+      taxBasis: { ...taxBase },
+    });
+    const completeTerms = summarizeQuoteTerms({
+      version: "qv-1",
+      contentHash: "hash-qv-1",
+      currency: "EUR",
+      lines: [lineBase],
+      charges: [
+        { chargeId: "c1", label: "Freight", scope: { kind: "quote" }, state: { kind: "included", coveringId: "l1" }, evidenceRefs: [] },
+      ],
+      taxBasis: { ...taxBase },
+    });
+    const base = {
+      negotiationId: "n1",
+      quoteId: "q1",
+      quoteVersion: "qv-1",
+      quoteContentHash: "hash-qv-1",
+      replyDigest: "no-reply",
+      conversationVersion: undefined as number | undefined,
+      roundsUsed: 0,
+      roundLimit: 3,
+      mandateState: "active",
+    };
+    const incomplete = buildNegotiationJevWorkload({
+      ...base,
+      quoteTerms: incompleteTerms,
+      missingTerms: missingTermsOf([
+        { chargeId: "c1", label: "Freight", scope: { kind: "quote" }, state: { kind: "unknown", reason: "ask supplier" }, evidenceRefs: [] },
+      ]),
+    });
+    const complete = buildNegotiationJevWorkload({
+      ...base,
+      quoteTerms: completeTerms,
+      missingTerms: missingTermsOf([
+        { chargeId: "c1", label: "Freight", scope: { kind: "quote" }, state: { kind: "included", coveringId: "l1" }, evidenceRefs: [] },
+      ]),
+    });
+    expect(incomplete.state["missingTerms"]).toBe("unknown:Freight");
+    expect(complete.state["missingTerms"]).toBe("none-complete");
+    expect(canonicalJson(complete)).not.toBe(canonicalJson(incomplete));
+  });
+
+  test("changed replies alter both workloads", () => {
+    const terms = summarizeQuoteTerms({
+      version: "qv-1",
+      contentHash: "hash-qv-1",
+      currency: "EUR",
+      lines: [lineBase],
+      charges: [],
+      taxBasis: { ...taxBase },
+    });
+    const digestA = replyDigestOf({ replyExcerpt: "Owner reply: freight is included.", replyVersion: "v1@100" });
+    const digestB = replyDigestOf({ replyExcerpt: "Owner reply: freight costs extra.", replyVersion: "v1@200" });
+    expect(replyDigestOf({ replyExcerpt: undefined, replyVersion: undefined })).toBe("no-reply");
+    expect(digestA).not.toBe(digestB);
+    const jevBase = {
+      negotiationId: "n1",
+      quoteId: "q1",
+      quoteVersion: "qv-1",
+      quoteContentHash: "hash-qv-1",
+      quoteTerms: terms,
+      missingTerms: "none-complete",
+      conversationVersion: 1 as number | undefined,
+      roundsUsed: 0,
+      roundLimit: 3,
+      mandateState: "active",
+    };
+    expect(canonicalJson(buildNegotiationJevWorkload({ ...jevBase, replyDigest: digestA }))).not.toBe(
+      canonicalJson(buildNegotiationJevWorkload({ ...jevBase, replyDigest: digestB })),
+    );
+    const draftBase = {
+      negotiationId: "n1",
+      quoteId: "q1",
+      quoteVersion: "qv-1",
+      quoteContentHash: "hash-qv-1",
+      quoteTerms: terms,
+      missingTerms: "none-complete",
+      mandateState: "active",
+      conversationId: "c1" as string | undefined,
+      conversationVersion: 1 as number | undefined,
+      roundsUsed: 0,
+      roundLimit: 3,
+    };
+    const withoutReply = buildNegotiationDraftWorkload(
+      { ...draftBase, replyExcerpt: undefined, replyVersion: undefined },
+      "clarify",
+    );
+    const withReply = buildNegotiationDraftWorkload(
+      { ...draftBase, replyExcerpt: "Owner reply: freight is included.", replyVersion: "v1@100" },
+      "clarify",
+    );
+    expect(withReply.sources).toHaveLength(withoutReply.sources.length + 1);
+    expect(withReply.sources.some((source) => source.locator === "latest-reply")).toBe(true);
+    expect(canonicalJson(withReply)).not.toBe(canonicalJson(withoutReply));
+  });
+
+  test("mandate context carries no confidential figures or mailbox", () => {
+    const summary = mandateContextSummary({
+      negotiationId: "n1",
+      quoteVersion: "qv-1",
+      mandateState: "active",
+      roundsUsed: 0,
+      roundLimit: 3,
+    });
+    expect(summary).toContain("clarify");
+    expect(summary).not.toContain("750000");
+    expect(summary).not.toContain("@");
+  });
+
+  test("a reply arriving after workload build waits honestly with zero sends", async () => {
+    const t = init();
+    const fixture = await createFixture(t, "clarify", {
+      conversation: { version: 1, state: "awaitingReply" },
+    });
+    if (fixture.conversationId === undefined) throw new Error("missing bound conversation");
+    const boundConversationId = fixture.conversationId;
+    const capturedAt = Date.now();
+    await t.run(async (ctx) => {
+      const evidenceId = await ctx.db.insert("evidence", {
+        organizationId: fixture.organizationId,
+        projectId: fixture.projectId,
+        sourceKind: "agentmail.message",
+        providerIds: JSON.stringify({
+          messageId: "astra-reply-1",
+          threadId: "seed-thread-e12-conversation",
+          inboxId: INBOX_ID,
+        }),
+        capturedAt,
+        contentHash: "reply-hash-1",
+        protectedSourceText: "Owner reply: freight is included in this supplier quote.",
+        completeness: "complete",
+        counterpartyRole: "ownerStandIn",
+        executionMode: "recorded",
+        locator: "redacted:reply-hash-1",
+      });
+      await ctx.db.insert("productEvidence", {
+        organizationId: fixture.organizationId,
+        projectId: fixture.projectId,
+        field: "agentmail.message",
+        sourceKind: "agentmail.message",
+        capturedAt,
+        originalValue: "Owner reply: freight is included in this supplier quote.",
+        normalizedValue: "Owner reply: freight is included in this supplier quote.",
+        verification: "unverified",
+        freshness: "fresh",
+        counterpartyRole: "ownerStandIn",
+        executionMode: "recorded",
+        origin: "ownerImport",
+        conflictEvidenceIds: [],
+        idempotencyKey: "astra-reply-1",
+        ingestionIdentity: "astra-reply-1",
+        sourceEvidenceId: evidenceId,
+        version: "source:1",
+        createdAt: Date.now(),
+      });
+      void boundConversationId;
+    });
+    // The reply changes the live Jev workload digest, so the pre-issued
+    // classification grant no longer binds it: preparation waits honestly
+    // instead of negotiating past the new reply.
+    const { result, log } = await runPrepare(fixture, {});
+    expect(result).toMatchObject({ ok: true, outcome: "waiting", reason: "jev-stale" });
+    expect(log.agentmail).toHaveLength(0);
+    const counts = await tableCounts(t);
+    expect(counts.negotiations).toEqual([{ roundsUsed: 0, state: "active" }]);
+  });
+
+  test("a reply arriving after preparation denies dispatch with zero sends", async () => {
+    const t = init();
+    const fixture = await createFixture(t, "clarify", {
+      conversation: { version: 1, state: "awaitingReply" },
+    });
+    const draftId = await prepareValidDraftId(fixture);
+    const capturedAt = Date.now();
+    await t.run(async (ctx) => {
+      const evidenceId = await ctx.db.insert("evidence", {
+        organizationId: fixture.organizationId,
+        projectId: fixture.projectId,
+        sourceKind: "agentmail.message",
+        providerIds: JSON.stringify({
+          messageId: "astra-reply-2",
+          threadId: "seed-thread-e12-conversation",
+          inboxId: INBOX_ID,
+        }),
+        capturedAt,
+        contentHash: "reply-hash-2",
+        protectedSourceText: "Owner reply: installation costs extra.",
+        completeness: "complete",
+        counterpartyRole: "ownerStandIn",
+        executionMode: "recorded",
+        locator: "redacted:reply-hash-2",
+      });
+      await ctx.db.insert("productEvidence", {
+        organizationId: fixture.organizationId,
+        projectId: fixture.projectId,
+        field: "agentmail.message",
+        sourceKind: "agentmail.message",
+        capturedAt,
+        originalValue: "Owner reply: installation costs extra.",
+        normalizedValue: "Owner reply: installation costs extra.",
+        verification: "unverified",
+        freshness: "fresh",
+        counterpartyRole: "ownerStandIn",
+        executionMode: "recorded",
+        origin: "ownerImport",
+        conflictEvidenceIds: [],
+        idempotencyKey: "astra-reply-2",
+        ingestionIdentity: "astra-reply-2",
+        sourceEvidenceId: evidenceId,
+        version: "source:1",
+        createdAt: Date.now(),
+      });
+    });
+    // The reply lands under the bound conversation's thread without
+    // advancing its version, so mandate fences still pass while the stored
+    // bundle (prepared with no reply) no longer matches the live reply
+    // pin: dispatch denies on the reply binding with zero sends.
+    const { result, log } = await runDispatch(fixture, "req-astra-reply-drift", draftId, {});
+    expect(result).toMatchObject({ ok: false, code: "draft-reply-changed" });
+    expect(log.jev).toHaveLength(0);
+    expect(log.openai).toHaveLength(0);
+    expect(log.agentmail).toHaveLength(0);
+    const rounds = await t.run(async (ctx) => (await ctx.db.get(fixture.negotiationId))?.roundsUsed);
+    expect(rounds).toBe(0);
   });
 });
