@@ -41,14 +41,23 @@ const LEGACY_BINDING_RECOVERY_LIMIT = 64;
 // of sampling an arbitrary prefix.
 const THREAD_BINDING_RESOLVE_LIMIT = 64;
 
-// Retained pre-binding replies replayed per trigger. The bound keeps one
-// repair pass finite; leftovers stay waitingForBinding for the next trigger.
+// Retained pre-binding replies replayed per trigger. Each pass reads the
+// exact waiting set (Greptile r4058523015 repair): a successful replay
+// patches its retained row to observedSuccess, which removes the row from
+// the waiting-state index, so the next bounded read advances past completed
+// rows instead of re-sampling a completed prefix. The raw event record and
+// its application outcome are preserved, never deleted. Leftovers stay
+// waitingForBinding for the next trigger.
 const WAITING_REPLAY_LIMIT = 8;
 
-// Retained inbound snapshot cap. Larger bodies stay waiting with an explicit
-// marker for the bounded provider-read repair path instead of being
-// truncated into a conflicting source hash.
-const WAITING_SNAPSHOT_MAX_BYTES = 65_536;
+// Durable retained inbound snapshot cap (Greptile r4058523016 repair).
+// Bodies at or below this bound are preserved byte-exact in the waiting row
+// so replay re-ingests the identical content hash. Larger bodies stay waiting
+// with an explicit oversized marker carrying their exact content hash, and
+// resume through `resumeWaitingInbound` with the exact bytes supplied through
+// the same validated interface (authorized provider read or re-delivery).
+// Nothing is ever truncated into a conflicting source hash.
+const WAITING_SNAPSHOT_DURABLE_MAX_BYTES = 262_144;
 
 const lateDeliveryRef = makeFunctionReference<
   "mutation",
@@ -407,11 +416,65 @@ const inboundResultValidator = v.union(
   }),
   denialValidator,
 );
+export { inboundResultValidator };
 
 interface ConversationBinding {
   readonly conversationId: Id<"conversations">;
   readonly organizationId: Id<"organizations">;
   readonly projectId: Id<"projects">;
+}
+
+/**
+ * Best-effort lazy migration for threads that predate the durable thread
+ * binding. Called only after a bounded scan has proven every visible
+ * binding row unanimous for one conversation. Records the durable identity
+ * so later routing is one exact read; a concurrently recorded conflicting
+ * identity fails closed instead. Threads whose history cannot be proven
+ * unanimous within the bounded horizon are never migrated: resolving a
+ * sampled prefix into a durable identity could mask a conflict further
+ * down the thread, so those threads stay on the explicit legacy
+ * fail-closed path (waitingForBinding with reconciliation).
+ */
+async function noteThreadBinding(
+  ctx: F1MutationCtx,
+  expected: BindingKey,
+  binding: ConversationBinding,
+  operationId: Id<"operations"> | undefined,
+): Promise<"recorded" | "present" | "conflict"> {
+  if (operationId === undefined) return "conflict";
+  const rows = await ctx.db
+    .query("threadBindings")
+    .withIndex("by_provider_environment_and_thread_and_inbox", (q) =>
+      q
+        .eq("provider", "agentmail-binding")
+        .eq("environment", "live")
+        .eq("providerThreadId", expected.threadId)
+        .eq("providerInboxId", expected.inboxId),
+    )
+    .take(2);
+  if (rows.length === 0) {
+    const now = Date.now();
+    await ctx.db.insert("threadBindings", {
+      provider: "agentmail-binding",
+      environment: "live",
+      providerThreadId: expected.threadId,
+      providerInboxId: expected.inboxId,
+      organizationId: binding.organizationId,
+      projectId: binding.projectId,
+      conversationId: binding.conversationId,
+      operationId,
+      createdAt: now,
+      updatedAt: now,
+    });
+    return "recorded";
+  }
+  const compatible = rows.every(
+    (row) =>
+      row.organizationId === binding.organizationId &&
+      row.projectId === binding.projectId &&
+      row.conversationId === binding.conversationId,
+  );
+  return compatible ? "present" : "conflict";
 }
 
 async function resolveBindingRowConversation(
@@ -437,13 +500,49 @@ async function resolveBindingRowConversation(
   ) return null;
   return { conversationId: grant.conversationId, organizationId: operation.organizationId, projectId: operation.projectId };
 }
-
 async function conversationForMessage(
   ctx: F1MutationCtx,
   message: Pick<InboundMessage, "messageId" | "threadId" | "inboxId">,
 ): Promise<ConversationBinding | null> {
   const expected = bindingKey(message.messageId, message.threadId, message.inboxId);
   if (expected === null) return null;
+  // Durable thread identity (Greptile r4058523017 repair): one exact indexed
+  // read resolves the thread no matter how many binding rows it holds.
+  // Compatible rows share this identity; conflicts were denied at bind time.
+  // Compatible duplicate identity rows resolve; conflicting ones fail closed.
+  const durableRows = await ctx.db
+    .query("threadBindings")
+    .withIndex("by_provider_environment_and_thread_and_inbox", (q) =>
+      q
+        .eq("provider", "agentmail-binding")
+        .eq("environment", "live")
+        .eq("providerThreadId", expected.threadId)
+        .eq("providerInboxId", expected.inboxId),
+    )
+    .take(2);
+  const durable = durableRows.length === 1
+    ? durableRows[0]
+    : durableRows.length === 2 &&
+      durableRows[0] !== undefined && durableRows[1] !== undefined &&
+      durableRows[0].organizationId === durableRows[1].organizationId &&
+      durableRows[0].projectId === durableRows[1].projectId &&
+      durableRows[0].conversationId === durableRows[1].conversationId
+    ? durableRows[0]
+    : undefined;
+  if (durableRows.length === 2 && durable === undefined) return null;
+  if (durable !== undefined) {
+    const conversation = await ctx.db.get(durable.conversationId);
+    if (
+      conversation === null ||
+      conversation.organizationId !== durable.organizationId ||
+      conversation.projectId !== durable.projectId
+    ) return null;
+    return {
+      conversationId: durable.conversationId,
+      organizationId: durable.organizationId,
+      projectId: durable.projectId,
+    };
+  }
   const indexedRows: StoredBindingRow[] = await ctx.db
     .query("processedEvents")
     .withIndex("by_provider_environment_and_provider_thread_and_inbox", (q) =>
@@ -455,10 +554,13 @@ async function conversationForMessage(
     )
     .take(THREAD_BINDING_RESOLVE_LIMIT + 1);
   if (indexedRows.length > THREAD_BINDING_RESOLVE_LIMIT) return null;
+  // Legacy fallback for threads that predate the durable thread binding.
   // Several binding rows routinely share one thread (one per provider
   // message). Compatible rows that resolve to the same conversation return
-  // it; rows implying different conversations fail closed.
+  // it; rows implying different conversations fail closed. Threads that
+  // outgrow this bounded horizon resolve through the durable binding above.
   let resolved: ConversationBinding | null = null;
+  let resolvedOperationId: Id<"operations"> | undefined = undefined;
   for (const row of indexedRows) {
     const single = await resolveBindingRowConversation(ctx, row, expected);
     if (single === null) return null;
@@ -469,8 +571,15 @@ async function conversationForMessage(
         resolved.projectId !== single.projectId)
     ) return null;
     resolved = single;
+    if (resolvedOperationId === undefined) resolvedOperationId = row.operationId;
   }
-  if (resolved !== null) return resolved;
+  if (resolved !== null) {
+    // A unanimous bounded horizon earns its durable identity; a conflicting
+    // identity recorded concurrently fails closed.
+    const noted = await noteThreadBinding(ctx, expected, resolved, resolvedOperationId);
+    if (noted === "conflict") return null;
+    return resolved;
+  }
   // Old binding rows have no indexed thread/inbox facts. Recovery is only
   // accepted when the bounded provider prefix is complete; otherwise the
   // inbound event stays in waitingForBinding for explicit reconciliation.
@@ -487,7 +596,11 @@ async function conversationForMessage(
     providerThreadId: facts.threadId,
     providerInboxId: facts.inboxId,
   });
-  return resolveBindingRowConversation(ctx, candidate, expected);
+  const migrated = await resolveBindingRowConversation(ctx, candidate, expected);
+  if (migrated === null) return null;
+  const noted = await noteThreadBinding(ctx, expected, migrated, candidate.operationId);
+  if (noted === "conflict") return null;
+  return migrated;
 }
 
 interface WaitingInboundSnapshot {
@@ -502,13 +615,15 @@ interface WaitingInboundSnapshot {
 }
 
 /**
- * Bounded snapshot of a retained pre-binding reply. Oversized bodies are not
- * truncated into a conflicting source hash; they stay waiting with an
- * explicit marker for the bounded provider-read repair path.
+ * Bounded snapshot of a retained pre-binding reply. Bodies within the
+ * durable bound are preserved byte-exact; larger bodies are never truncated
+ * into a conflicting source hash. They stay waiting with an explicit
+ * oversized marker (exact content hash plus byte size) for the
+ * `resumeWaitingInbound` recovery path.
  */
 function waitingSnapshotOf(message: InboundMessage): WaitingInboundSnapshot | null {
   const bytes = new TextEncoder().encode(message.text).byteLength + new TextEncoder().encode(message.html).byteLength;
-  if (bytes > WAITING_SNAPSHOT_MAX_BYTES) return null;
+  if (bytes > WAITING_SNAPSHOT_DURABLE_MAX_BYTES) return null;
   return {
     messageId: message.messageId,
     threadId: message.threadId,
@@ -714,25 +829,64 @@ async function ingestBoundMessage(
   };
 }
 
+interface WaitingOversizedMarker {
+  readonly messageId: string;
+  readonly threadId: string;
+  readonly inboxId: string;
+  readonly reason: string;
+  readonly snapshotOversized: true;
+  readonly contentHash: string;
+  readonly byteSize: number;
+}
+
+function inboundBodyBytes(message: Pick<InboundMessage, "text" | "html">): number {
+  return new TextEncoder().encode(message.text).byteLength + new TextEncoder().encode(message.html).byteLength;
+}
+
+function parseWaitingOversizedMarker(value: unknown): WaitingOversizedMarker | null {
+  if (!isRecord(value) || value["snapshotOversized"] !== true) return null;
+  const messageId = normalizedProviderId(value["messageId"]);
+  const threadId = normalizedProviderId(value["threadId"]);
+  const inboxId = normalizedProviderId(value["inboxId"]);
+  const reason = typeof value["reason"] === "string" ? value["reason"] : undefined;
+  const contentHash = typeof value["contentHash"] === "string" ? value["contentHash"] : undefined;
+  const byteSize = typeof value["byteSize"] === "number" ? value["byteSize"] : undefined;
+  if (
+    messageId === undefined || threadId === undefined || inboxId === undefined ||
+    reason === undefined || contentHash === undefined || byteSize === undefined ||
+    !Number.isInteger(byteSize) || byteSize <= WAITING_SNAPSHOT_DURABLE_MAX_BYTES
+  ) return null;
+  return { messageId, threadId, inboxId, reason, snapshotOversized: true as const, contentHash, byteSize };
+}
+
 async function replayWaitingForThread(
   ctx: F1MutationCtx,
   threadId: string,
   inboxId: string,
 ): Promise<{ readonly replayed: number; readonly stillWaiting: number }> {
+  // Waiting-set repair (Greptile r4058523015 repair). The query returns
+  // only rows still in outcomeUnknown through the exact waiting-state
+  // index, so completed rows never occupy the bounded prefix and later
+  // waiting replies stay reachable. One bounded exact-index read per
+  // trigger keeps every pass finite; each pass applies up to
+  // WAITING_REPLAY_LIMIT rows, which guarantees forward progress.
+  // Oversized rows without a replayable snapshot stay explicitly waiting
+  // for `resumeWaitingInbound`; anything unparseable also stays waiting
+  // rather than being dropped.
   const rows = await ctx.db
     .query("processedEvents")
-    .withIndex("by_provider_environment_and_provider_thread_and_inbox", (q) =>
+    .withIndex("by_provider_environment_and_thread_inbox_and_state", (q) =>
       q
         .eq("provider", "agentmail-inbound")
         .eq("environment", "live")
         .eq("providerThreadId", threadId)
-        .eq("providerInboxId", inboxId),
+        .eq("providerInboxId", inboxId)
+        .eq("applicationState", "outcomeUnknown"),
     )
     .take(WAITING_REPLAY_LIMIT + 1);
   let replayed = 0;
   let stillWaiting = 0;
   for (const row of rows.slice(0, WAITING_REPLAY_LIMIT)) {
-    if (row.applicationState === "observedSuccess") continue;
     const stored = parseWaitingSnapshot(parseObject(row.outcome));
     if (
       stored === null ||
@@ -765,6 +919,10 @@ async function replayWaitingForThread(
       stillWaiting += 1;
       continue;
     }
+    // Patching to observedSuccess removes the row from the waiting-state
+    // index while preserving the raw event record and its outcome. Marker
+    // idempotency keeps a concurrent trigger's duplicate ingest to exactly
+    // one effect.
     await ctx.db.patch(row._id, {
       organizationId: binding.organizationId,
       projectId: binding.projectId,
@@ -816,6 +974,7 @@ export const ingestMessage = f1InternalMutation({
         return { ok: true as const, messageId: parsed.messageId, deduplicated: true, state: "waitingForBinding" as const, evidenceId: null };
       }
       const snapshot = waitingSnapshotOf(parsed);
+      const snapshotBytes = inboundBodyBytes(parsed);
       await ctx.db.insert("processedEvents", {
         provider: "agentmail-inbound",
         environment: "live",
@@ -826,7 +985,12 @@ export const ingestMessage = f1InternalMutation({
           threadId: parsed.threadId,
           inboxId: parsed.inboxId,
           reason: "no verified conversation binding",
-          ...(snapshot === null ? { snapshotOversized: true } : { snapshot }),
+          // Oversized bodies keep their exact content hash and byte size so
+          // `resumeWaitingInbound` can verify the exact bytes later. The
+          // full content is never truncated into a conflicting source hash.
+          ...(snapshot === null
+            ? { snapshotOversized: true, contentHash: inboundContentHash(parsed), byteSize: snapshotBytes }
+            : { snapshot }),
         }),
         providerMessageId: parsed.messageId,
         providerThreadId: parsed.threadId,
@@ -874,6 +1038,166 @@ export const replayWaitingInbound = f1InternalMutation({
   },
 });
 
+/**
+ * Typed provider-message projection for the oversized resume path. The
+ * authorized provider-read adapter projects the redelivered payload to
+ * exactly these documented fields before calling; anything else is rejected
+ * at the boundary and the nested content is still validated by
+ * `parseInboundMessage` before any product change.
+ */
+const resumeMessageValidator = v.object({
+  message_id: v.string(),
+  thread_id: v.string(),
+  inbox_id: v.string(),
+  from: v.string(),
+  to: v.optional(v.union(v.string(), v.array(v.string()))),
+  cc: v.optional(v.union(v.string(), v.array(v.string()))),
+  subject: v.optional(v.string()),
+  text: v.optional(v.string()),
+  html: v.optional(v.string()),
+  timestamp: v.optional(v.union(v.number(), v.string())),
+  references: v.optional(v.array(v.string())),
+  in_reply_to: v.optional(v.string()),
+  attachments: v.optional(v.array(v.record(v.string(), v.string()))),
+});
+
+/**
+ * Authorized resume path for an oversized retained reply (Greptile r4058523016
+ * repair). The caller supplies the exact inbound bytes through the same
+ * validated provider interface used by the live callback — an authorized
+ * provider read or a re-delivered webhook payload — and this mutation
+ * verifies them against the retained content hash before ingesting through
+ * the identical bound-ingest core. Mismatched bytes fail closed; success is
+ * never claimed without the exact bytes.
+ */
+export const resumeWaitingInbound = f1InternalMutation({
+  args: { message: resumeMessageValidator, eventId: v.string() },
+  returns: inboundResultValidator,
+  handler: async (ctx, args) => {
+    const parsedValue = parseInboundMessage(args.message);
+    if (isCommunicationDenial(parsedValue)) return parsedValue;
+    const parsed = normalizedInboundMessage(parsedValue);
+    const retained = await ctx.db
+      .query("processedEvents")
+      .withIndex("by_provider_environment_and_provider_message_and_thread_and_inbox", (q) =>
+        q
+          .eq("provider", "agentmail-inbound")
+          .eq("environment", "live")
+          .eq("providerMessageId", parsed.messageId)
+          .eq("providerThreadId", parsed.threadId)
+          .eq("providerInboxId", parsed.inboxId),
+      )
+      .take(2);
+    if (retained.length !== 1) {
+      return denial("invalid-payload", "no single retained oversized reply matches this message");
+    }
+    const row = retained[0];
+    if (row === undefined) return denial("invalid-payload", "retained reply is not available");
+    if (row.applicationState === "observedSuccess") {
+      const binding = await conversationForMessage(ctx, parsed);
+      if (binding === null) {
+        return { ok: true as const, messageId: parsed.messageId, deduplicated: true, state: "waitingForBinding" as const, evidenceId: null };
+      }
+      const result = await ingestBoundMessage(ctx, parsed, binding);
+      if (isCommunicationDenial(result)) return result;
+      return {
+        ok: true as const,
+        messageId: result.messageId,
+        deduplicated: true,
+        state: result.state,
+        evidenceId: result.evidenceId,
+      };
+    }
+    const marker = parseWaitingOversizedMarker(parseObject(row.outcome));
+    if (marker === null) {
+      return denial("invalid-payload", "retained reply is not oversized; use the standard replay");
+    }
+    if (inboundBodyBytes(parsed) !== marker.byteSize || inboundContentHash(parsed) !== marker.contentHash) {
+      return denial("invalid-payload", "resumed bytes conflict with the retained source");
+    }
+    const binding = await conversationForMessage(ctx, parsed);
+    if (binding === null) {
+      return { ok: true as const, messageId: parsed.messageId, deduplicated: false, state: "waitingForBinding" as const, evidenceId: null };
+    }
+    const result = await ingestBoundMessage(ctx, parsed, binding);
+    if (isCommunicationDenial(result)) return result;
+    // Patching to observedSuccess removes the row from the waiting-state
+    // index while preserving the raw event record and its outcome.
+    await ctx.db.patch(row._id, {
+      organizationId: binding.organizationId,
+      projectId: binding.projectId,
+      applicationOutcome: "success",
+      applicationState: "observedSuccess",
+      appliedAt: Date.now(),
+    });
+    return {
+      ok: true as const,
+      messageId: result.messageId,
+      deduplicated: result.deduplicated,
+      state: result.state,
+      evidenceId: result.evidenceId,
+    };
+  },
+});
+
+/**
+ * Authority gate for the bounded provider-read recovery (S-15). Verifies
+ * that exactly one oversized retained reply waits for the given identity,
+ * that its thread resolves to a live conversation, and that the owning
+ * grant is still active and unexpired. No provider call may happen before
+ * this gate passes, and no row is modified by it.
+ */
+export const prepareOversizedRecovery = f1InternalMutation({
+  args: { threadId: v.string(), inboxId: v.string(), messageId: v.string() },
+  returns: v.union(v.object({ ok: v.literal(true) }), denialValidator),
+  handler: async (ctx, args) => {
+    const threadId = normalizedProviderId(args.threadId);
+    const inboxId = normalizedProviderId(args.inboxId);
+    const messageId = normalizedProviderId(args.messageId);
+    if (threadId === undefined || inboxId === undefined || messageId === undefined) {
+      return denial("invalid-payload", "thread, inbox, and message identifiers are required");
+    }
+    const retained = await ctx.db
+      .query("processedEvents")
+      .withIndex("by_provider_environment_and_provider_message_and_thread_and_inbox", (q) =>
+        q
+          .eq("provider", "agentmail-inbound")
+          .eq("environment", "live")
+          .eq("providerMessageId", messageId)
+          .eq("providerThreadId", threadId)
+          .eq("providerInboxId", inboxId),
+      )
+      .take(2);
+    if (retained.length !== 1) {
+      return denial("invalid-payload", "no single retained oversized reply matches this message");
+    }
+    const row = retained[0];
+    if (row === undefined || row.applicationState !== "outcomeUnknown") {
+      return denial("invalid-payload", "retained reply is not waiting for recovery");
+    }
+    if (parseWaitingOversizedMarker(parseObject(row.outcome)) === null) {
+      return denial("invalid-payload", "retained reply is not oversized; use the standard replay");
+    }
+    const binding = await conversationForMessage(ctx, { messageId, threadId, inboxId });
+    if (binding === null) {
+      return denial("invalid-payload", "thread has no verified conversation binding");
+    }
+    const conversation = await ctx.db.get(binding.conversationId);
+    if (conversation === null) return denial("invalid-payload", "conversation is not available");
+    const grant = await ctx.db.get(conversation.grantId);
+    if (
+      grant === null ||
+      grant.organizationId !== binding.organizationId ||
+      grant.projectId !== binding.projectId ||
+      grant.status !== "active" ||
+      grant.expiresAt <= Date.now()
+    ) {
+      return denial("alternate-channel-denied", "communication grant is not active for recovery");
+    }
+    return { ok: true as const };
+  },
+});
+
 const quoteResultValidator = v.union(
   v.object({ ok: v.literal(true), quoteId: v.id("quotes"), deduplicated: v.boolean(), executionMode: v.string() }),
   denialValidator,
@@ -911,6 +1235,43 @@ async function verifyQuoteSourceConversation(
   if (threadId === undefined || inboxId === undefined) {
     return denial("invalid-payload", "quote source snapshot lacks provider thread binding");
   }
+  // Durable thread identity (Greptile r4058523017 repair): one exact indexed
+  // read proves the requesting conversation owns the thread, regardless of
+  // how many binding rows the thread holds. Anything else fails closed.
+  const durableRows = await ctx.db
+    .query("threadBindings")
+    .withIndex("by_provider_environment_and_thread_and_inbox", (q) =>
+      q
+        .eq("provider", "agentmail-binding")
+        .eq("environment", "live")
+        .eq("providerThreadId", threadId)
+        .eq("providerInboxId", inboxId),
+    )
+    .take(2);
+  const durable = durableRows.length === 1
+    ? durableRows[0]
+    : durableRows.length === 2 &&
+      durableRows[0] !== undefined && durableRows[1] !== undefined &&
+      durableRows[0].organizationId === durableRows[1].organizationId &&
+      durableRows[0].projectId === durableRows[1].projectId &&
+      durableRows[0].conversationId === durableRows[1].conversationId
+    ? durableRows[0]
+    : undefined;
+  if (durableRows.length === 2 && durable === undefined) {
+    return denial("invalid-payload", "quote source conversation binding is ambiguous");
+  }
+  if (durable !== undefined) {
+    if (
+      durable.organizationId !== args.organizationId ||
+      durable.projectId !== args.projectId ||
+      durable.conversationId !== args.conversationId
+    ) {
+      return denial("invalid-payload", "quote source belongs to another conversation");
+    }
+    return { ok: true as const };
+  }
+  // Legacy fallback for quote sources whose thread predates the durable
+  // thread binding. Long threads resolve through the durable check above.
   const rows: StoredBindingRow[] = await ctx.db
     .query("processedEvents")
     .withIndex("by_provider_environment_and_provider_thread_and_inbox", (q) =>

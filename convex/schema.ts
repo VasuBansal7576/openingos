@@ -878,6 +878,15 @@ export default defineSchema({
     .index(
       "by_provider_environment_and_provider_thread_and_inbox",
       ["provider", "environment", "providerThreadId", "providerInboxId"],
+    )
+    // Retained pre-binding replies query their exact waiting set through
+    // this key (Greptile r4058523015 repair). Patching a replayed row to
+    // observedSuccess removes it from the waiting set, so the next bounded
+    // read advances past completed rows without sampling a fixed prefix and
+    // without deleting the raw event record or its application outcome.
+    .index(
+      "by_provider_environment_and_thread_inbox_and_state",
+      ["provider", "environment", "providerThreadId", "providerInboxId", "applicationState"],
     ),
 
   evidence: defineTable({
@@ -932,6 +941,39 @@ export default defineSchema({
     counterpartyRole: v.string(),
     createdAt: v.number(),
   }).index("by_operation", ["operationId"]),
+
+  /**
+   * C1 durable provider-thread identity (Greptile r4058523017 repair).
+   *
+   * One row binds a provider thread in an inbox to the single purchasing
+   * conversation it belongs to. `recordProviderBinding` establishes the row
+   * when the first outbound send binds, and denies a later send whose grant
+   * resolves to a different conversation, so conflicting identities fail
+   * closed at bind time. Inbound routing and quote-source proof read this
+   * row through one exact indexed lookup instead of scanning every binding
+   * row under the thread, so legitimate long threads keep routing no matter
+   * how many binding rows they accumulate. Threads that predate this table
+   * fall back to the bounded legacy row scan.
+   */
+  threadBindings: defineTable({
+    provider: v.string(),
+    environment: v.string(),
+    providerThreadId: v.string(),
+    providerInboxId: v.string(),
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    conversationId: v.id("conversations"),
+    operationId: v.id("operations"),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_provider_environment_and_thread_and_inbox", [
+      "provider",
+      "environment",
+      "providerThreadId",
+      "providerInboxId",
+    ])
+    .index("by_conversation", ["conversationId"]),
 
   conversations: defineTable({
     organizationId: v.id("organizations"),

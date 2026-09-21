@@ -8,8 +8,9 @@
 
 import { makeFunctionReference, type RegisteredMutation } from "convex/server";
 import { v } from "convex/values";
+import type { Id } from "../_generated/dataModel.js";
 import { env, internalAction } from "../_generated/server.js";
-import { f1InternalMutation } from "../server.js";
+import { f1InternalMutation, type F1MutationCtx } from "../server.js";
 import * as attempts from "../execution/attempts.js";
 import * as operations from "../execution/operations.js";
 import * as reconciliation from "../execution/reconciliation.js";
@@ -20,8 +21,11 @@ import {
   providerPayloadFromOutbound,
   validateOutboundPayload,
   isCommunicationDenial,
+  DEFAULT_AGENTMAIL_BASE_URL,
+  EU_AGENTMAIL_BASE_URL,
   type CommunicationDenial,
 } from "./contracts.js";
+import { inboundResultValidator } from "./callbacks.js";
 import { operationLabel, sendAgentMailOneShot } from "./transport.js";
 import type * as callbacks from "./callbacks.js";
 
@@ -54,6 +58,16 @@ const replayWaitingRef = makeFunctionReference<
   MutationArgs<typeof callbacks.replayWaitingInbound>,
   MutationReturn<typeof callbacks.replayWaitingInbound>
 >("communication/callbacks:replayWaitingInbound");
+const resumeWaitingRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof callbacks.resumeWaitingInbound>,
+  MutationReturn<typeof callbacks.resumeWaitingInbound>
+>("communication/callbacks:resumeWaitingInbound");
+const prepareRecoveryRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof callbacks.prepareOversizedRecovery>,
+  MutationReturn<typeof callbacks.prepareOversizedRecovery>
+>("communication/callbacks:prepareOversizedRecovery");
 
 const snapshotResultValidator = v.union(
   v.object({
@@ -284,6 +298,174 @@ function isSuccessEvent(eventType: string | undefined): boolean {
   return eventType === "message.sent" || eventType === "message.delivered";
 }
 
+// Bounded agreement horizon for establishing a durable thread identity.
+// Threads that already exceed it keep the legacy fail-closed behavior; only
+// unanimous horizons earn a durable binding, so a cap is never silently
+// raised over a conflict.
+const THREAD_BINDING_VERIFY_LIMIT = 64;
+
+interface ThreadBindingRow {
+  readonly _id: Id<"threadBindings">;
+  readonly organizationId: Id<"organizations">;
+  readonly projectId: Id<"projects">;
+  readonly conversationId: Id<"conversations">;
+}
+
+/**
+ * Exact durable thread-identity read. Compatible duplicates (same
+ * organization, project and conversation) resolve to that identity; rows
+ * implying different identities are a conflict.
+ */
+async function readThreadBinding(
+  ctx: F1MutationCtx,
+  threadId: string,
+  inboxId: string,
+): Promise<{ readonly status: "absent" } | { readonly status: "resolved"; readonly row: ThreadBindingRow } | { readonly status: "conflict" }> {
+  const rows = await ctx.db
+    .query("threadBindings")
+    .withIndex("by_provider_environment_and_thread_and_inbox", (q) =>
+      q
+        .eq("provider", "agentmail-binding")
+        .eq("environment", "live")
+        .eq("providerThreadId", threadId)
+        .eq("providerInboxId", inboxId),
+    )
+    .take(2);
+  if (rows.length === 0) return { status: "absent" as const };
+  if (rows.length > 1) {
+    const first = rows[0];
+    const second = rows[1];
+    if (
+      first === undefined || second === undefined ||
+      first.organizationId !== second.organizationId ||
+      first.projectId !== second.projectId ||
+      first.conversationId !== second.conversationId
+    ) return { status: "conflict" as const };
+  }
+  const row = rows[0];
+  if (row === undefined) return { status: "absent" as const };
+  return { status: "resolved" as const, row };
+}
+
+/** Grant conversation behind an outbound operation, if the grant names one. */
+async function grantConversationId(
+  ctx: F1MutationCtx,
+  operation: { readonly grantId: Id<"grants"> },
+): Promise<Id<"conversations"> | null> {
+  const grant = await ctx.db.get(operation.grantId);
+  if (grant === null || grant.conversationId === undefined) return null;
+  return grant.conversationId;
+}
+
+async function rowThreadConversation(
+  ctx: F1MutationCtx,
+  row: { readonly operationId?: Id<"operations"> },
+  scope: { readonly organizationId: Id<"organizations">; readonly projectId: Id<"projects"> },
+): Promise<Id<"conversations"> | null> {
+  if (row.operationId === undefined) return null;
+  const operation = await ctx.db.get(row.operationId);
+  if (
+    operation === null ||
+    operation.organizationId !== scope.organizationId ||
+    operation.projectId !== scope.projectId
+  ) return null;
+  return grantConversationId(ctx, operation);
+}
+
+/**
+ * Fail-closed gate for the durable thread identity (Greptile r4058523017
+ * repair). A thread already bound to a different conversation denies the new
+ * bind before anything is written. Absent identities are created only after
+ * the insert, and only when a bounded verification proves every existing
+ * binding row agrees; anything else keeps today's legacy behavior.
+ */
+async function checkThreadBindingGate(
+  ctx: F1MutationCtx,
+  scope: { readonly organizationId: Id<"organizations">; readonly projectId: Id<"projects"> },
+  threadId: string,
+  inboxId: string,
+  conversationId: Id<"conversations"> | null,
+): Promise<{ ok: true } | { ok: false; code: string; message: string }> {
+  if (conversationId === null) return { ok: true as const };
+  const current = await readThreadBinding(ctx, threadId, inboxId);
+  if (current.status === "conflict") {
+    return { ok: false as const, code: "invalid-payload", message: "provider thread binding is ambiguous" };
+  }
+  if (current.status === "resolved") {
+    if (
+      current.row.organizationId !== scope.organizationId ||
+      current.row.projectId !== scope.projectId ||
+      current.row.conversationId !== conversationId
+    ) {
+      return { ok: false as const, code: "invalid-payload", message: "provider thread is already bound to another conversation" };
+    }
+  }
+  return { ok: true as const };
+}
+
+/**
+ * Backfill the durable thread identity after a binding insert. Creation
+ * requires a bounded unanimous horizon across structured rows and legacy
+ * rows; a truncated horizon or any disagreement leaves the thread on the
+ * legacy path instead of masking a conflict.
+ */
+async function backfillThreadBinding(
+  ctx: F1MutationCtx,
+  scope: { readonly organizationId: Id<"organizations">; readonly projectId: Id<"projects"> },
+  threadId: string,
+  inboxId: string,
+  conversationId: Id<"conversations"> | null,
+  operationId: Id<"operations">,
+): Promise<void> {
+  if (conversationId === null) return;
+  const current = await readThreadBinding(ctx, threadId, inboxId);
+  if (current.status !== "absent") return;
+  const structured = await ctx.db
+    .query("processedEvents")
+    .withIndex("by_provider_environment_and_provider_thread_and_inbox", (q) =>
+      q
+        .eq("provider", "agentmail-binding")
+        .eq("environment", "live")
+        .eq("providerThreadId", threadId)
+        .eq("providerInboxId", inboxId),
+    )
+    .take(THREAD_BINDING_VERIFY_LIMIT + 1);
+  if (structured.length > THREAD_BINDING_VERIFY_LIMIT) return;
+  for (const row of structured) {
+    const facts = rowBindingFacts(row);
+    if (facts === null || facts.threadId !== threadId || facts.inboxId !== inboxId) return;
+    const rowConversation = await rowThreadConversation(ctx, row, scope);
+    if (rowConversation === null || rowConversation !== conversationId) return;
+  }
+  const legacy = await ctx.db
+    .query("processedEvents")
+    .withIndex("by_provider_environment_and_event", (q) =>
+      q.eq("provider", "agentmail-binding").eq("environment", "live"),
+    )
+    .take(THREAD_BINDING_VERIFY_LIMIT + 1);
+  if (legacy.length > THREAD_BINDING_VERIFY_LIMIT) return;
+  for (const row of legacy) {
+    if (row.providerThreadId !== undefined || row.providerInboxId !== undefined) continue;
+    const facts = rowBindingFacts(row);
+    if (facts === null || facts.threadId !== threadId || facts.inboxId !== inboxId) continue;
+    const rowConversation = await rowThreadConversation(ctx, row, scope);
+    if (rowConversation === null || rowConversation !== conversationId) return;
+  }
+  const now = Date.now();
+  await ctx.db.insert("threadBindings", {
+    provider: "agentmail-binding",
+    environment: "live",
+    providerThreadId: threadId,
+    providerInboxId: inboxId,
+    organizationId: scope.organizationId,
+    projectId: scope.projectId,
+    conversationId,
+    operationId,
+    createdAt: now,
+    updatedAt: now,
+  });
+}
+
 /**
  * Bind an out-of-order callback to the provider response. Binding rows are
  * stored in F1's processed-event ledger as compact, redacted facts, so no
@@ -312,6 +494,11 @@ export const recordProviderBinding = f1InternalMutation({
       return denial("alternate-channel-denied", "operation is not communication-bound");
     }
     const scope = { organizationId: operation.organizationId, projectId: operation.projectId };
+    // Durable thread-identity gate: a thread already bound to another
+    // conversation denies this bind before anything is written.
+    const threadConversationId = await grantConversationId(ctx, operation);
+    const gate = await checkThreadBindingGate(ctx, scope, expected.threadId, expected.inboxId, threadConversationId);
+    if (!gate.ok) return { ok: false as const, code: gate.code, message: gate.message };
     const existingRows = await ctx.db
       .query("processedEvents")
       .withIndex("by_provider_environment_and_event", (q) =>
@@ -350,6 +537,7 @@ export const recordProviderBinding = f1InternalMutation({
           appliedAt: Date.now(),
         });
       }
+      await backfillThreadBinding(ctx, scope, expected.threadId, expected.inboxId, threadConversationId, args.operationId);
       return { ok: true as const, bound: true, applied };
     }
 
@@ -445,6 +633,10 @@ export const recordProviderBinding = f1InternalMutation({
       ...(applied ? { appliedAt: now } : {}),
       createdAt: now,
     });
+    // Establish the durable thread identity once the bounded horizon proves
+    // every binding row agrees. Threads that cannot be proven keep the
+    // legacy fail-closed behavior.
+    await backfillThreadBinding(ctx, scope, expected.threadId, expected.inboxId, threadConversationId, args.operationId);
     // Retained pre-binding replies take effect now that their conversation
     // binding exists. The replay is bounded and marker-idempotent.
     const replay: MutationReturn<typeof callbacks.replayWaitingInbound> = await ctx.runMutation(replayWaitingRef, {
@@ -561,5 +753,203 @@ export const dispatch = internalAction({
       providerThreadId: null,
       recorded,
     };
+  },
+});
+
+// Bounded provider-read recovery (S-15, Greptile r4058523016 repair).
+//
+// A retained oversized reply has no replayable snapshot, so the standard
+// replay leaves it waiting forever. This internal action is the reachable
+// recovery trigger: after the `prepareOversizedRecovery` gate proves the
+// waiting row, its conversation binding, and its live grant, the action
+// performs one bounded, allowlisted GET against the provider message list,
+// matches the exact provider identity, projects the entry to the documented
+// resume fields, and sinks it through `resumeWaitingInbound`, which
+// hash-verifies the exact bytes and ingests marker-idempotently. Anything
+// else — missing row, stale grant, missing credentials, oversized or
+// ambiguous provider response, identity mismatch — stays waiting or returns
+// unknown; success is never claimed without the exact bytes.
+//
+// Owner-only and idempotency rules are unchanged: the recovered bytes take
+// the same validated path as a live callback, so a non-owner sender lands
+// in needsReview and a repeated recovery deduplicates by marker. Provider
+// read spend accounting beyond the grant gate stays with the execution
+// owner as a reported follow-up; this action performs no send and claims
+// no operation.
+const RECOVERY_READ_TIMEOUT_MS = 10_000;
+const RECOVERY_READ_MAX_BYTES = 1_048_576;
+const RECOVERY_LIST_LIMIT = 25;
+
+const recoveryResultValidator = v.union(
+  inboundResultValidator,
+  v.object({ ok: v.literal(true), outcome: v.literal("unknown"), reason: v.string() }),
+  denialValidator,
+);
+
+function recoveryDenial(code: CommunicationDenial["code"], message: string): { ok: false; code: string; message: string } {
+  return { ok: false, code, message };
+}
+
+function recoveryString(value: unknown, maxLength: number): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim();
+  if (normalized.length === 0 || normalized.length > maxLength) return undefined;
+  return normalized;
+}
+
+/**
+ * Project a raw provider list entry to the documented resume fields.
+ * Unknown provider fields are dropped at this boundary; attachment
+ * descriptors that are not plain string maps keep a placeholder so the
+ * entry count — which drives evidence completeness — stays exact.
+ */
+function projectRecoveryMessage(entry: Record<string, unknown>): Record<string, unknown> {
+  const projected: Record<string, unknown> = {};
+  for (const key of ["message_id", "thread_id", "inbox_id", "from"]) {
+    const trimmed = recoveryString(entry[key], 1024);
+    if (trimmed !== undefined) projected[key] = trimmed;
+  }
+  for (const key of ["subject", "text", "html", "in_reply_to"]) {
+    if (typeof entry[key] === "string") projected[key] = entry[key];
+  }
+  for (const key of ["to", "cc"]) {
+    const value = entry[key];
+    if (typeof value === "string") {
+      projected[key] = value;
+    } else if (Array.isArray(value) && value.every((item) => typeof item === "string")) {
+      projected[key] = [...value];
+    }
+  }
+  const timestamp = entry["timestamp"];
+  if ((typeof timestamp === "number" && Number.isFinite(timestamp)) || typeof timestamp === "string") {
+    projected["timestamp"] = timestamp;
+  }
+  const references = entry["references"];
+  if (Array.isArray(references) && references.every((item) => typeof item === "string")) {
+    projected["references"] = [...references];
+  }
+  const attachments = entry["attachments"];
+  if (Array.isArray(attachments)) {
+    projected["attachments"] = attachments.map((item) => {
+      if (
+        typeof item === "object" && item !== null && !Array.isArray(item) &&
+        Object.values(item).every((field) => typeof field === "string")
+      ) return { ...(item as Record<string, string>) };
+      return { unprojected: "true" };
+    });
+  }
+  return projected;
+}
+
+/** Internal bounded recovery read. Never exposed to browsers. */
+export const recoverOversizedInbound = internalAction({
+  args: {
+    threadId: v.string(),
+    inboxId: v.string(),
+    messageId: v.string(),
+  },
+  returns: recoveryResultValidator,
+  handler: async (ctx, args) => {
+    const threadId = recoveryString(args.threadId, 1024);
+    const inboxId = recoveryString(args.inboxId, 160);
+    const messageId = recoveryString(args.messageId, 1024);
+    if (threadId === undefined || inboxId === undefined || messageId === undefined) {
+      return recoveryDenial("invalid-payload", "thread, inbox, and message identifiers are required");
+    }
+    if (!/^[A-Za-z0-9._:-]{1,160}$/.test(inboxId)) {
+      return recoveryDenial("invalid-payload", "provider inbox id is invalid");
+    }
+    // Authority first: no provider call before the gate proves the waiting
+    // row, its conversation binding, and its live grant.
+    const gate: MutationReturn<typeof callbacks.prepareOversizedRecovery> = await ctx.runMutation(prepareRecoveryRef, {
+      threadId,
+      inboxId,
+      messageId,
+    });
+    if (!gate.ok) return gate;
+    const apiKey = env.AGENTMAIL_API_KEY;
+    if (apiKey === undefined || apiKey.trim().length === 0) {
+      return recoveryDenial("provider-rejection", "AgentMail allowance or credentials are unavailable");
+    }
+    const baseUrl = env.AGENTMAIL_BASE_URL ?? DEFAULT_AGENTMAIL_BASE_URL;
+    if (baseUrl !== DEFAULT_AGENTMAIL_BASE_URL && baseUrl !== EU_AGENTMAIL_BASE_URL) {
+      return recoveryDenial("provider-origin-denied", "AgentMail origin is not allowlisted");
+    }
+    const endpoint = `${baseUrl.replace(/\/$/, "")}/inboxes/${encodeURIComponent(inboxId)}/messages?limit=${RECOVERY_LIST_LIMIT}`;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), RECOVERY_READ_TIMEOUT_MS);
+    try {
+      const response = await fetch(endpoint, {
+        method: "GET",
+        redirect: "error",
+        cache: "no-store",
+        signal: controller.signal,
+        headers: { Authorization: `Bearer ${apiKey}` },
+      });
+      const bodyText = await response.text();
+      if (new TextEncoder().encode(bodyText).byteLength > RECOVERY_READ_MAX_BYTES) {
+        return { ok: true as const, outcome: "unknown" as const, reason: "provider response exceeded the recovery size bound" };
+      }
+      let body: unknown = null;
+      try {
+        body = bodyText.trim().length > 0 ? (JSON.parse(bodyText) as unknown) : null;
+      } catch {
+        return { ok: true as const, outcome: "unknown" as const, reason: "provider returned malformed recovery JSON" };
+      }
+      if (typeof body !== "object" || body === null || Array.isArray(body)) {
+        return { ok: true as const, outcome: "unknown" as const, reason: "provider recovery response is not an object" };
+      }
+      const candidates = (body as Record<string, unknown>)["messages"] ??
+        (body as Record<string, unknown>)["data"] ??
+        (body as Record<string, unknown>)["items"];
+      if (!Array.isArray(candidates)) {
+        return { ok: true as const, outcome: "unknown" as const, reason: "provider recovery response has no message list" };
+      }
+      const matches = candidates.filter(
+        (candidate) =>
+          typeof candidate === "object" && candidate !== null && !Array.isArray(candidate) &&
+          recoveryString((candidate as Record<string, unknown>)["message_id"], 1024) === messageId,
+      );
+      if (matches.length === 0) {
+        return { ok: true as const, outcome: "unknown" as const, reason: "provider list has no such message" };
+      }
+      if (matches.length > 1) {
+        return { ok: true as const, outcome: "unknown" as const, reason: "provider list match is ambiguous" };
+      }
+      const entry = matches[0] as Record<string, unknown>;
+      if (
+        recoveryString(entry["thread_id"], 1024) !== threadId ||
+        recoveryString(entry["inbox_id"], 1024) !== inboxId
+      ) {
+        return { ok: true as const, outcome: "unknown" as const, reason: "recovered message identity conflicts" };
+      }
+      const projected = projectRecoveryMessage(entry);
+      if (
+        typeof projected["message_id"] !== "string" ||
+        typeof projected["thread_id"] !== "string" ||
+        typeof projected["inbox_id"] !== "string" ||
+        typeof projected["from"] !== "string"
+      ) {
+        return { ok: true as const, outcome: "unknown" as const, reason: "recovered message lacks provider identity" };
+      }
+      let resumed: MutationReturn<typeof callbacks.resumeWaitingInbound>;
+      try {
+        resumed = await ctx.runMutation(resumeWaitingRef, {
+          message: projected as MutationArgs<typeof callbacks.resumeWaitingInbound>["message"],
+          eventId: `recovery:${messageId}`,
+        });
+      } catch {
+        return { ok: true as const, outcome: "unknown" as const, reason: "recovered payload failed boundary validation" };
+      }
+      return resumed;
+    } catch (error) {
+      return {
+        ok: true as const,
+        outcome: "unknown" as const,
+        reason: error instanceof Error ? `AgentMail recovery read failed: ${error.message}` : "AgentMail recovery read failed",
+      };
+    } finally {
+      clearTimeout(timer);
+    }
   },
 });
