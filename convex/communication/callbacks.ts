@@ -976,30 +976,21 @@ async function replayWaitingForThread(
   threadId: string,
   inboxId: string,
 ): Promise<{ readonly replayed: number; readonly stillWaiting: number }> {
-  // Fair-progress repair (Greptile r4058523015 follow-up). Each trigger
-  // reads exactly one bounded page of the exact waiting-state index and
-  // persists the positional continuation cursor, so permanently
-  // unprocessable rows cannot permanently hide later valid replies: the
-  // horizon rotates across triggers instead of re-sampling one fixed
+  // Fair-progress repair (Greptile r4058523015 follow-up). One bounded
+  // take ordered by least-recently-attempted through the exact waiting-set
+  // index: rows never evaluated sort first, so untouched replies always
+  // jump ahead of retried rows. Every evaluated-but-still-waiting row is
+  // patched to the current attempt time, so the next trigger rotates past
+  // permanently unprocessable rows instead of re-sampling one fixed
   // prefix. Completed rows leave the waiting set on success, so the set
   // only shrinks; marker idempotency keeps concurrent triggers to exactly
-  // one effect per source. At most WAITING_REPLAY_LIMIT ingests happen per
-  // trigger. stillWaiting counts evaluated-but-unapplied rows in this page,
-  // plus one when another page remains (at least one further waiting row
-  // exists then, since the page query itself is the waiting set).
-  const cursorRow = await ctx.db
-    .query("threadReplayCursors")
-    .withIndex("by_provider_environment_and_thread_and_inbox", (q) =>
-      q
-        .eq("provider", "agentmail-inbound")
-        .eq("environment", "live")
-        .eq("providerThreadId", threadId)
-        .eq("providerInboxId", inboxId),
-    )
-    .unique();
-  const page = await ctx.db
+  // one effect per source. At most WAITING_REPLAY_LIMIT rows are processed
+  // per trigger; one further row is read only to detect the overflow.
+  // stillWaiting counts evaluated-but-unapplied rows plus that overflow
+  // row when present.
+  const rows = await ctx.db
     .query("processedEvents")
-    .withIndex("by_provider_environment_and_thread_inbox_and_state", (q) =>
+    .withIndex("by_provider_environment_and_thread_inbox_state_and_attempt", (q) =>
       q
         .eq("provider", "agentmail-inbound")
         .eq("environment", "live")
@@ -1008,11 +999,12 @@ async function replayWaitingForThread(
         .eq("applicationState", "outcomeUnknown"),
     )
     .order("asc")
-    .paginate({ cursor: cursorRow?.cursor ?? null, numItems: WAITING_REPLAY_LIMIT });
+    .take(WAITING_REPLAY_LIMIT + 1);
   let replayed = 0;
   let stillWaiting = 0;
   let ingests = 0;
-  for (const row of page.page) {
+  const now = Date.now();
+  for (const row of rows.slice(0, WAITING_REPLAY_LIMIT)) {
     const stored = parseWaitingSnapshot(parseObject(row.outcome));
     if (
       stored === null ||
@@ -1040,11 +1032,13 @@ async function replayWaitingForThread(
         });
       }
       stillWaiting += 1;
+      await ctx.db.patch(row._id, { replayLastAttemptAt: now });
       continue;
     }
     const binding = await conversationForMessage(ctx, stored);
     if (binding === null || ingests >= WAITING_REPLAY_LIMIT) {
       stillWaiting += 1;
+      await ctx.db.patch(row._id, { replayLastAttemptAt: now });
       continue;
     }
     const result = await ingestBoundMessage(
@@ -1061,6 +1055,7 @@ async function replayWaitingForThread(
     );
     if (!result.ok) {
       stillWaiting += 1;
+      await ctx.db.patch(row._id, { replayLastAttemptAt: now });
       continue;
     }
     ingests += 1;
@@ -1077,24 +1072,9 @@ async function replayWaitingForThread(
     });
     replayed += 1;
   }
-  if (page.isDone) {
-    if (cursorRow !== null) await ctx.db.delete(cursorRow._id);
-  } else {
-    stillWaiting += 1;
-    const now = Date.now();
-    if (cursorRow === null) {
-      await ctx.db.insert("threadReplayCursors", {
-        provider: "agentmail-inbound",
-        environment: "live",
-        providerThreadId: threadId,
-        providerInboxId: inboxId,
-        cursor: page.continueCursor,
-        updatedAt: now,
-      });
-    } else {
-      await ctx.db.patch(cursorRow._id, { cursor: page.continueCursor, updatedAt: now });
-    }
-  }
+  // The extra row is only an overflow detector: it stays untouched (and
+  // therefore first) for the next trigger, so no evaluated row can hide it.
+  if (rows.length > WAITING_REPLAY_LIMIT) stillWaiting += rows.length - WAITING_REPLAY_LIMIT;
   return { replayed, stillWaiting };
 }
 

@@ -2961,13 +2961,13 @@ describe("C1 Greptile P1 replay/scale repairs (r4058523015/r4058523016/r40585230
     });
     expect(bound).toMatchObject({ ok: true });
     // The bind-time trigger pages the blocked prefix; the next trigger
-    // resumes past it and applies the valid reply.
+    // rotates past it (untouched rows sort first) and applies the valid reply.
     const replayed = await f.t.mutation(replayRef, { threadId: "blocked-thread", inboxId: "owner-inbox" });
-    expect(replayed).toEqual({ ok: true, replayed: 1, stillWaiting: 0 });
+    expect(replayed).toEqual({ ok: true, replayed: 1, stillWaiting: 8 });
     expect(await projectEvidenceRows(f)).toHaveLength(1);
     const drained = await f.t.mutation(replayRef, { threadId: "blocked-thread", inboxId: "owner-inbox" });
     // The valid work is done; the eight blocked rows honestly remain
-    // waiting (never applied, never relabeled, never deleted).
+    // waiting (never applied, never relabeled as success, never deleted).
     expect(drained).toEqual({ ok: true, replayed: 0, stillWaiting: 8 });
     // Blocked rows keep their honest unknown state: never applied, never
     // relabeled as success, never deleted.
