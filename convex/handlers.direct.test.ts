@@ -36,6 +36,7 @@ import * as reconciliation from "./execution/reconciliation.js";
 import * as quotes from "./purchasing/contracts/quotes.js";
 import * as evidence from "./purchasing/contracts/evidence.js";
 import * as fixtures from "./purchasing/contracts/fixtures.js";
+import * as usage from "./metrics/usage.js";
 import { commsPayload } from "./purchasing/contracts/fixtures.js";
 import { COMMUNICATION_PROFILE_OWNER_ROLEPLAY } from "./shared/provenance.js";
 import { payloadHash } from "./shared/hashing.js";
@@ -46,6 +47,7 @@ const modules = import.meta.glob([
   "./execution/**/*.ts",
   "./purchasing/**/*.ts",
   "./shared/**/*.ts",
+  "./metrics/**/*.ts",
   "./server.ts",
   "./auth.ts",
   "./models/**/*.ts",
@@ -54,6 +56,7 @@ const modules = import.meta.glob([
   "!./execution/**/*.test.ts",
   "!./purchasing/**/*.test.ts",
   "!./shared/**/*.test.ts",
+  "!./metrics/**/*.test.ts",
 ]);
 
 type MutationArgs<T> = T extends RegisteredMutation<infer _V, infer A, infer _R> ? A : never;
@@ -186,6 +189,11 @@ const listEvidenceRef = makeFunctionReference<
   QueryArgs<typeof evidence.list>,
   QueryReturn<typeof evidence.list>
 >("purchasing/contracts/evidence:list");
+const projectUsageMetricsRef = makeFunctionReference<
+  "query",
+  QueryArgs<typeof usage.projectUsageMetrics>,
+  QueryReturn<typeof usage.projectUsageMetrics>
+>("metrics/usage:projectUsageMetrics");
 const OWNER_A = { tokenIdentifier: "direct-owner-a" };
 const APPROVER_A = { tokenIdentifier: "direct-approver-a" };
 const CONTRIB_A = { tokenIdentifier: "direct-contrib-a" };
@@ -2192,5 +2200,846 @@ describe("direct checkpoint-A authority hardening", () => {
     const seed: FunctionReference<"mutation", "public", Record<string, never>, unknown> =
       makeFunctionReference("purchasing/contracts/fixtures:seed");
     await expect(asOwner.mutation(seed, {})).rejects.toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// E10 truthful usage and outcome metrics (P-22)
+// ---------------------------------------------------------------------------
+
+async function setupMetricsProject(
+  t: ReturnType<typeof convexTest>,
+  owner: { tokenIdentifier: string },
+) {
+  const asOwner = t.withIdentity(owner);
+  const org = await asOwner.mutation(createOrganizationRef, { name: "Metrics org", kind: "private" });
+  if (!org.ok) throw new Error("metrics org setup failed");
+  const proj = await asOwner.mutation(createProjectRef, {
+    organizationId: org.organizationId,
+    name: "Metrics project",
+    visibility: "open",
+  });
+  if (!proj.ok) throw new Error("metrics project setup failed");
+  return { orgId: org.organizationId, projectId: proj.projectId };
+}
+
+/**
+ * Test scaffolding only: a deterministic durable history (jobs, operations,
+ * attempts, reservations, approvals, service cases, collection provenance)
+ * that the metrics query must report as stored, without inventing fields.
+ */
+async function seedUsageHistory(
+  t: ReturnType<typeof convexTest>,
+  orgId: Id<"organizations">,
+  projectId: Id<"projects">,
+) {
+  return t.run(async (ctx) => {
+    const now = Date.now();
+    const grantId = await ctx.db.insert("grants", {
+      organizationId: orgId,
+      projectId,
+      operations: ["communication.send"],
+      communicationProfile: COMMUNICATION_PROFILE_OWNER_ROLEPLAY,
+      recipientConfigVersion: 1,
+      inputVersions: {},
+      canonicalPayload: "{}",
+      payloadHash: payloadHash("{}"),
+      costCeilingMicroUsd: 100_000,
+      roundLimit: 2,
+      expiresAt: now + 3_600_000,
+      revocationVersion: 0,
+      status: "active",
+      createdAt: now,
+    });
+    const completedJob = await ctx.db.insert("jobs", {
+      organizationId: orgId,
+      projectId,
+      grantId,
+      grantVersion: 1,
+      kind: "research",
+      state: "completed",
+      inputVersions: {},
+      createdAt: now,
+      updatedAt: now,
+    });
+    const failedJob = await ctx.db.insert("jobs", {
+      organizationId: orgId,
+      projectId,
+      grantId,
+      grantVersion: 1,
+      kind: "communication",
+      state: "failed",
+      inputVersions: {},
+      createdAt: now,
+      updatedAt: now,
+    });
+    const opSuccess = await ctx.db.insert("operations", {
+      organizationId: orgId,
+      projectId,
+      jobId: completedJob,
+      kind: "research.collect",
+      requestId: "req-metrics-ok",
+      requestKey: "metrics-ok",
+      normalizedPayload: "{}",
+      normalizedPayloadHash: payloadHash("{}"),
+      inputVersions: {},
+      grantId,
+      grantVersion: 1,
+      state: "observedSuccess",
+      createdAt: now,
+      updatedAt: now,
+    });
+    const opFailure = await ctx.db.insert("operations", {
+      organizationId: orgId,
+      projectId,
+      jobId: failedJob,
+      kind: "communication.send",
+      requestId: "req-metrics-fail",
+      requestKey: "metrics-fail",
+      normalizedPayload: "{}",
+      normalizedPayloadHash: payloadHash("{}"),
+      inputVersions: {},
+      grantId,
+      grantVersion: 1,
+      state: "observedFailure",
+      createdAt: now,
+      updatedAt: now,
+    });
+    const opUnknown = await ctx.db.insert("operations", {
+      organizationId: orgId,
+      projectId,
+      jobId: failedJob,
+      kind: "communication.send",
+      requestId: "req-metrics-unknown",
+      requestKey: "metrics-unknown",
+      normalizedPayload: "{}",
+      normalizedPayloadHash: payloadHash("{}"),
+      inputVersions: {},
+      grantId,
+      grantVersion: 1,
+      state: "outcomeUnknown",
+      createdAt: now,
+      updatedAt: now,
+    });
+    // One attempt on the success path, two on the failed path (one retry,
+    // which then observed success), and one unresolved attempt with no
+    // observed outcome.
+    await ctx.db.insert("attempts", {
+      operationId: opSuccess,
+      token: "tok-metrics-1",
+      state: "observedSuccess",
+      createdAt: now - 1000,
+      observedAt: now - 400,
+    });
+    await ctx.db.insert("attempts", {
+      operationId: opFailure,
+      token: "tok-metrics-2",
+      state: "observedFailure",
+      createdAt: now - 900,
+      observedAt: now - 800,
+    });
+    await ctx.db.insert("attempts", {
+      operationId: opFailure,
+      token: "tok-metrics-3",
+      state: "observedSuccess",
+      createdAt: now - 500,
+      observedAt: now - 100,
+    });
+    await ctx.db.insert("attempts", {
+      operationId: opUnknown,
+      token: "tok-metrics-4",
+      state: "outcomeUnknown",
+      createdAt: now - 300,
+    });
+    const budgetId = await ctx.db.insert("providerBudgets", {
+      organizationId: orgId,
+      ceilingMicroUsd: 1_000_000,
+      reservedMicroUsd: 300_000,
+      spentMicroUsd: 100_000,
+      unresolvedMicroUsd: 50_000,
+      pricingBasis: "controlled-test",
+      updatedAt: now,
+    });
+    await ctx.db.insert("reservations", {
+      organizationId: orgId,
+      jobId: completedJob,
+      budgetId,
+      ceilingMicroUsd: 500_000,
+      reservedMicroUsd: 200_000,
+      spentMicroUsd: 100_000,
+      unresolvedMicroUsd: 0,
+      pricingBasis: "controlled-test",
+      state: "closed",
+      updatedAt: now,
+    });
+    await ctx.db.insert("reservations", {
+      organizationId: orgId,
+      jobId: failedJob,
+      budgetId,
+      ceilingMicroUsd: 500_000,
+      reservedMicroUsd: 100_000,
+      spentMicroUsd: 0,
+      unresolvedMicroUsd: 50_000,
+      pricingBasis: "controlled-test",
+      state: "open",
+      updatedAt: now,
+    });
+    await ctx.db.insert("approvals", {
+      organizationId: orgId,
+      projectId,
+      scope: "metrics-approval",
+      snapshotCanonical: "{}",
+      snapshotHash: "snap-metrics-1",
+      state: "approved",
+      approver: OWNER_A.tokenIdentifier,
+      decidedAt: now,
+      createdAt: now,
+    });
+    await ctx.db.insert("approvals", {
+      organizationId: orgId,
+      projectId,
+      scope: "metrics-approval-pending",
+      snapshotCanonical: "{}",
+      snapshotHash: "snap-metrics-2",
+      state: "pending",
+      approver: OWNER_A.tokenIdentifier,
+      createdAt: now,
+    });
+    const assetId = await ctx.db.insert("assets", {
+      organizationId: orgId,
+      projectId,
+      label: "Metrics asset",
+      idempotencyKey: "asset-metrics-1",
+      createdAt: now,
+    });
+    await ctx.db.insert("serviceCases", {
+      organizationId: orgId,
+      projectId,
+      assetId,
+      urgency: "normal",
+      summary: "Resolved controlled case",
+      state: "resolved",
+      outcome: "accepted",
+      idempotencyKey: "case-metrics-1",
+      createdAt: now,
+      updatedAt: now,
+    });
+    await ctx.db.insert("serviceCases", {
+      organizationId: orgId,
+      projectId,
+      assetId,
+      urgency: "low",
+      summary: "Open controlled case",
+      state: "open",
+      idempotencyKey: "case-metrics-2",
+      createdAt: now,
+      updatedAt: now,
+    });
+    const provenanceRows = [
+      { freshness: "fresh" as const, executionMode: "live" as const, key: "a" },
+      { freshness: "fresh" as const, executionMode: "recorded" as const, key: "b" },
+      { freshness: "stale" as const, executionMode: "fixture" as const, key: "c" },
+      { freshness: "unknown" as const, executionMode: "fixture" as const, key: "d" },
+    ];
+    for (const row of provenanceRows) {
+      await ctx.db.insert("productEvidence", {
+        organizationId: orgId,
+        projectId,
+        field: `field-${row.key}`,
+        sourceKind: "controlled-test",
+        capturedAt: now,
+        originalValue: "raw",
+        normalizedValue: "normalized",
+        verification: "unverified",
+        freshness: row.freshness,
+        counterpartyRole: "vendor",
+        executionMode: row.executionMode,
+        origin: "internal",
+        conflictEvidenceIds: [],
+        idempotencyKey: `evidence-metrics-${row.key}`,
+        version: "v1",
+        createdAt: now,
+      });
+    }
+    return { grantId, completedJob, failedJob, opSuccess, opFailure, opUnknown, budgetId };
+  });
+}
+
+/**
+ * Test scaffolding only: requirement -> candidate -> quote -> selection
+ * chain WITHOUT an order, proving an unplaced selection produces no spend.
+ */
+async function seedUnplacedSelection(
+  t: ReturnType<typeof convexTest>,
+  orgId: Id<"organizations">,
+  projectId: Id<"projects">,
+) {
+  return t.run(async (ctx) => {
+    const now = Date.now();
+    const vendorId = await ctx.db.insert("vendors", {
+      organizationId: orgId,
+      name: "Metrics vendor",
+      regions: [],
+      createdAt: now,
+    });
+    const requirementId = await ctx.db.insert("requirements", {
+      organizationId: orgId,
+      projectId,
+      key: "req-metrics-sel",
+      title: "Unplaced selection requirement",
+      category: "test",
+      quantity: "1",
+      unit: "piece",
+      priority: "P0",
+      state: "selected",
+      fulfillment: "notOrdered",
+      version: 1,
+      createdAt: now,
+      updatedAt: now,
+    });
+    const candidateId = await ctx.db.insert("candidates", {
+      organizationId: orgId,
+      projectId,
+      requirementId,
+      vendorId,
+      productModel: "Model M1",
+      variant: "base",
+      variantKey: "m1-base",
+      compatibility: "pass",
+      conversationState: "draft",
+      createdAt: now,
+    });
+    const quoteId = await ctx.db.insert("quotes", {
+      organizationId: orgId,
+      projectId,
+      version: "q-metrics-1",
+      contentHash: "hash-unplaced-selection",
+      currency: "EUR",
+      lines: [],
+      charges: [],
+      taxBasis: { kind: "unknown" as const, reason: "controlled test", evidenceRefs: [] },
+      evidenceRefs: [],
+      counterpartyRole: "vendor",
+      executionMode: "fixture" as const,
+      createdAt: now,
+    });
+    const selectionId = await ctx.db.insert("selections", {
+      organizationId: orgId,
+      projectId,
+      idempotencyKey: "sel-metrics-unplaced",
+      requirementId,
+      candidateId,
+      quoteId,
+      quoteVersion: "q-metrics-1",
+      requirementVersion: 1,
+      actor: OWNER_A.tokenIdentifier,
+      createdAt: now,
+    });
+    return { vendorId, requirementId, candidateId, quoteId, selectionId };
+  });
+}
+
+/** Test scaffolding only: one placed order with EUR and USD cost entries. */
+async function seedPlacedOrderSpend(
+  t: ReturnType<typeof convexTest>,
+  orgId: Id<"organizations">,
+  projectId: Id<"projects">,
+  chain: { requirementId: Id<"requirements">; quoteId: Id<"quotes">; selectionId: Id<"selections"> },
+) {
+  return t.run(async (ctx) => {
+    const now = Date.now();
+    const orderId = await ctx.db.insert("orders", {
+      organizationId: orgId,
+      projectId,
+      selectionId: chain.selectionId,
+      requirementId: chain.requirementId,
+      quoteId: chain.quoteId,
+      quoteVersion: "q-metrics-1",
+      requirementVersion: 1,
+      idempotencyKey: "ord-metrics-1",
+      state: "recorded",
+      amendmentCount: 0,
+      createdAt: now,
+      updatedAt: now,
+    });
+    const entries: { kind: "payment" | "settledCost" | "refund" | "credit"; currency: string; minorUnits: number; key: string }[] = [
+      { kind: "payment", currency: "EUR", minorUnits: 100_00, key: "ce-metrics-eur-1" },
+      { kind: "credit", currency: "EUR", minorUnits: 20_00, key: "ce-metrics-eur-2" },
+      { kind: "payment", currency: "USD", minorUnits: 50_00, key: "ce-metrics-usd-1" },
+      { kind: "settledCost", currency: "USD", minorUnits: 25_00, key: "ce-metrics-usd-2" },
+    ];
+    for (const entry of entries) {
+      await ctx.db.insert("costEntries", {
+        organizationId: orgId,
+        projectId,
+        orderId,
+        kind: entry.kind,
+        amount: { currency: entry.currency, minorUnits: entry.minorUnits },
+        idempotencyKey: entry.key,
+        recordedBy: OWNER_A.tokenIdentifier,
+        createdAt: now,
+      });
+    }
+    return { orderId };
+  });
+}
+
+describe("direct E10 usage metrics (P-22)", () => {
+  test("metrics require project membership and deny foreign organizations", async () => {
+    const t = convexTest(schema, modules);
+    const setup = await setupMetricsProject(t, OWNER_A);
+    await seedUsageHistory(t, setup.orgId, setup.projectId);
+
+    const asForeign = t.withIdentity(OWNER_B);
+    const denied = await asForeign.query(projectUsageMetricsRef, {
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+    });
+    expect(denied.ok).toBe(false);
+    if (!denied.ok) expect(denied.code).toBe("denied-membership");
+
+    // A stored viewer membership is the minimum role that may read metrics.
+    const VIEWER = { tokenIdentifier: "direct-metrics-viewer" };
+    await t.run(async (ctx) => {
+      await ctx.db.insert("memberships", {
+        organizationId: setup.orgId,
+        projectId: setup.projectId,
+        identity: VIEWER.tokenIdentifier,
+        role: "viewer",
+        status: "active",
+        version: 1,
+        updatedAt: Date.now(),
+      });
+    });
+    const allowed = await t.withIdentity(VIEWER).query(projectUsageMetricsRef, {
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+    });
+    expect(allowed.ok).toBe(true);
+    if (!allowed.ok) throw new Error("viewer metrics read failed");
+    expect(allowed.scope.projectId).toBe(setup.projectId);
+    expect(allowed.completeness.complete).toBe(true);
+  });
+
+  test("measured facts include failed runs, retries, and unresolved accounting", async () => {
+    const t = convexTest(schema, modules);
+    const setup = await setupMetricsProject(t, OWNER_A);
+    await seedUsageHistory(t, setup.orgId, setup.projectId);
+    const result = await t.withIdentity(OWNER_A).query(projectUsageMetricsRef, {
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("metrics query failed");
+
+    expect(result.jobs.byState.completed).toBe(1);
+    expect(result.jobs.byState.failed).toBe(1);
+    expect(result.operations.byState.observedSuccess).toBe(1);
+    expect(result.operations.byState.observedFailure).toBe(1);
+    expect(result.operations.byState.outcomeUnknown).toBe(1);
+    expect(result.attempts.scanned).toBe(4);
+    expect(result.attempts.retries).toBe(1);
+    expect(result.attempts.byState.outcomeUnknown).toBe(1);
+
+    // Time fields exist only from authoritative attempt timestamps, and
+    // only as raw facts: 600 + 100 + 400 ms of observed intervals.
+    expect(result.attempts.observedElapsed.attemptsWithObservedAt).toBe(3);
+    expect(result.attempts.observedElapsed.attemptsWithSaneInterval).toBe(3);
+    expect(result.attempts.observedElapsed.totalObservedElapsedMs).toBe(1100);
+
+    // Unresolved charges stay unresolved: never turned into zero.
+    expect(result.providerUsage.reservedMicroUsd).toBe(300_000);
+    expect(result.providerUsage.spentMicroUsd).toBe(100_000);
+    expect(result.providerUsage.unresolvedMicroUsd).toBe(50_000);
+    expect(result.providerUsage.reservationsWithUnresolvedCharges).toBe(1);
+
+    // Stored interventions and recorded outcomes are raw counts.
+    expect(result.decisions.approvals.byState.approved).toBe(1);
+    expect(result.decisions.approvals.byState.pending).toBe(1);
+    expect(result.decisions.approvals.decided).toBe(1);
+    expect(result.decisions.serviceCases.withRecordedOutcome).toBe(1);
+
+    // Cached versus fresh and controlled versus live stay separated.
+    expect(result.collection.freshness).toEqual({ fresh: 2, stale: 1, expired: 0, unknown: 1 });
+    expect(result.collection.executionMode).toEqual({ live: 1, recorded: 1, fixture: 2 });
+
+    expect(result.completeness.complete).toBe(true);
+    expect(result.completeness.truncatedSections).toEqual([]);
+  });
+
+  test("confirmed spend stays separated by currency with no conversion", async () => {
+    const t = convexTest(schema, modules);
+    const setup = await setupMetricsProject(t, OWNER_A);
+    const chain = await seedUnplacedSelection(t, setup.orgId, setup.projectId);
+    await seedPlacedOrderSpend(t, setup.orgId, setup.projectId, chain);
+    const result = await t.withIdentity(OWNER_A).query(projectUsageMetricsRef, {
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("metrics query failed");
+
+    expect(result.spend.entriesScanned).toBe(4);
+    expect(result.spend.currencies).toEqual([
+      {
+        currency: "EUR",
+        entries: 2,
+        byKind: { payment: 1, settledCost: 0, refund: 0, credit: 1 },
+        paymentsAndSettledMinorUnits: 100_00,
+        refundsAndCreditsMinorUnits: 20_00,
+        netMinorUnits: 80_00,
+      },
+      {
+        currency: "USD",
+        entries: 2,
+        byKind: { payment: 1, settledCost: 1, refund: 0, credit: 0 },
+        paymentsAndSettledMinorUnits: 75_00,
+        refundsAndCreditsMinorUnits: 0,
+        netMinorUnits: 75_00,
+      },
+    ]);
+    // The spend section exposes no cross-currency aggregate.
+    expect(Object.keys(result.spend).sort()).toEqual([
+      "currencies",
+      "entriesScanned",
+      "entriesTruncated",
+    ]);
+  });
+
+  test("an unplaced selection never counts as procurement spend", async () => {
+    const t = convexTest(schema, modules);
+    const setup = await setupMetricsProject(t, OWNER_A);
+    const chain = await seedUnplacedSelection(t, setup.orgId, setup.projectId);
+    expect(chain.selectionId).toBeTruthy();
+    const result = await t.withIdentity(OWNER_A).query(projectUsageMetricsRef, {
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("metrics query failed");
+    expect(result.decisions.orders.scanned).toBe(0);
+    expect(result.spend.entriesScanned).toBe(0);
+    expect(result.spend.currencies).toEqual([]);
+  });
+
+  test("over-bound histories are reported truncated, not silently dropped", async () => {
+    const t = convexTest(schema, modules);
+    const setup = await setupMetricsProject(t, OWNER_A);
+    await t.run(async (ctx) => {
+      const now = Date.now();
+      const grantId = await ctx.db.insert("grants", {
+        organizationId: setup.orgId,
+        projectId: setup.projectId,
+        operations: ["communication.send"],
+        communicationProfile: COMMUNICATION_PROFILE_OWNER_ROLEPLAY,
+        recipientConfigVersion: 1,
+        inputVersions: {},
+        canonicalPayload: "{}",
+        payloadHash: payloadHash("{}"),
+        costCeilingMicroUsd: 100_000,
+        roundLimit: 2,
+        expiresAt: now + 3_600_000,
+        revocationVersion: 0,
+        status: "active",
+        createdAt: now,
+      });
+      for (let i = 0; i < 101; i += 1) {
+        await ctx.db.insert("jobs", {
+          organizationId: setup.orgId,
+          projectId: setup.projectId,
+          grantId,
+          grantVersion: 1,
+          kind: "research",
+          state: "queued",
+          inputVersions: {},
+          createdAt: now,
+          updatedAt: now,
+        });
+      }
+    });
+    const result = await t.withIdentity(OWNER_A).query(projectUsageMetricsRef, {
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("metrics query failed");
+    expect(result.jobs.truncated).toBe(true);
+    expect(result.jobs.scanned).toBe(100);
+    expect(result.jobs.byState.queued).toBe(100);
+    expect(result.completeness.complete).toBe(false);
+    expect(result.completeness.truncatedSections).toContain("jobs");
+  });
+
+  test("no invented savings, revenue, or activation fields exist", async () => {
+    const t = convexTest(schema, modules);
+    const setup = await setupMetricsProject(t, OWNER_A);
+    await seedUsageHistory(t, setup.orgId, setup.projectId);
+    const result = await t.withIdentity(OWNER_A).query(projectUsageMetricsRef, {
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("metrics query failed");
+
+    const keys: string[] = [];
+    const walk = (value: unknown, prefix: string) => {
+      if (value !== null && typeof value === "object") {
+        for (const [key, child] of Object.entries(value)) {
+          const path = prefix === "" ? key : `${prefix}.${key}`;
+          keys.push(path);
+          walk(child, path);
+        }
+      }
+    };
+    walk(result, "");
+    for (const banned of ["savings", "revenue", "activation"]) {
+      const hits = keys.filter(
+        (key) => key.toLowerCase().includes(banned) && !key.toLowerCase().startsWith("notassessed."),
+      );
+      expect(hits).toEqual([]);
+    }
+    expect(Object.keys(result).sort()).toEqual([
+      "attempts",
+      "collection",
+      "completeness",
+      "decisions",
+      "jobs",
+      "notAssessed",
+      "ok",
+      "operations",
+      "providerUsage",
+      "scope",
+      "spend",
+    ]);
+    expect(result.notAssessed.savings.startsWith("unavailable:")).toBe(true);
+    expect(result.notAssessed.revenue.startsWith("unavailable:")).toBe(true);
+    expect(result.notAssessed.providerCost.startsWith("unavailable:")).toBe(true);
+    expect(result.notAssessed.activation.startsWith("notAssessed:")).toBe(true);
+    expect(result.notAssessed.successRate.startsWith("notAssessed:")).toBe(true);
+  });
+
+  test("overflowing stored totals are reported unavailable, never rounded", async () => {
+    const t = convexTest(schema, modules);
+    const setup = await setupMetricsProject(t, OWNER_A);
+    const chain = await seedUnplacedSelection(t, setup.orgId, setup.projectId);
+    await t.run(async (ctx) => {
+      const now = Date.now();
+      const MAX_SAFE = Number.MAX_SAFE_INTEGER;
+      // Placed order with individually valid safe-integer cost entries
+      // whose EUR aggregate overflows the exact range.
+      const orderId = await ctx.db.insert("orders", {
+        organizationId: setup.orgId,
+        projectId: setup.projectId,
+        selectionId: chain.selectionId,
+        requirementId: chain.requirementId,
+        quoteId: chain.quoteId,
+        quoteVersion: "q-metrics-1",
+        requirementVersion: 1,
+        idempotencyKey: "ord-metrics-overflow",
+        state: "recorded",
+        amendmentCount: 0,
+        createdAt: now,
+        updatedAt: now,
+      });
+      await ctx.db.insert("costEntries", {
+        organizationId: setup.orgId,
+        projectId: setup.projectId,
+        orderId,
+        kind: "payment",
+        amount: { currency: "EUR", minorUnits: MAX_SAFE },
+        idempotencyKey: "ce-metrics-overflow-eur-1",
+        recordedBy: OWNER_A.tokenIdentifier,
+        createdAt: now,
+      });
+      await ctx.db.insert("costEntries", {
+        organizationId: setup.orgId,
+        projectId: setup.projectId,
+        orderId,
+        kind: "settledCost",
+        amount: { currency: "EUR", minorUnits: 1 },
+        idempotencyKey: "ce-metrics-overflow-eur-2",
+        recordedBy: OWNER_A.tokenIdentifier,
+        createdAt: now,
+      });
+      await ctx.db.insert("costEntries", {
+        organizationId: setup.orgId,
+        projectId: setup.projectId,
+        orderId,
+        kind: "payment",
+        amount: { currency: "USD", minorUnits: 5 },
+        idempotencyKey: "ce-metrics-overflow-usd-1",
+        recordedBy: OWNER_A.tokenIdentifier,
+        createdAt: now,
+      });
+      // Provider reservation rows whose reserved total overflows while the
+      // spent and unresolved totals stay exact.
+      const budgetId = await ctx.db.insert("providerBudgets", {
+        organizationId: setup.orgId,
+        ceilingMicroUsd: MAX_SAFE,
+        reservedMicroUsd: MAX_SAFE,
+        spentMicroUsd: 10,
+        unresolvedMicroUsd: 0,
+        pricingBasis: "controlled-test",
+        updatedAt: now,
+      });
+      const overflowGrantId = await ctx.db.insert("grants", {
+        organizationId: setup.orgId,
+        projectId: setup.projectId,
+        operations: ["communication.send"],
+        communicationProfile: COMMUNICATION_PROFILE_OWNER_ROLEPLAY,
+        recipientConfigVersion: 1,
+        inputVersions: {},
+        canonicalPayload: "{}",
+        payloadHash: payloadHash("{}"),
+        costCeilingMicroUsd: 100_000,
+        roundLimit: 2,
+        expiresAt: now + 3_600_000,
+        revocationVersion: 0,
+        status: "active",
+        createdAt: now,
+      });
+      const overflowJob = await ctx.db.insert("jobs", {
+        organizationId: setup.orgId,
+        projectId: setup.projectId,
+        grantId: overflowGrantId,
+        grantVersion: 1,
+        kind: "research",
+        state: "running",
+        inputVersions: {},
+        createdAt: now,
+        updatedAt: now,
+      });
+      await ctx.db.insert("reservations", {
+        organizationId: setup.orgId,
+        jobId: overflowJob,
+        budgetId,
+        ceilingMicroUsd: MAX_SAFE,
+        reservedMicroUsd: MAX_SAFE,
+        spentMicroUsd: 10,
+        unresolvedMicroUsd: 0,
+        pricingBasis: "controlled-test",
+        state: "open",
+        updatedAt: now,
+      });
+      await ctx.db.insert("reservations", {
+        organizationId: setup.orgId,
+        jobId: overflowJob,
+        budgetId,
+        ceilingMicroUsd: MAX_SAFE,
+        reservedMicroUsd: 5,
+        spentMicroUsd: 0,
+        unresolvedMicroUsd: 0,
+        pricingBasis: "controlled-test",
+        state: "open",
+        updatedAt: now,
+      });
+      // Two attempts with individually valid intervals whose observed
+      // elapsed total overflows. Timestamps are exactly representable
+      // doubles (epoch 0), so the fixture does not depend on wall-clock
+      // rounding above 2^53.
+      const overflowOperation = await ctx.db.insert("operations", {
+        organizationId: setup.orgId,
+        projectId: setup.projectId,
+        jobId: overflowJob,
+        kind: "research.collect",
+        requestId: "req-metrics-overflow",
+        requestKey: "metrics-overflow",
+        normalizedPayload: "{}",
+        normalizedPayloadHash: payloadHash("{}"),
+        inputVersions: {},
+        grantId: overflowGrantId,
+        grantVersion: 1,
+        state: "dispatching",
+        createdAt: now,
+        updatedAt: now,
+      });
+      await ctx.db.insert("attempts", {
+        operationId: overflowOperation,
+        token: "tok-metrics-overflow-1",
+        state: "prepared",
+        createdAt: 0,
+        observedAt: MAX_SAFE,
+      });
+      await ctx.db.insert("attempts", {
+        operationId: overflowOperation,
+        token: "tok-metrics-overflow-2",
+        state: "prepared",
+        createdAt: 0,
+        observedAt: 1,
+      });
+    });
+    const result = await t.withIdentity(OWNER_A).query(projectUsageMetricsRef, {
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("metrics query failed");
+
+    // Provider total: explicit unavailability, never a rounded number;
+    // the exact spent and unresolved totals remain plain numbers.
+    expect(result.providerUsage.reservedMicroUsd).toEqual({
+      unavailable: "overflow",
+      reason: expect.stringContaining("overflow"),
+    });
+    expect(result.providerUsage.spentMicroUsd).toBe(10);
+    expect(result.providerUsage.unresolvedMicroUsd).toBe(0);
+
+    // Observed elapsed total: unavailability discriminant.
+    expect(result.attempts.observedElapsed.totalObservedElapsedMs).toEqual({
+      unavailable: "overflow",
+      reason: expect.stringContaining("overflow"),
+    });
+    expect(result.attempts.observedElapsed.attemptsWithSaneInterval).toBe(2);
+
+    // Per-currency spend: EUR overflows and its net is unavailable with
+    // it; USD stays an exact plain number. Currency separation holds.
+    const eur = result.spend.currencies.find((bucket) => bucket.currency === "EUR");
+    const usd = result.spend.currencies.find((bucket) => bucket.currency === "USD");
+    expect(eur).toBeDefined();
+    expect(usd).toBeDefined();
+    if (!eur || !usd) throw new Error("currency buckets missing");
+    expect(eur.paymentsAndSettledMinorUnits).toEqual({
+      unavailable: "overflow",
+      reason: expect.stringContaining("overflow"),
+    });
+    expect(eur.refundsAndCreditsMinorUnits).toBe(0);
+    expect(eur.netMinorUnits).toEqual({
+      unavailable: "overflow",
+      reason: expect.stringContaining("overflow"),
+    });
+    expect(usd.paymentsAndSettledMinorUnits).toBe(5);
+    expect(usd.netMinorUnits).toBe(5);
+
+    // No unsafe numeric value is reported anywhere in the measured-total
+    // fields of the response.
+    const measuredTotalNumbers: number[] = [];
+    const walk = (value: unknown, path: string) => {
+      if (value !== null && typeof value === "object") {
+        for (const [key, child] of Object.entries(value)) {
+          const childPath = path === "" ? key : `${path}.${key}`;
+          if (
+            typeof child === "number" &&
+            /reservedMicroUsd|spentMicroUsd|unresolvedMicroUsd|paymentsAndSettledMinorUnits|refundsAndCreditsMinorUnits|netMinorUnits|totalObservedElapsedMs$/.test(
+              childPath,
+            )
+          ) {
+            measuredTotalNumbers.push(child);
+          }
+          walk(child, childPath);
+        }
+      }
+    };
+    walk(result, "");
+    for (const number of measuredTotalNumbers) {
+      expect(Number.isSafeInteger(number)).toBe(true);
+    }
+
+    expect(result.completeness.truncatedSections).toEqual([]);
+    expect(result.completeness.overflowedSections).toEqual([
+      "providerUsage",
+      "attempts.observedElapsed",
+      "spend.currencies.EUR",
+    ]);
+    expect(result.completeness.complete).toBe(false);
   });
 });
