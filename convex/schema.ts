@@ -52,6 +52,33 @@ import {
 import { workflowAuthoritiesValidator, workflowAuthorityValidator } from "./shared/scope.js";
 
 /**
+ * Negotiation authority binding (Devin findings 4060796830/4060796928):
+ * prepared negotiation sends carry an immutable pin of the exact mandate
+ * facts they were approved under. Every value is derived server-side from
+ * the live rows at preparation; the atomic claim rechecks each pin against
+ * the current rows immediately before provider effect. Optional so
+ * historical operations without the binding stay readable.
+ */
+const negotiationConversationStateValidator = v.union(
+  v.literal("draft"),
+  v.literal("queued"),
+  v.literal("awaitingReply"),
+  v.literal("replyReceived"),
+  v.literal("closed"),
+  v.literal("cancelled"),
+);
+const negotiationAuthorityValidator = v.object({
+  negotiationId: v.id("negotiations"),
+  quoteId: v.id("quotes"),
+  quoteVersion: v.string(),
+  quoteContentHash: v.string(),
+  roundsUsed: v.number(),
+  conversationId: v.optional(v.id("conversations")),
+  conversationVersion: v.optional(v.number()),
+  conversationState: v.optional(negotiationConversationStateValidator),
+});
+
+/**
  * Field-level evidence references for the F1 shared-domain graph use the
  * quote-semantics shape (optional locator): research claims often carry
  * source/version identity without a byte locator, and handlers narrow
@@ -364,6 +391,16 @@ export default defineSchema({
     quoteVersion: v.string(),
     currency: v.string(),
     conversationId: v.optional(v.id("conversations")),
+    // Mandate-approved conversation identity, pinned server-side when
+    // openNegotiation binds the quote conversation: the exact approved
+    // version AND the exact approved state. Raw inbound callback ingestion
+    // never advances these pins: the callback already increments the live
+    // conversation version and sets replyReceived, so a newer or
+    // state-drifted live conversation creates a fail-closed mismatch until
+    // an explicit reply-incorporation transition exists. Optional for
+    // historical rows.
+    conversationVersion: v.optional(v.number()),
+    conversationState: v.optional(negotiationConversationStateValidator),
     mandateHash: v.string(),
     targetMinorUnits: v.optional(v.number()),
     roundLimit: v.number(),
@@ -848,6 +885,12 @@ export default defineSchema({
     attemptToken: v.optional(v.string()),
     linkedResendOf: v.optional(v.id("operations")),
     workflowAuthority: v.optional(workflowAuthorityValidator),
+    // Optional immutable negotiation authority binding derived server-side
+    // at preparation and rechecked inside the atomic claim immediately
+    // before provider effect. Missing on historical rows keeps them
+    // claimable exactly as before; a bound mandate must stay exact, active,
+    // unexpired, round-current, and quote/conversation-current.
+    negotiationAuthority: v.optional(negotiationAuthorityValidator),
     createdAt: v.number(),
     updatedAt: v.number(),
   })
