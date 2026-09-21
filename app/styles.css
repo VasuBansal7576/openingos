@@ -101,11 +101,14 @@ h1, h2, h3, p { margin-top: 0; }
 .wb-metric strong { margin-top: .1rem; font-family: var(--wb-serif); font-size: 1.02rem; font-weight: 400; letter-spacing: -.03em; line-height: 1.1; }
 .wb-metric small { margin-top: .08rem; }
 
-/* Compare journey sits tight under the strip: bench heading, desk papers, tape, action */
-.wb-compare { padding-top: 1.4rem; }
+/* Compare journey: bench heading, desk papers, tape, action above the fold; the
+   real readiness/finance strip follows below the decision bar on this tab */
+.wb-compare { padding-top: 1rem; }
 .wb-compare .wb-bench-heading { padding-top: 0; }
+.wb-compare .wb-bench-heading h1 { margin-bottom: .6rem; }
 .wb-bench-heading-actions { display: flex; flex-wrap: wrap; align-items: center; gap: .6rem; margin-top: .9rem; flex: none; }
-.wb-compare .wb-scope-row { margin-bottom: 1rem; }
+.wb-compare .wb-scope-row { margin-bottom: .7rem; }
+.wb-compare .wb-overview-strip { margin-top: 1.5rem; border-top: 1px solid var(--wb-border); }
 .wb-desk-layout > .wb-load-more { grid-column: 1 / -1; }
 .wb-desk-layout > .wb-empty { grid-column: 2 / -1; min-width: 0; }
 
@@ -188,8 +191,8 @@ h1, h2, h3, p { margin-top: 0; }
 .wb-offer-header { display: flex; align-items: flex-start; gap: .7rem; }
 .wb-offer-header > div { min-width: 0; }
 .wb-offer-header > div > button { padding: 0; border: 0; background: transparent; text-align: left; }
-.wb-paper-version { flex: none; max-width: 6.5rem; padding-top: .375rem; color: #647268; font-size: .4375rem; letter-spacing: .06em; text-align: right; white-space: nowrap; }
-.wb-offer-header .wb-pill { margin-top: .55rem; }
+.wb-paper-version { flex: none; max-width: 7.5rem; padding-top: .375rem; color: #647268; font-size: .4375rem; letter-spacing: .06em; text-align: right; overflow-wrap: break-word; }
+.wb-offer-header .wb-pill { margin-top: .35rem; }
 .wb-vendor-monogram { display: inline-flex; width: 2.25rem; height: 2.25rem; flex: none; align-items: center; justify-content: center; border: 1px solid var(--wb-border); border-radius: 50%; color: var(--wb-ink); background: var(--wb-soft); font-family: var(--wb-serif); font-size: 1.3rem; }
 .wb-vendor-monogram.large { width: 3.2rem; height: 3.2rem; font-size: 1.7rem; }
 .wb-offer-header h3 { margin: .15rem 0 .18rem; font-family: var(--wb-serif); font-size: 1.9rem; font-weight: 400; letter-spacing: -.03em; line-height: 1.04; overflow-wrap: break-word; }
@@ -197,32 +200,35 @@ h1, h2, h3, p { margin-top: 0; }
 .wb-paper-kicker { margin: .1875rem 0 .8rem; font-size: .375rem; letter-spacing: .1em; }
 .wb-paper-rule { display: flex; align-items: center; justify-content: space-between; padding-bottom: .625rem; border-bottom: 1px solid var(--wb-rule); font-size: .5625rem; font-weight: 750; letter-spacing: .08em; }
 .wb-paper-rule > span { align-self: center; font-size: .375rem; font-weight: 450; }
-.wb-offer-tags { display: flex; flex-wrap: wrap; gap: .4rem; margin: .7rem 0 .8rem; }
+.wb-offer-tags { display: flex; flex-wrap: wrap; gap: .35rem; margin: .6rem 0 .7rem; }
+.wb-offer-card .wb-pill { font-size: .55rem; }
 .wb-quote-summary { margin-top: 0; }
-.wb-quote-total { display: flex; align-items: flex-end; justify-content: space-between; gap: .7rem; padding: .7rem 0; border-top: 1px solid var(--wb-rule); border-bottom: 1px solid var(--wb-rule); }
+.wb-quote-total { display: flex; align-items: flex-end; justify-content: space-between; gap: .7rem; padding: .6rem 0; border-top: 1px solid var(--wb-rule); border-bottom: 1px solid var(--wb-rule); }
 .wb-quote-total span { color: #728075; font-size: .61rem; }
-.wb-quote-total strong { font-family: var(--wb-serif); font-size: 1.6rem; font-weight: 400; letter-spacing: -.03em; text-align: right; }
+.wb-quote-total strong { font-family: var(--wb-serif); font-size: 1.45rem; font-weight: 400; letter-spacing: -.03em; text-align: right; }
 .wb-charge-list { display: grid; gap: 0; padding: .1rem 0; }
-.wb-charge-list > div { display: flex; justify-content: space-between; gap: .7rem; padding: .6rem 0; border-bottom: 1px solid var(--wb-thin-rule); color: #728075; font-size: .61rem; }
+.wb-charge-list > div { display: flex; justify-content: space-between; gap: .7rem; padding: .55rem 0; border-bottom: 1px solid var(--wb-thin-rule); color: #728075; font-size: .61rem; }
 .wb-charge-list strong { color: var(--wb-ink); font-weight: 700; text-align: right; }
 .wb-charge-list > div.missing strong { color: var(--wb-coral); }
-.wb-paper-meta { display: flex; justify-content: flex-end; padding: .45rem 0 0; color: #728075; font-size: .58rem; }
-.wb-paper-ready { display: flex; align-items: center; gap: .4rem; margin-top: .7rem; color: #304e3b; font-size: .6rem; font-weight: 600; }
-.wb-paper-bottom { display: flex; align-items: center; justify-content: space-between; gap: .55rem; margin-top: .8rem; color: #728075; font-size: .59rem; }
+.wb-paper-meta { display: flex; justify-content: flex-end; padding: .3rem 0 0; color: #728075; font-size: .58rem; }
+.wb-unknown-note { margin-top: .5rem; }
+.wb-paper-ready { display: flex; align-items: center; gap: .4rem; margin-top: .55rem; color: #304e3b; font-size: .6rem; font-weight: 600; }
+.wb-paper-bottom { display: flex; align-items: center; justify-content: space-between; gap: .55rem; margin-top: .6rem; color: #728075; font-size: .59rem; }
 .wb-paper-bottom > span { max-width: 8rem; }
 .wb-unknown-note, .wb-quote-unknown { display: flex; align-items: flex-start; gap: .4rem; padding: .6rem; border-radius: .25rem; color: #8d492b; background: #fff1e8; font-size: .61rem; line-height: 1.4; }
 .wb-quote-unknown { margin-top: auto; }
-.wb-missing-terms { display: flex; align-items: center; justify-content: space-between; gap: .3125rem; width: 100%; margin-top: .6rem; padding: .625rem .5rem; border: 0; color: var(--wb-coral); background: var(--wb-coral-bg); font-size: .5625rem; font-weight: 700; }
+.wb-missing-terms { display: flex; align-items: center; justify-content: space-between; gap: .3125rem; width: 100%; margin-top: .5rem; padding: .55rem .5rem; border: 0; color: var(--wb-coral); background: var(--wb-coral-bg); font-size: .5625rem; font-weight: 700; }
 .wb-offer-foot { display: flex; align-items: center; justify-content: space-between; gap: .55rem; margin-top: 1rem; color: #728075; font-size: .59rem; }
 .wb-offer-foot > span { max-width: 8rem; }
 .wb-card-footnote { display: flex; align-items: flex-start; gap: .35rem; margin: .8rem 0 0; color: #8d492b; font-size: .59rem; line-height: 1.4; }
-.wb-paper-source { display: flex; align-items: center; gap: .3rem; max-width: 100%; padding: 0; border: 0; color: #476641; background: transparent; font-size: .5625rem; font-weight: 600; text-align: left; }
+.wb-paper-source { display: flex; align-items: center; gap: .3rem; max-width: 100%; margin-top: .5rem; padding: 0; border: 0; color: #476641; background: transparent; font-size: .5625rem; font-weight: 600; text-align: left; }
 .wb-paper-source > span { min-width: 0; }
 .wb-paper-source:hover { text-decoration: underline; }
 .wb-load-more { display: flex; align-items: center; gap: .35rem; margin: 1.25rem auto 0; padding: .35rem .7rem; border: 0; color: var(--wb-success); background: transparent; font-size: .68rem; font-weight: 800; }
-.wb-comparison-tape { display: flex; grid-column: 1 / -1; width: auto; max-width: 90%; align-items: center; gap: 1.6875rem; margin: .875rem auto 2rem; padding: .8125rem 1.5rem; background: var(--wb-accent-soft); box-shadow: 0 4px 8px #1f37292b; transform: rotate(-1.3deg); font-size: .75rem; font-weight: 600; }
+.wb-comparison-tape { display: flex; grid-column: 1 / -1; width: auto; max-width: 90%; align-items: center; gap: 1.6875rem; margin: .7rem auto 1.2rem; padding: .8125rem 1.5rem; background: var(--wb-accent-soft); box-shadow: 0 4px 8px #1f37292b; transform: rotate(-1.3deg); font-size: .75rem; font-weight: 600; }
 .wb-comparison-tape.not-ranked { background: #f2ead8; color: var(--wb-ink-soft); transform: rotate(.4deg); }
-.wb-bench-action { display: grid; grid-column: 1 / -1; grid-template-columns: 1.1fr 1.2fr 1fr; align-items: center; gap: 1.75rem; margin: 1.5625rem -2.625rem 0; padding: 1.5625rem 2.625rem .9375rem; color: #fbf5df; background: #193b2fee; }
+.wb-comparison-tape > span { min-width: 0; }
+.wb-bench-action { display: grid; grid-column: 1 / -1; grid-template-columns: 1.1fr 1.2fr 1fr; align-items: center; gap: 1.75rem; margin: 1rem -2.625rem 0; padding: 1.5625rem 2.625rem .9375rem; color: #fbf5df; background: #193b2fee; }
 .wb-bench-action:focus-visible { outline-color: var(--wb-accent); }
 .wb-bench-selected { display: flex; align-items: center; gap: .9375rem; font-size: .625rem; color: #b8c7b6; }
 .wb-bench-selected > .ui-icon { padding: .5rem; box-sizing: content-box; border-radius: 50%; color: #213b2d; background: #f7eeb6; }

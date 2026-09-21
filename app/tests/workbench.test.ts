@@ -2469,11 +2469,11 @@ test("E16 quote cards preserve explicit charge states with native money and vali
 test("E16 responsive CSS keeps desk density without horizontal overflow", async () => {
   const css = await Bun.file(new URL("../styles.css", import.meta.url)).text();
   // Slim status strip keeps the desk above the fold.
-  expect(css).toContain(".wb-compare { padding-top: 1.4rem;");
+  expect(css).toContain(".wb-compare { padding-top: 1rem;");
   expect(css).toContain(".wb-overview-intro strong { margin-top: .1rem;");
   // Bench heading carries the compare journey without the tall page heading.
   expect(css).toContain(".wb-bench-heading-actions");
-  expect(css).toContain(".wb-compare .wb-scope-row { margin-bottom: 1rem;");
+  expect(css).toContain(".wb-compare .wb-scope-row { margin-bottom: .7rem;");
   // Paper-document density: tight kicker/tags, lines before total, ready + bottom rows.
   expect(css).toContain(".wb-paper-kicker { margin: .1875rem 0 .8rem;");
   expect(css).toContain(".wb-paper-ready");
@@ -2627,4 +2627,97 @@ test("unsafe, malformed, and ambiguous budgets never reach the intake route", as
       await mounted.cleanup();
     }
   }
+});
+
+// -- Pixel QA iteration 2: overview below the decision bar on Project --------
+
+test("the Project tab renders readiness and finance below the decision bar", () => {
+  const snapshot = parseWorkbenchSnapshot(projection, projection.project.id);
+  if (snapshot === null) throw new Error("W1 projection should parse");
+  const html = renderToStaticMarkup(createElement(WorkbenchView, { loadState: { state: "ready", snapshot } }));
+  expect(html).toContain("wb-overview-strip");
+  expect(html).toContain("PROCUREMENT READINESS");
+  expect(html).toContain("Approved budget");
+  const deskAt = html.indexOf("wb-desk-layout");
+  const actionAt = html.indexOf("wb-bench-action");
+  const stripAt = html.indexOf("wb-overview-strip");
+  const lowerAt = html.indexOf("wb-project-lower");
+  expect(deskAt).toBeGreaterThanOrEqual(0);
+  expect(actionAt).toBeGreaterThan(deskAt);
+  expect(stripAt).toBeGreaterThan(actionAt);
+  expect(lowerAt).toBeGreaterThan(stripAt);
+  // No honesty data is dropped by the move.
+  expect(html).toContain("Not assessed");
+  expect(html).toContain("Selected forecast");
+  expect(html).toContain("Committed");
+});
+
+test("non-Project tabs keep the readiness strip above the page content", async () => {
+  const snapshot = parseWorkbenchSnapshot(projection, projection.project.id);
+  if (snapshot === null) throw new Error("W1 projection should parse");
+  const mounted = await mountE8Tab({ state: "ready", snapshot }, () => ({ ok: false, message: "controlled test refusal" }));
+  try {
+    await mounted.clickTab("Suppliers");
+    const app = mounted.container.querySelector(".wb-app");
+    if (app === null) throw new Error("Workbench app not found");
+    const appHtml = app.innerHTML;
+    expect(appHtml).toContain("wb-overview-strip");
+    expect(appHtml.indexOf("wb-overview-strip")).toBeLessThan(appHtml.indexOf('id="workbench-main"'));
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+// -- Pixel QA iteration 2: compact controlled-fixture card headings ----------
+
+function controlledNameProjection(): Record<string, unknown> {
+  const value = twoOfferProjection();
+  const candidates = value.candidates as readonly Record<string, unknown>[];
+  const first = candidates[0]!;
+  const second = candidates[1]!;
+  return {
+    ...value,
+    candidates: [
+      {
+        ...first,
+        vendor: { id: "vendor-controlled-1", name: "Sample Vendor A (controlled demo)", regions: ["NL"], serviceCoverage: "Service coverage reported for this inquiry" },
+        provenance: { mode: "fixture", label: "Controlled fixture evidence", ownerAuthoredTerms: true },
+      },
+      {
+        ...second,
+        vendor: { id: "vendor-live-2", name: "Harbor Equipment (EU Satellite)", regions: ["NL"], serviceCoverage: "Service coverage reported for this inquiry" },
+        provenance: { mode: "live", label: "Live provider result", ownerAuthoredTerms: false },
+      },
+    ],
+  };
+}
+
+test("controlled fixture headings stay concise while the full name remains available", () => {
+  const snapshot = parseWorkbenchSnapshot(controlledNameProjection(), projection.project.id);
+  if (snapshot === null) throw new Error("Controlled-name projection should parse");
+  const html = renderToStaticMarkup(createElement(WorkbenchView, { loadState: { state: "ready", snapshot } }));
+  // Concise visible heading with the full name retained for assistive use.
+  expect(html).toContain(">Sample Vendor A</h3>");
+  expect(html).toContain('title="Sample Vendor A (controlled demo)"');
+  expect(html).toContain("Review quote from Sample Vendor A (controlled demo)");
+  // The honesty pill stays on the same card.
+  expect(html).toContain("Controlled fixture evidence");
+  // A live vendor keeps its full display name.
+  expect(html).toContain(">Harbor Equipment (EU Satellite)</h3>");
+  expect(html).toContain("Live provider result");
+});
+
+test("pixel-QA CSS keeps the tape and decision bar above the fold", async () => {
+  const css = await Bun.file(new URL("../styles.css", import.meta.url)).text();
+  // The real strip follows the decision bar instead of consuming top height.
+  expect(css).toContain(".wb-compare .wb-overview-strip { margin-top: 1.5rem;");
+  // Paper headings recover source density without hiding controlled labels.
+  expect(css).toContain(".wb-offer-header .wb-pill { margin-top: .35rem;");
+  expect(css).toContain(".wb-offer-card .wb-pill { font-size: .55rem;");
+  expect(css).not.toMatch(/\.wb-paper-version \{[^}]*white-space:\s*nowrap/);
+  // Tightened paper rhythm and decision-bar placement.
+  expect(css).toContain(".wb-quote-total strong { font-family: var(--wb-serif); font-size: 1.45rem;");
+  expect(css).toContain("margin: .7rem auto 1.2rem;");
+  expect(css).toContain(".wb-bench-action { display: grid; grid-column: 1 / -1;");
+  expect(css).toContain("margin: 1rem -2.625rem 0;");
 });
