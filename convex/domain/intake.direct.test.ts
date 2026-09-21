@@ -49,6 +49,13 @@ type MutationReturn<T> = T extends RegisteredMutation<infer _V, infer _A, infer 
 type QueryArgs<T> = T extends RegisteredQuery<infer _V, infer A, infer _R> ? A : never;
 type QueryReturn<T> = T extends RegisteredQuery<infer _V, infer _A, infer R> ? R : never;
 
+function createKit() {
+  return convexTest(schema, modules);
+}
+
+/** Typed test kit so ctx.db keeps the project's indexes and documents. */
+type TestKit = ReturnType<typeof createKit>;
+
 const createWorkspaceRef = makeFunctionReference<
   "mutation",
   MutationArgs<typeof intake.createWorkspace>,
@@ -160,7 +167,7 @@ function installControlledClock(): ControlledClock {
  * horizon is the maximum authority until across the seeded rows.
  */
 async function seedOrgOwnerAuthority(
-  t: ReturnType<typeof convexTest>,
+  t: TestKit,
   identity: string,
   suffix: string,
   rows: readonly ("temporary" | "permanent")[],
@@ -209,7 +216,7 @@ type ProjectGrantSnapshot = {
 };
 
 async function readProjectGrant(
-  t: ReturnType<typeof convexTest>,
+  t: TestKit,
   organizationId: Id<"organizations">,
   projectId: Id<"projects">,
   identity: string,
@@ -259,7 +266,7 @@ function openingArgs(key: string) {
 
 describe("P-01 intake boundary", () => {
   test("opening creates an owned workspace with minimal records and history", async () => {
-    const t = convexTest(schema, modules);
+    const t = createKit();
     const asOwner = t.withIdentity(OWNER);
     const result = await asOwner.mutation(createWorkspaceRef, openingArgs("opening-1"));
     if (!result.ok) throw new Error(`intake failed: ${JSON.stringify(result)}`);
@@ -282,7 +289,7 @@ describe("P-01 intake boundary", () => {
   });
 
   test("quote comparison and equipment modes create their minimal records", async () => {
-    const t = convexTest(schema, modules);
+    const t = createKit();
     const asOwner = t.withIdentity(OWNER);
     const quote = await asOwner.mutation(createWorkspaceRef, {
       idempotencyKey: "quote-1",
@@ -322,7 +329,7 @@ describe("P-01 intake boundary", () => {
   });
 
   test("exact replay succeeds while a changed reuse of the key conflicts", async () => {
-    const t = convexTest(schema, modules);
+    const t = createKit();
     const asOwner = t.withIdentity(OWNER);
     const first = await asOwner.mutation(createWorkspaceRef, openingArgs("replay-1"));
     if (!first.ok) throw new Error(`first intake failed: ${JSON.stringify(first)}`);
@@ -346,7 +353,7 @@ describe("P-01 intake boundary", () => {
   });
 
   test("same-key resubmission creates one workspace and reuses the organization", async () => {
-    const t = convexTest(schema, modules);
+    const t = createKit();
     const asOwner = t.withIdentity(OWNER);
     const first = await asOwner.mutation(createWorkspaceRef, openingArgs("shared-1"));
     if (!first.ok) throw new Error(`first intake failed: ${JSON.stringify(first)}`);
@@ -371,7 +378,7 @@ describe("P-01 intake boundary", () => {
   });
 
   test("guest and private kinds use separate organizations", async () => {
-    const t = convexTest(schema, modules);
+    const t = createKit();
     const asOwner = t.withIdentity(OWNER);
     const guest = await asOwner.mutation(createWorkspaceRef, {
       idempotencyKey: "kind-guest",
@@ -403,7 +410,7 @@ describe("P-01 intake boundary", () => {
   });
 
   test("validation failure writes nothing", async () => {
-    const t = convexTest(schema, modules);
+    const t = createKit();
     const asOwner = t.withIdentity(OWNER);
     const before = await asOwner.query(listProjectsRef, { limit: 10 });
     if (!before.ok) throw new Error(`listing failed: ${JSON.stringify(before)}`);
@@ -436,7 +443,7 @@ describe("P-01 intake boundary", () => {
   });
 
   test("unauthenticated and cross-tenant calls deny without an existence oracle", async () => {
-    const t = convexTest(schema, modules);
+    const t = createKit();
     const anonymous = await t.mutation(createWorkspaceRef, openingArgs("anonymous-1"));
     expect(anonymous.ok).toBe(false);
     if (anonymous.ok) throw new Error("anonymous intake must fail");
@@ -465,7 +472,7 @@ describe("P-01 intake boundary", () => {
 describe("F6 temporary organization reuse preserves the authority horizon", () => {
   test("temporary org ownership derives an equally temporary project grant that reactively expires", async () => {
     const clock = installControlledClock();
-    const t = convexTest(schema, modules);
+    const t = createKit();
     const asOwner = t.withIdentity(OWNER);
     const seeded = await seedOrgOwnerAuthority(t, OWNER.tokenIdentifier, "f6-temporary", ["temporary"]);
     const horizon = seeded.horizon;
@@ -560,7 +567,7 @@ describe("F6 temporary organization reuse preserves the authority horizon", () =
 
   test("coexistence with stronger permanent authority stays permanent and wins reuse", async () => {
     const clock = installControlledClock();
-    const t = convexTest(schema, modules);
+    const t = createKit();
     const asOwner = t.withIdentity(OWNER);
     const sameOrg = await seedOrgOwnerAuthority(t, OWNER.tokenIdentifier, "f6-coexist", ["temporary", "permanent"]);
     const temporaryElsewhere = await seedOrgOwnerAuthority(t, OWNER.tokenIdentifier, "f6-temporary-only", ["temporary"]);
@@ -606,7 +613,7 @@ describe("F6 temporary organization reuse preserves the authority horizon", () =
   });
 
   test("another tenant without authority creates its own organization", async () => {
-    const t = convexTest(schema, modules);
+    const t = createKit();
     const seeded = await seedOrgOwnerAuthority(t, OWNER.tokenIdentifier, "f6-tenant", ["temporary"]);
     const asOther = t.withIdentity(OTHER);
     const result = await asOther.mutation(createWorkspaceRef, {
