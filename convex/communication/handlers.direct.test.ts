@@ -8,7 +8,7 @@ import * as cleanup from "./cleanup.js";
 import * as send from "./send.js";
 import * as attempts from "../execution/attempts.js";
 import { canonicalJson, payloadHash } from "../shared/hashing.js";
-import { OUTBOUND_RETENTION_MS } from "./contracts.js";
+import { OUTBOUND_RETENTION_MS, reconciliationPricingBasis } from "./contracts.js";
 
 const rawModules = import.meta.glob([
   "../access/**/*.ts",
@@ -236,22 +236,22 @@ describe("C1 Convex callback handlers", () => {
       if (operation === null) throw new Error("operation missing");
       const budgetId = await ctx.db.insert("providerBudgets", {
         organizationId: f.organizationId,
-        ceilingMicroUsd: 2,
-        reservedMicroUsd: 2,
+        ceilingMicroUsd: 14,
+        reservedMicroUsd: 14,
         spentMicroUsd: 0,
         unresolvedMicroUsd: 0,
-        pricingBasis: "controlled-reconciliation-read",
+        pricingBasis: reconciliationPricingBasis(7),
         updatedAt: now,
       });
       const reservationId = await ctx.db.insert("reservations", {
         organizationId: f.organizationId,
         jobId: operation.jobId,
         budgetId,
-        ceilingMicroUsd: 2,
-        reservedMicroUsd: 2,
+        ceilingMicroUsd: 14,
+        reservedMicroUsd: 14,
         spentMicroUsd: 0,
         unresolvedMicroUsd: 0,
-        pricingBasis: "controlled-reconciliation-read",
+        pricingBasis: reconciliationPricingBasis(7),
         state: "open",
         updatedAt: now,
       });
@@ -265,6 +265,65 @@ describe("C1 Convex callback handlers", () => {
         createdAt: now,
       });
       return { reservationId, budgetId };
+    });
+    const absentPricing = await f.t.run(async (ctx) => {
+      const row = await ctx.db.get(reservation.reservationId);
+      const budget = await ctx.db.get(reservation.budgetId);
+      if (row === null || budget === null) throw new Error("accounting rows missing");
+      await ctx.db.patch(row._id, { pricingBasis: "" });
+      await ctx.db.patch(budget._id, { pricingBasis: "" });
+      return {
+        reservation: { reservedMicroUsd: row.reservedMicroUsd, spentMicroUsd: row.spentMicroUsd },
+        budget: { reservedMicroUsd: budget.reservedMicroUsd, spentMicroUsd: budget.spentMicroUsd },
+      };
+    });
+    expect(absentPricing).toEqual({
+      reservation: { reservedMicroUsd: 14, spentMicroUsd: 0 },
+      budget: { reservedMicroUsd: 14, spentMicroUsd: 0 },
+    });
+    const absentDenied = await f.t.mutation(reconcileAfterCrashRef, {
+      operationId: f.operationId,
+      mode: "admitRead",
+      attemptToken: "reconciliation-attempt",
+      readNumber: 1,
+    });
+    expect(absentDenied).toMatchObject({ ok: false, code: "stale-pricing-basis" });
+    const invalidPricing = await f.t.run(async (ctx) => {
+      const row = await ctx.db.get(reservation.reservationId);
+      const budget = await ctx.db.get(reservation.budgetId);
+      if (row === null || budget === null) throw new Error("accounting rows missing");
+      await ctx.db.patch(row._id, { pricingBasis: "caller-invented-pricing" });
+      await ctx.db.patch(budget._id, { pricingBasis: "caller-invented-pricing" });
+      return {
+        reservation: { reservedMicroUsd: row.reservedMicroUsd, spentMicroUsd: row.spentMicroUsd },
+        budget: { reservedMicroUsd: budget.reservedMicroUsd, spentMicroUsd: budget.spentMicroUsd },
+      };
+    });
+    expect(invalidPricing).toEqual({
+      reservation: { reservedMicroUsd: 14, spentMicroUsd: 0 },
+      budget: { reservedMicroUsd: 14, spentMicroUsd: 0 },
+    });
+    const invalidDenied = await f.t.mutation(reconcileAfterCrashRef, {
+      operationId: f.operationId,
+      mode: "admitRead",
+      attemptToken: "reconciliation-attempt",
+      readNumber: 1,
+    });
+    expect(invalidDenied).toMatchObject({ ok: false, code: "stale-pricing-basis" });
+    const unchangedAfterInvalid = await f.t.run(async (ctx) => {
+      const row = await ctx.db.get(reservation.reservationId);
+      const budget = await ctx.db.get(reservation.budgetId);
+      if (row === null || budget === null) throw new Error("accounting rows missing");
+      await ctx.db.patch(row._id, { pricingBasis: reconciliationPricingBasis(7) });
+      await ctx.db.patch(budget._id, { pricingBasis: reconciliationPricingBasis(7) });
+      return {
+        reservation: { reservedMicroUsd: row.reservedMicroUsd, spentMicroUsd: row.spentMicroUsd },
+        budget: { reservedMicroUsd: budget.reservedMicroUsd, spentMicroUsd: budget.spentMicroUsd },
+      };
+    });
+    expect(unchangedAfterInvalid).toEqual({
+      reservation: { reservedMicroUsd: 14, spentMicroUsd: 0 },
+      budget: { reservedMicroUsd: 14, spentMicroUsd: 0 },
     });
     const admitted = await f.t.mutation(reconcileAfterCrashRef, {
       operationId: f.operationId,
@@ -290,24 +349,42 @@ describe("C1 Convex callback handlers", () => {
       };
     });
     expect(accounted).toEqual({
-      reservation: { reservedMicroUsd: 1, spentMicroUsd: 1 },
-      budget: { reservedMicroUsd: 1, spentMicroUsd: 1 },
+      reservation: { reservedMicroUsd: 7, spentMicroUsd: 7 },
+      budget: { reservedMicroUsd: 7, spentMicroUsd: 7 },
     });
-    const exhausted = await f.t.run(async (ctx) => {
-      const row = await ctx.db.get(reservation.reservationId);
-      if (row === null) throw new Error("reservation missing");
-      await ctx.db.patch(row._id, { reservedMicroUsd: 0, unresolvedMicroUsd: 0 });
-      const budget = await ctx.db.get(reservation.budgetId);
-      if (budget === null) throw new Error("budget missing");
-      await ctx.db.patch(budget._id, { reservedMicroUsd: 0, unresolvedMicroUsd: 0 });
-      return true;
-    });
-    expect(exhausted).toBe(true);
-    const denied = await f.t.mutation(reconcileAfterCrashRef, {
+    const second = await f.t.mutation(reconcileAfterCrashRef, {
       operationId: f.operationId,
       mode: "admitRead",
       attemptToken: "reconciliation-attempt",
       readNumber: 2,
+    });
+    expect(second).toMatchObject({ ok: true, allowed: true });
+    const spentTwice = await f.t.run(async (ctx) => {
+      const row = await ctx.db.get(reservation.reservationId);
+      const budget = await ctx.db.get(reservation.budgetId);
+      if (row === null || budget === null) throw new Error("accounting rows missing");
+      return {
+        reservation: { reservedMicroUsd: row.reservedMicroUsd, spentMicroUsd: row.spentMicroUsd },
+        budget: { reservedMicroUsd: budget.reservedMicroUsd, spentMicroUsd: budget.spentMicroUsd },
+      };
+    });
+    expect(spentTwice).toEqual({
+      reservation: { reservedMicroUsd: 0, spentMicroUsd: 14 },
+      budget: { reservedMicroUsd: 0, spentMicroUsd: 14 },
+    });
+    const exhausted = await f.t.run(async (ctx) => {
+      const row = await ctx.db.get(reservation.reservationId);
+      if (row === null) throw new Error("reservation missing");
+      const budget = await ctx.db.get(reservation.budgetId);
+      if (budget === null) throw new Error("budget missing");
+      return { reservedMicroUsd: row.reservedMicroUsd, spentMicroUsd: row.spentMicroUsd, budgetReservedMicroUsd: budget.reservedMicroUsd, budgetSpentMicroUsd: budget.spentMicroUsd };
+    });
+    expect(exhausted).toEqual({ reservedMicroUsd: 0, spentMicroUsd: 14, budgetReservedMicroUsd: 0, budgetSpentMicroUsd: 14 });
+    const denied = await f.t.mutation(reconcileAfterCrashRef, {
+      operationId: f.operationId,
+      mode: "admitRead",
+      attemptToken: "reconciliation-attempt",
+      readNumber: 3,
     });
     expect(denied).toMatchObject({ ok: false, code: "allowance-exhausted" });
   });
