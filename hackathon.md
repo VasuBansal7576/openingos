@@ -12,7 +12,7 @@
 - **Auth:** Convex Auth foundation only; no hosted guest/private isolation proof
 - **AI models:** controlled Jev `jev-1.13.0` adapter tests only; no live application inference
 - **Started:** 2026-09-19T09:46:19Z
-- **Last updated:** 2026-09-20T07:30:00Z
+- **Last updated:** 2026-09-21T07:52:00Z
 
 ## Log
 
@@ -397,3 +397,15 @@ Mixed supported communication still persists only its approved segment, and the 
 The worker's exact repair tree passed 782 controlled tests across the full repository matrix, strict TypeScript and the production build; the integration head independently passed the focused regression, strict TypeScript, production build and tree-equivalence check.
 No hosted Convex run, provider call, owner-mailbox exchange or external effect was performed.
 PR #2 still requires exact-head CI, direct Greptile thread closure, separate Astra acceptance and desktop/narrow browser inspection before merge.
+
+### 2026-09-21 - post-1a1bf7d controlled delivery wave
+
+The integration branch remains at `1a1bf7d`, which includes server-side cross-client research-start idempotency and authoritative quote total/currentness projection in addition to the earlier R1, C1, U1 and E1 work.
+Four ready, non-draft child PRs now expose further progress without claiming it is integrated: PR #7 at `e73277c` adds commissioning-to-asset and service outcomes, PR #8 at `f4c9177` adds changed-term impact and substitute approval fencing, PR #9 at `bc8bcfe` adds truthful usage/outcome metrics with explicit overflow unavailability, and PR #10 at `c6e6f76` repairs 390px navigation/heading fit and nested-dialog background inertness.
+Every one of those exact heads is conflict-free and passes the nine expected application and repository CI checks.
+Coordinator reruns passed 332 E11 direct tests plus 38 domain-contract tests, 13 focused E5 tests, 53 E10 direct-handler tests, 37 U1 workbench tests, strict TypeScript checks and production builds where applicable.
+Controlled Chrome inspection of PR #10 passed at 1440x900 and 390x844, with viewport and document widths equal, no overflow offenders, usable navigation, dialog focus containment, Escape close and exact background-state restoration.
+Greptile did not perform a code review on these latest heads because the connected trial reached its 50-credit limit; its quota comments are recorded as a blocker and never as approval.
+The completed PRs therefore remain unmerged while E6 controlled negotiation, E7 import/review gating and E9 second-location revalidation continue in isolated OpenCode high workers.
+All cited implementation and browser evidence is controlled.
+No hosted Convex deployment, live provider call, owner-mailbox exchange, genuine supplier response, public ChatGPT Sites origin, purchase, realized saving or commercial outcome was observed.

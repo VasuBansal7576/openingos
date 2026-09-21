@@ -25,11 +25,13 @@ This file supplies order, not duplicate contracts or a running automation.
    - [x] R1 bounded Firecrawl collection and controlled S-11 through S-14 coverage include independently paginated evidence, claims and candidate streams at exact PR head `099d016`.
    - [x] C1 owner-only transport, callbacks, reconciliation and quote ingestion use indexed provider binding lookup at exact PR head `099d016`.
    - [x] U1 production-state adapter and live Convex wiring are implemented at pushed PR #3 head `284e528`; the complete local suite passes on that exact commit.
-   - [ ] U1 desktop/narrow browser proof, authoritative quote-selection projection and final exact-head review remain open.
+   - [x] The authoritative quote-selection projection is integrated through `1a1bf7d`, and PR #10 head `c6e6f76` passes controlled desktop and 390px browser inspection with keyboard dialog recovery and no horizontal overflow.
+   - [ ] Integrate PR #10 and obtain the final fixed-head Astra review; the controlled browser proof is not hosted or live-provider evidence.
 5. [ ] **E1, integrated behavior.** Build recovery, change impact and equipment/service flows against the integrated research and communication modules.
    - [x] Project-authorized, bounded equipment projection reads real asset, safe document and service-case records at local integration commit `436dc61`.
-   - [x] The workbench consumes that exact equipment shape at local integration commit `8ac84de`, renders honest empty and truncation states, and keeps service creation disabled because no backend command route exists.
-   - [ ] Equipment/service mutations, commissioning, recovery and change-impact flows remain open.
+   - [x] The workbench consumes that exact equipment shape at local integration commit `8ac84de`, renders honest empty and truncation states, and now routes service creation through the real authorized backend action integrated before `1a1bf7d`.
+   - [x] Ready PR #7 head `e73277c` implements controlled commissioning-to-asset and service-outcome behavior; ready PR #8 head `f4c9177` implements controlled changed-term impact, substitute proposals and fresh approval fencing. Both exact heads are conflict-free and pass all nine expected CI checks.
+   - [ ] Integrate PRs #7 and #8, finish the recovery surface and negotiation/import/reuse packages, then run fixed-head Astra review.
 6. [ ] **V1, proof and review.** A separate Astra session reviews a fixed combined commit; implementation owners repair its findings.
    Prove all 52 P/H/D requirements, 24 S-cases and 7 J-cases, recording live versus controlled evidence and any unmet case.
    Exercise the real owner-email negotiation, Jev decisions, browser recovery, guest isolation and responsive UI; an early working path is not completion.
@@ -109,8 +111,14 @@ This file supplies order, not duplicate contracts or a running automation.
 - [x] Repair the three separate Astra C1 findings at pushed PR #2 head `0fb855f`: reconciliation slots are charged per provider read, retained replies continue through bounded autonomous batches, and complete inbound source bodies remain protected while public excerpts stay bounded. Focused communication suites, TypeScript and every expected GitHub check pass on that head.
 - [x] Repair the four separate Astra workbench findings at pushed PR #3 head `284e528`: mutation completion preserves newer reactive projections, decimals and coordinated objects remain intact during scope classification, readiness stays explicitly unassessed without authoritative data, and every overlay uses a shared modal keyboard/focus contract. The complete local `bun run test` suite passes with 293 direct handler tests; exact-head GitHub checks are still being observed.
 - [x] Repair PR #4 readiness lineage, quantity aggregation and evidence bounds at pushed head `947561c`; the complete local suite and every expected GitHub check pass on that exact commit.
+- [x] Integrate cross-client research-start idempotency and authoritative quote total/currentness projection through `1a1bf7d`; the earlier stale open item is closed.
+- [x] Deliver ready PR #7 at `e73277c` for commissioning-to-asset and service outcomes; 332 direct tests and its 38-test domain contract suite pass locally, and all nine expected CI checks pass on the exact head.
+- [x] Deliver ready PR #8 at `f4c9177` for changed-term impact and substitution; 13 focused tests, strict TypeScript and all nine expected CI checks pass on the exact head after authority, lineage, replay and no-write repairs.
+- [x] Deliver ready PR #9 at `bc8bcfe` for truthful usage/outcome metrics; 53 direct-handler tests, strict TypeScript, the complete worker-reported suite, production build and all nine expected CI checks pass on the exact head, including explicit overflow unavailability rather than rounded totals.
+- [x] Deliver ready PR #10 at `c6e6f76` for narrow-layout and nested-dialog recovery; 37 workbench tests, strict TypeScript, production build, 1440x900 and 390x844 controlled browser proofs, and all nine expected CI checks pass on the exact head.
+- [ ] E6 controlled negotiation, E7 import/review gating and E9 second-location revalidation are active in isolated OpenCode high workers with exclusive ownership; E8 projection/recovery and W2 integrated browser proof follow their dependencies.
 - [ ] Fresh Greptile reviews are unavailable because the connected trial reports its 50-credit limit exhausted; prior actionable threads are resolved with exact commit evidence, but a skipped review is not treated as acceptance.
-- [ ] Finish server-side cross-client research-start idempotency and authoritative quote total/currentness projection, integrate the latest PR #2 base into PRs #3 and #4, inspect the selected flow at desktop and narrow widths, then obtain exact-head CI and separate Astra review.
+- [ ] PRs #7 through #10 remain unmerged despite green CI and conflict-free states because Greptile supplied only quota notices; integrate the completed packages only after the review gate is explicitly resolved, then obtain one separate Astra verdict on the fixed combined head.
 
 The completed money and Jev proof wave contains controlled proofs only, reviewed at `595d30c` with no actionable findings remaining.
 Luna owned `proofs/money/**`; Muse Spark owned `proofs/jev/**`; Astra owned shared tooling, integration and progress files.
