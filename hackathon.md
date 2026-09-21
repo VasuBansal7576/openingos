@@ -409,3 +409,19 @@ Greptile did not perform a code review on these latest heads because the connect
 The completed PRs therefore remain unmerged while E6 controlled negotiation, E7 import/review gating and E9 second-location revalidation continue in isolated OpenCode high workers.
 All cited implementation and browser evidence is controlled.
 No hosted Convex deployment, live provider call, owner-mailbox exchange, genuine supplier response, public ChatGPT Sites origin, purchase, realized saving or commercial outcome was observed.
+
+### 2026-09-21 - E6 delivery and combined validation checkpoint
+
+Ready PR #11 at `157d09d` now contains the repaired controlled E6 negotiation policy and adapter contract.
+It enforces exact quote, conversation and grant bindings, mandatory draft source pins, a fixed server-derived subject, disclosure screening, dispatch-shaped outcomes and round advancement only for recorded success with a provider message ID.
+The module remains a pure controlled contract with no Convex persistence and no Jev, OpenAI or AgentMail call; production negotiation orchestration and live P-05/D-12 evidence remain open.
+Coordinator reruns passed 58 focused tests, strict TypeScript, the production build and all nine exact-head GitHub checks.
+The isolated validation branch at `25c6064` combines ready PRs #7 through #11 without changing the protected integration branch and passes strict TypeScript, production build, the full existing test command and 71 additional E5/E6 tests omitted from the shared test script.
+The shared test-registration gap is assigned to E8.
+E8 is active on supervised OpenCode Muse Spark 1.3 Contributor high dispatch `ctx_52e359d1617d`, with exclusive workbench projection, adapter, UI and test ownership.
+E7 pushed initial import/review commit `62dd541`, but coordinator review returned exact-source/BOM replay, deduplicated-key binding, promotion-collision and attachment-metadata defects to its OpenCode GLM high owner.
+E9 opened ready PR #12 at `513b28f`, but coordinator review returned missing source-project separation and malformed query-limit handling to its OpenCode GLM high owner.
+Neither repair package is accepted until its new exact head passes focused checks, the full matrix and all expected CI jobs.
+Greptile again supplied quota notices rather than code review, so the review gate remains unresolved.
+All cited evidence is controlled local or CI execution.
+No hosted Convex deployment, live provider call, owner-mailbox exchange, genuine supplier response, public origin, purchase, realized saving or commercial outcome was observed.
