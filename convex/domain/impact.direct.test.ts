@@ -29,6 +29,7 @@ import {
   ALTERNATIVE_EVALUATION_BOUND,
   PLACED_ORDER_PROBE_BOUND,
   PROPOSAL_REASON_MAX_LENGTH,
+  REVISION_LINEAGE_BOUND,
   SELECTION_SCAN_BOUND,
 } from "./impact.js";
 
@@ -1582,5 +1583,353 @@ describe("E5 lineage-independent order impact (P-12, D-15)", () => {
     expect(view.assessment.orderImpact).toBe("selectionOnly");
     expect(view.assessment.affectedSelectionId).toBe(seed.selectionId);
     expect(view.assessment.reason).toContain(`exceeded ${SELECTION_SCAN_BOUND} rows`);
+  });
+});
+
+describe("E5 current-vs-historical impact separation", () => {
+  test("an obsolete unplaced selection creates no fresh decision once replaced", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t);
+    const seed = await seedSelectedRequirement(t, project, "obsolete");
+    const selectionB = await selectQuote(
+      t,
+      project,
+      seed.requirementId,
+      seed.candidateB,
+      seed.quoteB1.quoteId,
+      "q-b1-obsolete",
+      "obsolete-selection-b",
+    );
+    expect(selectionB).not.toBe(seed.selectionId);
+    const quoteA2 = await createQuote(t, project, seed.requirementId, seed.vendorA, "q-a2-obsolete", seed.quoteA1Hash);
+    const result = await t.withIdentity(OWNER).mutation(assessQuoteRevisionImpactRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      idempotencyKey: "impact-obsolete",
+      quoteId: quoteA2.quoteId,
+    });
+    if (!result.ok) throw new Error(`assessment failed: ${JSON.stringify(result)}`);
+    const view = await t.withIdentity(OWNER).query(getImpactAssessmentRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      assessmentId: result.assessmentId,
+    });
+    if (!view.ok) throw new Error("assessment view failed");
+    expect(view.assessment.orderImpact).toBe("none");
+    expect(view.assessment.state).toBe("recorded");
+    expect(view.assessment.affectedSelectionId).toBeUndefined();
+    expect(view.assessment.placedOrderCount).toBe(0);
+    expect(view.assessment.reason).toContain("another revision");
+    expect(view.assessment.reason).not.toContain("re-decided");
+    const history = await t.run(async (ctx) => ({
+      selections: await ctx.db
+        .query("selections")
+        .withIndex("by_project", (q) => q.eq("projectId", project.projectId))
+        .collect(),
+      orders: await ctx.db
+        .query("orders")
+        .withIndex("by_project", (q) => q.eq("projectId", project.projectId))
+        .collect(),
+    }));
+    expect(history.selections).toHaveLength(2);
+    expect(history.orders).toHaveLength(0);
+  });
+
+  test("a placed historical order stays reviewRequired after the current selection moves on", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t);
+    const seed = await seedSelectedRequirement(t, project, "obsolete-placed", true);
+    const selectionB = await selectQuote(
+      t,
+      project,
+      seed.requirementId,
+      seed.candidateB,
+      seed.quoteB1.quoteId,
+      "q-b1-obsolete-placed",
+      "obsolete-placed-selection-b",
+    );
+    const latest = await t.run(async (ctx) =>
+      ctx.db
+        .query("selections")
+        .withIndex("by_requirement", (q) => q.eq("requirementId", seed.requirementId))
+        .order("desc")
+        .take(1),
+    );
+    expect(latest[0]?._id).toBe(selectionB);
+    const quoteA2 = await createQuote(t, project, seed.requirementId, seed.vendorA, "q-a2-obsolete-placed", seed.quoteA1Hash);
+    const result = await t.withIdentity(OWNER).mutation(assessQuoteRevisionImpactRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      idempotencyKey: "impact-obsolete-placed",
+      quoteId: quoteA2.quoteId,
+    });
+    if (!result.ok) throw new Error(`assessment failed: ${JSON.stringify(result)}`);
+    const view = await t.withIdentity(OWNER).query(getImpactAssessmentRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      assessmentId: result.assessmentId,
+    });
+    if (!view.ok) throw new Error("assessment view failed");
+    expect(view.assessment.orderImpact).toBe("reviewRequired");
+    expect(view.assessment.state).toBe("recorded");
+    expect(view.assessment.affectedSelectionId).toBe(seed.selectionId);
+    expect(view.assessment.placedOrderCount).toBe(1);
+    expect(view.assessment.reason).toContain("keep their history");
+  });
+
+  test("a watch on an obsolete unplaced selection is none until its order commits", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t);
+    const seed = await seedSelectedRequirement(t, project, "watch-obsolete");
+    await selectQuote(
+      t,
+      project,
+      seed.requirementId,
+      seed.candidateB,
+      seed.quoteB1.quoteId,
+      "q-b1-watch-obsolete",
+      "watch-obsolete-selection-b",
+    );
+    const watchId = await createWatch(t, project, seed.candidateA, "watch-obsolete-key");
+    const unplaced = await t.withIdentity(OWNER).mutation(assessWatchObservationRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      idempotencyKey: "watch-obsolete-unplaced",
+      watchId,
+      result: "ok",
+    });
+    if (!unplaced.ok) throw new Error(`watch assessment failed: ${JSON.stringify(unplaced)}`);
+    const unplacedView = await t.withIdentity(OWNER).query(getImpactAssessmentRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      assessmentId: unplaced.assessmentId,
+    });
+    if (!unplacedView.ok) throw new Error("assessment view failed");
+    expect(unplacedView.assessment.orderImpact).toBe("none");
+    expect(unplacedView.assessment.state).toBe("recorded");
+    expect(unplacedView.assessment.affectedSelectionId).toBeUndefined();
+    expect(unplacedView.assessment.placedOrderCount).toBe(0);
+    await placeOrder(t, project, seed.selectionId, "watch-obsolete-order");
+    const committed = await t.withIdentity(OWNER).mutation(assessWatchObservationRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      idempotencyKey: "watch-obsolete-committed",
+      watchId,
+      result: "ok",
+    });
+    if (!committed.ok) throw new Error(`watch assessment failed: ${JSON.stringify(committed)}`);
+    const committedView = await t.withIdentity(OWNER).query(getImpactAssessmentRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      assessmentId: committed.assessmentId,
+    });
+    if (!committedView.ok) throw new Error("assessment view failed");
+    expect(committedView.assessment.orderImpact).toBe("reviewRequired");
+    expect(committedView.assessment.affectedSelectionId).toBe(seed.selectionId);
+    expect(committedView.assessment.placedOrderCount).toBe(1);
+  });
+
+  test("a two-generation revision separates obsolete unplaced history from committed orders", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t);
+    const seed = await seedSelectedRequirement(t, project, "obsolete-gen");
+    await selectQuote(
+      t,
+      project,
+      seed.requirementId,
+      seed.candidateB,
+      seed.quoteB1.quoteId,
+      "q-b1-obsolete-gen",
+      "obsolete-gen-selection-b",
+    );
+    const quoteA2 = await createQuote(t, project, seed.requirementId, seed.vendorA, "q-a2-obsolete-gen", seed.quoteA1Hash);
+    const quoteA3 = await createQuote(t, project, seed.requirementId, seed.vendorA, "q-a3-obsolete-gen", quoteA2.contentHash);
+    const unplaced = await t.withIdentity(OWNER).mutation(assessQuoteRevisionImpactRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      idempotencyKey: "impact-obsolete-gen",
+      quoteId: quoteA3.quoteId,
+    });
+    if (!unplaced.ok) throw new Error(`assessment failed: ${JSON.stringify(unplaced)}`);
+    const unplacedView = await t.withIdentity(OWNER).query(getImpactAssessmentRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      assessmentId: unplaced.assessmentId,
+    });
+    if (!unplacedView.ok) throw new Error("assessment view failed");
+    expect(unplacedView.assessment.orderImpact).toBe("none");
+    expect(unplacedView.assessment.state).toBe("recorded");
+    expect(unplacedView.assessment.affectedSelectionId).toBeUndefined();
+    expect(unplacedView.assessment.reason).toContain("was superseded by q-a3-obsolete-gen");
+    await placeOrder(t, project, seed.selectionId, "obsolete-gen-order");
+    const committed = await t.withIdentity(OWNER).mutation(assessQuoteRevisionImpactRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      idempotencyKey: "impact-obsolete-gen-committed",
+      quoteId: quoteA3.quoteId,
+    });
+    if (!committed.ok) throw new Error(`assessment failed: ${JSON.stringify(committed)}`);
+    const committedView = await t.withIdentity(OWNER).query(getImpactAssessmentRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      assessmentId: committed.assessmentId,
+    });
+    if (!committedView.ok) throw new Error("assessment view failed");
+    expect(committedView.assessment.orderImpact).toBe("reviewRequired");
+    expect(committedView.assessment.affectedSelectionId).toBe(seed.selectionId);
+    expect(committedView.assessment.placedOrderCount).toBe(1);
+  });
+
+  test("an over-bound selection scan with a replaced current selection stays explicitly incomplete", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t);
+    const seed = await seedSelectedRequirement(t, project, "obsolete-bound");
+    await t.run(async (ctx) => {
+      const now = Date.now();
+      for (let index = 0; index < SELECTION_SCAN_BOUND; index += 1) {
+        await ctx.db.insert("selections", {
+          organizationId: project.organizationId,
+          projectId: project.projectId,
+          idempotencyKey: `sel-obsolete-bound-${index}`,
+          requirementId: seed.requirementId,
+          candidateId: seed.candidateA,
+          quoteId: seed.quoteA1,
+          quoteVersion: "q-a1-obsolete-bound",
+          requirementVersion: 1,
+          actor: OWNER.tokenIdentifier,
+          createdAt: now,
+        });
+      }
+    });
+    await selectQuote(
+      t,
+      project,
+      seed.requirementId,
+      seed.candidateB,
+      seed.quoteB1.quoteId,
+      "q-b1-obsolete-bound",
+      "obsolete-bound-selection-b",
+    );
+    const quoteA2 = await createQuote(t, project, seed.requirementId, seed.vendorA, "q-a2-obsolete-bound", seed.quoteA1Hash);
+    const result = await t.withIdentity(OWNER).mutation(assessQuoteRevisionImpactRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      idempotencyKey: "impact-obsolete-bound",
+      quoteId: quoteA2.quoteId,
+    });
+    if (!result.ok) throw new Error("assessment failed");
+    const view = await t.withIdentity(OWNER).query(getImpactAssessmentRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      assessmentId: result.assessmentId,
+    });
+    if (!view.ok) throw new Error("assessment view failed");
+    expect(view.assessment.state).toBe("incomplete");
+    expect(view.assessment.orderImpact).toBe("none");
+    expect(view.assessment.affectedSelectionId).toBeUndefined();
+    expect(view.assessment.reason).toContain(`exceeded ${SELECTION_SCAN_BOUND} rows`);
+  });
+
+  test("a truncated revision lineage with a current affected selection stays explicitly incomplete", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t);
+    const requirementId = await createRequirement(t, project, "obsolete-lineage");
+    const vendorA = await createVendor(t, project, "Vendor lineage obsolete");
+    const vendorB = await createVendor(t, project, "Vendor lineage other");
+    const candidateA = await createCandidate(t, project, requirementId, vendorA, "lineage-obsolete");
+    await createCandidate(t, project, requirementId, vendorB, "lineage-other");
+    const chain: { quoteId: Id<"quotes">; contentHash: string; version: string }[] = [];
+    let previous: { quoteId: Id<"quotes">; contentHash: string } | undefined;
+    for (let index = 1; index <= REVISION_LINEAGE_BOUND + 2; index += 1) {
+      const version = `q-v${index}-obsolete-lineage`;
+      const created = await createQuote(t, project, requirementId, vendorA, version, previous?.contentHash);
+      chain.push({ ...created, version });
+      previous = created;
+    }
+    const newest = chain[chain.length - 1]!;
+    const secondGeneration = chain[1]!;
+    // Controlled row: the public selection path fences superseded quotes, so
+    // the current affected selection inside the ancestry window is inserted
+    // directly, mirroring the over-bound fixtures above.
+    const currentSelectionId = await t.run(async (ctx) =>
+      ctx.db.insert("selections", {
+        organizationId: project.organizationId,
+        projectId: project.projectId,
+        idempotencyKey: "sel-obsolete-lineage",
+        requirementId,
+        candidateId: candidateA,
+        quoteId: secondGeneration.quoteId,
+        quoteVersion: secondGeneration.version,
+        requirementVersion: 1,
+        actor: OWNER.tokenIdentifier,
+        createdAt: Date.now(),
+      }),
+    );
+    const result = await t.withIdentity(OWNER).mutation(assessQuoteRevisionImpactRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      idempotencyKey: "impact-obsolete-lineage",
+      quoteId: newest.quoteId,
+    });
+    if (!result.ok) throw new Error(`assessment failed: ${JSON.stringify(result)}`);
+    const view = await t.withIdentity(OWNER).query(getImpactAssessmentRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      assessmentId: result.assessmentId,
+    });
+    if (!view.ok) throw new Error("assessment view failed");
+    expect(view.assessment.state).toBe("incomplete");
+    expect(view.assessment.orderImpact).toBe("selectionOnly");
+    expect(view.assessment.affectedSelectionId).toBe(currentSelectionId);
+    expect(view.assessment.reason).toContain(`exceeded ${REVISION_LINEAGE_BOUND} generations`);
+  });
+
+  test("another tenant's historical selection does not create impact", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t);
+    const seed = await seedSelectedRequirement(t, project, "obsolete-tenant");
+    await selectQuote(
+      t,
+      project,
+      seed.requirementId,
+      seed.candidateB,
+      seed.quoteB1.quoteId,
+      "q-b1-obsolete-tenant",
+      "obsolete-tenant-selection-b",
+    );
+    const foreign = await setupProject(t, OTHER, "obsolete-foreign");
+    await t.run(async (ctx) =>
+      ctx.db.insert("selections", {
+        organizationId: foreign.organizationId,
+        projectId: foreign.projectId,
+        idempotencyKey: "sel-obsolete-foreign",
+        requirementId: seed.requirementId,
+        candidateId: seed.candidateA,
+        quoteId: seed.quoteA1,
+        quoteVersion: "q-a1-obsolete-tenant",
+        requirementVersion: 1,
+        actor: OTHER.tokenIdentifier,
+        createdAt: Date.now(),
+      }),
+    );
+    const quoteA2 = await createQuote(t, project, seed.requirementId, seed.vendorA, "q-a2-obsolete-tenant", seed.quoteA1Hash);
+    const result = await t.withIdentity(OWNER).mutation(assessQuoteRevisionImpactRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      idempotencyKey: "impact-obsolete-tenant",
+      quoteId: quoteA2.quoteId,
+    });
+    if (!result.ok) throw new Error(`assessment failed: ${JSON.stringify(result)}`);
+    const view = await t.withIdentity(OWNER).query(getImpactAssessmentRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      assessmentId: result.assessmentId,
+    });
+    if (!view.ok) throw new Error("assessment view failed");
+    expect(view.assessment.orderImpact).toBe("none");
+    expect(view.assessment.state).toBe("recorded");
+    expect(view.assessment.affectedSelectionId).toBeUndefined();
+    expect(view.assessment.placedOrderCount).toBe(0);
+    expect(foreign.projectId).not.toBe(project.projectId);
   });
 });

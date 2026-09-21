@@ -28,7 +28,11 @@
  * in its supersedes ancestry (bounded indexed lineage), so an order on
  * an older selection stays impacted after a newer selection is recorded.
  * Old orders are never rewritten; over-bound scans produce explicit
- * incompleteness instead of an undercounted commitment figure.
+ * incompleteness instead of an undercounted commitment figure. Only the
+ * current selection's unplaced basis change is `selectionOnly`:
+ * historical unplaced selections create no fresh decision once the
+ * requirement is re-selected, while placed orders on any affected
+ * selection still make the impact `reviewRequired`.
  */
 
 import { v, type Infer } from "convex/values";
@@ -366,11 +370,12 @@ async function evaluateAlternatives(
  * Record the durable impact of a superseding quote revision. The quote
  * must be a requirement-bound revision whose `supersedes` content hash
  * resolves to an in-project predecessor, so the assessment always rests
- * on exact revision lineage. The current selection is compared against
- * the predecessor: an unplaced selection whose basis changed is
- * `selectionOnly`, while placed orders make the impact `reviewRequired`
- * — the order history stays untouched and any substitute needs fresh
- * approval.
+ * on exact revision lineage. Only the current selection's unplaced basis
+ * change is `selectionOnly`: affected historical selections without
+ * placed orders create no fresh decision once the requirement is
+ * re-selected, while placed orders on any affected selection make the
+ * impact `reviewRequired` — the order history stays untouched and any
+ * substitute needs fresh approval.
  */
 export const assessQuoteRevisionImpact = f1Mutation({
   args: {
@@ -472,6 +477,15 @@ export const assessQuoteRevisionImpact = f1Mutation({
     );
     const scan = await scanSelections(ctx, basis);
     const affected = scan.rows.filter((row) => ancestorQuoteIds.has(row.quoteId));
+    // Current-vs-historical separation: the current selection is resolved
+    // exactly (newest indexed row), independently of the bounded scan, so
+    // a replaced historical selection never reopens a fresh decision.
+    // Only the current selection's unplaced basis change is `selectionOnly`;
+    // historical unplaced selections create no fresh decision, while placed
+    // orders on any affected selection still make the impact
+    // `reviewRequired`.
+    const currentAffected =
+      selection !== null && ancestorQuoteIds.has(selection.quoteId);
     const { placedOrderCount, orderScanOverBound } = await probePlacedOrdersAcross(
       ctx,
       basis,
@@ -509,17 +523,31 @@ export const assessQuoteRevisionImpact = f1Mutation({
       orderImpact = "reviewRequired";
       impactClause = `the placed-order scan exceeded ${PLACED_ORDER_PROBE_BOUND} rows; the re-evaluation is incomplete`;
     } else if (scan.selectionScanOverBound) {
-      orderImpact = placedOrderCount > 0 ? "reviewRequired" : "selectionOnly";
-      impactClause =
-        placedOrderCount > 0
-          ? `${placedOrderCount} placed order(s) keep their history and need fresh approval before any substitute; the selection scan exceeded ${SELECTION_SCAN_BOUND} rows, so the re-evaluation is incomplete`
-          : `the unplaced selection basis changed and can be re-decided; the selection scan exceeded ${SELECTION_SCAN_BOUND} rows, so the re-evaluation is incomplete`;
+      if (placedOrderCount > 0) {
+        orderImpact = "reviewRequired";
+        impactClause = `${placedOrderCount} placed order(s) keep their history and need fresh approval before any substitute; the selection scan exceeded ${SELECTION_SCAN_BOUND} rows, so the re-evaluation is incomplete`;
+      } else if (currentAffected) {
+        orderImpact = "selectionOnly";
+        impactClause = `the unplaced selection basis changed and can be re-decided; the selection scan exceeded ${SELECTION_SCAN_BOUND} rows, so the re-evaluation is incomplete`;
+      } else {
+        impactClause =
+          selection === null
+            ? `no selection exists for this requirement; the selection scan exceeded ${SELECTION_SCAN_BOUND} rows, so the re-evaluation is incomplete`
+            : `the current selection pins another revision (${selection.quoteVersion}); historical unplaced selections create no fresh decision; the selection scan exceeded ${SELECTION_SCAN_BOUND} rows, so the re-evaluation is incomplete`;
+      }
     } else if (lineageTruncated) {
-      orderImpact = placedOrderCount > 0 ? "reviewRequired" : "selectionOnly";
-      impactClause =
-        placedOrderCount > 0
-          ? `${placedOrderCount} placed order(s) keep their history and need fresh approval before any substitute; the revision lineage exceeded ${REVISION_LINEAGE_BOUND} generations, so the re-evaluation is incomplete`
-          : `the unplaced selection basis changed and can be re-decided; the revision lineage exceeded ${REVISION_LINEAGE_BOUND} generations, so the re-evaluation is incomplete`;
+      if (placedOrderCount > 0) {
+        orderImpact = "reviewRequired";
+        impactClause = `${placedOrderCount} placed order(s) keep their history and need fresh approval before any substitute; the revision lineage exceeded ${REVISION_LINEAGE_BOUND} generations, so the re-evaluation is incomplete`;
+      } else if (currentAffected) {
+        orderImpact = "selectionOnly";
+        impactClause = `the unplaced selection basis changed and can be re-decided; the revision lineage exceeded ${REVISION_LINEAGE_BOUND} generations, so the re-evaluation is incomplete`;
+      } else {
+        impactClause =
+          selection === null
+            ? `no selection exists for this requirement; the revision lineage exceeded ${REVISION_LINEAGE_BOUND} generations, so the re-evaluation is incomplete`
+            : `the current selection pins another revision (${selection.quoteVersion}); historical unplaced selections create no fresh decision; the revision lineage exceeded ${REVISION_LINEAGE_BOUND} generations, so the re-evaluation is incomplete`;
+      }
     } else if (placedOrderCount > 0) {
       orderImpact = "reviewRequired";
       impactClause =
@@ -530,12 +558,24 @@ export const assessQuoteRevisionImpact = f1Mutation({
       // The current decision already pins the new revision while older
       // affected selections carry no placed orders: nothing to re-decide.
       impactClause = "the current selection already pins this revision";
-    } else {
+    } else if (currentAffected) {
       orderImpact = "selectionOnly";
       impactClause =
         affected.length > 1
           ? `the unplaced selection basis changed on ${affected.length} affected selection(s) and can be re-decided`
           : "the unplaced selection basis changed and can be re-decided";
+    } else {
+      // The affected selections are all historical and unplaced while the
+      // current selection pins another revision: no fresh decision.
+      impactClause =
+        selection === null
+          ? "no selection exists for this requirement"
+          : `the current selection pins another revision (${selection.quoteVersion}); historical unplaced selections create no fresh decision`;
+    }
+    if (orderImpact === "none") {
+      // No fresh decision means no affected selection pointer: a `none`
+      // assessment never reopens a historical selection.
+      primaryAffected = null;
     }
     const { alternatives, truncated } = await evaluateAlternatives(
       ctx,
@@ -577,7 +617,11 @@ export const assessQuoteRevisionImpact = f1Mutation({
  * check (error/unknown) keeps the whole assessment `unknown`: availability
  * stays unknown, and placed orders are never marked delayed or otherwise
  * changed — the observation only records what is (not) known. A stale
- * observation is explicitly incomplete. Alternatives are re-evaluated
+ * observation is explicitly incomplete. Only the current selection of the
+ * watched candidate is `selectionOnly`: historical unplaced selections of
+ * the watched candidate create no fresh decision once the requirement is
+ * re-selected, while placed orders on any watched selection still make
+ * the impact `reviewRequired`. Alternatives are re-evaluated
  * from stored quote rows only.
  */
 export const assessWatchObservation = f1Mutation({
@@ -650,7 +694,14 @@ export const assessWatchObservation = f1Mutation({
     const selection = await latestSelection(ctx, basis);
     const scan = await scanSelections(ctx, basis);
     const watched = scan.rows.filter((row) => row.candidateId === watch.value.targetId);
-    const watchedCandidateSelected = watched.length > 0;
+    // Current-vs-historical separation, mirroring the quote-revision path:
+    // a replaced historical selection of the watched candidate never
+    // reopens a fresh decision. Only the current selection of the watched
+    // candidate is `selectionOnly`; historical unplaced selections create
+    // no fresh decision, while placed orders on any watched selection
+    // still make the impact `reviewRequired`.
+    const currentWatched =
+      selection !== null && selection.candidateId === watch.value.targetId;
     const failedCheck = args.result === "error" || args.result === "unknown";
     const { placedOrderCount, orderScanOverBound } = await probePlacedOrdersAcross(
       ctx,
@@ -658,18 +709,25 @@ export const assessWatchObservation = f1Mutation({
       watched.map((row) => row._id),
     );
     // Primary affected selection: the latest watched selection, matching
-    // the previous single-selection behavior when only one exists.
-    const primaryWatched: (typeof watched)[number] | null =
+    // the previous single-selection behavior when only one exists. A
+    // `none` assessment points at no selection: a replaced historical
+    // selection is never reopened.
+    let primaryWatched: (typeof watched)[number] | null =
       watched.length === 0 ? null : watched[watched.length - 1]!;
     let orderImpact: "none" | "selectionOnly" | "reviewRequired" | "unknown" = "none";
     if (failedCheck) {
       orderImpact = "unknown";
-    } else if (!watchedCandidateSelected) {
+    } else if (watched.length === 0) {
       orderImpact = "none";
     } else if (orderScanOverBound || scan.selectionScanOverBound || placedOrderCount > 0) {
       orderImpact = "reviewRequired";
+    } else if (!currentWatched) {
+      orderImpact = "none";
     } else {
       orderImpact = "selectionOnly";
+    }
+    if (orderImpact === "none") {
+      primaryWatched = null;
     }
     let impactClause: string;
     if (failedCheck) {
@@ -681,13 +739,16 @@ export const assessWatchObservation = f1Mutation({
         placedOrderCount > 0
           ? `${placedOrderCount} placed order(s) keep their history and need fresh approval before any substitute; the selection scan exceeded ${SELECTION_SCAN_BOUND} rows, so the re-evaluation is incomplete`
           : `the watched candidate is not the current selection; the selection scan exceeded ${SELECTION_SCAN_BOUND} rows, so the re-evaluation is incomplete`;
-    } else if (!watchedCandidateSelected) {
+    } else if (watched.length === 0) {
       impactClause = "the watched candidate is not the current selection";
     } else if (placedOrderCount > 0) {
       impactClause =
         watched.length > 1
           ? `${placedOrderCount} placed order(s) across ${watched.length} watched selection(s) keep their history and need fresh approval before any substitute`
           : `${placedOrderCount} placed order(s) keep their history and need fresh approval before any substitute`;
+    } else if (!currentWatched) {
+      impactClause =
+        "the watched candidate is not the current selection; historical unplaced selections create no fresh decision";
     } else {
       impactClause = "the unplaced selection can be re-decided";
     }
