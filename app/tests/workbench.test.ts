@@ -211,6 +211,13 @@ test("formats unknown money without turning missing charges into zero", () => {
   expect(formatMoney(795000, "EUR")).toContain("7,950");
 });
 
+test("keeps the narrow hero heading fluid with word wrapping", async () => {
+  const css = await Bun.file(new URL("../styles.css", import.meta.url)).text();
+  const narrow = css.slice(css.indexOf("@media (max-width: 480px)"));
+  expect(narrow).toMatch(/\.wb-page-heading h1 \{[^}]*clamp\(/);
+  expect(narrow).toContain("overflow-wrap: break-word");
+});
+
 // -- E4 quote currentness and authoritative comparable total ----------------
 
 function projectionWithCurrentCompleteQuote(): Record<string, unknown> {
@@ -1159,6 +1166,8 @@ test("contains service dialog focus, cycles first and last controls, handles Esc
     await act(async () => { open.click(); });
     const dialog = mounted.container.querySelector('[role="dialog"]');
     if (!(dialog instanceof Object)) throw new Error("Service dialog not found");
+    expect(mounted.container.querySelector(".wb-header")?.hasAttribute("inert")).toBe(true);
+    expect(mounted.container.querySelector(".wb-header")?.getAttribute("aria-hidden")).toBe("true");
     const controls = Array.from(dialog.querySelectorAll<HTMLElement>("button:not([disabled]), select:not([disabled]), textarea:not([disabled])"));
     const first = controls[0];
     const last = controls[controls.length - 1];
@@ -1182,6 +1191,8 @@ test("contains service dialog focus, cycles first and last controls, handles Esc
     });
     expect(mounted.container.querySelector('[role="dialog"]')).toBeNull();
     expect(mounted.container.ownerDocument.activeElement).toBe(open);
+    expect(mounted.container.querySelector(".wb-header")?.hasAttribute("inert")).toBe(false);
+    expect(mounted.container.querySelector(".wb-header")?.hasAttribute("aria-hidden")).toBe(false);
   } finally {
     await mounted.cleanup();
   }

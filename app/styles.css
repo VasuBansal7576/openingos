@@ -392,7 +392,7 @@ h1, h2, h3, p { margin-top: 0; }
   .wb-project-picker strong { font-size: .68rem; }
   .wb-nav button { padding-inline: .55rem; font-size: .56rem; }
   .wb-nav button .ui-icon { width: 13px; }
-  .wb-page-heading h1 { font-size: 2.85rem; }
+  .wb-page-heading h1 { font-size: clamp(2.1rem, 11vw, 2.85rem); overflow-wrap: break-word; }
   .wb-requirement-card, .wb-panel { padding: 1rem; }
   .wb-requirement-top { flex-direction: column; gap: .7rem; }
   .wb-requirement-facts { gap: .75rem; }

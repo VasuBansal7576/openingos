@@ -124,20 +124,36 @@ function useModalAccessibility(dialogRef: ModalElementRef, onClose: () => void, 
     const dialog = dialogRef.current;
     if (dialog === null || typeof document === "undefined") return;
     const previousActiveElement = document.activeElement as HTMLElement | null;
-    const modalRoot = dialog.closest<HTMLElement>(".wb-overlay");
-    const backgroundElements = modalRoot?.parentElement === null || modalRoot?.parentElement === undefined
-      ? []
-      : Array.from(modalRoot.parentElement.children)
-        .map((element) => element as HTMLElement)
-        .filter((element) => element !== modalRoot);
-    const previousBackgroundState = backgroundElements.map((element) => ({
-      element,
-      hadInert: element.hasAttribute("inert"),
-      ariaHidden: element.getAttribute("aria-hidden"),
-    }));
-    for (const element of backgroundElements) {
-      element.setAttribute("inert", "");
-      element.setAttribute("aria-hidden", "true");
+    // Hide the background level by level up to the workbench root, so deeply
+    // nested overlays (for example the service-case dialog inside an asset
+    // card) hide the header, navigation, and sibling content exactly like a
+    // root-level overlay. At each level every sibling that does not contain
+    // the dialog becomes inert; the dialog's own ancestor chain stays live.
+    const root = dialog.closest<HTMLElement>(".wb-app") ?? dialog.closest<HTMLElement>(".wb-overlay")?.parentElement ?? null;
+    const previousBackgroundState: { element: HTMLElement; hadInert: boolean; ariaHidden: string | null }[] = [];
+    const hideSiblings = (node: HTMLElement): void => {
+      const parent = node.parentElement;
+      if (parent === null) return;
+      for (const sibling of Array.from(parent.children)) {
+        const element = sibling as HTMLElement;
+        if (element.contains(dialog)) continue;
+        previousBackgroundState.push({
+          element,
+          hadInert: element.hasAttribute("inert"),
+          ariaHidden: element.getAttribute("aria-hidden"),
+        });
+        element.setAttribute("inert", "");
+        element.setAttribute("aria-hidden", "true");
+      }
+    };
+    if (root !== null) {
+      let node: HTMLElement | null = dialog;
+      while (node !== null && node !== root) {
+        hideSiblings(node);
+        node = node.parentElement;
+      }
+    } else {
+      hideSiblings(dialog);
     }
 
     const focusFirst = (): void => {
