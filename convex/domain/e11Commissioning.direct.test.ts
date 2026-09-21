@@ -124,6 +124,11 @@ const recordCostEntryRef = makeFunctionReference<
   MutationArgs<typeof fulfillment.recordCostEntry>,
   MutationReturn<typeof fulfillment.recordCostEntry>
 >("domain/fulfillment:recordCostEntry");
+const recordAssetRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof fulfillment.recordAsset>,
+  MutationReturn<typeof fulfillment.recordAsset>
+>("domain/fulfillment:recordAsset");
 const openServiceCaseRef = makeFunctionReference<
   "mutation",
   MutationArgs<typeof fulfillment.openServiceCase>,
@@ -425,6 +430,113 @@ describe("E11 duplicate callbacks and replays never duplicate assets (P-14)", ()
     if (!late.ok) expect(late.code).toBe("duplicate-conflict");
     const after = await counts(t, project);
     expect(after).toEqual({ events: 1, assets: 0, entries: 0, orders: 1 });
+  });
+});
+
+describe("E11 derived-key preemption can never attach a wrong asset", () => {
+  test("same visible label but wrong order conflicts with no event written", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, "preempt-order");
+    const graph = await setupOrderedMachine(t, project, "preempt-order");
+    const asOwner = t.withIdentity(OWNER);
+    // The derived key is public-shaped: anyone can pre-write it through
+    // the manual asset path with the same visible label but no order.
+    const planted = await asOwner.mutation(recordAssetRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      label: "Linea Mini #1",
+      idempotencyKey: "commissioning:evt-preempt-order",
+    });
+    if (!planted.ok) throw new Error("plant setup failed");
+    const collision = await asOwner.mutation(appendOrderEventRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      orderId: graph.orderId,
+      kind: "commissioning",
+      idempotencyKey: "evt-preempt-order",
+      commissioningAsset: { label: "Linea Mini #1" },
+    });
+    expect(collision.ok).toBe(false);
+    if (!collision.ok) expect(collision.code).toBe("duplicate-conflict");
+    // No partial write: the event never lands and the planted row keeps
+    // its shape (no order attached, no provenance invented).
+    const after = await counts(t, project);
+    expect(after).toEqual({ events: 0, assets: 1, entries: 0, orders: 1 });
+    const kept = await t.run((ctx) => ctx.db.get(planted.assetId));
+    expect(kept).not.toHaveProperty("orderId");
+    expect(kept).not.toHaveProperty("purchaseProvenance");
+  });
+
+  test("same order and label but forged provenance conflicts with no event written", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, "preempt-prov");
+    const graph = await setupOrderedMachine(t, project, "preempt-prov");
+    const asOwner = t.withIdentity(OWNER);
+    const planted = await asOwner.mutation(recordAssetRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      orderId: graph.orderId,
+      label: "Linea Mini #1",
+      purchaseProvenance: "forged handover",
+      idempotencyKey: "commissioning:evt-preempt-prov",
+    });
+    if (!planted.ok) throw new Error("plant setup failed");
+    const collision = await asOwner.mutation(appendOrderEventRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      orderId: graph.orderId,
+      kind: "commissioning",
+      idempotencyKey: "evt-preempt-prov",
+      commissioningAsset: { label: "Linea Mini #1" },
+    });
+    expect(collision.ok).toBe(false);
+    if (!collision.ok) expect(collision.code).toBe("duplicate-conflict");
+    const after = await counts(t, project);
+    expect(after).toEqual({ events: 0, assets: 1, entries: 0, orders: 1 });
+    const kept = await t.run((ctx) => ctx.db.get(planted.assetId));
+    expect(kept?.purchaseProvenance).toBe("forged handover");
+  });
+
+  test("original with payload then replay without payload fails closed", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, "omit-replay");
+    const graph = await setupOrderedMachine(t, project, "omit-replay");
+    const asOwner = t.withIdentity(OWNER);
+    const first = await asOwner.mutation(appendOrderEventRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      orderId: graph.orderId,
+      kind: "commissioning",
+      idempotencyKey: "evt-omit-replay",
+      commissioningAsset: { label: "Linea Mini #1" },
+    });
+    if (!first.ok) throw new Error("first failed");
+    // The event row cannot prove the omitted payload, so the derived
+    // asset is neither exposed nor attached: stable conflict, no writes.
+    const omitted = await asOwner.mutation(appendOrderEventRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      orderId: graph.orderId,
+      kind: "commissioning",
+      idempotencyKey: "evt-omit-replay",
+    });
+    expect(omitted.ok).toBe(false);
+    if (!omitted.ok) expect(omitted.code).toBe("duplicate-conflict");
+    const after = await counts(t, project);
+    expect(after).toEqual({ events: 1, assets: 1, entries: 0, orders: 1 });
+    // The exact replay still resolves to both rows.
+    const exact = await asOwner.mutation(appendOrderEventRef, {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      orderId: graph.orderId,
+      kind: "commissioning",
+      idempotencyKey: "evt-omit-replay",
+      commissioningAsset: { label: "Linea Mini #1" },
+    });
+    if (!exact.ok) throw new Error(`exact replay failed: ${JSON.stringify(exact)}`);
+    expect(exact.eventId).toBe(first.eventId);
+    expect(exact.assetId).toBe(first.assetId);
+    expect(exact.assetDeduplicated).toBe(true);
   });
 });
 
