@@ -89,6 +89,16 @@ const claimRecoveryRef = makeFunctionReference<
   MutationArgs<typeof callbacks.claimRecoveryRead>,
   MutationReturn<typeof callbacks.claimRecoveryRead>
 >("communication/callbacks:claimRecoveryRead");
+const settleRecoveryRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof callbacks.settleRecoveryRun>,
+  MutationReturn<typeof callbacks.settleRecoveryRun>
+>("communication/callbacks:settleRecoveryRun");
+const watchdogRecoveryRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof callbacks.watchdogRecoveryRun>,
+  MutationReturn<typeof callbacks.watchdogRecoveryRun>
+>("communication/callbacks:watchdogRecoveryRun");
 const advanceMigrationRef = makeFunctionReference<
   "mutation",
   MutationArgs<typeof callbacks.advanceThreadMigration>,
@@ -1762,33 +1772,40 @@ describe("C1 Greptile P1 replay/scale repairs (r4058523015/r4058523016/r40585230
 
   test("recovery claims stop after three admitted reads", async () => {
     const f = await fixture();
-    await f.t.mutation(bindingRef, {
-      operationId: f.operationId,
-      messageId: "claim-outbound",
-      threadId: "claim-thread",
-      inboxId: "owner-inbox",
-    });
-    await seedOversizedRow(f, "claim-reply", "claim-thread", { contentHash: "controlled", byteSize: 300_000 });
-    expect(await f.t.mutation(claimRecoveryRef, {
-      threadId: "claim-thread",
-      inboxId: "owner-inbox",
-      messageId: "claim-reply",
-    })).toMatchObject({ ok: true, attemptNumber: 1 });
-    expect(await f.t.mutation(claimRecoveryRef, {
-      threadId: "claim-thread",
-      inboxId: "owner-inbox",
-      messageId: "claim-reply",
-    })).toMatchObject({ ok: true, attemptNumber: 2 });
-    expect(await f.t.mutation(claimRecoveryRef, {
-      threadId: "claim-thread",
-      inboxId: "owner-inbox",
-      messageId: "claim-reply",
-    })).toMatchObject({ ok: true, attemptNumber: 3 });
-    expect(await f.t.mutation(claimRecoveryRef, {
-      threadId: "claim-thread",
-      inboxId: "owner-inbox",
-      messageId: "claim-reply",
-    })).toMatchObject({ ok: false, code: "recovery-attempts-exhausted" });
+    const restorePricing = setRecoveryPricingEnv(RECOVERY_READ_COST);
+    try {
+      await ensureRecoveryBudget(f, 1_000);
+      await f.t.mutation(bindingRef, {
+        operationId: f.operationId,
+        messageId: "claim-outbound",
+        threadId: "claim-thread",
+        inboxId: "owner-inbox",
+      });
+      await seedOversizedRow(f, "claim-reply", "claim-thread", { contentHash: "controlled", byteSize: 300_000 });
+      const gated = await f.t.mutation(recoveryGateRef, {
+        threadId: "claim-thread",
+        inboxId: "owner-inbox",
+        messageId: "claim-reply",
+      });
+      expect(gated).toMatchObject({ ok: true });
+      if (!gated.ok) throw new Error("gate denied");
+      const claimArgs = {
+        threadId: "claim-thread",
+        inboxId: "owner-inbox",
+        messageId: "claim-reply",
+        jobId: gated.jobId,
+        reservationId: gated.reservationId,
+      };
+      expect(await f.t.mutation(claimRecoveryRef, claimArgs)).toMatchObject({ ok: true, attemptNumber: 1 });
+      expect(await f.t.mutation(claimRecoveryRef, claimArgs)).toMatchObject({ ok: true, attemptNumber: 2 });
+      expect(await f.t.mutation(claimRecoveryRef, claimArgs)).toMatchObject({ ok: true, attemptNumber: 3 });
+      expect(await f.t.mutation(claimRecoveryRef, claimArgs)).toMatchObject({
+        ok: false,
+        code: "recovery-attempts-exhausted",
+      });
+    } finally {
+      restorePricing();
+    }
   });
 
   test("resume denies conflicting bytes without exact content", async () => {
@@ -2006,7 +2023,7 @@ describe("C1 Greptile P1 replay/scale repairs (r4058523015/r4058523016/r40585230
     }
   });
 
-  test("a hung provider read trips the per-read deadline", async () => {
+    test("a hung provider read trips the per-read deadline", async () => {
     const f = await fixture();
     const restorePricing = setRecoveryPricingEnv(RECOVERY_READ_COST);
     const restoreKey = setApiKeyEnv("controlled-recovery-key");
@@ -2087,10 +2104,12 @@ describe("C1 Greptile P1 replay/scale repairs (r4058523015/r4058523016/r40585230
       eventId: "mig-early",
     });
     expect(early).toMatchObject({ ok: true, state: "waitingForBinding" });
-    // First bounded pass proves 65 rows without writing any identity: the
-    // cap is a page size, not a verdict.
+    // First bounded page proves 64 rows without writing any identity: the
+    // page size is a bound, not a verdict. The positional continuation
+    // cursor never reads creation times, so rows sharing a timestamp
+    // cannot stall progress the way a time cursor could.
     const first = await f.t.mutation(advanceMigrationRef, { threadId: "mig-thread", inboxId: "owner-inbox" });
-    expect(first).toMatchObject({ ok: true, state: "verifying", verifiedReads: 65, replayed: 0, stillWaiting: 0 });
+    expect(first).toMatchObject({ ok: true, state: "verifying", verifiedReads: 64, replayed: 0, stillWaiting: 0 });
     const noBindingYet = await threadIdentityRows(f, "mig-thread");
     expect(noBindingYet).toHaveLength(0);
     // The second pass proves the remainder, writes one durable identity,
@@ -2211,4 +2230,695 @@ describe("C1 Greptile P1 replay/scale repairs (r4058523015/r4058523016/r40585230
     expect(states).toHaveLength(1);
     expect(states[0]?.state).toBe("complete");
   });
+
+  test("a restarted run retains prior claims and settles the exact total", async () => {
+    const f = await fixture();
+    const giant = `z`.repeat(262_145);
+    const giantMessage = { ...inbound("crash-reply", "crash-thread"), text: giant };
+    const restorePricing = setRecoveryPricingEnv(RECOVERY_READ_COST);
+    const restoreKey = setApiKeyEnv("controlled-recovery-key");
+    try {
+      await ensureRecoveryBudget(f, 1_000);
+      await f.t.mutation(bindingRef, {
+        operationId: f.operationId,
+        messageId: "crash-outbound",
+        threadId: "crash-thread",
+        inboxId: "owner-inbox",
+      });
+      await seedOversizedRow(f, "crash-reply", "crash-thread", {
+        contentHash: payloadHash({ messageId: "crash-reply", text: giant, html: "" }),
+        byteSize: 262_145,
+      });
+      // A first run is admitted and claims one read, then crashes before reading.
+      const firstGate = await f.t.mutation(recoveryGateRef, {
+        threadId: "crash-thread",
+        inboxId: "owner-inbox",
+        messageId: "crash-reply",
+      });
+      expect(firstGate).toMatchObject({ ok: true });
+      if (!firstGate.ok) throw new Error("gate denied");
+      expect(await f.t.mutation(claimRecoveryRef, {
+        threadId: "crash-thread",
+        inboxId: "owner-inbox",
+        messageId: "crash-reply",
+        jobId: firstGate.jobId,
+        reservationId: firstGate.reservationId,
+      })).toMatchObject({ ok: true, attemptNumber: 1 });
+      // Restart: the gate reuses the open run, the action reads once more,
+      // and settlement retains both claimed reads, not just its own.
+      const { calls } = stubGetMessage(giantMessage);
+      const recovered = await f.t.action(recoverRef, {
+        threadId: "crash-thread",
+        inboxId: "owner-inbox",
+        messageId: "crash-reply",
+      });
+      expect(calls).toHaveLength(1);
+      expect(recovered).toMatchObject({ ok: true, state: "replyReceived", deduplicated: false });
+      expect(await readLedger(f)).toEqual({ reserved: 0, spent: 0, unresolved: 20 });
+      const gate = await f.t.mutation(recoveryGateRef, {
+        threadId: "crash-thread",
+        inboxId: "owner-inbox",
+        messageId: "crash-reply",
+      });
+      expect(gate).toMatchObject({ ok: false, code: "invalid-payload" });
+    } finally {
+      restorePricing();
+      restoreKey();
+    }
+  }, 120_000);
+
+  test("an exhausted crashed run settles through the watchdog path", async () => {
+    const f = await fixture();
+    const restorePricing = setRecoveryPricingEnv(RECOVERY_READ_COST);
+    try {
+      await ensureRecoveryBudget(f, 1_000);
+      await f.t.mutation(bindingRef, {
+        operationId: f.operationId,
+        messageId: "watchdog-outbound",
+        threadId: "watchdog-thread",
+        inboxId: "owner-inbox",
+      });
+      await seedOversizedRow(f, "watchdog-reply", "watchdog-thread", {
+        contentHash: "controlled",
+        byteSize: 300_000,
+      });
+      const gated = await f.t.mutation(recoveryGateRef, {
+        threadId: "watchdog-thread",
+        inboxId: "owner-inbox",
+        messageId: "watchdog-reply",
+      });
+      expect(gated).toMatchObject({ ok: true });
+      if (!gated.ok) throw new Error("gate denied");
+      // Three claimed reads, then the run crashes before settling.
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        expect(await f.t.mutation(claimRecoveryRef, {
+          threadId: "watchdog-thread",
+          inboxId: "owner-inbox",
+          messageId: "watchdog-reply",
+          jobId: gated.jobId,
+          reservationId: gated.reservationId,
+        })).toMatchObject({ ok: true, attemptNumber: attempt });
+      }
+      const watched = await f.t.mutation(watchdogRecoveryRef, {
+        jobId: gated.jobId,
+        reservationId: gated.reservationId,
+        threadId: "watchdog-thread",
+        inboxId: "owner-inbox",
+        messageId: "watchdog-reply",
+      });
+      expect(watched).toMatchObject({ ok: true, settled: true });
+      expect(await readLedger(f)).toEqual({ reserved: 0, spent: 0, unresolved: 30 });
+      expect(await executionJobs(f)).toHaveLength(1);
+      const jobs = await executionJobs(f);
+      expect(jobs[0]?.state).toBe("failed");
+      const replay = await f.t.mutation(replayRef, { threadId: "watchdog-thread", inboxId: "owner-inbox" });
+      expect(replay).toMatchObject({ ok: true, replayed: 0, stillWaiting: 1 });
+    } finally {
+      restorePricing();
+    }
+  });
+
+  test("settlement fails closed when the budget row is gone", async () => {
+    const f = await fixture();
+    const restorePricing = setRecoveryPricingEnv(RECOVERY_READ_COST);
+    try {
+      await ensureRecoveryBudget(f, 1_000);
+      await f.t.mutation(bindingRef, {
+        operationId: f.operationId,
+        messageId: "nobudget-outbound",
+        threadId: "nobudget-thread",
+        inboxId: "owner-inbox",
+      });
+      await seedOversizedRow(f, "nobudget-reply", "nobudget-thread", {
+        contentHash: "controlled",
+        byteSize: 300_000,
+      });
+      const gated = await f.t.mutation(recoveryGateRef, {
+        threadId: "nobudget-thread",
+        inboxId: "owner-inbox",
+        messageId: "nobudget-reply",
+      });
+      expect(gated).toMatchObject({ ok: true });
+      if (!gated.ok) throw new Error("gate denied");
+      await f.t.run(async (ctx) => {
+        const rows = await ctx.db.query("providerBudgets").take(2);
+        for (const row of rows) {
+          await ctx.db.delete(row._id);
+        }
+      });
+      const settled = await f.t.mutation(settleRecoveryRef, {
+        jobId: gated.jobId,
+        reservationId: gated.reservationId,
+        threadId: "nobudget-thread",
+        inboxId: "owner-inbox",
+        messageId: "nobudget-reply",
+        outcome: "unknown",
+      });
+      expect(settled).toMatchObject({ ok: false, code: "allowance-exhausted" });
+      // The reservation stays open and locked rather than closing silently.
+      const reservations = await reservationRows(f);
+      expect(reservations).toHaveLength(1);
+      expect(reservations[0]?.state).toBe("open");
+      expect(reservations[0]?.reservedMicroUsd).toBe(30);
+    } finally {
+      restorePricing();
+    }
+  });
+
+  test("a stale-basis reservation is not reused for a new run", async () => {
+    const f = await fixture();
+    const restorePricing = setRecoveryPricingEnv(RECOVERY_READ_COST);
+    try {
+      await ensureRecoveryBudget(f, 1_000);
+      await f.t.mutation(bindingRef, {
+        operationId: f.operationId,
+        messageId: "stale-reply",
+        threadId: "stale-thread",
+        inboxId: "owner-inbox",
+      });
+      await seedOversizedRow(f, "stale-reply", "stale-thread", {
+        contentHash: "controlled",
+        byteSize: 300_000,
+      });
+      const first = await f.t.mutation(recoveryGateRef, {
+        threadId: "stale-thread",
+        inboxId: "owner-inbox",
+        messageId: "stale-reply",
+      });
+      expect(first).toMatchObject({ ok: true });
+      if (!first.ok) throw new Error("gate denied");
+      await f.t.run(async (ctx) => {
+        const reservation = await ctx.db.get(first.reservationId);
+        if (reservation === null) throw new Error("reservation missing");
+        await ctx.db.patch(reservation._id, { pricingBasis: reconciliationPricingBasis(99) });
+      });
+      // The stale open run blocks rotation instead of stranding a second
+      // open reservation beside it.
+      const blocked = await f.t.mutation(recoveryGateRef, {
+        threadId: "stale-thread",
+        inboxId: "owner-inbox",
+        messageId: "stale-reply",
+      });
+      expect(blocked).toMatchObject({ ok: false, code: "unknown-charges-reserved" });
+      expect((await reservationRows(f)).filter((row) => row.state === "open")).toHaveLength(1);
+      // After the old run closes, a later gate admits the remaining-read run.
+      expect(await f.t.mutation(settleRecoveryRef, {
+        jobId: first.jobId,
+        reservationId: first.reservationId,
+        threadId: "stale-thread",
+        inboxId: "owner-inbox",
+        messageId: "stale-reply",
+        outcome: "unknown",
+      })).toMatchObject({ ok: true });
+      const second = await f.t.mutation(recoveryGateRef, {
+        threadId: "stale-thread",
+        inboxId: "owner-inbox",
+        messageId: "stale-reply",
+      });
+      expect(second).toMatchObject({ ok: true });
+      if (!second.ok) throw new Error("gate denied");
+      expect(second.reservationId).not.toBe(first.reservationId);
+      expect(second.jobId).not.toBe(first.jobId);
+    } finally {
+      restorePricing();
+    }
+  });
+
+  test("admission queues a watchdog that releases a zero-claim run", async () => {
+    const f = await fixture();
+    const restorePricing = setRecoveryPricingEnv(RECOVERY_READ_COST);
+    // Fake timers before admission so the 60s admission watchdog lands on
+    // the fake clock and the harness can advance past it.
+    vi.useFakeTimers();
+    try {
+      await ensureRecoveryBudget(f, 1_000);
+      await f.t.mutation(bindingRef, {
+        operationId: f.operationId,
+        messageId: "admit-watch-outbound",
+        threadId: "admit-watch-thread",
+        inboxId: "owner-inbox",
+      });
+      await seedOversizedRow(f, "admit-watch-reply", "admit-watch-thread", {
+        contentHash: "controlled",
+        byteSize: 300_000,
+      });
+      const gated = await f.t.mutation(recoveryGateRef, {
+        threadId: "admit-watch-thread",
+        inboxId: "owner-inbox",
+        messageId: "admit-watch-reply",
+      });
+      expect(gated).toMatchObject({ ok: true, readsRemaining: 3 });
+      expect(await readLedger(f)).toEqual({ reserved: 30, spent: 0, unresolved: 0 });
+      // No claim and no action ever run: advancing past the admission
+      // watchdog delay settles the zero-claim run with zero provider reads.
+      await f.t.finishAllScheduledFunctions(() => vi.advanceTimersByTime(61_000));
+      expect(await readLedger(f)).toEqual({ reserved: 0, spent: 0, unresolved: 0 });
+      const jobs = await executionJobs(f);
+      expect(jobs).toHaveLength(1);
+      expect(jobs[0]?.state).toBe("failed");
+      const replay = await f.t.mutation(replayRef, { threadId: "admit-watch-thread", inboxId: "owner-inbox" });
+      expect(replay).toMatchObject({ ok: true, replayed: 0, stillWaiting: 1 });
+    } finally {
+      vi.useRealTimers();
+      restorePricing();
+    }
+  });
+  test("a crash after admission settles the zero-claim run", async () => {
+    const f = await fixture();
+    const restorePricing = setRecoveryPricingEnv(RECOVERY_READ_COST);
+    try {
+      await ensureRecoveryBudget(f, 1_000);
+      await f.t.mutation(bindingRef, {
+        operationId: f.operationId,
+        messageId: "admit-crash-outbound",
+        threadId: "admit-crash-thread",
+        inboxId: "owner-inbox",
+      });
+      await seedOversizedRow(f, "admit-crash-reply", "admit-crash-thread", {
+        contentHash: "controlled",
+        byteSize: 300_000,
+      });
+      const gated = await f.t.mutation(recoveryGateRef, {
+        threadId: "admit-crash-thread",
+        inboxId: "owner-inbox",
+        messageId: "admit-crash-reply",
+      });
+      expect(gated).toMatchObject({ ok: true });
+      if (!gated.ok) throw new Error("gate denied");
+      expect(await readLedger(f)).toEqual({ reserved: 30, spent: 0, unresolved: 0 });
+      // The admitted run crashes before any claim. Its admission watchdog
+      // settles the zero-claim run without any provider read.
+      expect(await f.t.mutation(watchdogRecoveryRef, {
+        jobId: gated.jobId,
+        reservationId: gated.reservationId,
+        threadId: "admit-crash-thread",
+        inboxId: "owner-inbox",
+        messageId: "admit-crash-reply",
+      })).toMatchObject({ ok: true, settled: true });
+      expect(await readLedger(f)).toEqual({ reserved: 0, spent: 0, unresolved: 0 });
+      const jobs = await executionJobs(f);
+      expect(jobs).toHaveLength(1);
+      expect(jobs[0]?.state).toBe("failed");
+      // The row still waits with zero claims, so a later gate admits fresh.
+      const retry = await f.t.mutation(recoveryGateRef, {
+        threadId: "admit-crash-thread",
+        inboxId: "owner-inbox",
+        messageId: "admit-crash-reply",
+      });
+      expect(retry).toMatchObject({ ok: true, readsRemaining: 3 });
+    } finally {
+      restorePricing();
+    }
+  });
+
+  test("a rotated run settles only its own reads and resets its watchdog budget", async () => {
+    const f = await fixture();
+    const restorePricing = setRecoveryPricingEnv(RECOVERY_READ_COST);
+    try {
+      await ensureRecoveryBudget(f, 1_000);
+      await f.t.mutation(bindingRef, {
+        operationId: f.operationId,
+        messageId: "rotate-outbound",
+        threadId: "rotate-thread",
+        inboxId: "owner-inbox",
+      });
+      await seedOversizedRow(f, "rotate-reply", "rotate-thread", {
+        contentHash: "controlled",
+        byteSize: 300_000,
+      });
+      // Run A: admit, claim once, then settle unknown (simulated crash
+      // after one read). Retains exactly 1c.
+      const gateA = await f.t.mutation(recoveryGateRef, {
+        threadId: "rotate-thread",
+        inboxId: "owner-inbox",
+        messageId: "rotate-reply",
+      });
+      expect(gateA).toMatchObject({ ok: true });
+      if (!gateA.ok) throw new Error("gate denied");
+      expect(await f.t.mutation(claimRecoveryRef, {
+        threadId: "rotate-thread",
+        inboxId: "owner-inbox",
+        messageId: "rotate-reply",
+        jobId: gateA.jobId,
+        reservationId: gateA.reservationId,
+      })).toMatchObject({ ok: true, attemptNumber: 1 });
+      expect(await f.t.mutation(settleRecoveryRef, {
+        jobId: gateA.jobId,
+        reservationId: gateA.reservationId,
+        threadId: "rotate-thread",
+        inboxId: "owner-inbox",
+        messageId: "rotate-reply",
+        outcome: "unknown",
+      })).toMatchObject({ ok: true });
+      expect(await readLedger(f)).toEqual({ reserved: 0, spent: 0, unresolved: 10 });
+      // Run B rotates at baseline 1 with a 2c reservation.
+      const gateB = await f.t.mutation(recoveryGateRef, {
+        threadId: "rotate-thread",
+        inboxId: "owner-inbox",
+        messageId: "rotate-reply",
+      });
+      expect(gateB).toMatchObject({ ok: true, readsRemaining: 2, readCostMicroUsd: RECOVERY_READ_COST });
+      if (!gateB.ok) throw new Error("gate denied");
+      expect(gateB.jobId).not.toBe(gateA.jobId);
+      // Crash before and after run B's only claim: restarts reuse the same
+      // open run and never create a second open reservation.
+      expect(await f.t.mutation(claimRecoveryRef, {
+        threadId: "rotate-thread",
+        inboxId: "owner-inbox",
+        messageId: "rotate-reply",
+        jobId: gateB.jobId,
+        reservationId: gateB.reservationId,
+      })).toMatchObject({ ok: true, attemptNumber: 2 });
+      const restart = await f.t.mutation(recoveryGateRef, {
+        threadId: "rotate-thread",
+        inboxId: "owner-inbox",
+        messageId: "rotate-reply",
+      });
+      expect(restart).toMatchObject({
+        ok: true,
+        jobId: gateB.jobId,
+        reservationId: gateB.reservationId,
+        readsRemaining: 1,
+      });
+      const openReservations = (await reservationRows(f)).filter((row) => row.state === "open");
+      expect(openReservations).toHaveLength(1);
+      expect(openReservations[0]?._id).toBe(gateB.reservationId);
+      // Settlement retains only run B's single read: 1c here plus run A's
+      // 1c, exactly 2c total for two actual reads, not 3c.
+      expect(await f.t.mutation(settleRecoveryRef, {
+        jobId: gateB.jobId,
+        reservationId: gateB.reservationId,
+        threadId: "rotate-thread",
+        inboxId: "owner-inbox",
+        messageId: "rotate-reply",
+        outcome: "unknown",
+      })).toMatchObject({ ok: true });
+      expect(await readLedger(f)).toEqual({ reserved: 0, spent: 0, unresolved: 20 });
+      expect((await reservationRows(f)).filter((row) => row.state === "open")).toHaveLength(0);
+    } finally {
+      restorePricing();
+    }
+  });
+
+  test("a failed settlement retries after repair and then stops scheduling", async () => {
+    const f = await fixture();
+    const restorePricing = setRecoveryPricingEnv(RECOVERY_READ_COST);
+    try {
+      await ensureRecoveryBudget(f, 1_000);
+      await f.t.mutation(bindingRef, {
+        operationId: f.operationId,
+        messageId: "retry-outbound",
+        threadId: "retry-thread",
+        inboxId: "owner-inbox",
+      });
+      await seedOversizedRow(f, "retry-reply", "retry-thread", {
+        contentHash: "controlled",
+        byteSize: 300_000,
+      });
+      const gated = await f.t.mutation(recoveryGateRef, {
+        threadId: "retry-thread",
+        inboxId: "owner-inbox",
+        messageId: "retry-reply",
+      });
+      expect(gated).toMatchObject({ ok: true });
+      if (!gated.ok) throw new Error("gate denied");
+      expect(await f.t.mutation(claimRecoveryRef, {
+        threadId: "retry-thread",
+        inboxId: "owner-inbox",
+        messageId: "retry-reply",
+        jobId: gated.jobId,
+        reservationId: gated.reservationId,
+      })).toMatchObject({ ok: true, attemptNumber: 1 });
+      // Break the run linkage so the first settlement fails.
+      await f.t.run(async (ctx) => {
+        const rows = await ctx.db
+          .query("processedEvents")
+          .withIndex("by_provider_environment_and_provider_message_and_thread_and_inbox", (q) =>
+            q
+              .eq("provider", "agentmail-inbound")
+              .eq("environment", "live")
+              .eq("providerMessageId", "retry-reply")
+              .eq("providerThreadId", "retry-thread")
+              .eq("providerInboxId", "owner-inbox"),
+          )
+          .take(2);
+        const row = rows[0];
+        if (row === undefined) throw new Error("row missing");
+        const outcome = JSON.parse(row.outcome as string) as Record<string, unknown>;
+        await ctx.db.patch(row._id, {
+          outcome: JSON.stringify({ ...outcome, recoveryReservationId: "broken-reservation-id" }),
+        });
+      });
+      const failed = await f.t.mutation(watchdogRecoveryRef, {
+        jobId: gated.jobId,
+        reservationId: gated.reservationId,
+        threadId: "retry-thread",
+        inboxId: "owner-inbox",
+        messageId: "retry-reply",
+      });
+      expect(failed).toMatchObject({ ok: true, settled: false });
+      expect(await readLedger(f)).toEqual({ reserved: 30, spent: 0, unresolved: 0 });
+      // Repair the linkage; the manual retry (standing in for the scheduled
+      // backoff) settles exactly the one claimed read.
+      await f.t.run(async (ctx) => {
+        const rows = await ctx.db
+          .query("processedEvents")
+          .withIndex("by_provider_environment_and_provider_message_and_thread_and_inbox", (q) =>
+            q
+              .eq("provider", "agentmail-inbound")
+              .eq("environment", "live")
+              .eq("providerMessageId", "retry-reply")
+              .eq("providerThreadId", "retry-thread")
+              .eq("providerInboxId", "owner-inbox"),
+          )
+          .take(2);
+        const row = rows[0];
+        if (row === undefined) throw new Error("row missing");
+        const outcome = JSON.parse(row.outcome as string) as Record<string, unknown>;
+        await ctx.db.patch(row._id, {
+          outcome: JSON.stringify({ ...outcome, recoveryReservationId: gated.reservationId }),
+        });
+      });
+      const retried = await f.t.mutation(watchdogRecoveryRef, {
+        jobId: gated.jobId,
+        reservationId: gated.reservationId,
+        threadId: "retry-thread",
+        inboxId: "owner-inbox",
+        messageId: "retry-reply",
+      });
+      expect(retried).toMatchObject({ ok: true, settled: true });
+      expect(await readLedger(f)).toEqual({ reserved: 0, spent: 0, unresolved: 10 });
+      const jobs = await executionJobs(f);
+      expect(jobs).toHaveLength(1);
+      expect(jobs[0]?.state).toBe("failed");
+    } finally {
+      restorePricing();
+    }
+  });
+
+  async function seedStructuredNoise(
+    f: Fixture,
+    provider: string,
+    count: number,
+    messagePrefix: string,
+  ): Promise<void> {
+    await f.t.run(async (ctx) => {
+      const now = Date.now();
+      for (let index = 0; index < count; index += 1) {
+        const messageId = `${messagePrefix}-${index}`;
+        await ctx.db.insert("processedEvents", {
+          provider,
+          environment: "live",
+          eventId: `noise-event-${messagePrefix}-${index}`,
+          processingVersion: 1,
+          outcome: JSON.stringify({ messageId, threadId: `noise-thread-${index}`, inboxId: "owner-inbox" }),
+          providerMessageId: messageId,
+          providerThreadId: `noise-thread-${index}`,
+          providerInboxId: "owner-inbox",
+          organizationId: f.organizationId,
+          projectId: f.projectId,
+          operationId: f.operationId,
+          applicationOutcome: "unknown",
+          applicationState: "outcomeUnknown",
+          createdAt: now + index,
+        });
+      }
+    });
+  }
+
+  test("backfill finds a legacy row among hundreds of structured rows", async () => {
+    const f = await fixture();
+    await seedStructuredNoise(f, "agentmail-binding", 100, "noise-binding");
+    // One true legacy row: binding facts only in outcome JSON, no
+    // structured provider fields.
+    await f.t.run(async (ctx) => {
+      await ctx.db.insert("processedEvents", {
+        provider: "agentmail-binding",
+        environment: "live",
+        eventId: "legacy-outbound",
+        processingVersion: 1,
+        outcome: JSON.stringify({ messageId: "legacy-outbound", threadId: "legacy-thread", inboxId: "owner-inbox" }),
+        organizationId: f.organizationId,
+        projectId: f.projectId,
+        operationId: f.operationId,
+        applicationOutcome: "unknown",
+        applicationState: "outcomeUnknown",
+        createdAt: Date.now(),
+      });
+    });
+    const bound = await f.t.mutation(bindingRef, {
+      operationId: f.operationId,
+      messageId: "legacy-send",
+      threadId: "legacy-thread",
+      inboxId: "owner-inbox",
+    });
+    expect(bound).toMatchObject({ ok: true });
+    const identities = await threadIdentityRows(f, "legacy-thread");
+    expect(identities).toHaveLength(1);
+    expect(identities[0]?.conversationId).toBe(f.conversationId);
+  });
+
+  test("legacy inbound routing finds its row among hundreds of structured rows", async () => {
+    const f = await fixture();
+    await seedStructuredNoise(f, "agentmail-binding", 100, "noise-route");
+    await f.t.run(async (ctx) => {
+      await ctx.db.insert("processedEvents", {
+        provider: "agentmail-binding",
+        environment: "live",
+        eventId: "legacy-route-outbound",
+        processingVersion: 1,
+        outcome: JSON.stringify({ messageId: "legacy-route-outbound", threadId: "legacy-route-thread", inboxId: "owner-inbox" }),
+        organizationId: f.organizationId,
+        projectId: f.projectId,
+        operationId: f.operationId,
+        applicationOutcome: "unknown",
+        applicationState: "outcomeUnknown",
+        createdAt: Date.now(),
+      });
+    });
+    const reply = await f.t.mutation(ingestMessageRef, {
+      message: inbound("legacy-route-reply", "legacy-route-thread", "<p>Legacy routed terms</p>"),
+      thread: { thread_id: "legacy-route-thread" },
+      eventId: "legacy-route-inbound",
+    });
+    expect(reply).toMatchObject({ ok: true, state: "replyReceived", deduplicated: false });
+    // The legacy row earned structured fields and the durable identity.
+    const migrated = await f.t.run(async (ctx) =>
+      await ctx.db
+        .query("processedEvents")
+        .withIndex("by_provider_environment_and_provider_message_and_thread_and_inbox", (q) =>
+          q
+            .eq("provider", "agentmail-binding")
+            .eq("environment", "live")
+            .eq("providerMessageId", "legacy-route-outbound")
+            .eq("providerThreadId", "legacy-route-thread")
+            .eq("providerInboxId", "owner-inbox"),
+        )
+        .take(2),
+    );
+    expect(migrated).toHaveLength(1);
+    expect(await threadIdentityRows(f, "legacy-route-thread")).toHaveLength(1);
+  });
+
+  test("early callback reconciliation finds its legacy row among structured rows", async () => {
+    const f = await fixture();
+    await seedStructuredNoise(f, "agentmail-callback", 100, "noise-callback");
+    // One true legacy callback row: binding facts only in outcome JSON.
+    await f.t.run(async (ctx) => {
+      await ctx.db.insert("processedEvents", {
+        provider: "agentmail-callback",
+        environment: "live",
+        eventId: "event-legacy-callback",
+        processingVersion: 1,
+        outcome: JSON.stringify({
+          eventId: "event-legacy-callback",
+          eventType: "message.sent",
+          messageId: "legacy-callback-message",
+          threadId: "legacy-callback-thread",
+          inboxId: "owner-inbox",
+          rawForBinding: "{}",
+        }),
+        applicationOutcome: "unknown",
+        applicationState: "outcomeUnknown",
+        createdAt: Date.now(),
+      });
+    });
+    const bound = await f.t.mutation(bindingRef, {
+      operationId: f.operationId,
+      messageId: "legacy-callback-message",
+      threadId: "legacy-callback-thread",
+      inboxId: "owner-inbox",
+    });
+    expect(bound).toMatchObject({ ok: true, bound: true, applied: true });
+  });
+
+  test("a watchdog settlement denies later claims before any provider read", async () => {
+    const f = await fixture();
+    const restorePricing = setRecoveryPricingEnv(RECOVERY_READ_COST);
+    const restoreKey = setApiKeyEnv("controlled-recovery-key");
+    try {
+      await ensureRecoveryBudget(f, 1_000);
+      await f.t.mutation(bindingRef, {
+        operationId: f.operationId,
+        messageId: "race-outbound",
+        threadId: "race-thread",
+        inboxId: "owner-inbox",
+      });
+      await seedOversizedRow(f, "race-reply", "race-thread", {
+        contentHash: "controlled",
+        byteSize: 300_000,
+      });
+      const gated = await f.t.mutation(recoveryGateRef, {
+        threadId: "race-thread",
+        inboxId: "owner-inbox",
+        messageId: "race-reply",
+      });
+      expect(gated).toMatchObject({ ok: true });
+      if (!gated.ok) throw new Error("gate denied");
+      const claimArgs = {
+        threadId: "race-thread",
+        inboxId: "owner-inbox",
+        messageId: "race-reply",
+        jobId: gated.jobId,
+        reservationId: gated.reservationId,
+      };
+      // The active loop claims twice, then the watchdog fires mid-loop and
+      // settles the run from the durable claimed total.
+      expect(await f.t.mutation(claimRecoveryRef, claimArgs)).toMatchObject({ ok: true, attemptNumber: 1 });
+      expect(await f.t.mutation(claimRecoveryRef, claimArgs)).toMatchObject({ ok: true, attemptNumber: 2 });
+      expect(await f.t.mutation(watchdogRecoveryRef, {
+        jobId: gated.jobId,
+        reservationId: gated.reservationId,
+        threadId: "race-thread",
+        inboxId: "owner-inbox",
+        messageId: "race-reply",
+      })).toMatchObject({ ok: true, settled: true });
+      // A subsequent claim against the settled run is denied before HTTP.
+      expect(await f.t.mutation(claimRecoveryRef, claimArgs)).toMatchObject({
+        ok: false,
+        code: "allowance-exhausted",
+      });
+      // The loop's fresh retry admits a new run and performs exactly one
+      // accounted read; the stale run contributes zero provider reads.
+      const calls: string[] = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: string | URL | Request) => {
+          calls.push(String(input instanceof Request ? input.url : input));
+          return new Promise<Response>(() => {});
+        }),
+      );
+      const recovered = await f.t.action(recoverRef, {
+        threadId: "race-thread",
+        inboxId: "owner-inbox",
+        messageId: "race-reply",
+      });
+      expect(calls).toHaveLength(1);
+      expect(recovered).toMatchObject({ ok: true, outcome: "unknown" });
+      expect(await readLedger(f)).toEqual({ reserved: 0, spent: 0, unresolved: 30 });
+    } finally {
+      restorePricing();
+      restoreKey();
+    }
+  }, 60_000);
 });
