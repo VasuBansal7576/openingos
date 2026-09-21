@@ -160,6 +160,46 @@ describe("C1 inbound safety and reconciliation", () => {
     expect(result.dangerous).toBe(true);
   });
 
+  test("redacts normal, multiple, and punctuated addresses without leaking", () => {
+    const cases: ReadonlyArray<readonly [string, string]> = [
+      ["Contact vendor@example.test for details.", "Contact [redacted-mailbox] for details."],
+      ["a@b.co and c@d.org here", "[redacted-mailbox] and [redacted-mailbox] here"],
+      ["Mail <a@b.co>, (c@d.org). Ping e@f.io!", "Mail <[redacted-mailbox]>, ([redacted-mailbox]). Ping [redacted-mailbox]!"],
+      ["UPPER@EXAMPLE.TEST", "[redacted-mailbox]"],
+      ["a.b_c-d@sub.domain.co", "[redacted-mailbox]"],
+      ["x@y.zz!", "[redacted-mailbox]!"],
+      ["trailing a@b.co", "trailing [redacted-mailbox]"],
+      ["a@b.co trailing", "[redacted-mailbox] trailing"],
+    ];
+    for (const [input, expected] of cases) {
+      expect(sanitizeInboundContent({ text: input, html: "" }).text).toBe(expected);
+    }
+  });
+
+  test("leaves malformed address-like text untouched", () => {
+    for (const input of ["a@b", "@b.co", "a@.co", "a@b.c", "a b@c.d", "plain text no mail", "a@@b.co"]) {
+      expect(sanitizeInboundContent({ text: input, html: "" }).text).toBe(input);
+    }
+  });
+
+  test("redacts at 70KB scale without leaking or hanging", () => {
+    // Runs under the default timeout: a quadratic matcher would exceed it.
+    // Sanitized text keeps its 64KB cap; the assertions prove exact
+    // redaction behavior at scale, not truncation.
+    const plain = sanitizeInboundContent({ text: "x".repeat(70_000), html: "" });
+    expect(plain.text).toHaveLength(64_000);
+    const nearMiss = sanitizeInboundContent({ text: `${"a".repeat(35_000)}@${"b".repeat(34_999)}`, html: "" });
+    expect(nearMiss.text).toHaveLength(64_000);
+    const embeddedInput = `Terms from buyer@example.test, please confirm. ${"y".repeat(69_900)}`;
+    const embedded = sanitizeInboundContent({
+      text: embeddedInput,
+      html: "",
+    });
+    expect(embedded.text).not.toContain("buyer@example.test");
+    expect(embedded.text).toContain("[redacted-mailbox]");
+    expect(embedded.text).toHaveLength(64_000);
+  });
+
   test("retains exact binding and treats ambiguous matches as unknown", () => {
     const messages = [
       { messageId: "msg-1", threadId: "thread-1", to: [OWNER], cc: [], bcc: [], subject: "Controlled RFQ", text: "Terms", attachments: [], headers: { "x-openingos-operation": "openingos-op-1" } },

@@ -93,6 +93,12 @@ const advanceMigrationRef = makeFunctionReference<
   { threadId: string; inboxId: string },
   { ok: true; state: string; verifiedReads: number; replayed: number; stillWaiting: number } | { ok: false; code: string; message: string }
 >("communication/callbacks:advanceThreadMigration");
+const replayWaitingSelfRef = makeFunctionReference<
+  "mutation",
+  { threadId: string; inboxId: string },
+  | { ok: true; replayed: number; stillWaiting: number }
+  | CommunicationDenial
+>("communication/callbacks:replayWaitingInbound");
 const settleRecoverySelfRef = makeFunctionReference<
   "mutation",
   {
@@ -823,7 +829,10 @@ async function ingestBoundMessage(
     contentHash,
     completeness,
     counterpartyRole: "ownerStandIn",
-    executionMode: "live",
+    // Controlled demo evidence, never genuine vendor evidence: the content
+    // is owner-authored supplier terms. Live transport stays proven
+    // separately by the provider callback receipt and operation outcome.
+    executionMode: "recorded",
     locator: `redacted:${contentHash}`,
   });
   await ctx.db.insert("productEvidence", {
@@ -837,7 +846,7 @@ async function ingestBoundMessage(
     verification: "unverified",
     freshness: "fresh",
     counterpartyRole: "ownerStandIn",
-    executionMode: "live",
+    executionMode: "recorded",
     origin: "ownerImport",
     conflictEvidenceIds: [],
     idempotencyKey: key,
@@ -858,7 +867,7 @@ async function ingestBoundMessage(
       verification: "unverified",
       freshness: "unknown",
       counterpartyRole: "ownerStandIn",
-      executionMode: "live",
+      executionMode: "recorded",
       origin: "ownerImport",
       conflictEvidenceIds: [],
       idempotencyKey: `${key}:missing:attachment`,
@@ -967,19 +976,21 @@ async function replayWaitingForThread(
   threadId: string,
   inboxId: string,
 ): Promise<{ readonly replayed: number; readonly stillWaiting: number }> {
-  // Waiting-set repair (Greptile r4058523015 repair). The query returns
-  // only rows still in outcomeUnknown through the exact waiting-state
-  // index, so completed rows never occupy the bounded prefix and later
-  // waiting replies stay reachable. One bounded exact-index read per
-  // trigger keeps every pass finite; each pass applies up to
-  // WAITING_REPLAY_LIMIT rows, which guarantees forward progress.
-  // Oversized rows without a replayable snapshot stay explicitly waiting
-  // and schedule their bounded provider-read recovery while attempts
-  // remain; anything unparseable also stays waiting rather than being
-  // dropped.
+  // Fair-progress repair (Greptile r4058523015 follow-up). One bounded
+  // take ordered by least-recently-attempted through the exact waiting-set
+  // index: rows never evaluated sort first, so untouched replies always
+  // jump ahead of retried rows. Every evaluated-but-still-waiting row is
+  // patched to the current attempt time, so the next trigger rotates past
+  // permanently unprocessable rows instead of re-sampling one fixed
+  // prefix. Completed rows leave the waiting set on success, so the set
+  // only shrinks; marker idempotency keeps concurrent triggers to exactly
+  // one effect per source. At most WAITING_REPLAY_LIMIT rows are processed
+  // per trigger; one further row is read only to detect the overflow.
+  // stillWaiting counts evaluated-but-unapplied rows plus that overflow
+  // row when present.
   const rows = await ctx.db
     .query("processedEvents")
-    .withIndex("by_provider_environment_and_thread_inbox_and_state", (q) =>
+    .withIndex("by_provider_environment_and_thread_inbox_state_and_attempt", (q) =>
       q
         .eq("provider", "agentmail-inbound")
         .eq("environment", "live")
@@ -987,9 +998,32 @@ async function replayWaitingForThread(
         .eq("providerInboxId", inboxId)
         .eq("applicationState", "outcomeUnknown"),
     )
+    .order("asc")
     .take(WAITING_REPLAY_LIMIT + 1);
   let replayed = 0;
   let stillWaiting = 0;
+  let ingests = 0;
+  // Monotonic attempt ordering: the stamp strictly exceeds both the wall
+  // clock and the highest waiting attempt value already stored, so patched
+  // rows always sort behind every row evaluated earlier — even when the
+  // clock is frozen. Progress never depends on time advancing.
+  const highest = await ctx.db
+    .query("processedEvents")
+    .withIndex("by_provider_environment_and_thread_inbox_state_and_attempt", (q) =>
+      q
+        .eq("provider", "agentmail-inbound")
+        .eq("environment", "live")
+        .eq("providerThreadId", threadId)
+        .eq("providerInboxId", inboxId)
+        .eq("applicationState", "outcomeUnknown"),
+    )
+    .order("desc")
+    .take(1);
+  const highestValue = highest[0]?.replayLastAttemptAt;
+  const now = Date.now();
+  const stamp = typeof highestValue === "number" && Number.isSafeInteger(highestValue) && highestValue >= now
+    ? highestValue + 1
+    : now;
   for (const row of rows.slice(0, WAITING_REPLAY_LIMIT)) {
     const stored = parseWaitingSnapshot(parseObject(row.outcome));
     if (
@@ -1018,11 +1052,13 @@ async function replayWaitingForThread(
         });
       }
       stillWaiting += 1;
+      await ctx.db.patch(row._id, { replayLastAttemptAt: stamp });
       continue;
     }
     const binding = await conversationForMessage(ctx, stored);
-    if (binding === null) {
+    if (binding === null || ingests >= WAITING_REPLAY_LIMIT) {
       stillWaiting += 1;
+      await ctx.db.patch(row._id, { replayLastAttemptAt: stamp });
       continue;
     }
     const result = await ingestBoundMessage(
@@ -1039,8 +1075,10 @@ async function replayWaitingForThread(
     );
     if (!result.ok) {
       stillWaiting += 1;
+      await ctx.db.patch(row._id, { replayLastAttemptAt: stamp });
       continue;
     }
+    ingests += 1;
     // Patching to observedSuccess removes the row from the waiting-state
     // index while preserving the raw event record and its outcome. Marker
     // idempotency keeps a concurrent trigger's duplicate ingest to exactly
@@ -1054,6 +1092,8 @@ async function replayWaitingForThread(
     });
     replayed += 1;
   }
+  // The extra row is only an overflow detector: it stays untouched (and
+  // therefore first) for the next trigger, so no evaluated row can hide it.
   if (rows.length > WAITING_REPLAY_LIMIT) stillWaiting += rows.length - WAITING_REPLAY_LIMIT;
   return { replayed, stillWaiting };
 }
@@ -1813,7 +1853,15 @@ export const advanceThreadMigration = f1InternalMutation({
       let replayed = 0;
       let stillWaiting = 0;
       if (state === "complete") {
-        const replay = await replayWaitingForThread(ctx, threadId, inboxId);
+        // Nested subtransaction: the replay gets its own paginated-query
+        // budget because only one paginate call is allowed per execution.
+        const replay: MutationReturn<typeof replayWaitingInbound> = await ctx.runMutation(replayWaitingSelfRef, {
+          threadId,
+          inboxId,
+        });
+        if (!replay.ok) {
+          return { ok: true as const, state, verifiedReads, replayed, stillWaiting };
+        }
         replayed = replay.replayed;
         stillWaiting = replay.stillWaiting;
       }
@@ -2219,6 +2267,12 @@ export const ingestQuote = f1InternalMutation({
     const version = typeof quoteValue["version"] === "string" && quoteValue["version"].trim().length > 0
       ? quoteValue["version"]
       : `${args.providerMessageId}:${args.extractionVersion}`;
+    // Controlled demo evidence: this pipeline is owner-only, so extracted
+    // quote terms are always owner-authored supplier terms, never genuine
+    // vendor evidence, regardless of the transport mode the caller observed.
+    // Live transport stays proven separately by the provider callback
+    // receipt and operation outcome.
+    const quoteExecutionMode = "recorded" as const;
     const sourceRefs = [{ sourceId: `agentmail:${args.providerMessageId}`, version: args.extractionVersion, locator: `message:${args.providerMessageId}` }];
     // `parseBoundedPayloadJson` proves the size, depth and canonical JSON
     // boundary; F1's provider validator is the authoritative field schema.
@@ -2233,7 +2287,7 @@ export const ingestQuote = f1InternalMutation({
       ...(quoteValue["comparisonScope"] === undefined ? {} : { comparisonScope: quoteValue["comparisonScope"] }),
       evidenceRefs: sourceRefs,
       counterpartyRole: "ownerStandIn" as const,
-      executionMode: args.executionMode,
+      executionMode: quoteExecutionMode,
       conversationId: args.conversationId,
       ...(quoteValue["requirementId"] !== undefined ? { requirementId: quoteValue["requirementId"] } : {}),
       ...(quoteValue["vendorId"] !== undefined ? { vendorId: quoteValue["vendorId"] } : {}),
@@ -2253,7 +2307,7 @@ export const ingestQuote = f1InternalMutation({
       verification: "unverified",
       freshness: "fresh",
       counterpartyRole: "ownerStandIn",
-      executionMode: args.executionMode,
+      executionMode: quoteExecutionMode,
       origin: "ownerImport",
       conflictEvidenceIds: [],
       idempotencyKey: extractionKey,
@@ -2270,7 +2324,7 @@ export const ingestQuote = f1InternalMutation({
       evidenceRefs: projectEventEvidence,
       createdAt: Date.now(),
     });
-    return { ok: true as const, quoteId: recorded.quoteId, deduplicated: false, executionMode: args.executionMode };
+    return { ok: true as const, quoteId: recorded.quoteId, deduplicated: false, executionMode: quoteExecutionMode };
   },
 });
 

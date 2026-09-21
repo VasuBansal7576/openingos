@@ -449,8 +449,49 @@ function decodeBasicEntities(value: string): string {
     .replace(/&amp;/gi, "&");
 }
 
+const MAILBOX_PATTERN = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
+// Candidate radius around each `@`: the pattern backtracks quadratically
+// on long runs without a nearby match, so matching runs only inside a
+// bounded window anchored at a real `@`. The radius exceeds any
+// deliverable mailbox by an order of magnitude, so every genuine address
+// matches exactly as in a full-text pass.
+const MAILBOX_SCAN_RADIUS = 512;
+
 function redactMailboxAddresses(value: string): string {
-  return value.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[redacted-mailbox]");
+  let at = value.indexOf("@");
+  if (at === -1) return value;
+  interface Span {
+    readonly start: number;
+    readonly end: number;
+  }
+  const spans: Span[] = [];
+  let acceptedEnd = 0;
+  while (at !== -1) {
+    if (at >= acceptedEnd) {
+      const candidate = value.slice(Math.max(0, at - MAILBOX_SCAN_RADIUS), at + MAILBOX_SCAN_RADIUS + 1);
+      MAILBOX_PATTERN.lastIndex = 0;
+      let match: RegExpExecArray | null;
+      while ((match = MAILBOX_PATTERN.exec(candidate)) !== null) {
+        const start = Math.max(0, at - MAILBOX_SCAN_RADIUS) + match.index;
+        if (start <= at && at < start + match[0].length) {
+          spans.push({ start, end: start + match[0].length });
+          acceptedEnd = Math.max(acceptedEnd, start + match[0].length);
+          break;
+        }
+      }
+    }
+    at = value.indexOf("@", at + 1);
+  }
+  if (spans.length === 0) return value;
+  let out = "";
+  let cursor = 0;
+  for (const span of spans) {
+    if (span.start < cursor) continue;
+    out += value.slice(cursor, span.start);
+    out += "[redacted-mailbox]";
+    cursor = span.end;
+  }
+  return out + value.slice(cursor);
 }
 
 /**

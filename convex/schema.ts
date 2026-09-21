@@ -908,6 +908,10 @@ export default defineSchema({
     applicationOutcome: v.optional(v.union(v.literal("success"), v.literal("failure"), v.literal("unknown"))),
     applicationState: v.optional(v.string()),
     appliedAt: v.optional(v.number()),
+    // Fair replay rotation: the last time this row was evaluated by a
+    // waiting-set repair pass. Absent until the first evaluation; rows
+    // never evaluated sort ahead of retried rows.
+    replayLastAttemptAt: v.optional(v.number()),
     createdAt: v.number(),
   })
     .index("by_provider_environment_and_event", ["provider", "environment", "eventId"])
@@ -932,6 +936,13 @@ export default defineSchema({
     .index(
       "by_provider_environment_and_thread_inbox_and_state",
       ["provider", "environment", "providerThreadId", "providerInboxId", "applicationState"],
+    )
+    // Fair replay rotation: equality on the waiting set plus ascending
+    // order over the last evaluation time, so each bounded take returns
+    // the least-recently-attempted waiting rows first.
+    .index(
+      "by_provider_environment_and_thread_inbox_state_and_attempt",
+      ["provider", "environment", "providerThreadId", "providerInboxId", "applicationState", "replayLastAttemptAt"],
     ),
 
   evidence: defineTable({
