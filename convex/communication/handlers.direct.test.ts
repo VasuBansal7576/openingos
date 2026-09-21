@@ -7,6 +7,7 @@ import type { Id } from "../_generated/dataModel.js";
 import * as callbacks from "./callbacks.js";
 import * as cleanup from "./cleanup.js";
 import * as send from "./send.js";
+import * as reconciliation from "./reconciliation.js";
 import * as attempts from "../execution/attempts.js";
 import { canonicalJson, payloadHash } from "../shared/hashing.js";
 import { provenanceLabel } from "../shared/provenance.js";
@@ -120,6 +121,11 @@ const reconcileAfterCrashRef = makeFunctionReference<
   MutationArgs<typeof attempts.reconcileAfterCrash>,
   MutationReturn<typeof attempts.reconcileAfterCrash>
 >("execution/attempts:reconcileAfterCrash");
+const reconcileRef = makeFunctionReference<
+  "action",
+  ActionArgs<typeof reconciliation.reconcile>,
+  ActionReturn<typeof reconciliation.reconcile>
+>("communication/reconciliation:reconcile");
 
 const DRAFT = {
   profile: "ownerRoleplay",
@@ -270,6 +276,61 @@ function setApiKeyEnv(key: string | undefined): () => void {
       process.env.AGENTMAIL_API_KEY = previous;
     }
   };
+}
+
+function setReconciliationEnv(): () => void {
+  const previousKey = process.env.AGENTMAIL_API_KEY;
+  const previousOwner = process.env.HACKATHON_OWNER_RECIPIENT;
+  process.env.AGENTMAIL_API_KEY = "controlled-reconciliation-key";
+  process.env.HACKATHON_OWNER_RECIPIENT = "owner@example.test";
+  return () => {
+    if (previousKey === undefined) {
+      delete process.env.AGENTMAIL_API_KEY;
+    } else {
+      process.env.AGENTMAIL_API_KEY = previousKey;
+    }
+    if (previousOwner === undefined) {
+      delete process.env.HACKATHON_OWNER_RECIPIENT;
+    } else {
+      process.env.HACKATHON_OWNER_RECIPIENT = previousOwner;
+    }
+  };
+}
+
+async function prepareActionReconciliation(f: Fixture, readCostMicroUsd = 1): Promise<void> {
+  const prepared = await f.t.mutation(prepareRef, { operationId: f.operationId, inboxId: "owner-inbox" });
+  if (!prepared.ok) throw new Error(`snapshot preparation failed: ${prepared.message}`);
+  await f.t.run(async (ctx) => {
+    const now = Date.now();
+    const operation = await ctx.db.get(f.operationId);
+    if (operation === null) throw new Error("operation missing");
+    const budgetId = await ctx.db.insert("providerBudgets", {
+      organizationId: f.organizationId,
+      ceilingMicroUsd: readCostMicroUsd * 3,
+      reservedMicroUsd: readCostMicroUsd * 3,
+      spentMicroUsd: 0,
+      unresolvedMicroUsd: 0,
+      pricingBasis: reconciliationPricingBasis(readCostMicroUsd),
+      updatedAt: now,
+    });
+    const reservationId = await ctx.db.insert("reservations", {
+      organizationId: f.organizationId,
+      jobId: operation.jobId,
+      budgetId,
+      ceilingMicroUsd: readCostMicroUsd * 3,
+      reservedMicroUsd: readCostMicroUsd * 3,
+      spentMicroUsd: 0,
+      unresolvedMicroUsd: 0,
+      pricingBasis: reconciliationPricingBasis(readCostMicroUsd),
+      state: "open",
+      updatedAt: now,
+    });
+    await ctx.db.patch(f.operationId, {
+      state: "outcomeUnknown",
+      attemptToken: "reconciliation-action-token",
+      reservationId,
+    });
+  });
 }
 
 async function ensureRecoveryBudget(f: Fixture, ceilingMicroUsd: number): Promise<void> {
@@ -549,7 +610,7 @@ describe("C1 Convex callback handlers", () => {
       attemptToken: "reconciliation-attempt",
       readNumber: 1,
     });
-    expect(retried).toMatchObject({ ok: true, allowed: true });
+    expect(retried).toMatchObject({ ok: false, code: "already-claimed" });
     const accounted = await f.t.run(async (ctx) => {
       const row = await ctx.db.get(reservation.reservationId);
       const budget = await ctx.db.get(reservation.budgetId);
@@ -598,6 +659,74 @@ describe("C1 Convex callback handlers", () => {
       readNumber: 3,
     });
     expect(denied).toMatchObject({ ok: false, code: "allowance-exhausted" });
+  });
+
+  test("repeated reconciliation actions allocate and charge fresh read slots", async () => {
+    const f = await fixture("prepared");
+    await prepareActionReconciliation(f);
+    const restoreEnv = setReconciliationEnv();
+    const { calls } = stubGetMessage({ messages: [], next_page_token: null });
+    try {
+      const first = await f.t.action(reconcileRef, {
+        operationId: f.operationId,
+        attemptToken: "reconciliation-action-token",
+        inboxId: "owner-inbox",
+      });
+      const second = await f.t.action(reconcileRef, {
+        operationId: f.operationId,
+        attemptToken: "reconciliation-action-token",
+        inboxId: "owner-inbox",
+      });
+      expect(first).toMatchObject({ ok: true, outcome: "unknown", reads: 1 });
+      expect(second).toMatchObject({ ok: true, outcome: "unknown", reads: 1 });
+      expect(calls).toHaveLength(2);
+      const accounted = await readLedger(f);
+      expect(accounted).toEqual({ reserved: 1, spent: 2, unresolved: 0 });
+      const readAttempts = await f.t.run(async (ctx) =>
+        (await ctx.db.query("attempts").withIndex("by_operation", (q) => q.eq("operationId", f.operationId)).take(8))
+          .filter((row) => row.token.startsWith("openingos.execution.reconciliation:")),
+      );
+      expect(readAttempts.map((row) => row.token)).toEqual([
+        "openingos.execution.reconciliation:reconciliation-action-token:1",
+        "openingos.execution.reconciliation:reconciliation-action-token:2",
+      ]);
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test("concurrent reconciliation actions each pay for their own provider read", async () => {
+    const f = await fixture("prepared");
+    await prepareActionReconciliation(f);
+    const restoreEnv = setReconciliationEnv();
+    const { calls } = stubGetMessage({ messages: [], next_page_token: null });
+    try {
+      const results = await Promise.all([
+        f.t.action(reconcileRef, {
+          operationId: f.operationId,
+          attemptToken: "reconciliation-action-token",
+          inboxId: "owner-inbox",
+        }),
+        f.t.action(reconcileRef, {
+          operationId: f.operationId,
+          attemptToken: "reconciliation-action-token",
+          inboxId: "owner-inbox",
+        }),
+      ]);
+      expect(results.every((result) => result.ok && result.outcome === "unknown" && result.reads === 1)).toBe(true);
+      expect(calls).toHaveLength(2);
+      expect(await readLedger(f)).toEqual({ reserved: 1, spent: 2, unresolved: 0 });
+      const readAttempts = await f.t.run(async (ctx) =>
+        (await ctx.db.query("attempts").withIndex("by_operation", (q) => q.eq("operationId", f.operationId)).take(8))
+          .filter((row) => row.token.startsWith("openingos.execution.reconciliation:")),
+      );
+      expect(new Set(readAttempts.map((row) => row.token))).toEqual(new Set([
+        "openingos.execution.reconciliation:reconciliation-action-token:1",
+        "openingos.execution.reconciliation:reconciliation-action-token:2",
+      ]));
+    } finally {
+      restoreEnv();
+    }
   });
 
   test("creates one exact outbound snapshot under concurrent replay and rejects stale authority", async () => {
@@ -1325,6 +1454,37 @@ describe("C1 Astra follow-up repairs (F04/F05/F09/F10/F11/F12)", () => {
     expect(plain).toHaveLength(1);
     expect(plain[0]?.completeness).toBe("complete");
   });
+
+  test("bound long replies keep exact protected source bytes beside a bounded excerpt", async () => {
+    const f = await fixture();
+    await f.t.mutation(bindingRef, {
+      operationId: f.operationId,
+      messageId: "long-outbound",
+      threadId: "long-thread",
+      inboxId: "owner-inbox",
+    });
+    const tail = "Tail charge: EUR 9042";
+    const longText = `${"x".repeat(9_042 - tail.length)}${tail}`;
+    expect(longText).toHaveLength(9_042);
+    const reply = await f.t.mutation(ingestMessageRef, {
+      message: { ...inbound("long-reply", "long-thread"), text: longText },
+      thread: { thread_id: "long-thread" },
+      eventId: "long-inbound",
+    });
+    expect(reply).toMatchObject({ ok: true, state: "replyReceived", deduplicated: false });
+    const evidence = await projectEvidenceRows(f);
+    expect(evidence).toHaveLength(1);
+    expect(evidence[0]).toMatchObject({
+      completeness: "complete",
+      contentHash: payloadHash({ messageId: "long-reply", text: longText, html: "" }),
+      protectedSourceText: longText,
+      protectedSourceHtml: "",
+    });
+    const markers = (await projectMarkerRows(f)).filter((row) => row.idempotencyKey === "agentmail:long-reply:source:1");
+    expect(markers).toHaveLength(1);
+    expect(markers[0]?.normalizedValue).toHaveLength(8_000);
+    expect(markers[0]?.normalizedValue).not.toContain(tail);
+  });
 });
 
 describe("C1 Greptile P1 replay/scale repairs (r4058523015/r4058523016/r4058523017)", () => {
@@ -1345,16 +1505,61 @@ describe("C1 Greptile P1 replay/scale repairs (r4058523015/r4058523016/r40585230
       inboxId: "owner-inbox",
     });
     expect(bound).toMatchObject({ ok: true });
-    // The bind-time replay drains its bounded per-trigger budget; the next
-    // bounded trigger moves past the succeeded prefix and reaches the rest.
-    const second = await f.t.mutation(replayRef, { threadId: "starve-thread", inboxId: "owner-inbox" });
-    expect(second).toEqual({ ok: true, replayed: 4, stillWaiting: 0 });
-    const drained = await f.t.mutation(replayRef, { threadId: "starve-thread", inboxId: "owner-inbox" });
-    expect(drained).toEqual({ ok: true, replayed: 0, stillWaiting: 0 });
+    // The bind-time replay schedules a bounded continuation, so no second
+    // provider event or explicit replay call is needed to drain the backlog.
+    await f.t.finishAllScheduledFunctions(() => {});
     const evidence = await projectEvidenceRows(f);
     expect(evidence).toHaveLength(12);
     const markers = (await projectMarkerRows(f)).filter((row) => row.field === "agentmail.message");
     expect(markers).toHaveLength(12);
+  });
+
+  test("autonomous replay drains valid backlog and leaves blocked rows honest", async () => {
+    const f = await fixture();
+    await seedOversizedRow(f, "blocked-reply", "mixed-replay-thread", {
+      contentHash: "controlled-blocked-source",
+      byteSize: 300_000,
+    });
+    for (let index = 0; index < 9; index += 1) {
+      const early = await f.t.mutation(ingestMessageRef, {
+        message: inbound(`mixed-reply-${index}`, "mixed-replay-thread", `<p>Terms ${index}</p>`),
+        thread: { thread_id: "mixed-replay-thread" },
+        eventId: `mixed-early-${index}`,
+      });
+      expect(early).toMatchObject({ ok: true, state: "waitingForBinding" });
+    }
+    const bound = await f.t.mutation(bindingRef, {
+      operationId: f.operationId,
+      messageId: "mixed-replay-outbound",
+      threadId: "mixed-replay-thread",
+      inboxId: "owner-inbox",
+    });
+    expect(bound).toMatchObject({ ok: true });
+
+    // The scheduled continuation reaches the valid rows behind the blocked
+    // prefix without a second provider event. The permanently oversized row
+    // remains waiting because no recovery pricing or provider read exists.
+    await f.t.finishAllScheduledFunctions(() => {});
+    expect(await projectEvidenceRows(f)).toHaveLength(9);
+    const waiting = await f.t.run(async (ctx) =>
+      await ctx.db
+        .query("processedEvents")
+        .withIndex("by_provider_environment_and_thread_inbox_state_and_attempt", (q) =>
+          q
+            .eq("provider", "agentmail-inbound")
+            .eq("environment", "live")
+            .eq("providerThreadId", "mixed-replay-thread")
+            .eq("providerInboxId", "owner-inbox")
+            .eq("applicationState", "outcomeUnknown"),
+        )
+        .take(16),
+    );
+    expect(waiting).toHaveLength(1);
+    expect(waiting[0]?.providerMessageId).toBe("blocked-reply");
+    expect(JSON.parse(waiting[0]?.outcome ?? "{}")).toMatchObject({ snapshotOversized: true });
+    const honest = await f.t.mutation(replayRef, { threadId: "mixed-replay-thread", inboxId: "owner-inbox" });
+    expect(honest).toMatchObject({ ok: true, replayed: 0, stillWaiting: 1 });
+    await f.t.finishAllScheduledFunctions(() => {});
   });
 
   test("oversized replies wait explicitly and schedule their bounded recovery", async () => {

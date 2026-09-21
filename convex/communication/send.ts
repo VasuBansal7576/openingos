@@ -59,7 +59,7 @@ const lateDeliveryRef = makeFunctionReference<
 >("execution/reconciliation:recordLateDelivery");
 const replayWaitingRef = makeFunctionReference<
   "mutation",
-  MutationArgs<typeof callbacks.replayWaitingInbound>,
+  { threadId: string; inboxId: string; continuation?: number },
   MutationReturn<typeof callbacks.replayWaitingInbound>
 >("communication/callbacks:replayWaitingInbound");
 const resumeWaitingRef = makeFunctionReference<
