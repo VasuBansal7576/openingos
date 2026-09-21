@@ -23,7 +23,8 @@ export const MAX_RECONCILIATION_READS = 3;
  * send was cancelled or its grant was later revoked.
  */
 export const RECONCILIATION_RETRY_OWNER = "openingos.execution.reconciliation" as const;
-export const RECONCILIATION_READ_COST_MICRO_USD = 1;
+export const RECONCILIATION_PRICING_BASIS_VERSION = "agentmail-reconciliation-read-v1" as const;
+const RECONCILIATION_PRICING_BASIS_NAME = "agentmail-reconciliation-read" as const;
 export const DEFAULT_RECONCILIATION_READ_TIMEOUT_MS = 10_000;
 export const DEFAULT_RECONCILIATION_OVERALL_TIMEOUT_MS = 30_000;
 export const MAX_RECONCILIATION_TIMEOUT_MS = 30_000;
@@ -177,6 +178,55 @@ export interface ReconciliationSnapshot {
 export type ReconciliationReadAdmission =
   | { readonly allowed: true; readonly snapshot: ReconciliationSnapshot }
   | { readonly allowed: false; readonly reason?: string };
+
+export interface ReconciliationPricingPolicy {
+  readonly version: typeof RECONCILIATION_PRICING_BASIS_VERSION;
+  readonly readCostMicroUsd: number;
+}
+
+/**
+ * Build the exact reservation basis for a bounded reconciliation read.
+ * The amount is supplied by the current provider pricing configuration; this
+ * boundary never infers or invents a provider charge.
+ */
+export function reconciliationPricingBasis(readCostMicroUsd: number): string {
+  return canonicalJson({
+    basis: RECONCILIATION_PRICING_BASIS_NAME,
+    provider: "agentmail",
+    readCostMicroUsd,
+    retryOwner: RECONCILIATION_RETRY_OWNER,
+    version: RECONCILIATION_PRICING_BASIS_VERSION,
+  });
+}
+
+/** Parse and pin the versioned reconciliation pricing basis before any read. */
+export function parseReconciliationPricingBasis(value: unknown): ReconciliationPricingPolicy | null {
+  if (typeof value !== "string" || value.length === 0 || value.length > 4_096) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value) as unknown;
+  } catch {
+    return null;
+  }
+  if (!isRecord(parsed)) return null;
+  const keys = Object.keys(parsed).sort();
+  const expectedKeys = ["basis", "provider", "readCostMicroUsd", "retryOwner", "version"];
+  if (keys.length !== expectedKeys.length || keys.some((key, index) => key !== expectedKeys[index])) return null;
+  if (
+    parsed["basis"] !== RECONCILIATION_PRICING_BASIS_NAME ||
+    parsed["provider"] !== "agentmail" ||
+    parsed["retryOwner"] !== RECONCILIATION_RETRY_OWNER ||
+    parsed["version"] !== RECONCILIATION_PRICING_BASIS_VERSION ||
+    typeof parsed["readCostMicroUsd"] !== "number" ||
+    !Number.isSafeInteger(parsed["readCostMicroUsd"]) ||
+    parsed["readCostMicroUsd"] <= 0 ||
+    canonicalJson(parsed) !== value
+  ) return null;
+  return {
+    version: RECONCILIATION_PRICING_BASIS_VERSION,
+    readCostMicroUsd: parsed["readCostMicroUsd"],
+  };
+}
 
 export type ReconciliationResult =
   | { readonly kind: "confirmed"; readonly message: ReconciliationMessage }
