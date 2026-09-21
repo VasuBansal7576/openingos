@@ -2934,7 +2934,9 @@ describe("direct E10 usage metrics (P-22)", () => {
         updatedAt: now,
       });
       // Two attempts with individually valid intervals whose observed
-      // elapsed total overflows.
+      // elapsed total overflows. Timestamps are exactly representable
+      // doubles (epoch 0), so the fixture does not depend on wall-clock
+      // rounding above 2^53.
       const overflowOperation = await ctx.db.insert("operations", {
         organizationId: setup.orgId,
         projectId: setup.projectId,
@@ -2955,15 +2957,15 @@ describe("direct E10 usage metrics (P-22)", () => {
         operationId: overflowOperation,
         token: "tok-metrics-overflow-1",
         state: "prepared",
-        createdAt: now,
-        observedAt: now + MAX_SAFE,
+        createdAt: 0,
+        observedAt: MAX_SAFE,
       });
       await ctx.db.insert("attempts", {
         operationId: overflowOperation,
         token: "tok-metrics-overflow-2",
         state: "prepared",
-        createdAt: now,
-        observedAt: now + 1,
+        createdAt: 0,
+        observedAt: 1,
       });
     });
     const result = await t.withIdentity(OWNER_A).query(projectUsageMetricsRef, {
