@@ -25,8 +25,8 @@ import {
 import { checkProjectAccess, denialValidator, identityOf } from "../access/checks.js";
 import {
   MAX_RECONCILIATION_READS,
-  RECONCILIATION_READ_COST_MICRO_USD,
   RECONCILIATION_RETRY_OWNER,
+  parseReconciliationPricingBasis,
   type ReconciliationAttachment,
 } from "../communication/contracts.js";
 import { isValidSingleMailbox, normalizeMailbox } from "../shared/mailbox.js";
@@ -343,17 +343,6 @@ async function admitReconciliationRead(
   if (snapshot === null) {
     return { ok: false as const, code: "outcome-unknown", message: "immutable outbound snapshot does not match the operation" };
   }
-  const readToken = `${RECONCILIATION_RETRY_OWNER}:${args.attemptToken}:${args.readNumber}`;
-  const existingRows = await ctx.db
-    .query("attempts")
-    .withIndex("by_token", (q) => q.eq("token", readToken))
-    .take(2);
-  if (existingRows.length > 1 || (existingRows[0] !== undefined && existingRows[0].operationId !== args.operationId)) {
-    return { ok: false as const, code: "already-claimed", message: "reconciliation read token is already bound" };
-  }
-  if (existingRows[0] !== undefined) {
-    return { ok: true as const, allowed: true as const, snapshot, readToken };
-  }
   if (operation.reservationId === undefined) {
     return { ok: false as const, code: "allowance-exhausted", message: "reconciliation requires a reservation" };
   }
@@ -366,31 +355,50 @@ async function admitReconciliationRead(
   ) {
     return { ok: false as const, code: "allowance-exhausted", message: "reconciliation reservation is unavailable" };
   }
-  const held = reservation.reservedMicroUsd + reservation.unresolvedMicroUsd;
-  if (!Number.isSafeInteger(held) || held < RECONCILIATION_READ_COST_MICRO_USD) {
-    return { ok: false as const, code: "allowance-exhausted", message: "reconciliation reservation is exhausted" };
-  }
+  const pricing = parseReconciliationPricingBasis(reservation.pricingBasis);
   const budget = await ctx.db.get(reservation.budgetId);
   if (
+    pricing === null ||
     budget === null ||
     budget.organizationId !== operation.organizationId ||
-    budget.reservedMicroUsd < Math.min(reservation.reservedMicroUsd, RECONCILIATION_READ_COST_MICRO_USD) ||
-    budget.unresolvedMicroUsd < Math.max(0, RECONCILIATION_READ_COST_MICRO_USD - reservation.reservedMicroUsd)
+    budget.pricingBasis !== reservation.pricingBasis ||
+    reservation.ceilingMicroUsd < pricing.readCostMicroUsd
+  ) {
+    return { ok: false as const, code: "stale-pricing-basis", message: "reconciliation pricing basis is unavailable or stale" };
+  }
+  const readToken = `${RECONCILIATION_RETRY_OWNER}:${args.attemptToken}:${args.readNumber}`;
+  const existingRows = await ctx.db
+    .query("attempts")
+    .withIndex("by_token", (q) => q.eq("token", readToken))
+    .take(2);
+  if (existingRows.length > 1 || (existingRows[0] !== undefined && existingRows[0].operationId !== args.operationId)) {
+    return { ok: false as const, code: "already-claimed", message: "reconciliation read token is already bound" };
+  }
+  if (existingRows[0] !== undefined) {
+    return { ok: true as const, allowed: true as const, snapshot, readToken };
+  }
+  const held = reservation.reservedMicroUsd + reservation.unresolvedMicroUsd;
+  if (!Number.isSafeInteger(held) || held < pricing.readCostMicroUsd) {
+    return { ok: false as const, code: "allowance-exhausted", message: "reconciliation reservation is exhausted" };
+  }
+  if (
+    budget.reservedMicroUsd < Math.min(reservation.reservedMicroUsd, pricing.readCostMicroUsd) ||
+    budget.unresolvedMicroUsd < Math.max(0, pricing.readCostMicroUsd - reservation.reservedMicroUsd)
   ) {
     return { ok: false as const, code: "allowance-exhausted", message: "reconciliation budget is exhausted" };
   }
-  const fromReserved = Math.min(reservation.reservedMicroUsd, RECONCILIATION_READ_COST_MICRO_USD);
-  const fromUnknown = RECONCILIATION_READ_COST_MICRO_USD - fromReserved;
+  const fromReserved = Math.min(reservation.reservedMicroUsd, pricing.readCostMicroUsd);
+  const fromUnknown = pricing.readCostMicroUsd - fromReserved;
   await ctx.db.patch(reservation.budgetId, {
     reservedMicroUsd: budget.reservedMicroUsd - fromReserved,
     unresolvedMicroUsd: budget.unresolvedMicroUsd - fromUnknown,
-    spentMicroUsd: budget.spentMicroUsd + RECONCILIATION_READ_COST_MICRO_USD,
+    spentMicroUsd: budget.spentMicroUsd + pricing.readCostMicroUsd,
     updatedAt: Date.now(),
   });
   await ctx.db.patch(reservation._id, {
     reservedMicroUsd: reservation.reservedMicroUsd - fromReserved,
     unresolvedMicroUsd: reservation.unresolvedMicroUsd - fromUnknown,
-    spentMicroUsd: reservation.spentMicroUsd + RECONCILIATION_READ_COST_MICRO_USD,
+    spentMicroUsd: reservation.spentMicroUsd + pricing.readCostMicroUsd,
     updatedAt: Date.now(),
   });
   await ctx.db.insert("attempts", {
