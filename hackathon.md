@@ -12,7 +12,7 @@
 - **Auth:** Convex Auth foundation only; no hosted guest/private isolation proof
 - **AI models:** controlled Jev `jev-1.13.0` adapter tests only; no live application inference
 - **Started:** 2026-09-19T09:46:19Z
-- **Last updated:** 2026-09-21T16:10:00Z
+- **Last updated:** 2026-09-21T17:35:55Z
 
 ## Log
 
@@ -544,4 +544,26 @@ Implementation workers used verified OpenCode models with high reasoning and den
 Denied compound shell calls did not prompt the owner or broaden access.
 The Orca desktop runtime remained disconnected, so the coordinator did not reopen the app that had been interrupting the owner's work and continued through the validated non-interactive OpenCode CLI path.
 All temporary Chrome profiles were removed after their evidence was captured.
+No hosted Convex deployment, live provider call, owner-mailbox exchange, genuine supplier response, public origin, purchase, realized saving or commercial outcome was observed.
+
+### 2026-09-21 - integrated privacy, auth, parser and final workbench QA checkpoint
+
+Combined checkpoint `b47887e` integrates three ready child deliveries after exact-head checks passed.
+PR #22 stores the canonical owner mailbox envelope only in protected server evidence, returns a redacted preparation preview and resolves the envelope server-side at dispatch.
+PR #24 establishes a real Convex Auth anonymous session before discovery or mutations, reports retryable auth failure honestly and rejects malformed or stale comparison verdicts in the browser parser.
+PR #23 completes the selected prototype decision-desk pass with the photographic sage canvas, paper offers, yellow comparison tape, dark decision bar, concise controlled-fixture headings and a compact exact-390-pixel mobile composition.
+
+The first PR #23 merge-CI run exposed two stale UI tests after the stricter parser entered its base.
+The failure was reproduced locally, the tests were changed to assert fail-closed parsing without weakening the parser, and replacement head `6538246` passed both application-test runs and every other agreed GitHub check before merging.
+The OpenCode Muse Spark worker reproduced that integration failure but then received an external insufficient-balance response, so the coordinator completed only the narrow two-assertion repair directly.
+
+The complete local matrix passes on `b47887e`: 23 repository tests, 77 proof tests, 15 evaluation tests, 342 F1 tests, 155 browser-executor tests, 148 application tests, 18 application Jev tests, 32 communication-contract tests and 528 direct Convex tests.
+Both strict TypeScript checks and the production Vite build pass.
+Controlled Chrome QA at 1440 × 1200 and exact 390 × 844 covers same-state comparison with the selected prototype, loading, empty, explicit error, retry-to-ready, populated sample, Project and Suppliers navigation, dialog background inertness, Escape close, focus restoration and bounded no-send feedback with no runtime exception or page overflow.
+The sample state was generated through the real sample mutation and projection path, but this remains controlled local evidence.
+
+Completed E13, E15, E17 and E18 task worktrees were verified remotely preserved and removed non-forcibly.
+E16 remains temporarily only for final QA artifact cleanup and will be removed after the combined handoff is settled.
+Greptile remains unavailable because its connected plan reports the 50-credit limit exhausted, and Devin's green status explicitly says its review was skipped because the trial expired.
+A fresh separate GPT-6 Astra fixed-head review and latest-head combined CI remain mandatory before merge.
 No hosted Convex deployment, live provider call, owner-mailbox exchange, genuine supplier response, public origin, purchase, realized saving or commercial outcome was observed.
