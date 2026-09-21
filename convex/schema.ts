@@ -1017,6 +1017,29 @@ export default defineSchema({
     "providerInboxId",
   ]),
 
+  /**
+   * C1 fair-progress cursor for retained pre-binding replies (Greptile
+   * r4058523015 follow-up). One row per waiting thread holds the opaque
+   * pagination continuation of the exact waiting-state index. Each replay
+   * trigger reads exactly one bounded page and advances the cursor, so
+   * permanently unprocessable rows cannot permanently hide later valid
+   * replies. The row is removed when a page completes the set; the next
+   * trigger restarts from the beginning.
+   */
+  threadReplayCursors: defineTable({
+    provider: v.string(),
+    environment: v.string(),
+    providerThreadId: v.string(),
+    providerInboxId: v.string(),
+    cursor: v.string(),
+    updatedAt: v.number(),
+  }).index("by_provider_environment_and_thread_and_inbox", [
+    "provider",
+    "environment",
+    "providerThreadId",
+    "providerInboxId",
+  ]),
+
   conversations: defineTable({
     organizationId: v.id("organizations"),
     projectId: v.id("projects"),
