@@ -78,11 +78,13 @@ function ActionButton({
   children,
   disabled = false,
   kind = "primary",
+  className,
   onClick,
   title,
   type = "button",
 }: {
   readonly children: ReactNode;
+  readonly className?: string | undefined;
   readonly disabled?: boolean;
   readonly kind?: "primary" | "secondary" | "text" | "danger";
   readonly onClick?: () => void;
@@ -90,7 +92,7 @@ function ActionButton({
   readonly type?: "button" | "submit";
 }) {
   return (
-    <button className={`wb-button wb-button-${kind}`} disabled={disabled} onClick={onClick} title={title} type={type}>
+    <button className={`wb-button wb-button-${kind}${className === undefined ? "" : ` ${className}`}`} disabled={disabled} onClick={onClick} title={title} type={type}>
       {children}
     </button>
   );
@@ -331,7 +333,7 @@ export function WorkbenchUnavailableView({ eyebrow, title, message, tone, action
             <p>{message}</p>
             <div className="wb-connection-rule"><span>Provider effects</span><strong>Unavailable</strong></div>
             <div className="wb-connection-rule"><span>Customer data</span><strong>Not displayed</strong></div>
-            {action !== undefined && onRetry !== undefined ? <ActionButton kind="secondary" onClick={onRetry}><Icon name="refresh" size={15} /> {action}</ActionButton> : null}
+            {action !== undefined && onRetry !== undefined ? <ActionButton className="retry-button" kind="secondary" onClick={onRetry}><Icon name="refresh" size={15} /> {action}</ActionButton> : null}
           </section>
           <aside className="wb-connection-note" aria-label="What happens next">
             <span className="wb-eyebrow">WHAT HAPPENS NEXT</span>
