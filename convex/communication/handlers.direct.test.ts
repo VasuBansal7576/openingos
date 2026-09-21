@@ -1,5 +1,5 @@
 import { convexTest } from "convex-test";
-import { makeFunctionReference, type RegisteredMutation } from "convex/server";
+import { makeFunctionReference, type RegisteredAction, type RegisteredMutation } from "convex/server";
 import { describe, expect, test } from "vitest";
 import schema from "../schema.js";
 import type { Id } from "../_generated/dataModel.js";
@@ -35,6 +35,8 @@ for (const [path, loader] of Object.entries(rawModules)) {
 
 type MutationArgs<T> = T extends RegisteredMutation<infer _Visibility, infer Args, infer _Return> ? Args : never;
 type MutationReturn<T> = T extends RegisteredMutation<infer _Visibility, infer _Args, infer Return> ? Return : never;
+type ActionArgs<T> = T extends RegisteredAction<infer _Visibility, infer Args, infer _Return> ? Args : never;
+type ActionReturn<T> = T extends RegisteredAction<infer _Visibility, infer _Args, infer Return> ? Awaited<Return> : never;
 
 const ingestEventRef = makeFunctionReference<
   "mutation",
@@ -66,6 +68,21 @@ const replayRef = makeFunctionReference<
   MutationArgs<typeof callbacks.replayWaitingInbound>,
   MutationReturn<typeof callbacks.replayWaitingInbound>
 >("communication/callbacks:replayWaitingInbound");
+const resumeRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof callbacks.resumeWaitingInbound>,
+  MutationReturn<typeof callbacks.resumeWaitingInbound>
+>("communication/callbacks:resumeWaitingInbound");
+const recoveryGateRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof callbacks.prepareOversizedRecovery>,
+  MutationReturn<typeof callbacks.prepareOversizedRecovery>
+>("communication/callbacks:prepareOversizedRecovery");
+const recoverRef = makeFunctionReference<
+  "action",
+  ActionArgs<typeof send.recoverOversizedInbound>,
+  ActionReturn<typeof send.recoverOversizedInbound>
+>("communication/send:recoverOversizedInbound");
 const cleanupRef = makeFunctionReference<
   "mutation",
   MutationArgs<typeof cleanup.cleanupFinalizedProviderRows>,
@@ -885,28 +902,32 @@ describe("C1 Astra follow-up repairs (F04/F05/F09/F10/F11/F12)", () => {
     expect(reply.ok && reply.evidenceId !== null).toBe(true);
 
     const other = await secondConversation(f);
-    await f.t.mutation(bindingRef, {
-      operationId: other.operationId,
-      messageId: "f09-outbound-other",
-      threadId: "f09-conflict-thread",
-      inboxId: "owner-inbox",
-    });
-    await f.t.mutation(bindingRef, {
+    // The first binding establishes the durable thread identity; a later
+    // bind from a different conversation fails closed at bind time.
+    const mine = await f.t.mutation(bindingRef, {
       operationId: f.operationId,
       messageId: "f09-outbound-mine",
       threadId: "f09-conflict-thread",
       inboxId: "owner-inbox",
     });
+    expect(mine).toMatchObject({ ok: true });
+    const conflictBind = await f.t.mutation(bindingRef, {
+      operationId: other.operationId,
+      messageId: "f09-outbound-other",
+      threadId: "f09-conflict-thread",
+      inboxId: "owner-inbox",
+    });
+    expect(conflictBind).toMatchObject({ ok: false, code: "invalid-payload" });
     const conflicted = await f.t.mutation(ingestMessageRef, {
       message: inbound("f09-reply-conflict", "f09-conflict-thread", "<p>Conflicted reply</p>"),
       thread: { thread_id: "f09-conflict-thread" },
       eventId: "f09-inbound-conflict",
     });
-    expect(conflicted).toMatchObject({ ok: true, state: "waitingForBinding" });
+    expect(conflicted).toMatchObject({ ok: true, state: "replyReceived", deduplicated: false });
     const stored = await f.t.run(async (ctx) =>
       (await ctx.db.query("evidence").collect()).filter((row) => row.projectId === f.projectId),
     );
-    expect(stored).toHaveLength(1);
+    expect(stored).toHaveLength(2);
   });
 
   test("F10: retained pre-binding replies replay idempotently after binding", async () => {
@@ -961,7 +982,7 @@ describe("C1 Astra follow-up repairs (F04/F05/F09/F10/F11/F12)", () => {
     expect(duplicate).toMatchObject({ ok: true, deduplicated: true, state: "replyReceived" });
   });
 
-  test("F10: oversized retained replies stay waiting instead of conflicting", async () => {
+  test("F10: over-threshold retained replies replay with exact bytes", async () => {
     const f = await fixture();
     const big = `x`.repeat(70_000);
     const early = await f.t.mutation(ingestMessageRef, {
@@ -978,11 +999,13 @@ describe("C1 Astra follow-up repairs (F04/F05/F09/F10/F11/F12)", () => {
     });
     expect(bound).toMatchObject({ ok: true });
     const replay = await f.t.mutation(replayRef, { threadId: "f10-big-thread", inboxId: "owner-inbox" });
-    expect(replay).toMatchObject({ ok: true, replayed: 0, stillWaiting: 1 });
+    expect(replay).toMatchObject({ ok: true, replayed: 0, stillWaiting: 0 });
     const evidence = await f.t.run(async (ctx) =>
       (await ctx.db.query("evidence").collect()).filter((row) => row.projectId === f.projectId),
     );
-    expect(evidence).toHaveLength(0);
+    expect(evidence).toHaveLength(1);
+    // The stored source hash covers the exact full body, never a truncation.
+    expect(evidence[0]?.contentHash).toBe(payloadHash({ messageId: "f10-big", text: big, html: "" }));
   });
 
   test("F11: replay resolves exact links past 130 unrelated rows", async () => {
@@ -1094,5 +1117,422 @@ describe("C1 Astra follow-up repairs (F04/F05/F09/F10/F11/F12)", () => {
     );
     expect(plain).toHaveLength(1);
     expect(plain[0]?.completeness).toBe("complete");
+  });
+});
+
+describe("C1 Greptile P1 replay/scale repairs (r4058523015/r4058523016/r4058523017)", () => {
+  test("later waiting replies stay reachable after earlier rows succeed", async () => {
+    const f = await fixture();
+    for (let index = 0; index < 12; index += 1) {
+      const early = await f.t.mutation(ingestMessageRef, {
+        message: inbound(`starve-reply-${index}`, "starve-thread", `<p>Terms ${index}</p>`),
+        thread: { thread_id: "starve-thread" },
+        eventId: `starve-early-${index}`,
+      });
+      expect(early).toMatchObject({ ok: true, state: "waitingForBinding" });
+    }
+    const bound = await f.t.mutation(bindingRef, {
+      operationId: f.operationId,
+      messageId: "starve-outbound",
+      threadId: "starve-thread",
+      inboxId: "owner-inbox",
+    });
+    expect(bound).toMatchObject({ ok: true });
+    // The bind-time replay drains its bounded per-trigger budget; the next
+    // bounded trigger moves past the succeeded prefix and reaches the rest.
+    const second = await f.t.mutation(replayRef, { threadId: "starve-thread", inboxId: "owner-inbox" });
+    expect(second).toEqual({ ok: true, replayed: 4, stillWaiting: 0 });
+    const drained = await f.t.mutation(replayRef, { threadId: "starve-thread", inboxId: "owner-inbox" });
+    expect(drained).toEqual({ ok: true, replayed: 0, stillWaiting: 0 });
+    const evidence = await f.t.run(async (ctx) =>
+      (await ctx.db.query("evidence").collect()).filter((row) => row.projectId === f.projectId),
+    );
+    expect(evidence).toHaveLength(12);
+    const markers = await f.t.run(async (ctx) =>
+      (await ctx.db.query("productEvidence").collect()).filter(
+        (row) => row.projectId === f.projectId && row.field === "agentmail.message",
+      ),
+    );
+    expect(markers).toHaveLength(12);
+  });
+
+  test("bodies past the durable snapshot bound wait explicitly and resume with exact bytes", async () => {
+    const f = await fixture();
+    // Minimal just-over-bound body: one byte past the durable snapshot
+    // bound, so the oversized path is exercised without oversized cost.
+    const giant = `z`.repeat(262_145);
+    const giantMessage = { ...inbound("giant-reply", "giant-thread"), text: giant };
+    const early = await f.t.mutation(ingestMessageRef, {
+      message: giantMessage,
+      thread: { thread_id: "giant-thread" },
+      eventId: "giant-early",
+    });
+    expect(early).toMatchObject({ ok: true, state: "waitingForBinding" });
+    const bound = await f.t.mutation(bindingRef, {
+      operationId: f.operationId,
+      messageId: "giant-outbound",
+      threadId: "giant-thread",
+      inboxId: "owner-inbox",
+    });
+    expect(bound).toMatchObject({ ok: true });
+    const replay = await f.t.mutation(replayRef, { threadId: "giant-thread", inboxId: "owner-inbox" });
+    expect(replay).toMatchObject({ ok: true, replayed: 0, stillWaiting: 1 });
+    const before = await f.t.run(async (ctx) =>
+      (await ctx.db.query("evidence").collect()).filter((row) => row.projectId === f.projectId),
+    );
+    expect(before).toHaveLength(0);
+    // Conflicting bytes fail closed: no evidence and no success claim.
+    const tampered = await f.t.mutation(resumeRef, {
+      message: { ...giantMessage, text: `${giant}x` },
+      eventId: "giant-resume-tampered",
+    });
+    expect(tampered).toMatchObject({ ok: false, code: "invalid-payload" });
+    // The exact bytes resume through the same validated ingest core.
+    const resumed = await f.t.mutation(resumeRef, { message: giantMessage, eventId: "giant-resume" });
+    expect(resumed).toMatchObject({ ok: true, state: "replyReceived", deduplicated: false });
+    const evidence = await f.t.run(async (ctx) =>
+      (await ctx.db.query("evidence").collect()).filter((row) => row.projectId === f.projectId),
+    );
+    expect(evidence).toHaveLength(1);
+    expect(evidence[0]?.contentHash).toBe(payloadHash({ messageId: "giant-reply", text: giant, html: "" }));
+    // Re-delivery through the live callback path deduplicates by marker.
+    const redelivery = await f.t.mutation(ingestMessageRef, {
+      message: giantMessage,
+      thread: { thread_id: "giant-thread" },
+      eventId: "giant-resume-redelivery",
+    });
+    expect(redelivery).toMatchObject({ ok: true, state: "replyReceived", deduplicated: true });
+  }, 120_000);
+
+  test("more than 64 compatible thread bindings keep routing and quote proof; conflicts fail closed", async () => {
+    const f = await fixture();
+    const operationIds = await f.t.run(async (ctx) => {
+      const now = Date.now();
+      const operation = await ctx.db.get(f.operationId);
+      if (operation === null) throw new Error("operation missing");
+      const ids: Id<"operations">[] = [];
+      for (let index = 0; index < 70; index += 1) {
+        ids.push(
+          await ctx.db.insert("operations", {
+            organizationId: f.organizationId,
+            projectId: f.projectId,
+            jobId: operation.jobId,
+            kind: "communication.send",
+            requestId: `scale-request-${index}`,
+            requestKey: `scale-request-key-${index}`,
+            normalizedPayload: CANONICAL_DRAFT,
+            normalizedPayloadHash: payloadHash(DRAFT),
+            inputVersions: { brief: "v1" },
+            grantId: operation.grantId,
+            grantVersion: 1,
+            recipientConfigVersion: 1,
+            conversationVersion: 1,
+            state: "observedSuccess",
+            attemptToken: `scale-token-${index}`,
+            createdAt: now + index,
+            updatedAt: now + index,
+          }),
+        );
+      }
+      return ids;
+    });
+    for (const [index, operationId] of operationIds.entries()) {
+      const bound = await f.t.mutation(bindingRef, {
+        operationId,
+        messageId: `scale-outbound-${index}`,
+        threadId: "scale-thread",
+        inboxId: "owner-inbox",
+      });
+      expect(bound).toMatchObject({ ok: true });
+    }
+    const identities = await f.t.run(async (ctx) =>
+      (await ctx.db.query("threadBindings").collect()).filter((row) => row.providerThreadId === "scale-thread"),
+    );
+    expect(identities).toHaveLength(1);
+    expect(identities[0]?.conversationId).toBe(f.conversationId);
+    const reply = await f.t.mutation(ingestMessageRef, {
+      message: inbound("scale-reply", "scale-thread", "<p>Long-thread terms</p>"),
+      thread: { thread_id: "scale-thread" },
+      eventId: "scale-inbound",
+    });
+    expect(reply).toMatchObject({ ok: true, state: "replyReceived", deduplicated: false });
+    const quoteJson = JSON.stringify({
+      version: "scale-v1",
+      currency: "EUR",
+      lines: [{
+        lineId: "machine",
+        description: "Machine",
+        quantity: "1",
+        unitPrice: { currency: "EUR", minorUnits: 1_000 },
+        evidenceRefs: [{ sourceId: "agentmail:scale-reply", version: "extract-v1", locator: "message:scale-reply" }],
+      }],
+      charges: [],
+      taxBasis: { kind: "exclusive", basisId: "controlled-exclusive", evidenceRefs: [] },
+    });
+    const quote = await f.t.mutation(ingestQuoteRef, {
+      organizationId: f.organizationId,
+      projectId: f.projectId,
+      conversationId: f.conversationId,
+      providerMessageId: "scale-reply",
+      extractionVersion: "extract-v1",
+      quoteJson,
+      executionMode: "recorded",
+    });
+    expect(quote).toMatchObject({ ok: true, deduplicated: false });
+    // A different conversation binding the same long thread fails closed,
+    // and it cannot claim the established conversation's quote source.
+    const other = await f.t.run(async (ctx) => {
+      const now = Date.now();
+      const operation = await ctx.db.get(f.operationId);
+      if (operation === null) throw new Error("operation missing");
+      const grantId = await ctx.db.insert("grants", {
+        organizationId: f.organizationId,
+        projectId: f.projectId,
+        operations: ["communication.send"],
+        communicationProfile: "ownerRoleplay",
+        recipientConfigVersion: 1,
+        inputVersions: { brief: "v1" },
+        canonicalPayload: CANONICAL_DRAFT,
+        payloadHash: payloadHash(DRAFT),
+        costCeilingMicroUsd: 1_000,
+        roundLimit: 2,
+        expiresAt: now + 60_000,
+        revocationVersion: 1,
+        status: "active",
+        createdAt: now,
+      });
+      const conversationId = await ctx.db.insert("conversations", {
+        organizationId: f.organizationId,
+        projectId: f.projectId,
+        grantId,
+        version: 1,
+        state: "awaitingReply",
+        recipientConfigVersion: 1,
+        updatedAt: now,
+      });
+      await ctx.db.patch(grantId, { conversationId });
+      const jobId = await ctx.db.insert("jobs", {
+        organizationId: f.organizationId,
+        projectId: f.projectId,
+        grantId,
+        grantVersion: 1,
+        kind: "communication",
+        state: "running",
+        inputVersions: { brief: "v1" },
+        createdAt: now,
+        updatedAt: now,
+      });
+      const operationId = await ctx.db.insert("operations", {
+        organizationId: f.organizationId,
+        projectId: f.projectId,
+        jobId,
+        kind: "communication.send",
+        requestId: "scale-conflict-request",
+        requestKey: "scale-conflict-request-key",
+        normalizedPayload: CANONICAL_DRAFT,
+        normalizedPayloadHash: payloadHash(DRAFT),
+        inputVersions: { brief: "v1" },
+        grantId,
+        grantVersion: 1,
+        recipientConfigVersion: 1,
+        conversationVersion: 1,
+        state: "observedSuccess",
+        attemptToken: "scale-conflict-token",
+        createdAt: now,
+        updatedAt: now,
+      });
+      return { conversationId, operationId };
+    });
+    const conflict = await f.t.mutation(bindingRef, {
+      operationId: other.operationId,
+      messageId: "scale-outbound-conflict",
+      threadId: "scale-thread",
+      inboxId: "owner-inbox",
+    });
+    expect(conflict).toMatchObject({ ok: false, code: "invalid-payload" });
+    const foreignQuote = await f.t.mutation(ingestQuoteRef, {
+      organizationId: f.organizationId,
+      projectId: f.projectId,
+      conversationId: other.conversationId,
+      providerMessageId: "scale-reply",
+      extractionVersion: "extract-v1",
+      quoteJson,
+      executionMode: "recorded",
+    });
+    expect(foreignQuote).toMatchObject({ ok: false, code: "invalid-payload" });
+    // The established conversation still routes after the denied conflict.
+    const followup = await f.t.mutation(ingestMessageRef, {
+      message: inbound("scale-reply-2", "scale-thread", "<p>Long-thread follow-up</p>"),
+      thread: { thread_id: "scale-thread" },
+      eventId: "scale-inbound-2",
+    });
+    expect(followup).toMatchObject({ ok: true, state: "replyReceived", deduplicated: false });
+  });
+
+  test("a provable legacy thread earns its durable identity on first touch", async () => {
+    const f = await fixture();
+    // A binding row written before the durable identity existed.
+    await f.t.run(async (ctx) => {
+      const now = Date.now();
+      await ctx.db.insert("processedEvents", {
+        provider: "agentmail-binding",
+        environment: "live",
+        eventId: "legacy-outbound",
+        processingVersion: 1,
+        outcome: JSON.stringify({ messageId: "legacy-outbound", threadId: "legacy-thread", inboxId: "owner-inbox" }),
+        providerMessageId: "legacy-outbound",
+        providerThreadId: "legacy-thread",
+        providerInboxId: "owner-inbox",
+        organizationId: f.organizationId,
+        projectId: f.projectId,
+        operationId: f.operationId,
+        applicationOutcome: "unknown",
+        applicationState: "outcomeUnknown",
+        createdAt: now,
+      });
+    });
+    const reply = await f.t.mutation(ingestMessageRef, {
+      message: inbound("legacy-reply", "legacy-thread", "<p>Legacy terms</p>"),
+      thread: { thread_id: "legacy-thread" },
+      eventId: "legacy-inbound",
+    });
+    expect(reply).toMatchObject({ ok: true, state: "replyReceived", deduplicated: false });
+    const identities = await f.t.run(async (ctx) => (await ctx.db.query("threadBindings").collect()));
+    expect(identities).toHaveLength(1);
+    expect(identities[0]?.conversationId).toBe(f.conversationId);
+    expect(identities[0]?.providerThreadId).toBe("legacy-thread");
+  });
+
+  test("recovery gate fails closed without a waiting oversized row and never fetches", async () => {
+    const f = await fixture();
+    const gated = await f.t.mutation(recoveryGateRef, {
+      threadId: "absent-thread",
+      inboxId: "owner-inbox",
+      messageId: "absent-message",
+    });
+    expect(gated).toMatchObject({ ok: false, code: "invalid-payload" });
+    const originalFetch = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls += 1;
+      throw new Error("must not fetch before the gate passes");
+    }) as unknown as typeof fetch;
+    try {
+      const recovered = await f.t.action(recoverRef, {
+        threadId: "absent-thread",
+        inboxId: "owner-inbox",
+        messageId: "absent-message",
+      });
+      expect(recovered).toMatchObject({ ok: false, code: "invalid-payload" });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+    expect(calls).toBe(0);
+  });
+
+  test("bounded provider read recovers an oversized reply end to end", async () => {
+    const f = await fixture();
+    const giant = `z`.repeat(262_145);
+    const giantMessage = { ...inbound("recover-reply", "recover-thread"), text: giant };
+    const early = await f.t.mutation(ingestMessageRef, {
+      message: giantMessage,
+      thread: { thread_id: "recover-thread" },
+      eventId: "recover-early",
+    });
+    expect(early).toMatchObject({ ok: true, state: "waitingForBinding" });
+    const bound = await f.t.mutation(bindingRef, {
+      operationId: f.operationId,
+      messageId: "recover-outbound",
+      threadId: "recover-thread",
+      inboxId: "owner-inbox",
+    });
+    expect(bound).toMatchObject({ ok: true });
+    const gated = await f.t.mutation(recoveryGateRef, {
+      threadId: "recover-thread",
+      inboxId: "owner-inbox",
+      messageId: "recover-reply",
+    });
+    expect(gated).toEqual({ ok: true });
+    const originalFetch = globalThis.fetch;
+    const originalKey = process.env.AGENTMAIL_API_KEY;
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls += 1;
+      return { ok: true, status: 200, text: async () => JSON.stringify({ messages: [giantMessage] }) };
+    }) as unknown as typeof fetch;
+    process.env.AGENTMAIL_API_KEY = "controlled-recovery-key";
+    try {
+      const recovered = await f.t.action(recoverRef, {
+        threadId: "recover-thread",
+        inboxId: "owner-inbox",
+        messageId: "recover-reply",
+      });
+      expect(recovered).toMatchObject({ ok: true, state: "replyReceived", deduplicated: false });
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (originalKey === undefined) {
+        delete process.env.AGENTMAIL_API_KEY;
+      } else {
+        process.env.AGENTMAIL_API_KEY = originalKey;
+      }
+    }
+    expect(calls).toBe(1);
+    const evidence = await f.t.run(async (ctx) =>
+      (await ctx.db.query("evidence").collect()).filter((row) => row.projectId === f.projectId),
+    );
+    expect(evidence).toHaveLength(1);
+    expect(evidence[0]?.contentHash).toBe(payloadHash({ messageId: "recover-reply", text: giant, html: "" }));
+    // A second recovery finds no waiting row, so it denies before fetching.
+    const again = await f.t.action(recoverRef, {
+      threadId: "recover-thread",
+      inboxId: "owner-inbox",
+      messageId: "recover-reply",
+    });
+    expect(again).toMatchObject({ ok: false, code: "invalid-payload" });
+  });
+
+  test("empty provider list stays unknown and keeps the reply waiting", async () => {
+    const f = await fixture();
+    const giant = `z`.repeat(262_145);
+    await f.t.mutation(ingestMessageRef, {
+      message: { ...inbound("unknown-reply", "unknown-thread"), text: giant },
+      thread: { thread_id: "unknown-thread" },
+      eventId: "unknown-early",
+    });
+    await f.t.mutation(bindingRef, {
+      operationId: f.operationId,
+      messageId: "unknown-outbound",
+      threadId: "unknown-thread",
+      inboxId: "owner-inbox",
+    });
+    const originalFetch = globalThis.fetch;
+    const originalKey = process.env.AGENTMAIL_API_KEY;
+    globalThis.fetch = (async () => ({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ messages: [] }),
+    })) as unknown as typeof fetch;
+    process.env.AGENTMAIL_API_KEY = "controlled-recovery-key";
+    try {
+      const recovered = await f.t.action(recoverRef, {
+        threadId: "unknown-thread",
+        inboxId: "owner-inbox",
+        messageId: "unknown-reply",
+      });
+      expect(recovered).toEqual({ ok: true, outcome: "unknown", reason: "provider list has no such message" });
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (originalKey === undefined) {
+        delete process.env.AGENTMAIL_API_KEY;
+      } else {
+        process.env.AGENTMAIL_API_KEY = originalKey;
+      }
+    }
+    const evidence = await f.t.run(async (ctx) =>
+      (await ctx.db.query("evidence").collect()).filter((row) => row.projectId === f.projectId),
+    );
+    expect(evidence).toHaveLength(0);
+    const replay = await f.t.mutation(replayRef, { threadId: "unknown-thread", inboxId: "owner-inbox" });
+    expect(replay).toMatchObject({ ok: true, replayed: 0, stillWaiting: 1 });
   });
 });
