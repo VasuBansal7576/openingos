@@ -93,6 +93,10 @@ const projectValidator = v.object({
   currency: v.optional(v.string()),
   budgetMinorUnits: v.optional(v.number()),
   needByAt: v.optional(v.number()),
+  // E15 controlled sample marker. Absent on every non-sample project;
+  // present only on projects seeded by the controlled sample boundary.
+  sampleKind: v.optional(v.string()),
+  sampleLabel: v.optional(v.string()),
   createdAt: v.number(),
 });
 
@@ -483,6 +487,8 @@ type ProjectRow = {
   readonly currency?: string;
   readonly budgetMinorUnits?: number;
   readonly needByAt?: number;
+  readonly sampleKind?: string;
+  readonly sampleLabel?: string;
   readonly createdAt: number;
 };
 
@@ -874,6 +880,11 @@ async function readProjectSummary(
     ...(project.currency === undefined ? {} : { currency: project.currency }),
     ...(project.budgetMinorUnits === undefined ? {} : { budgetMinorUnits: project.budgetMinorUnits }),
     ...(project.needByAt === undefined ? {} : { needByAt: project.needByAt }),
+    // E15: the durable controlled-sample marker travels with the project
+    // summary on every surface that uses it, so sample data is visibly
+    // identified and never leaks onto non-sample projects.
+    ...(project.sampleKind === undefined ? {} : { sampleKind: project.sampleKind }),
+    ...(project.sampleLabel === undefined ? {} : { sampleLabel: project.sampleLabel }),
     createdAt: project.createdAt,
   };
 }

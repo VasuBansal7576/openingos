@@ -7,6 +7,7 @@ import type { Id } from "../_generated/dataModel.js";
 import type { Doc as SchemaDoc } from "../_generated/dataModel.js";
 import * as memberships from "../access/memberships.js";
 import * as requirements from "../domain/requirements.js";
+import * as sampleProject from "../domain/sampleProject.js";
 import * as sourcing from "../domain/sourcing.js";
 import * as projection from "./projection.js";
 import schema from "../schema.js";
@@ -77,6 +78,11 @@ const createRequirementRef = makeFunctionReference<
   MutationArgs<typeof requirements.create>,
   MutationReturn<typeof requirements.create>
 >("domain/requirements:create");
+const createSampleGuestProjectRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof sampleProject.createSampleGuestProject>,
+  MutationReturn<typeof sampleProject.createSampleGuestProject>
+>("domain/sampleProject:createSampleGuestProject");
 const recordVendorRef = makeFunctionReference<
   "mutation",
   MutationArgs<typeof sourcing.recordVendor>,
@@ -1623,5 +1629,74 @@ describe("F2 authoritative pairwise comparison verdicts", () => {
     expect(mirror?.status).toBe("comparable");
     expect(mirror?.differenceMinorUnits).toBe(54951);
     expect(mirror?.cheaper).toBe("other");
+  });
+});
+
+describe("E15 controlled sample metadata and isolation", () => {
+  test("projects the durable sample marker on the sample project only", async () => {
+    const t = convexTest(schema, modules);
+    const plain = await setupProject(t, OWNER, "plain");
+    const created = await t.withIdentity(OWNER).mutation(createSampleGuestProjectRef, {
+      idempotencyKey: "projection-sample-1",
+    });
+    if (!created.ok) throw new Error(`sample creation failed: ${JSON.stringify(created)}`);
+
+    const sample = await t.withIdentity(OWNER).query(getProjectionRef, {
+      projectId: created.projectId,
+      limit: 4,
+    });
+    expect(sample.ok).toBe(true);
+    if (!sample.ok) throw new Error("sample projection denied");
+    expect(sample.project.sampleKind).toBe("controlledSample");
+    expect(sample.project.sampleLabel).toBe("Controlled sample data");
+    expect(sample.project.currency).toBe("EUR");
+
+    const listed = await t.withIdentity(OWNER).query(listProjectsRef, { limit: 10 });
+    expect(listed.ok).toBe(true);
+    if (!listed.ok) throw new Error("sample list denied");
+    const listedSample = listed.projects.find((entry) => entry.id === created.projectId);
+    expect(listedSample?.sampleKind).toBe("controlledSample");
+    expect(listedSample?.sampleLabel).toBe("Controlled sample data");
+    const listedPlain = listed.projects.find((entry) => entry.id === plain.projectId);
+    expect(listedPlain).toBeDefined();
+    expect("sampleKind" in (listedPlain as object)).toBe(false);
+    expect("sampleLabel" in (listedPlain as object)).toBe(false);
+
+    const plainView = await t.withIdentity(OWNER).query(getProjectionRef, {
+      projectId: plain.projectId,
+      limit: 1,
+    });
+    expect(plainView.ok).toBe(true);
+    if (!plainView.ok) throw new Error("plain projection denied");
+    expect("sampleKind" in plainView.project).toBe(false);
+    expect("sampleLabel" in plainView.project).toBe(false);
+  });
+
+  test("denies a second identity the sample projection and listing", async () => {
+    const t = convexTest(schema, modules);
+    const created = await t.withIdentity(OWNER).mutation(createSampleGuestProjectRef, {
+      idempotencyKey: "projection-sample-2",
+    });
+    if (!created.ok) throw new Error(`sample creation failed: ${JSON.stringify(created)}`);
+
+    const denied = await t.withIdentity(OTHER).query(getProjectionRef, {
+      projectId: created.projectId,
+      limit: 1,
+    });
+    expect(denied).toEqual({
+      ok: false,
+      code: "denied-membership",
+      message: "not authorized for this project",
+    });
+
+    const otherList = await t.withIdentity(OTHER).query(listProjectsRef, { limit: 10 });
+    expect(otherList.ok).toBe(true);
+    if (!otherList.ok) throw new Error("other list denied");
+    expect(otherList.projects.map((entry) => entry.id)).not.toContain(created.projectId);
+
+    const ownerList = await t.withIdentity(OWNER).query(listProjectsRef, { limit: 10 });
+    expect(ownerList.ok).toBe(true);
+    if (!ownerList.ok) throw new Error("owner list denied");
+    expect(ownerList.projects.map((entry) => entry.id)).toContain(created.projectId);
   });
 });
