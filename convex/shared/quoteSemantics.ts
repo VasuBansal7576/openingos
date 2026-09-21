@@ -613,15 +613,15 @@ export function compareStoredQuotes(left: StoredComparableQuote, right: StoredCo
     return end("incomplete", message.length > 0 ? message : "comparison-failed");
   }
   if (result.status === "complete" && result.equivalent !== undefined) {
+    // The equivalent delta is left total minus right total. cheaperQuoteId
+    // is unusable for side mapping here: toProofInput derives each proof
+    // quoteId from the stored version, so two competing quotes with the
+    // same version identity collide and the mapping would always report
+    // the left side. The signed delta is unique regardless of identity.
     const delta = result.equivalent.delta.minorUnits;
     return end("complete", "equivalent-scope", {
       differenceMinorUnits: Math.abs(delta),
-      cheaper:
-        result.equivalent.cheaperQuoteId === undefined
-          ? "equal"
-          : result.equivalent.cheaperQuoteId === result.left.quoteId
-            ? "left"
-            : "right",
+      cheaper: delta < 0 ? "left" : delta > 0 ? "right" : "equal",
     });
   }
   if (result.status === "estimated" && result.estimatedDeltaRange !== undefined) {
