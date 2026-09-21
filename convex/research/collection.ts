@@ -424,6 +424,24 @@ function collectionCreationRequestId(projectId: Id<"projects">, boundRequestId: 
   return `${projectId}|${boundRequestId}`;
 }
 
+/**
+ * Rows written before the project-scoped request key fold the original
+ * collection target into their organization-scoped key, so a changed-target
+ * retry cannot recompute that exact key. Every bound requestId for one
+ * client requestId shares this deterministic prefix regardless of the stored
+ * mode or source URL, so one lexicographic range covers the whole legacy
+ * bound-key family.
+ */
+function legacyBoundCollectionRequestKeyPrefix(
+  organizationId: Id<"organizations">,
+  clientRequestId: string,
+): string {
+  return legacyCollectionRequestKey(
+    organizationId,
+    `${COLLECTION_BINDING_PREFIX}{"r":${JSON.stringify(clientRequestId)},`,
+  );
+}
+
 function collectionTargetMatches(
   binding: CollectionTarget | undefined,
   requestedTarget: CollectionTarget,
@@ -438,10 +456,14 @@ function collectionTargetMatches(
  * Cross-grant request lookup for one logical project/client request ID.
  *
  * The primary probe is one exact project/client key, so grant rotation does
- * not enumerate active, revoked, or expired grants. Two legacy probes keep
- * the current controlled fixture rows and pre-fix bound keys readable while
- * new rows converge on the project-scoped exact key. Every probe is an
- * indexed, two-row maximum read and only rows belonging to this organization,
+ * not enumerate active, revoked, or expired grants. Two legacy exact probes
+ * keep the current controlled fixture rows readable, and one project-scoped
+ * lexicographic range over `by_project_and_requestKey` covers every
+ * previous-F03 bound key for this client requestId — the stored target
+ * varies inside those keys, so no exact key can reach them after a target
+ * change. Only rows written before the project-scoped key sort inside that
+ * range, so it reads a closed historical set. Every probe is an indexed,
+ * two-row maximum read and only rows belonging to this organization,
  * project, and operation kind participate.
  */
 async function lookupProjectRequest(
@@ -494,7 +516,47 @@ async function lookupProjectRequest(
       },
     };
   }
-  return { ok: true as const, sibling: null };
+  // Previous-F03 bound rows cannot be reached by an exact key when the
+  // requested target differs from the stored one. The project equality in
+  // the index confines this prefix range to this project, so rows another
+  // project wrote under the same client requestId never collide here.
+  const boundKeyPrefix = legacyBoundCollectionRequestKeyPrefix(organizationId, clientRequestId);
+  const boundRows = await ctx.db
+    .query("operations")
+    .withIndex("by_project_and_requestKey", (q) =>
+      q
+        .eq("projectId", projectId)
+        .gte("requestKey", boundKeyPrefix)
+        .lt("requestKey", `${boundKeyPrefix}\uFFFF`),
+    )
+    .take(2);
+  if (boundRows.length > 1) {
+    return {
+      ok: false as const,
+      code: "duplicate-conflict" as const,
+      message: "requestId maps to multiple collection operations",
+    };
+  }
+  const bound = boundRows[0];
+  if (bound === undefined) return { ok: true as const, sibling: null };
+  const decodedBound = decodeCollectionRequestId(bound.requestId);
+  if (
+    bound.organizationId !== organizationId ||
+    bound.kind !== COLLECTION_OPERATION_KIND ||
+    decodedBound.clientRequestId !== clientRequestId
+  ) {
+    return { ok: true as const, sibling: null };
+  }
+  return {
+    ok: true as const,
+    sibling: {
+      operationId: bound._id,
+      jobId: bound.jobId,
+      normalizedPayload: bound.normalizedPayload,
+      state: bound.state,
+      binding: decodedBound.binding,
+    },
+  };
 }
 
 /**
