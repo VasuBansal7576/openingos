@@ -29,6 +29,10 @@
  * - Every scan is an indexed, bounded read with a one-row truncation
  *   probe; the result carries explicit completeness and truncation
  *   metadata instead of silently dropping history.
+ * - Every multi-row total uses checked safe-integer accumulation: a total
+ *   that cannot be represented exactly is reported as an explicit
+ *   unavailable/overflow discriminant with a reason (recorded in
+ *   `completeness.overflowedSections`), never as a rounded number.
  *
  * Authorization: caller identity (never a client-supplied user id) must
  * hold an active project membership at viewer role or above for the exact
@@ -120,6 +124,39 @@ function zeroCounts(states: readonly string[]): Record<string, number> {
 
 const countsValidator = v.record(v.string(), v.number());
 
+/**
+ * Checked safe-integer accumulation (P-22 truthfulness repair).
+ *
+ * Every stored amount is a safe integer, but a bounded multi-row total is
+ * not: plain JavaScript addition past 2^53-1 rounds silently and a rounded
+ * total would be reported as measured. Each overflow-capable total is
+ * therefore either an exact safe-integer number or an explicit
+ * unavailable/overflow discriminant with a reason — never a rounded,
+ * zeroed, or invented value.
+ */
+const OVERFLOW = "overflow" as const;
+type Overflow = typeof OVERFLOW;
+
+const OVERFLOW_TOTAL_REASON =
+  "overflow: the stored-row total exceeds the exact safe-integer range; no rounded or invented total is reported.";
+
+type MeasuredTotal = number | { readonly unavailable: typeof OVERFLOW; readonly reason: string };
+
+function addSafe(total: number | Overflow, amount: number): number | Overflow {
+  if (total === OVERFLOW) return OVERFLOW;
+  const next = total + amount;
+  return Number.isSafeInteger(next) ? next : OVERFLOW;
+}
+
+function measuredTotal(total: number | Overflow): MeasuredTotal {
+  return typeof total === "number" ? total : { unavailable: OVERFLOW, reason: OVERFLOW_TOTAL_REASON };
+}
+
+const measuredTotalValidator = v.union(
+  v.number(),
+  v.object({ unavailable: v.literal(OVERFLOW), reason: v.string() }),
+);
+
 const notAssessedReasons = {
   activation:
     "notAssessed: no activation-event records exist in the durable schema, so no activation or time-to-value claim is made.",
@@ -160,16 +197,16 @@ const metricsValidator = v.object({
     observedElapsed: v.object({
       attemptsWithObservedAt: v.number(),
       attemptsWithSaneInterval: v.number(),
-      totalObservedElapsedMs: v.number(),
+      totalObservedElapsedMs: measuredTotalValidator,
     }),
   }),
   providerUsage: v.object({
     reservationsScanned: v.number(),
     reservationsTruncated: v.boolean(),
     byState: countsValidator,
-    reservedMicroUsd: v.number(),
-    spentMicroUsd: v.number(),
-    unresolvedMicroUsd: v.number(),
+    reservedMicroUsd: measuredTotalValidator,
+    spentMicroUsd: measuredTotalValidator,
+    unresolvedMicroUsd: measuredTotalValidator,
     reservationsWithUnresolvedCharges: v.number(),
   }),
   decisions: v.object({
@@ -199,9 +236,9 @@ const metricsValidator = v.object({
         currency: v.string(),
         entries: v.number(),
         byKind: countsValidator,
-        paymentsAndSettledMinorUnits: v.number(),
-        refundsAndCreditsMinorUnits: v.number(),
-        netMinorUnits: v.number(),
+        paymentsAndSettledMinorUnits: measuredTotalValidator,
+        refundsAndCreditsMinorUnits: measuredTotalValidator,
+        netMinorUnits: measuredTotalValidator,
       }),
     ),
   }),
@@ -223,6 +260,7 @@ const metricsValidator = v.object({
   completeness: v.object({
     complete: v.boolean(),
     truncatedSections: v.array(v.string()),
+    overflowedSections: v.array(v.string()),
   }),
 });
 
@@ -285,11 +323,11 @@ export const projectUsageMetrics = f1Query({
     let retries = 0;
     let attemptsWithObservedAt = 0;
     let attemptsWithSaneInterval = 0;
-    let totalObservedElapsedMs = 0;
+    let totalObservedElapsedMs: number | Overflow = 0;
     let reservationsScanned = 0;
-    let reservedMicroUsd = 0;
-    let spentMicroUsd = 0;
-    let unresolvedMicroUsd = 0;
+    let reservedMicroUsd: number | Overflow = 0;
+    let spentMicroUsd: number | Overflow = 0;
+    let unresolvedMicroUsd: number | Overflow = 0;
     let reservationsWithUnresolvedCharges = 0;
 
     for (const job of jobsPage.rows) {
@@ -322,7 +360,10 @@ export const projectUsageMetrics = f1Query({
             attemptsWithObservedAt += 1;
             if (attempt.observedAt >= attempt.createdAt) {
               attemptsWithSaneInterval += 1;
-              totalObservedElapsedMs += attempt.observedAt - attempt.createdAt;
+              totalObservedElapsedMs = addSafe(
+                totalObservedElapsedMs,
+                attempt.observedAt - attempt.createdAt,
+              );
             }
           }
         }
@@ -339,9 +380,9 @@ export const projectUsageMetrics = f1Query({
       reservationsScanned += reservationsPage.rows.length;
       for (const reservation of reservationsPage.rows) {
         bump(reservationCounts, reservation.state);
-        reservedMicroUsd += reservation.reservedMicroUsd;
-        spentMicroUsd += reservation.spentMicroUsd;
-        unresolvedMicroUsd += reservation.unresolvedMicroUsd;
+        reservedMicroUsd = addSafe(reservedMicroUsd, reservation.reservedMicroUsd);
+        spentMicroUsd = addSafe(spentMicroUsd, reservation.spentMicroUsd);
+        unresolvedMicroUsd = addSafe(unresolvedMicroUsd, reservation.unresolvedMicroUsd);
         if (reservation.unresolvedMicroUsd > 0) {
           reservationsWithUnresolvedCharges += 1;
         }
@@ -350,6 +391,17 @@ export const projectUsageMetrics = f1Query({
     if (operationsTruncated) truncatedSections.push("operations");
     if (attemptsTruncated) truncatedSections.push("attempts");
     if (reservationsTruncated) truncatedSections.push("providerUsage.reservations");
+    const overflowedSections: string[] = [];
+    if (
+      reservedMicroUsd === OVERFLOW ||
+      spentMicroUsd === OVERFLOW ||
+      unresolvedMicroUsd === OVERFLOW
+    ) {
+      overflowedSections.push("providerUsage");
+    }
+    if (totalObservedElapsedMs === OVERFLOW) {
+      overflowedSections.push("attempts.observedElapsed");
+    }
 
     // -- Approvals (approved decisions and recorded user interventions) ---
     const approvalsPage = await boundedTake(
@@ -409,8 +461,8 @@ export const projectUsageMetrics = f1Query({
     interface CurrencyBucket {
       entries: number;
       byKind: Record<string, number>;
-      paymentsAndSettledMinorUnits: number;
-      refundsAndCreditsMinorUnits: number;
+      paymentsAndSettledMinorUnits: number | Overflow;
+      refundsAndCreditsMinorUnits: number | Overflow;
     }
     const spendByCurrency = new Map<string, CurrencyBucket>();
     for (const entry of spendPage.rows) {
@@ -427,22 +479,43 @@ export const projectUsageMetrics = f1Query({
       bucket.entries += 1;
       bump(bucket.byKind, entry.kind);
       if (entry.kind === "payment" || entry.kind === "settledCost") {
-        bucket.paymentsAndSettledMinorUnits += entry.amount.minorUnits;
+        bucket.paymentsAndSettledMinorUnits = addSafe(
+          bucket.paymentsAndSettledMinorUnits,
+          entry.amount.minorUnits,
+        );
       } else {
-        bucket.refundsAndCreditsMinorUnits += entry.amount.minorUnits;
+        bucket.refundsAndCreditsMinorUnits = addSafe(
+          bucket.refundsAndCreditsMinorUnits,
+          entry.amount.minorUnits,
+        );
       }
     }
     const currencies = [...spendByCurrency.entries()]
       .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
-      .map(([currency, bucket]) => ({
-        currency,
-        entries: bucket.entries,
-        byKind: bucket.byKind,
-        paymentsAndSettledMinorUnits: bucket.paymentsAndSettledMinorUnits,
-        refundsAndCreditsMinorUnits: bucket.refundsAndCreditsMinorUnits,
-        netMinorUnits:
-          bucket.paymentsAndSettledMinorUnits - bucket.refundsAndCreditsMinorUnits,
-      }));
+      .map(([currency, bucket]) => {
+        if (
+          bucket.paymentsAndSettledMinorUnits === OVERFLOW ||
+          bucket.refundsAndCreditsMinorUnits === OVERFLOW
+        ) {
+          overflowedSections.push(`spend.currencies.${currency}`);
+        }
+        return {
+          currency,
+          entries: bucket.entries,
+          byKind: bucket.byKind,
+          paymentsAndSettledMinorUnits: measuredTotal(bucket.paymentsAndSettledMinorUnits),
+          refundsAndCreditsMinorUnits: measuredTotal(bucket.refundsAndCreditsMinorUnits),
+          // With both components exact, the difference stays exact; with
+          // either component unavailable, the net is unavailable too.
+          netMinorUnits:
+            bucket.paymentsAndSettledMinorUnits === OVERFLOW ||
+            bucket.refundsAndCreditsMinorUnits === OVERFLOW
+              ? measuredTotal(OVERFLOW)
+              : measuredTotal(
+                  bucket.paymentsAndSettledMinorUnits - bucket.refundsAndCreditsMinorUnits,
+                ),
+        };
+      });
 
     // -- Collection provenance: cached vs fresh, controlled vs live -------
     const evidencePage = await boundedTake(
@@ -484,16 +557,16 @@ export const projectUsageMetrics = f1Query({
         observedElapsed: {
           attemptsWithObservedAt,
           attemptsWithSaneInterval,
-          totalObservedElapsedMs,
+          totalObservedElapsedMs: measuredTotal(totalObservedElapsedMs),
         },
       },
       providerUsage: {
         reservationsScanned,
         reservationsTruncated,
         byState: reservationCounts,
-        reservedMicroUsd,
-        spentMicroUsd,
-        unresolvedMicroUsd,
+        reservedMicroUsd: measuredTotal(reservedMicroUsd),
+        spentMicroUsd: measuredTotal(spentMicroUsd),
+        unresolvedMicroUsd: measuredTotal(unresolvedMicroUsd),
         reservationsWithUnresolvedCharges,
       },
       decisions: {
@@ -528,10 +601,10 @@ export const projectUsageMetrics = f1Query({
       },
       notAssessed: { ...notAssessedReasons },
       completeness: {
-        complete: truncatedSections.length === 0,
+        complete: truncatedSections.length === 0 && overflowedSections.length === 0,
         truncatedSections,
+        overflowedSections,
       },
     };
   },
 });
-

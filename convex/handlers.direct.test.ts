@@ -2817,4 +2817,227 @@ describe("direct E10 usage metrics (P-22)", () => {
     expect(result.notAssessed.activation.startsWith("notAssessed:")).toBe(true);
     expect(result.notAssessed.successRate.startsWith("notAssessed:")).toBe(true);
   });
+
+  test("overflowing stored totals are reported unavailable, never rounded", async () => {
+    const t = convexTest(schema, modules);
+    const setup = await setupMetricsProject(t, OWNER_A);
+    const chain = await seedUnplacedSelection(t, setup.orgId, setup.projectId);
+    await t.run(async (ctx) => {
+      const now = Date.now();
+      const MAX_SAFE = Number.MAX_SAFE_INTEGER;
+      // Placed order with individually valid safe-integer cost entries
+      // whose EUR aggregate overflows the exact range.
+      const orderId = await ctx.db.insert("orders", {
+        organizationId: setup.orgId,
+        projectId: setup.projectId,
+        selectionId: chain.selectionId,
+        requirementId: chain.requirementId,
+        quoteId: chain.quoteId,
+        quoteVersion: "q-metrics-1",
+        requirementVersion: 1,
+        idempotencyKey: "ord-metrics-overflow",
+        state: "recorded",
+        amendmentCount: 0,
+        createdAt: now,
+        updatedAt: now,
+      });
+      await ctx.db.insert("costEntries", {
+        organizationId: setup.orgId,
+        projectId: setup.projectId,
+        orderId,
+        kind: "payment",
+        amount: { currency: "EUR", minorUnits: MAX_SAFE },
+        idempotencyKey: "ce-metrics-overflow-eur-1",
+        recordedBy: OWNER_A.tokenIdentifier,
+        createdAt: now,
+      });
+      await ctx.db.insert("costEntries", {
+        organizationId: setup.orgId,
+        projectId: setup.projectId,
+        orderId,
+        kind: "settledCost",
+        amount: { currency: "EUR", minorUnits: 1 },
+        idempotencyKey: "ce-metrics-overflow-eur-2",
+        recordedBy: OWNER_A.tokenIdentifier,
+        createdAt: now,
+      });
+      await ctx.db.insert("costEntries", {
+        organizationId: setup.orgId,
+        projectId: setup.projectId,
+        orderId,
+        kind: "payment",
+        amount: { currency: "USD", minorUnits: 5 },
+        idempotencyKey: "ce-metrics-overflow-usd-1",
+        recordedBy: OWNER_A.tokenIdentifier,
+        createdAt: now,
+      });
+      // Provider reservation rows whose reserved total overflows while the
+      // spent and unresolved totals stay exact.
+      const budgetId = await ctx.db.insert("providerBudgets", {
+        organizationId: setup.orgId,
+        ceilingMicroUsd: MAX_SAFE,
+        reservedMicroUsd: MAX_SAFE,
+        spentMicroUsd: 10,
+        unresolvedMicroUsd: 0,
+        pricingBasis: "controlled-test",
+        updatedAt: now,
+      });
+      const overflowGrantId = await ctx.db.insert("grants", {
+        organizationId: setup.orgId,
+        projectId: setup.projectId,
+        operations: ["communication.send"],
+        communicationProfile: COMMUNICATION_PROFILE_OWNER_ROLEPLAY,
+        recipientConfigVersion: 1,
+        inputVersions: {},
+        canonicalPayload: "{}",
+        payloadHash: payloadHash("{}"),
+        costCeilingMicroUsd: 100_000,
+        roundLimit: 2,
+        expiresAt: now + 3_600_000,
+        revocationVersion: 0,
+        status: "active",
+        createdAt: now,
+      });
+      const overflowJob = await ctx.db.insert("jobs", {
+        organizationId: setup.orgId,
+        projectId: setup.projectId,
+        grantId: overflowGrantId,
+        grantVersion: 1,
+        kind: "research",
+        state: "running",
+        inputVersions: {},
+        createdAt: now,
+        updatedAt: now,
+      });
+      await ctx.db.insert("reservations", {
+        organizationId: setup.orgId,
+        jobId: overflowJob,
+        budgetId,
+        ceilingMicroUsd: MAX_SAFE,
+        reservedMicroUsd: MAX_SAFE,
+        spentMicroUsd: 10,
+        unresolvedMicroUsd: 0,
+        pricingBasis: "controlled-test",
+        state: "open",
+        updatedAt: now,
+      });
+      await ctx.db.insert("reservations", {
+        organizationId: setup.orgId,
+        jobId: overflowJob,
+        budgetId,
+        ceilingMicroUsd: MAX_SAFE,
+        reservedMicroUsd: 5,
+        spentMicroUsd: 0,
+        unresolvedMicroUsd: 0,
+        pricingBasis: "controlled-test",
+        state: "open",
+        updatedAt: now,
+      });
+      // Two attempts with individually valid intervals whose observed
+      // elapsed total overflows.
+      const overflowOperation = await ctx.db.insert("operations", {
+        organizationId: setup.orgId,
+        projectId: setup.projectId,
+        jobId: overflowJob,
+        kind: "research.collect",
+        requestId: "req-metrics-overflow",
+        requestKey: "metrics-overflow",
+        normalizedPayload: "{}",
+        normalizedPayloadHash: payloadHash("{}"),
+        inputVersions: {},
+        grantId: overflowGrantId,
+        grantVersion: 1,
+        state: "dispatching",
+        createdAt: now,
+        updatedAt: now,
+      });
+      await ctx.db.insert("attempts", {
+        operationId: overflowOperation,
+        token: "tok-metrics-overflow-1",
+        state: "prepared",
+        createdAt: now,
+        observedAt: now + MAX_SAFE,
+      });
+      await ctx.db.insert("attempts", {
+        operationId: overflowOperation,
+        token: "tok-metrics-overflow-2",
+        state: "prepared",
+        createdAt: now,
+        observedAt: now + 1,
+      });
+    });
+    const result = await t.withIdentity(OWNER_A).query(projectUsageMetricsRef, {
+      organizationId: setup.orgId,
+      projectId: setup.projectId,
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("metrics query failed");
+
+    // Provider total: explicit unavailability, never a rounded number;
+    // the exact spent and unresolved totals remain plain numbers.
+    expect(result.providerUsage.reservedMicroUsd).toEqual({
+      unavailable: "overflow",
+      reason: expect.stringContaining("overflow"),
+    });
+    expect(result.providerUsage.spentMicroUsd).toBe(10);
+    expect(result.providerUsage.unresolvedMicroUsd).toBe(0);
+
+    // Observed elapsed total: unavailability discriminant.
+    expect(result.attempts.observedElapsed.totalObservedElapsedMs).toEqual({
+      unavailable: "overflow",
+      reason: expect.stringContaining("overflow"),
+    });
+    expect(result.attempts.observedElapsed.attemptsWithSaneInterval).toBe(2);
+
+    // Per-currency spend: EUR overflows and its net is unavailable with
+    // it; USD stays an exact plain number. Currency separation holds.
+    const eur = result.spend.currencies.find((bucket) => bucket.currency === "EUR");
+    const usd = result.spend.currencies.find((bucket) => bucket.currency === "USD");
+    expect(eur).toBeDefined();
+    expect(usd).toBeDefined();
+    if (!eur || !usd) throw new Error("currency buckets missing");
+    expect(eur.paymentsAndSettledMinorUnits).toEqual({
+      unavailable: "overflow",
+      reason: expect.stringContaining("overflow"),
+    });
+    expect(eur.refundsAndCreditsMinorUnits).toBe(0);
+    expect(eur.netMinorUnits).toEqual({
+      unavailable: "overflow",
+      reason: expect.stringContaining("overflow"),
+    });
+    expect(usd.paymentsAndSettledMinorUnits).toBe(5);
+    expect(usd.netMinorUnits).toBe(5);
+
+    // No unsafe numeric value is reported anywhere in the measured-total
+    // fields of the response.
+    const measuredTotalNumbers: number[] = [];
+    const walk = (value: unknown, path: string) => {
+      if (value !== null && typeof value === "object") {
+        for (const [key, child] of Object.entries(value)) {
+          const childPath = path === "" ? key : `${path}.${key}`;
+          if (
+            typeof child === "number" &&
+            /reservedMicroUsd|spentMicroUsd|unresolvedMicroUsd|paymentsAndSettledMinorUnits|refundsAndCreditsMinorUnits|netMinorUnits|totalObservedElapsedMs$/.test(
+              childPath,
+            )
+          ) {
+            measuredTotalNumbers.push(child);
+          }
+          walk(child, childPath);
+        }
+      }
+    };
+    walk(result, "");
+    for (const number of measuredTotalNumbers) {
+      expect(Number.isSafeInteger(number)).toBe(true);
+    }
+
+    expect(result.completeness.truncatedSections).toEqual([]);
+    expect(result.completeness.overflowedSections).toEqual([
+      "providerUsage",
+      "attempts.observedElapsed",
+      "spend.currencies.EUR",
+    ]);
+    expect(result.completeness.complete).toBe(false);
+  });
 });
