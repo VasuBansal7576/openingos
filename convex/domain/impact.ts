@@ -22,6 +22,13 @@
  * rewrites prior selection, approval, order, or financial history;
  * executing an approved substitute remains an explicit new selection
  * through the decision machinery, which re-fences staleness itself.
+ *
+ * Affected placed orders are assessed independently of the latest
+ * selection: a revision affects every selection pinned to any revision
+ * in its supersedes ancestry (bounded indexed lineage), so an order on
+ * an older selection stays impacted after a newer selection is recorded.
+ * Old orders are never rewritten; over-bound scans produce explicit
+ * incompleteness instead of an undercounted commitment figure.
  */
 
 import { v, type Infer } from "convex/values";
@@ -58,6 +65,24 @@ export const ALTERNATIVE_EVALUATION_BOUND = 25;
  * explicit incompleteness instead of an undercounted commitment figure.
  */
 export const PLACED_ORDER_PROBE_BOUND = 100;
+
+/**
+ * Bounded revision-lineage walk: at most this many predecessor generations
+ * are resolved through the exact content-hash index when an assessment
+ * determines which selections a superseding revision affects. A longer
+ * chain produces explicit incompleteness instead of silently ignoring the
+ * oldest generations.
+ */
+export const REVISION_LINEAGE_BOUND = 10;
+
+/**
+ * Bounded selection scan per requirement: at most this many selections
+ * are read through the requirement index when an assessment determines
+ * the affected selections. One row past the bound is probed; an
+ * over-bound requirement produces explicit incompleteness instead of an
+ * assessment that only sees the newest selections.
+ */
+export const SELECTION_SCAN_BOUND = 50;
 
 /** Caller-provided proposal explanations stay bounded. */
 export const PROPOSAL_REASON_MAX_LENGTH = 500;
@@ -151,6 +176,107 @@ async function probePlacedOrders(
   return rows.filter(
     (row) => row.organizationId === basis.organizationId && row.projectId === basis.projectId,
   ).length;
+}
+
+/**
+ * Bounded revision-ancestry walk for a superseding quote revision. Each
+ * predecessor resolves through one exact `by_project_and_contentHash`
+ * index seek, starting from the already-resolved immediate predecessor.
+ * Returns the set of ancestor quote ids (immediate predecessor plus
+ * older generations, up to REVISION_LINEAGE_BOUND) and whether a longer
+ * chain was cut off. Old generations are never skipped silently: a cut
+ * chain marks the assessment incomplete.
+ */
+async function collectRevisionAncestry(
+  ctx: Parameters<typeof requireDomainAccess>[0],
+  basis: AssessmentBasis,
+  predecessor: {
+    readonly _id: Id<"quotes">;
+    readonly supersedes?: string;
+  },
+): Promise<{ ancestorQuoteIds: Set<Id<"quotes">>; lineageTruncated: boolean }> {
+  const ancestorQuoteIds = new Set<Id<"quotes">>([predecessor._id]);
+  let currentSupersedes = predecessor.supersedes;
+  while (currentSupersedes !== undefined && ancestorQuoteIds.size < REVISION_LINEAGE_BOUND) {
+    const ancestor = await ctx.db
+      .query("quotes")
+      .withIndex("by_project_and_contentHash", (q) =>
+        q.eq("projectId", basis.projectId).eq("contentHash", currentSupersedes as string),
+      )
+      .first();
+    if (ancestor === null || ancestor.organizationId !== basis.organizationId) break;
+    ancestorQuoteIds.add(ancestor._id);
+    currentSupersedes = ancestor.supersedes;
+  }
+  // One-row existence probe past the bound: a still-resolvable older
+  // generation means the walk was cut short.
+  let lineageTruncated = false;
+  if (currentSupersedes !== undefined && ancestorQuoteIds.size >= REVISION_LINEAGE_BOUND) {
+    const beyond = await ctx.db
+      .query("quotes")
+      .withIndex("by_project_and_contentHash", (q) =>
+        q.eq("projectId", basis.projectId).eq("contentHash", currentSupersedes as string),
+      )
+      .first();
+    lineageTruncated =
+      beyond !== null && beyond.organizationId === basis.organizationId;
+  }
+  return { ancestorQuoteIds, lineageTruncated };
+}
+
+interface SelectionScan {
+  readonly rows: {
+    readonly _id: Id<"selections">;
+    readonly candidateId: Id<"candidates">;
+    readonly quoteId: Id<"quotes">;
+    readonly quoteVersion: string;
+  }[];
+  readonly selectionScanOverBound: boolean;
+}
+
+/**
+ * Bounded indexed scan of a requirement's selections (oldest first, at
+ * most SELECTION_SCAN_BOUND rows). One row past the bound is probed so
+ * an over-bound requirement yields explicit incompleteness instead of a
+ * newest-only view that silently drops older affected selections.
+ */
+async function scanSelections(
+  ctx: Parameters<typeof requireDomainAccess>[0],
+  basis: AssessmentBasis,
+): Promise<SelectionScan> {
+  const rows = await ctx.db
+    .query("selections")
+    .withIndex("by_requirement", (q) => q.eq("requirementId", basis.requirementId))
+    .take(SELECTION_SCAN_BOUND + 1);
+  const selectionScanOverBound = rows.length > SELECTION_SCAN_BOUND;
+  const inScope = rows
+    .slice(0, SELECTION_SCAN_BOUND)
+    .filter(
+      (row) =>
+        row.organizationId === basis.organizationId && row.projectId === basis.projectId,
+    );
+  return { rows: inScope, selectionScanOverBound };
+}
+
+/**
+ * Bounded placed-order probe across several affected selections. Returns
+ * the total observed placed-order count and whether any selection's scan
+ * exceeded the per-selection probe bound. Old orders are only read,
+ * never rewritten.
+ */
+async function probePlacedOrdersAcross(
+  ctx: Parameters<typeof requireDomainAccess>[0],
+  basis: AssessmentBasis,
+  selectionIds: readonly Id<"selections">[],
+): Promise<{ placedOrderCount: number; orderScanOverBound: boolean }> {
+  let placedOrderCount = 0;
+  let orderScanOverBound = false;
+  for (const selectionId of selectionIds) {
+    const count = await probePlacedOrders(ctx, basis, selectionId);
+    placedOrderCount += count;
+    if (count > PLACED_ORDER_PROBE_BOUND) orderScanOverBound = true;
+  }
+  return { placedOrderCount, orderScanOverBound };
 }
 
 /**
@@ -332,30 +458,84 @@ export const assessQuoteRevisionImpact = f1Mutation({
       projectId: args.projectId,
       requirementId: quote.value.requirementId,
     };
+    // Affected selections resolve through bounded revision ancestry,
+    // not through the latest selection alone: every selection pinned to
+    // the predecessor or any older generation in this revision's
+    // supersedes chain is affected, so an order on an older selection
+    // stays impacted after a newer selection is recorded. Old orders are
+    // only read here, never rewritten.
     const selection = await latestSelection(ctx, basis);
-    let orderImpact: "none" | "selectionOnly" | "reviewRequired" = "none";
-    let placedOrderCount = 0;
-    let orderScanOverBound = false;
-    let impactClause: string;
-    if (selection === null) {
-      impactClause = "no selection exists for this requirement";
-    } else if (selection.quoteId === quote.value._id) {
-      impactClause = "the current selection already pins this revision";
-    } else if (selection.quoteId !== predecessor._id) {
-      impactClause = `the current selection pins another revision (${selection.quoteVersion})`;
-    } else {
-      placedOrderCount = await probePlacedOrders(ctx, basis, selection._id);
-      orderScanOverBound = placedOrderCount > PLACED_ORDER_PROBE_BOUND;
-      if (orderScanOverBound) {
-        orderImpact = "reviewRequired";
-        impactClause = `the placed-order scan exceeded ${PLACED_ORDER_PROBE_BOUND} rows; the re-evaluation is incomplete`;
-      } else if (placedOrderCount > 0) {
-        orderImpact = "reviewRequired";
-        impactClause = `${placedOrderCount} placed order(s) keep their history and need fresh approval before any substitute`;
-      } else {
-        orderImpact = "selectionOnly";
-        impactClause = "the unplaced selection basis changed and can be re-decided";
+    const { ancestorQuoteIds, lineageTruncated } = await collectRevisionAncestry(
+      ctx,
+      basis,
+      predecessor,
+    );
+    const scan = await scanSelections(ctx, basis);
+    const affected = scan.rows.filter((row) => ancestorQuoteIds.has(row.quoteId));
+    const { placedOrderCount, orderScanOverBound } = await probePlacedOrdersAcross(
+      ctx,
+      basis,
+      affected.map((row) => row._id),
+    );
+    // Primary affected selection: the oldest affected selection carrying
+    // placed orders, else the oldest affected selection. Preferring the
+    // oldest keeps the original affected order stable when a newer
+    // selection is recorded later.
+    let primaryAffected: (typeof affected)[number] | null = null;
+    if (affected.length > 0) {
+      if (placedOrderCount > 0 && !orderScanOverBound) {
+        for (const row of affected) {
+          const count = await probePlacedOrders(ctx, basis, row._id);
+          if (count > 0) {
+            primaryAffected = row;
+            break;
+          }
+        }
       }
+      primaryAffected ??= affected[0] ?? null;
+    }
+    let orderImpact: "none" | "selectionOnly" | "reviewRequired" = "none";
+    let impactClause: string;
+    if (scan.rows.length === 0) {
+      impactClause = "no selection exists for this requirement";
+    } else if (affected.length === 0) {
+      impactClause =
+        selection === null
+          ? "no selection exists for this requirement"
+          : selection.quoteId === quote.value._id
+            ? "the current selection already pins this revision"
+            : `the current selection pins another revision (${selection.quoteVersion})`;
+    } else if (orderScanOverBound) {
+      orderImpact = "reviewRequired";
+      impactClause = `the placed-order scan exceeded ${PLACED_ORDER_PROBE_BOUND} rows; the re-evaluation is incomplete`;
+    } else if (scan.selectionScanOverBound) {
+      orderImpact = placedOrderCount > 0 ? "reviewRequired" : "selectionOnly";
+      impactClause =
+        placedOrderCount > 0
+          ? `${placedOrderCount} placed order(s) keep their history and need fresh approval before any substitute; the selection scan exceeded ${SELECTION_SCAN_BOUND} rows, so the re-evaluation is incomplete`
+          : `the unplaced selection basis changed and can be re-decided; the selection scan exceeded ${SELECTION_SCAN_BOUND} rows, so the re-evaluation is incomplete`;
+    } else if (lineageTruncated) {
+      orderImpact = placedOrderCount > 0 ? "reviewRequired" : "selectionOnly";
+      impactClause =
+        placedOrderCount > 0
+          ? `${placedOrderCount} placed order(s) keep their history and need fresh approval before any substitute; the revision lineage exceeded ${REVISION_LINEAGE_BOUND} generations, so the re-evaluation is incomplete`
+          : `the unplaced selection basis changed and can be re-decided; the revision lineage exceeded ${REVISION_LINEAGE_BOUND} generations, so the re-evaluation is incomplete`;
+    } else if (placedOrderCount > 0) {
+      orderImpact = "reviewRequired";
+      impactClause =
+        affected.length > 1
+          ? `${placedOrderCount} placed order(s) across ${affected.length} affected selection(s) keep their history and need fresh approval before any substitute`
+          : `${placedOrderCount} placed order(s) keep their history and need fresh approval before any substitute`;
+    } else if (selection !== null && selection.quoteId === quote.value._id) {
+      // The current decision already pins the new revision while older
+      // affected selections carry no placed orders: nothing to re-decide.
+      impactClause = "the current selection already pins this revision";
+    } else {
+      orderImpact = "selectionOnly";
+      impactClause =
+        affected.length > 1
+          ? `the unplaced selection basis changed on ${affected.length} affected selection(s) and can be re-decided`
+          : "the unplaced selection basis changed and can be re-decided";
     }
     const { alternatives, truncated } = await evaluateAlternatives(
       ctx,
@@ -363,7 +543,9 @@ export const assessQuoteRevisionImpact = f1Mutation({
       selection?.candidateId ?? null,
     );
     const state: "recorded" | "incomplete" =
-      truncated || orderScanOverBound ? "incomplete" : "recorded";
+      truncated || orderScanOverBound || scan.selectionScanOverBound || lineageTruncated
+        ? "incomplete"
+        : "recorded";
     const assessmentId = await ctx.db.insert("impactAssessments", {
       organizationId: args.organizationId,
       projectId: args.projectId,
@@ -376,9 +558,7 @@ export const assessQuoteRevisionImpact = f1Mutation({
       predecessorQuoteVersion: predecessor.version,
       orderImpact,
       state,
-      ...(selection !== null && selection.quoteId === predecessor._id
-        ? { affectedSelectionId: selection._id }
-        : {}),
+      ...(primaryAffected !== null ? { affectedSelectionId: primaryAffected._id } : {}),
       placedOrderCount,
       reason: `Quote ${predecessor.version} was superseded by ${quote.value.version}; ${impactClause}`,
       alternatives,
@@ -462,21 +642,31 @@ export const assessWatchObservation = f1Mutation({
       projectId: args.projectId,
       requirementId: candidate.value.requirementId,
     };
+    // The watched candidate is matched against every recorded selection
+    // for the requirement (bounded indexed scan), not only the latest:
+    // an order placed on an older selection of the watched candidate
+    // stays impacted after the requirement is re-selected. Old orders are
+    // only read here, never rewritten.
     const selection = await latestSelection(ctx, basis);
-    const watchedCandidateSelected = selection !== null && selection.candidateId === watch.value.targetId;
+    const scan = await scanSelections(ctx, basis);
+    const watched = scan.rows.filter((row) => row.candidateId === watch.value.targetId);
+    const watchedCandidateSelected = watched.length > 0;
     const failedCheck = args.result === "error" || args.result === "unknown";
+    const { placedOrderCount, orderScanOverBound } = await probePlacedOrdersAcross(
+      ctx,
+      basis,
+      watched.map((row) => row._id),
+    );
+    // Primary affected selection: the latest watched selection, matching
+    // the previous single-selection behavior when only one exists.
+    const primaryWatched: (typeof watched)[number] | null =
+      watched.length === 0 ? null : watched[watched.length - 1]!;
     let orderImpact: "none" | "selectionOnly" | "reviewRequired" | "unknown" = "none";
-    let placedOrderCount = 0;
-    let orderScanOverBound = false;
-    if (watchedCandidateSelected && selection !== null) {
-      placedOrderCount = await probePlacedOrders(ctx, basis, selection._id);
-      orderScanOverBound = placedOrderCount > PLACED_ORDER_PROBE_BOUND;
-    }
     if (failedCheck) {
       orderImpact = "unknown";
-    } else if (!watchedCandidateSelected || selection === null) {
+    } else if (!watchedCandidateSelected) {
       orderImpact = "none";
-    } else if (orderScanOverBound || placedOrderCount > 0) {
+    } else if (orderScanOverBound || scan.selectionScanOverBound || placedOrderCount > 0) {
       orderImpact = "reviewRequired";
     } else {
       orderImpact = "selectionOnly";
@@ -486,10 +676,18 @@ export const assessWatchObservation = f1Mutation({
       impactClause = "availability stays unknown and placed orders are unchanged";
     } else if (orderScanOverBound) {
       impactClause = `the placed-order scan exceeded ${PLACED_ORDER_PROBE_BOUND} rows; the re-evaluation is incomplete`;
-    } else if (!watchedCandidateSelected || selection === null) {
+    } else if (scan.selectionScanOverBound) {
+      impactClause =
+        placedOrderCount > 0
+          ? `${placedOrderCount} placed order(s) keep their history and need fresh approval before any substitute; the selection scan exceeded ${SELECTION_SCAN_BOUND} rows, so the re-evaluation is incomplete`
+          : `the watched candidate is not the current selection; the selection scan exceeded ${SELECTION_SCAN_BOUND} rows, so the re-evaluation is incomplete`;
+    } else if (!watchedCandidateSelected) {
       impactClause = "the watched candidate is not the current selection";
     } else if (placedOrderCount > 0) {
-      impactClause = `${placedOrderCount} placed order(s) keep their history and need fresh approval before any substitute`;
+      impactClause =
+        watched.length > 1
+          ? `${placedOrderCount} placed order(s) across ${watched.length} watched selection(s) keep their history and need fresh approval before any substitute`
+          : `${placedOrderCount} placed order(s) keep their history and need fresh approval before any substitute`;
     } else {
       impactClause = "the unplaced selection can be re-decided";
     }
@@ -506,7 +704,7 @@ export const assessWatchObservation = f1Mutation({
     );
     const state: "recorded" | "unknown" | "incomplete" = failedCheck
       ? "unknown"
-      : truncated || orderScanOverBound || args.result === "stale"
+      : truncated || orderScanOverBound || scan.selectionScanOverBound || args.result === "stale"
         ? "incomplete"
         : "recorded";
     const assessmentId = await ctx.db.insert("impactAssessments", {
@@ -519,9 +717,7 @@ export const assessWatchObservation = f1Mutation({
       watchResult: args.result,
       orderImpact,
       state,
-      ...(watchedCandidateSelected && selection !== null
-        ? { affectedSelectionId: selection._id }
-        : {}),
+      ...(primaryWatched !== null ? { affectedSelectionId: primaryWatched._id } : {}),
       placedOrderCount,
       reason: `${observationClause}; ${impactClause}`,
       alternatives,
