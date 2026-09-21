@@ -764,6 +764,12 @@ export const instantiateTemplate = f1Mutation({
     if (template === null || template.organizationId !== args.organizationId) {
       return { ok: false as const, code: "denied-project", message: "template is not in this organization" };
     }
+    // P-19: second-location reuse targets a distinct project. The source
+    // project already holds its own live graph, so instantiating into it
+    // is denied before any replay lookup or write.
+    if (template.sourceProjectId === args.targetProjectId) {
+      return { ok: false as const, code: "invalid-payload", message: "template cannot instantiate into its own source project" };
+    }
     const wanted = parseSnapshotRequirements(template.requirementSnapshot);
     const edges = parseSnapshotConstraints(template.constraintSnapshot);
     if (wanted === null || edges === null) {
@@ -932,19 +938,30 @@ export const instantiateTemplate = f1Mutation({
  * the template version and target project. No current commercial or
  * operational fact is asserted, no stale evidence is claimed, and no
  * source-project data is exposed: the read returns lineage as the
- * template id and version only. The read is bounded through the project
- * index and reports `complete: false` when the bounded scan truncated.
+ * template id and version only.
+ *
+ * Cursor paging over the project index keeps every reused row reachable
+ * no matter how many manually authored requirements precede it: each
+ * call scans at most `limit` project rows (a positive safe integer up
+ * to 200; anything else is denied) and returns every reused requirement
+ * inside that scanned window. `complete` is
+ * true only when the whole project has been scanned, so a page is never
+ * mistaken for the exhaustive set; when `complete` is false, the caller
+ * resumes from `continueCursor`, which continues exactly after the
+ * scanned window so no row is skipped.
  */
 export const listTemplateReuseRevalidation = f1Query({
   args: {
     organizationId: v.id("organizations"),
     projectId: v.id("projects"),
     limit: v.number(),
+    cursor: v.optional(v.string()),
   },
   returns: v.union(
     v.object({
       ok: v.literal(true),
       complete: v.boolean(),
+      continueCursor: v.optional(v.string()),
       scanned: v.number(),
       requirements: v.array(
         v.object({
@@ -973,26 +990,40 @@ export const listTemplateReuseRevalidation = f1Query({
     if (!access.ok) {
       return { ok: false as const, code: access.code, message: access.message };
     }
-    const limit = Math.max(1, Math.min(50, Math.floor(args.limit)));
-    // Bounded scan over the target project's requirements. Instantiation
-    // caps a template at 50 requirements, so 300 scanned rows cover the
-    // reuse graph of a target project several times over while the read
-    // stays inside a fixed budget; truncation is reported, never hidden.
-    const scanBound = 300;
-    const scanned = await ctx.db
+    // Fail closed on malformed bounds: only a positive safe integer
+    // within the supported scan bound is accepted. Non-finite, fractional,
+    // zero/negative, and over-max values are denied, never clamped.
+    if (
+      !Number.isSafeInteger(args.limit) ||
+      args.limit <= 0 ||
+      args.limit > 200
+    ) {
+      return { ok: false as const, code: "invalid-payload", message: "limit must be a positive safe integer within the supported scan bound of 200" };
+    }
+    // `limit` bounds the rows scanned and returned per page, not an
+    // output cap beyond the scan: every reused requirement inside the
+    // scanned window is returned, so truncating output could never
+    // silently drop a reused row that the continuation cursor would
+    // otherwise skip.
+    const scanRows = args.limit;
+    const page = await ctx.db
       .query("requirements")
       .withIndex("by_project", (q) => q.eq("projectId", args.projectId))
-      .take(scanBound);
-    const complete = scanned.length < scanBound;
-    const reused = scanned.filter(
+      .paginate({
+        cursor: args.cursor ?? null,
+        numItems: scanRows,
+        maximumRowsRead: scanRows,
+      });
+    const reused = page.page.filter(
       (row): row is typeof row & { readonly templateId: Id<"templates"> } =>
         row.organizationId === args.organizationId && row.templateId !== undefined,
     );
     return {
       ok: true as const,
-      complete,
-      scanned: scanned.length,
-      requirements: reused.slice(0, limit).map((row) => ({
+      complete: page.isDone,
+      ...(page.isDone ? {} : { continueCursor: page.continueCursor }),
+      scanned: page.page.length,
+      requirements: reused.map((row) => ({
         requirementId: row._id,
         key: row.key,
         title: row.title,

@@ -934,17 +934,23 @@ describe("P-19 second-location template reuse", () => {
     const asOwner = t.withIdentity(OWNER);
 
     // A non-reused authored requirement must not appear in the reuse view.
-    const manual = await asOwner.mutation(createRequirementRef, {
-      organizationId: source.orgId,
-      projectId: target.projectId,
-      key: "authored",
-      title: "Authored requirement",
-      category: "other",
-      quantity: "1",
-      unit: "pcs",
-      priority: "P2",
-    });
-    if (!manual.ok) throw new Error("authored requirement setup failed");
+    for (const [key, title] of [
+      ["authored-a", "Authored A"],
+      ["authored-b", "Authored B"],
+      ["authored-c", "Authored C"],
+    ] as const) {
+      const manual = await asOwner.mutation(createRequirementRef, {
+        organizationId: source.orgId,
+        projectId: target.projectId,
+        key,
+        title,
+        category: "other",
+        quantity: "1",
+        unit: "pcs",
+        priority: "P2",
+      });
+      if (!manual.ok) throw new Error("authored requirement setup failed");
+    }
 
     const instantiated = await asOwner.mutation(instantiateTemplateRef, {
       organizationId: source.orgId,
@@ -992,14 +998,75 @@ describe("P-19 second-location template reuse", () => {
     expect(serialized).not.toContain(source.projectId);
     expectNoCommercialLeak(serialized);
 
-    // The bound is enforced and honest: a tiny limit truncates the list
-    // without hiding the truncation.
-    const truncated = await asOwner.query(listTemplateReuseRevalidationRef, {
+    // Malformed limits fail closed with the agreed denial shape: NaN,
+    // Infinity, fractions, zero, negative, and over-max are all denied,
+    // never clamped into a valid scan.
+    for (const malformedLimit of [
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      2.5,
+      0,
+      -3,
+      201,
+    ]) {
+      const denied = await asOwner.query(listTemplateReuseRevalidationRef, {
+        organizationId: source.orgId,
+        projectId: target.projectId,
+        limit: malformedLimit,
+      });
+      expect(denied.ok).toBe(false);
+      if (!denied.ok) {
+        expect(denied.code).toBe("invalid-payload");
+        expect(denied.message).toBe(
+          "limit must be a positive safe integer within the supported scan bound of 200",
+        );
+      }
+    }
+
+    // Cursor paging reaches reused rows behind manually authored rows and
+    // no page is mistaken for the exhaustive set: pages accumulate until
+    // `complete`, and their union is exactly the instantiated set.
+    let cursor: string | undefined;
+    const collected: Id<"requirements">[] = [];
+    for (let pageIndex = 0; pageIndex < 20; pageIndex += 1) {
+      const page = await asOwner.query(listTemplateReuseRevalidationRef, {
+          organizationId: source.orgId,
+          projectId: target.projectId,
+          limit: 2,
+          ...(cursor === undefined ? {} : { cursor }),
+        });
+      if (!page.ok) throw new Error(`paged revalidation query failed: ${page.message}`);
+      collected.push(...page.requirements.map((entry) => entry.requirementId));
+      if (page.complete) {
+        expect(page.continueCursor).toBeUndefined();
+        break;
+      }
+      expect(page.continueCursor).toBeDefined();
+      cursor = page.continueCursor;
+    }
+    expect(collected).toHaveLength(instantiated.requirementIds.length);
+    expect(new Set(collected)).toEqual(new Set(instantiated.requirementIds));
+  });
+});
+
+describe("P-19 source-project instantiation guard", () => {
+  test("instantiating a template into its own source project is denied with zero writes", async () => {
+    const t = convexTest(schema, modules);
+    const source = await setupProject(t, "self-source");
+    const saved = await saveReuseTemplate(t, source, "v1");
+    const asOwner = t.withIdentity(OWNER);
+
+    const denied = await asOwner.mutation(instantiateTemplateRef, {
       organizationId: source.orgId,
-      projectId: target.projectId,
-      limit: 2,
+      targetProjectId: source.projectId,
+      templateId: saved.templateId,
     });
-    if (!truncated.ok) throw new Error("truncated revalidation query failed");
-    expect(truncated.requirements).toHaveLength(2);
+    expect(denied.ok).toBe(false);
+    if (!denied.ok) {
+      expect(denied.code).toBe("invalid-payload");
+      expect(denied.message).toBe("template cannot instantiate into its own source project");
+    }
+    expect(await countProject(t, "requirements", source.projectId)).toBe(0);
+    expect(await countProject(t, "dependencies", source.projectId)).toBe(0);
   });
 });
