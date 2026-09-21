@@ -1127,6 +1127,114 @@ describe("R1 collection-target binding (F03)", () => {
     expect(await countProjectEffects(t, fixture.projectId)).toEqual(before);
   });
 
+  test("previous-F03 bound row conflicts a changed-target cross-grant retry", async () => {
+    // Controlled regression for Greptile r4058654413: rows written before the
+    // project-scoped request key carry the original collection target inside
+    // both the stored requestId and the organization-scoped requestKey, so a
+    // changed-target retry cannot recompute that exact key. The fence must
+    // still find the row through its bound-request prefix and conflict before
+    // any job, reservation, operation, or provider dispatch.
+    const t = init();
+    const fixture = await createFixture(t, "f03-legacy-bound");
+    const asOwner = t.withIdentity(OWNER);
+    const legacyBoundRequestId = `r1cb1:${JSON.stringify({ r: "f03-legacy-bound", m: "search", s: null })}`;
+    await t.run(async (ctx) => {
+      await ctx.db.patch(fixture.operationId, {
+        requestId: legacyBoundRequestId,
+        requestKey: `${fixture.organizationId}|research.collect|${legacyBoundRequestId}`,
+      });
+    });
+    const secondGrant = await asOwner.mutation(issueGrantRef, {
+      organizationId: fixture.organizationId,
+      projectId: fixture.projectId,
+      operations: ["research.collect"],
+      communicationProfile: "ownerRoleplay",
+      recipientConfigVersion: 0,
+      inputVersions: { brief: "r1-v1" },
+      payloadJson: canonicalJson({ query: INTENT }),
+      costCeilingMicroUsd: 250_000,
+      roundLimit: 8,
+      expiresAt: Date.now() + 60 * 60 * 1000,
+    });
+    if (!secondGrant.ok) throw new Error(`second grant setup failed: ${secondGrant.message}`);
+    const calls: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL) => {
+      calls.push(String(url));
+      return new Response(JSON.stringify({ success: true, data: { web: [] } }), { status: 200 });
+    }));
+    const before = await countProjectEffects(t, fixture.projectId);
+    const changed = await asOwner.mutation(requestGrantedResearchRef, {
+      projectId: fixture.projectId,
+      researchIntent: INTENT,
+      requestId: "f03-legacy-bound",
+      grantId: secondGrant.grantId,
+      mode: "scrape",
+      sourceUrl: "https://supplier.example.test/legacy-changed",
+    });
+    expect(changed).toMatchObject({ ok: false, code: "duplicate-conflict" });
+    await t.finishAllScheduledFunctions(() => {});
+    expect(calls).toHaveLength(0);
+    expect(await countProjectEffects(t, fixture.projectId)).toEqual(before);
+    // An identical retry under the other grant still deduplicates to the
+    // original legacy-bound operation.
+    const identical = await asOwner.mutation(requestGrantedResearchRef, {
+      projectId: fixture.projectId,
+      researchIntent: INTENT,
+      requestId: "f03-legacy-bound",
+      grantId: secondGrant.grantId,
+      mode: "search",
+    });
+    expect(identical).toMatchObject({ ok: true, jobId: fixture.jobId, operationId: fixture.operationId });
+    expect(await countProjectEffects(t, fixture.projectId)).toEqual(before);
+  });
+
+  test("previous-F03 bound rows do not block the same requestId in another project", async () => {
+    // The legacy bound-key prefix is organization-scoped, so the lookup must
+    // still filter to this project: another project's identical client
+    // requestId keeps its own job, operation, and target.
+    const t = init();
+    const fixture = await createFixture(t, "f03-legacy-xproject");
+    const asOwner = t.withIdentity(OWNER);
+    const legacyBoundRequestId = `r1cb1:${JSON.stringify({ r: "f03-legacy-xproject", m: "search", s: null })}`;
+    await t.run(async (ctx) => {
+      await ctx.db.patch(fixture.operationId, {
+        requestId: legacyBoundRequestId,
+        requestKey: `${fixture.organizationId}|research.collect|${legacyBoundRequestId}`,
+      });
+    });
+    const otherProject = await asOwner.mutation(createProjectRef, {
+      organizationId: fixture.organizationId,
+      name: "R1 legacy cross-project research",
+      visibility: "open",
+    });
+    if (!otherProject.ok) throw new Error(`second project setup failed: ${otherProject.message}`);
+    const otherGrant = await asOwner.mutation(issueGrantRef, {
+      organizationId: fixture.organizationId,
+      projectId: otherProject.projectId,
+      operations: ["research.collect"],
+      communicationProfile: "ownerRoleplay",
+      recipientConfigVersion: 0,
+      inputVersions: { brief: "r1-v1" },
+      payloadJson: canonicalJson({ query: INTENT }),
+      costCeilingMicroUsd: 250_000,
+      roundLimit: 8,
+      expiresAt: Date.now() + 60 * 60 * 1000,
+    });
+    if (!otherGrant.ok) throw new Error(`cross-project grant setup failed: ${otherGrant.message}`);
+    const other = await asOwner.mutation(requestGrantedResearchRef, {
+      projectId: otherProject.projectId,
+      researchIntent: INTENT,
+      requestId: "f03-legacy-xproject",
+      grantId: otherGrant.grantId,
+      mode: "scrape",
+      sourceUrl: "https://supplier.example.test/other-project",
+    });
+    expect(other.ok).toBe(true);
+    if (!other.ok || other.operationId === null) throw new Error("cross-project request was blocked by a legacy bound row");
+    expect(other.operationId).not.toBe(fixture.operationId);
+    expect(other.jobId).not.toBe(fixture.jobId);
+  });
+
   async function assertGrantRotation(status: RotatedGrantStatus): Promise<void> {
     const t = init();
     const fixture = await createFixture(t, `rotation-fixture-${status}`);
