@@ -903,13 +903,10 @@ export function createConvexWorkbenchAdapter(client: ConvexWorkbenchClient): Con
       if (failure !== null) return failure;
       const projectId = isRecord(result) ? requiredString(result.projectId) : null;
       if (projectId === null) return { ok: false, message: "The server did not return a valid workspace." };
-      try {
-        await load(projectId);
-      } catch {
-        // The workspace exists server-side; projection refresh failure is
-        // reported but the creation result still carries the project id so
-        // the caller can subscribe to it.
-      }
+      // No eager projection load here: the parent owns the connection/auth
+      // epoch and adapter fence, and decides whether this success may adopt
+      // and load the returned project. An eager load would let a stale-epoch
+      // success populate the cache before that fence runs.
       return { ok: true, projectId, message: "Workspace created by the server." };
     } catch (error) {
       return { ok: false, message: error instanceof Error ? error.message : "The server did not create this workspace." };

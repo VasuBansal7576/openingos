@@ -364,4 +364,63 @@ describe("P-01 intake user path", () => {
       await mounted.restore();
     }
   });
+
+  test("changed payload after a failure sends a fresh key", async () => {
+    const keys: string[] = [];
+    let calls = 0;
+    const mounted = await mountIntake(async (input) => {
+      calls += 1;
+      keys.push(input.idempotencyKey);
+      if (calls === 1) return { ok: false, message: "Controlled intake failure." };
+      return { ok: true, projectId: "project-changed" };
+    });
+    try {
+      setValue(mounted.dom, mounted.field("Project name"), "Northside café");
+      setValue(mounted.dom, mounted.field("City or region"), "Amsterdam");
+      await mounted.submit();
+      expect(keys).toHaveLength(1);
+      expect(mounted.container.textContent).toContain("Controlled intake failure.");
+
+      setValue(mounted.dom, mounted.field("Project name"), "Northside café v2");
+      await mounted.submit();
+      expect(keys).toHaveLength(2);
+      expect(keys[1]).not.toBe(keys[0]);
+      expect(mounted.container.textContent).toContain("Workspace created. Loading the persisted project.");
+    } finally {
+      await mounted.restore();
+    }
+  });
+});
+
+describe("P2 intake reconnect defects (real adapter)", () => {
+  test("createIntake success performs no eager projection load", async () => {
+    const mutationCalls: { reference: unknown; args: unknown }[] = [];
+    const queryCalls: unknown[] = [];
+    const adapter = createConvexWorkbenchAdapter({
+      query: async (_reference: unknown, args: unknown) => {
+        queryCalls.push(args);
+        return null;
+      },
+      watchQuery: () => ({ localQueryResult: () => undefined, onUpdate: () => () => {} }) as never,
+      mutation: async (reference: unknown, args: unknown) => {
+        mutationCalls.push({ reference, args });
+        return { ok: true, projectId: "project-intake-fresh" };
+      },
+    } as unknown as ConvexWorkbenchClient);
+    const result = await adapter.createIntake({
+      idempotencyKey: "intake-reconnect-1",
+      mode: "opening",
+      projectName: "Harbor expansion",
+      workspaceKind: "private",
+      region: "Amsterdam, Netherlands",
+      currency: "EUR",
+    });
+    expect(result).toMatchObject({ ok: true, projectId: "project-intake-fresh" });
+    expect(mutationCalls).toHaveLength(1);
+    expect(getFunctionName(mutationCalls[0]?.reference as never)).toBe("domain/intake:createWorkspace");
+    // The parent epoch/adapter fence owns adoption and loading: a stale-epoch
+    // success must load nothing, so the adapter itself loads nothing eagerly.
+    expect(queryCalls).toHaveLength(0);
+    adapter.dispose();
+  });
 });
