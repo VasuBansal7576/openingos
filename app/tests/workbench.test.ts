@@ -1722,16 +1722,16 @@ function candidateWithCompleteQuote(overrides: Record<string, unknown>): Record<
   return { ...template, compatibility: "pass", ...overrides };
 }
 
-function completeQuote(totalMinorUnits: number): Record<string, unknown> {
+function completeQuote(totalMinorUnits: number, currency = "EUR"): Record<string, unknown> {
   return {
     id: `quote-complete-${totalMinorUnits}`,
     version: "2",
-    currency: "EUR",
-    lines: [{ lineId: "machine", description: "Atlas 2G", quantity: "1", unitPrice: { currency: "EUR", minorUnits: totalMinorUnits - 100000 } }],
+    currency,
+    lines: [{ lineId: "machine", description: "Atlas 2G", quantity: "1", unitPrice: { currency, minorUnits: totalMinorUnits - 100000 } }],
     charges: [
-      { chargeId: "charge-freight", label: "freight", scope: { kind: "quote" }, state: { kind: "known", amount: { currency: "EUR", minorUnits: 60000 } } },
-      { chargeId: "charge-installation", label: "installation", scope: { kind: "quote" }, state: { kind: "known", amount: { currency: "EUR", minorUnits: 40000 } } },
-      { chargeId: "charge-machine", label: "machine", scope: { kind: "line", lineId: "machine" }, state: { kind: "known", amount: { currency: "EUR", minorUnits: totalMinorUnits - 100000 } } },
+      { chargeId: "charge-freight", label: "freight", scope: { kind: "quote" }, state: { kind: "known", amount: { currency, minorUnits: 60000 } } },
+      { chargeId: "charge-installation", label: "installation", scope: { kind: "quote" }, state: { kind: "known", amount: { currency, minorUnits: 40000 } } },
+      { chargeId: "charge-machine", label: "machine", scope: { kind: "line", lineId: "machine" }, state: { kind: "known", amount: { currency, minorUnits: totalMinorUnits - 100000 } } },
     ],
     taxBasis: { kind: "inclusive", basisId: "tax-w1-1" },
     createdAt: Date.UTC(2026, 8, 20),
@@ -1740,6 +1740,12 @@ function completeQuote(totalMinorUnits: number): Record<string, unknown> {
     superseded: false,
     totalMinorUnits,
     comparableTotalMinorUnits: totalMinorUnits,
+    total: { currency, minorUnits: totalMinorUnits },
+    comparisonScope: {
+      requirementId: "requirement-w1-1",
+      scopeId: "scope-w1-espresso",
+      items: [{ itemId: "item-w1-machine", lineId: "machine", unit: "unit", requiredQuantity: "1" }],
+    },
   };
 }
 
@@ -1754,11 +1760,13 @@ function twoOfferProjection(): Record<string, unknown> {
         id: "candidate-w1-1",
         vendor: { id: "vendor-w1-1", name: "Harbor Equipment", regions: ["NL"], serviceCoverage: "Service coverage reported for this inquiry" },
         latestValidQuote: { ...firstQuote, ...completeQuote(850000), id: "quote-w1-complete" },
+        comparisons: [{ againstCandidateId: "candidate-w1-2", againstQuoteId: "quote-w1-2-complete", status: "comparable", reason: "equivalent-scope", differenceMinorUnits: 54951, cheaper: "other", estimatedDeltaMinorUnits: null }],
       }),
       candidateWithCompleteQuote({
         id: "candidate-w1-2",
         vendor: { id: "vendor-w1-2", name: "Elm Supply", regions: ["NL"], serviceCoverage: "Service coverage reported for this inquiry" },
-        latestValidQuote: { ...firstQuote, ...completeQuote(795000), id: "quote-w1-2-complete" },
+        latestValidQuote: { ...firstQuote, ...completeQuote(795049), id: "quote-w1-2-complete" },
+        comparisons: [{ againstCandidateId: "candidate-w1-1", againstQuoteId: "quote-w1-complete", status: "comparable", reason: "equivalent-scope", differenceMinorUnits: 54951, cheaper: "self", estimatedDeltaMinorUnits: null }],
       }),
     ],
   };
@@ -1786,7 +1794,7 @@ test("renders the decision desk from real requirement and offer records", async 
   }
 });
 
-test("shows an honest comparable-total difference only for complete papers", async () => {
+test("shows the exact backend 549.51 EUR delta without recomputing a rank", async () => {
   const snapshot = parseWorkbenchSnapshot(twoOfferProjection(), projection.project.id);
   if (snapshot === null) throw new Error("Two-offer projection should parse");
   const mounted = await mountE8Tab({ state: "ready", snapshot }, () => ({ ok: false, message: "controlled test refusal" }));
@@ -1795,8 +1803,90 @@ test("shows an honest comparable-total difference only for complete papers", asy
     if (tape === null) throw new Error("Comparison tape should render for two complete offers");
     expect(tape.textContent).toContain("Elm Supply");
     expect(tape.textContent).toContain("Harbor Equipment");
-    expect(tape.textContent).toContain("apart in comparable totals");
+    expect(tape.textContent).toContain("549.51");
+    expect(tape.textContent).toContain("lower than");
+    expect(tape.textContent).toContain("accepted comparison scope");
     expect(tape.textContent).not.toContain("saving");
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+function projectionWithPairStatus(
+  status: "estimated" | "incompatible" | "incomplete",
+  reason: string,
+): Record<string, unknown> {
+  const value = twoOfferProjection();
+  const candidates = value.candidates as readonly Record<string, unknown>[];
+  return {
+    ...value,
+    candidates: candidates.map((candidate, index) => ({
+      ...candidate,
+      comparisons: [{
+        againstCandidateId: index === 0 ? "candidate-w1-2" : "candidate-w1-1",
+        againstQuoteId: index === 0 ? "quote-w1-2-complete" : "quote-w1-complete",
+        status,
+        reason,
+        differenceMinorUnits: null,
+        cheaper: null,
+        estimatedDeltaMinorUnits: status === "estimated" ? { minimum: -60000, maximum: -50000 } : null,
+      }],
+    })),
+  };
+}
+
+test("mixed native currencies stay visible without a frontend rank", async () => {
+  const value = projectionWithPairStatus("incompatible", "mixed-currency-requires-accepted-conversion-basis");
+  const candidates = value.candidates as readonly Record<string, unknown>[];
+  const first = candidates[0];
+  const second = candidates[1];
+  if (first === undefined || second === undefined) throw new Error("Both offers are required");
+  value.candidates = [
+    first,
+    { ...second, latestValidQuote: { ...completeQuote(795049, "USD"), id: "quote-w1-2-complete" } },
+  ];
+  const snapshot = parseWorkbenchSnapshot(value, projection.project.id);
+  if (snapshot === null) throw new Error("Mixed-currency projection should parse");
+  const mounted = await mountE8Tab({ state: "ready", snapshot }, () => ({ ok: false, message: "controlled test refusal" }));
+  try {
+    const tape = mounted.container.querySelector(".wb-comparison-tape.not-ranked");
+    if (tape === null) throw new Error("Non-ranking comparison tape should render");
+    expect(tape.textContent).toContain("Not comparable");
+    expect(tape.textContent).toContain("No offer is ranked");
+    expect(tape.textContent).not.toContain("lower than");
+    await mounted.clickTab("Suppliers");
+    const prices = [...mounted.container.querySelectorAll(".wb-supplier-price strong")].map((node) => node.textContent ?? "");
+    expect(prices.some((price) => price.includes("€"))).toBe(true);
+    expect(prices.some((price) => price.includes("$"))).toBe(true);
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("tax and scope incompatibility reasons remain non-ranking", async () => {
+  for (const reason of ["tax bases are not compatible", "comparison scopes are not compatible"]) {
+    const snapshot = parseWorkbenchSnapshot(projectionWithPairStatus("incompatible", reason), projection.project.id);
+    if (snapshot === null) throw new Error("Incompatible projection should parse");
+    const mounted = await mountE8Tab({ state: "ready", snapshot }, () => ({ ok: false, message: "controlled test refusal" }));
+    try {
+      const tape = mounted.container.querySelector(".wb-comparison-tape.not-ranked");
+      expect(tape?.textContent).toContain(reason);
+      expect(tape?.textContent).toContain("No offer is ranked");
+    } finally {
+      await mounted.cleanup();
+    }
+  }
+});
+
+test("an incomplete pair stays visible with no exact difference", async () => {
+  const snapshot = parseWorkbenchSnapshot(projectionWithPairStatus("incomplete", "Freight is unknown"), projection.project.id);
+  if (snapshot === null) throw new Error("Incomplete projection should parse");
+  const mounted = await mountE8Tab({ state: "ready", snapshot }, () => ({ ok: false, message: "controlled test refusal" }));
+  try {
+    const tape = mounted.container.querySelector(".wb-comparison-tape.not-ranked");
+    expect(tape?.textContent).toContain("Comparison incomplete");
+    expect(tape?.textContent).toContain("Freight is unknown");
+    expect(tape?.textContent).not.toContain("549.51");
   } finally {
     await mounted.cleanup();
   }

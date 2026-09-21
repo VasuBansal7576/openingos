@@ -9,26 +9,26 @@
 **Implementation evidence (this repair)**
 
 - Production bundle built from this checkout: `dist/` via `bun run build`
-  (renders `dist/assets/index-D_0_lEDz.js`, contains the landing copy; the
+  (renders `dist/assets/index-CEWej7NF.js`, contains the landing copy; the
   espresso-machine visual ships as `dist/assets/espresso-machine-Ci7aWQZ4.png`).
 - Automated verification, all passing on this checkout:
-  - `bun test app/tests/application.test.ts` — 11 pass, 103 assertions
+  - `bun test app/tests/application.test.ts`: 11 pass, 103 assertions
     (landing composition per backend state, narrow-layout CSS rules,
     focus/reduced-motion rules, 4.5:1 contrast math on shipped tokens).
-  - `bun test app/tests/user-path.test.ts` — 10 pass, 78 assertions
+  - `bun test app/tests/user-path.test.ts`: 10 pass, 78 assertions
     (demo unavailable flow, brief gating, keyboard entry points, skip link,
     focus, status retry, plus the pre-existing recovery/disposal path).
-  - `bun test app/tests/workbench.test.ts` — 54 pass, 317 assertions
+  - `bun test app/tests/workbench.test.ts`: 57 pass, 331 assertions
     (ready/loading/empty/error/reconnecting projections, F4 source-URL link
     and unavailable states, F7 unsafe/over-precision/valid budget paths,
     selection gating, pagination fences, equipment honesty).
-  - `bun test app/tests/intake.test.ts` — 10 pass, 48 assertions (unchanged,
+  - `bun test app/tests/intake.test.ts`: 10 pass, 48 assertions (unchanged,
     still green: intake contract and connected empty-state intake offer).
-  - `bun test app/tests/convex-workbench-adapter.test.ts` — 28 pass.
-  - `bun test app/tests/provider-contracts.test.ts` — 20 pass.
-  - `bun run typecheck` (root `tsc --noEmit`) — clean.
-  - `bun run typecheck:browser` — clean.
-  - `bun run build` (vite production) — clean.
+  - `bun test app/tests/convex-workbench-adapter.test.ts`: 28 pass.
+  - `bun test app/tests/provider-contracts.test.ts`: 20 pass.
+  - `bun run typecheck` (root `tsc --noEmit`): clean.
+  - `bun run typecheck:browser`: clean.
+  - `bun run build` (vite production): clean.
 - Static audit: no fixed-pixel `width:` overflow offenders in landing rules;
   landing grids use fractional units with `minmax(0, …)`/`min-width: 0` and
   `overflow-wrap: break-word` on display headings.
@@ -103,20 +103,22 @@
   production bundle ships the image.
 - P1 (fixed): combined `bun test` of several app suites in one piped command
   exceeded 180s with no output. Diagnosed by running each suite alone:
-  application 11/11, intake 10/10, workbench 54/54, user-path 10/10 —
+  application 11/11, intake 10/10, workbench 57/57, user-path 10/10;
   no hanging test; the stall was the combined piped invocation, not product
   code. Suites are run individually.
 - P1 (fixed): `tsc --noEmit` flagged a narrowed `empty`-state comparison in
   `App.tsx` and a happy-dom `activeElement` type mismatch in the new
   keyboard test. Both repaired; both typechecks are clean.
-- P2 (fixed): F4/F7/F9 findings from the coordinator's Astra UI review are
-  repaired in code with regression tests as described above. F2 (display
-  contract) waits for its separate authoritative commit and was not touched.
+- P2 (fixed in code, browser verification pending): F2/F4/F7/F9 findings
+  from the coordinator's Astra UI review are repaired with regression tests.
+  F2 now renders native quote currency and exact minor units, consumes only
+  backend-authored pairwise verdicts, and does not rank incompatible,
+  incomplete, estimated, or absent comparisons.
 
 **Responsive / accessibility findings**
 
 - Desktop: two-column hero (47%/53%), polaroid + rotated paper + yellow
-  note, four-column how-it-works — matches the prototype's composition and
+  note, and four-column how-it-works match the prototype's composition and
   hierarchy at wide widths.
 - Narrow (≤800px): hero stacks, nav links collapse to brand + brief CTA,
   how-it-works goes two-column; at ≤540px the workbench preview becomes a

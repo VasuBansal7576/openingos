@@ -207,6 +207,7 @@ h1, h2, h3, p { margin-top: 0; }
 .wb-paper-source:hover { text-decoration: underline; }
 .wb-load-more { display: flex; align-items: center; gap: .35rem; margin: 1.25rem auto 0; padding: .35rem .7rem; border: 0; color: var(--wb-success); background: transparent; font-size: .68rem; font-weight: 800; }
 .wb-comparison-tape { display: flex; grid-column: 1 / -1; width: auto; max-width: 90%; align-items: center; gap: 1.6875rem; margin: .875rem auto 2rem; padding: .8125rem 1.5rem; background: var(--wb-accent-soft); box-shadow: 0 4px 8px #1f37292b; transform: rotate(-1.3deg); font-size: .75rem; font-weight: 600; }
+.wb-comparison-tape.not-ranked { background: #f2ead8; color: var(--wb-ink-soft); transform: rotate(.4deg); }
 .wb-bench-action { display: grid; grid-column: 1 / -1; grid-template-columns: 1.1fr 1.2fr 1fr; align-items: center; gap: 1.75rem; margin: 1.5625rem -2.625rem 0; padding: 1.5625rem 2.625rem .9375rem; color: #fbf5df; background: #193b2fee; }
 .wb-bench-action:focus-visible { outline-color: var(--wb-accent); }
 .wb-bench-selected { display: flex; align-items: center; gap: .9375rem; font-size: .625rem; color: #b8c7b6; }
