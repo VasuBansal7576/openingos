@@ -455,6 +455,105 @@ function toProofInput(stored: StoredComparableQuote): Record<string, unknown> {
   };
 }
 
+export interface F1QuoteCost {
+  readonly status: "complete" | "estimated" | "incomplete";
+  /** The quote's own exact total in minor units; present only when its cost summary is complete. */
+  readonly totalMinorUnits: number | null;
+  /**
+   * Comparable total in minor units; present only when the accepted
+   * comparison result itself is complete, which requires a recorded
+   * comparison scope that the proofs judge compatible.
+   */
+  readonly comparableTotalMinorUnits: number | null;
+  readonly estimatedMinimumMinorUnits: number | null;
+  readonly estimatedMaximumMinorUnits: number | null;
+  readonly reason: string;
+}
+
+/**
+ * One stored quote's own comparable acquisition cost through the accepted
+ * proofs semantics. The stored parts are re-parsed through the accepted
+ * constructors, then compared against themselves: the proof summary of the
+ * left side is exactly the authoritative single-quote cost (all quoted
+ * lines at their quoted quantities, included charges resolved through
+ * coverage, unknown charges blocking, estimates exposed only as a signed
+ * range). An unknown tax basis, a parse failure, or any incomplete or
+ * estimated summary fails closed with no total: estimates, unknown and
+ * unresolved-included charges never become a complete total, and no
+ * arithmetic is re-implemented outside the accepted proofs.
+ *
+ * Two totals are kept distinct: `totalMinorUnits` is the quote's own exact
+ * total whenever the accepted cost summary is complete, while
+ * `comparableTotalMinorUnits` stays null unless the accepted comparison
+ * result itself is complete — a quote without a recorded comparison scope
+ * has an exact total but is not proven comparable.
+ */
+export function storedQuoteCost(stored: StoredComparableQuote): F1QuoteCost {
+  const incomplete = (reason: string): F1QuoteCost => ({
+    status: "incomplete",
+    totalMinorUnits: null,
+    comparableTotalMinorUnits: null,
+    estimatedMinimumMinorUnits: null,
+    estimatedMaximumMinorUnits: null,
+    reason,
+  });
+  if (stored.taxBasis.kind === "unknown") {
+    return incomplete("tax basis is unknown");
+  }
+  let quote: Quote;
+  let comparison: ReturnType<typeof compareQuotes>;
+  try {
+    quote = parseQuoteDocument(toProofInput(stored) as unknown as QuoteDocumentInput);
+    comparison = compareQuotes(quote, quote);
+  } catch (error) {
+    return incomplete(error instanceof Error ? error.message : "stored quote is invalid");
+  }
+  const summary = comparison.left;
+  if (summary.status === "incomplete") {
+    const issue = summary.unknownCharges[0];
+    return incomplete(issue === undefined ? "quote cost is incomplete" : `${issue.label} is ${issue.kind} (${issue.reason})`);
+  }
+  if (summary.status === "estimated") {
+    const range = summary.estimatedRange;
+    if (range === undefined) {
+      return incomplete("estimated quote has no bounded range");
+    }
+    return {
+      status: "estimated",
+      totalMinorUnits: null,
+      comparableTotalMinorUnits: null,
+      estimatedMinimumMinorUnits: range.minimum.minorUnits,
+      estimatedMaximumMinorUnits: range.maximum.minorUnits,
+      reason: "estimated charges prevent an exact comparable total",
+    };
+  }
+  const total = summary.total;
+  if (total === undefined) {
+    return incomplete("complete summary has no total");
+  }
+  if (!Number.isSafeInteger(total.minorUnits)) {
+    return incomplete("total is not a safe integer");
+  }
+  if (total.minorUnits < 0) {
+    return incomplete("quote total is negative");
+  }
+  if (total.currency !== stored.currency) {
+    return incomplete("total currency does not match the quote currency");
+  }
+  // Comparable requires the accepted comparison result itself to be
+  // complete: a self-comparison is complete only when the proof judged
+  // the recorded comparison scope compatible on both sides.
+  const comparable = comparison.status === "complete" ? total.minorUnits : null;
+  return {
+    status: "complete",
+    totalMinorUnits: total.minorUnits,
+    comparableTotalMinorUnits: comparable,
+    estimatedMinimumMinorUnits: null,
+    estimatedMaximumMinorUnits: null,
+    reason: comparable === null ? "complete total without an accepted comparison scope" : "complete comparable scope",
+  };
+}
+
 export type F1ComparisonStatus = "complete" | "estimated" | "incomplete" | "incompatible";
 
 export interface F1EstimatedDeltaRange {

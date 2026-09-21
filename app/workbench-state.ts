@@ -39,8 +39,8 @@ export interface WorkbenchCapabilities {
   readonly canCompare: boolean;
   readonly canCommunicate: boolean;
   readonly canClarify: boolean;
-  /** Server-authoritative approval capability. Missing/malformed values fail closed in the parser. */
-  readonly canApprove: boolean;
+  /** Server-authoritative approval capability. Absent means unrepresented authority (null). */
+  readonly canApprove: boolean | null;
   /** Server-authoritative service-case capability. Missing/malformed values fail closed in the parser. */
   readonly canOpenServiceCase: boolean;
   readonly canRecordOrder: boolean | null;
@@ -450,6 +450,17 @@ function parseCharge(value: unknown, quoteCurrency: string): WorkbenchQuoteCharg
   return { kind, state: stateKind, minorUnits, currency, scope, evidenceIds: [] };
 }
 
+/**
+ * E4 authoritative totals: the wire field must be null or a non-negative
+ * safe integer. A present but non-safe-integer (float, NaN, string) or
+ * negative value is invalid money supplied by the backend and rejects the
+ * payload instead of being synthesized into null.
+ */
+function parseExactTotal(value: unknown): number | null | undefined {
+  if (value === null) return null;
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
 function parseQuote(value: unknown): WorkbenchQuote | null {
   if (!isRecord(value)) return null;
   const id = requiredString(value.id);
@@ -460,6 +471,15 @@ function parseQuote(value: unknown): WorkbenchQuote | null {
   const basisId = value.taxBasis.kind === "unknown" ? null : requiredString(value.taxBasis.basisId);
   const reason = value.taxBasis.kind === "unknown" ? requiredString(value.taxBasis.reason) : null;
   if (value.taxBasis.kind === "unknown" ? reason === null : basisId === null) return null;
+  if (value.currentness !== "current" || value.superseded !== false) return null;
+  const totalMinorUnits = parseExactTotal(value.totalMinorUnits);
+  const comparableTotalMinorUnits = parseExactTotal(value.comparableTotalMinorUnits);
+  if (totalMinorUnits === undefined || comparableTotalMinorUnits === undefined) return null;
+  // A comparable total must agree with the quote's own exact total. An
+  // exact total without a comparable total is allowed only as the
+  // complete-but-not-proven-comparable shape; any other relationship is
+  // an ambiguous payload and fails closed.
+  if (comparableTotalMinorUnits !== null && (totalMinorUnits === null || comparableTotalMinorUnits !== totalMinorUnits)) return null;
   const lines: WorkbenchQuoteLine[] = [];
   for (const entry of value.lines) {
     if (!isRecord(entry)) return null;
@@ -479,7 +499,7 @@ function parseQuote(value: unknown): WorkbenchQuote | null {
   }
   const provenance = parseProjectionProvenance(value.provenance);
   if (provenance === null) return null;
-  return { id, version, currency, lines, charges, totalMinorUnits: null, comparableTotalMinorUnits: null, validUntil: null, taxBasis: value.taxBasis.kind, superseded: null };
+  return { id, version, currency, lines, charges, totalMinorUnits, comparableTotalMinorUnits, validUntil: null, taxBasis: value.taxBasis.kind, superseded: false };
 }
 
 function parseVendor(value: unknown): WorkbenchVendor | null {
@@ -598,7 +618,12 @@ function parseProject(value: unknown): WorkbenchProject | null {
 function parseAccess(value: unknown): WorkbenchAccess | null {
   if (!isRecord(value) || !isOneOf(value.role, ["viewer", "contributor", "approver", "owner"] as const) || !isRecord(value.capabilities)) return null;
   const capabilities = value.capabilities;
-  if (typeof capabilities.canResearch !== "boolean" || typeof capabilities.canRecordEvidence !== "boolean" || typeof capabilities.canRecordQuote !== "boolean" || typeof capabilities.canCompare !== "boolean" || typeof capabilities.canCommunicate !== "boolean" || typeof capabilities.canClarify !== "boolean" || typeof capabilities.canApprove !== "boolean" || typeof capabilities.canOpenServiceCase !== "boolean") return null;
+  if (typeof capabilities.canResearch !== "boolean" || typeof capabilities.canRecordEvidence !== "boolean" || typeof capabilities.canRecordQuote !== "boolean" || typeof capabilities.canCompare !== "boolean" || typeof capabilities.canCommunicate !== "boolean" || typeof capabilities.canClarify !== "boolean" || typeof capabilities.canOpenServiceCase !== "boolean") return null;
+  // E4: the backend projects canApprove from the caller's resolved role.
+  // A present non-boolean value rejects the payload; an absent value keeps
+  // the honest unrepresented-authority null instead of guessing.
+  const rawCanApprove = capabilities.canApprove;
+  if (rawCanApprove !== undefined && typeof rawCanApprove !== "boolean") return null;
   return {
     role: value.role,
     capabilities: {
@@ -608,7 +633,7 @@ function parseAccess(value: unknown): WorkbenchAccess | null {
       canCompare: capabilities.canCompare,
       canCommunicate: capabilities.canCommunicate,
       canClarify: capabilities.canClarify,
-      canApprove: capabilities.canApprove,
+      canApprove: rawCanApprove === undefined ? null : rawCanApprove,
       canOpenServiceCase: capabilities.canOpenServiceCase,
       canRecordOrder: null,
       canResolveRisk: null,
