@@ -13,10 +13,14 @@ import { checkProjectAccess, denialValidator, identityOf, requireCapability, typ
 import { f1Query } from "../server.js";
 import { provenanceLabel, type ExecutionMode } from "../shared/provenance.js";
 import { roleSatisfies } from "../shared/scope.js";
-import { storedQuoteCost } from "../shared/quoteSemantics.js";
+import {
+  compareStoredQuotes,
+  storedQuoteCost,
+  type StoredComparableQuote,
+  type StoredComparisonScope,
+} from "../shared/quoteSemantics.js";
 import {
   type StoredChargeState,
-  type StoredComparisonScope,
   type StoredQuoteCharge,
   type StoredQuoteLine,
   type StoredTaxBasis,
@@ -37,10 +41,14 @@ export const MAX_OPERATIONS_PER_JOB = 8;
 export const MAX_ATTEMPTS_PER_OPERATION = 4;
 export const MAX_ATTEMPTS_PER_JOB = MAX_OPERATIONS_PER_JOB * MAX_ATTEMPTS_PER_OPERATION;
 export const MAX_DECISIONS = 24;
+export const MAX_IMPACTS = 12;
+export const MAX_SUBSTITUTES = 12;
 export const MAX_ACTIVITY_PAGE = 24;
 export const MAX_EQUIPMENT_ASSETS = 12;
 export const MAX_ASSET_DOCUMENTS = 8;
 export const MAX_ASSET_CASES = 8;
+/** Worst-case unordered pairs among the bounded candidate page. */
+export const MAX_COMPARISON_PAIRS = (MAX_CANDIDATES * (MAX_CANDIDATES - 1)) / 2;
 
 const roleValidator = v.union(
   v.literal("owner"),
@@ -85,6 +93,10 @@ const projectValidator = v.object({
   currency: v.optional(v.string()),
   budgetMinorUnits: v.optional(v.number()),
   needByAt: v.optional(v.number()),
+  // E15 controlled sample marker. Absent on every non-sample project;
+  // present only on projects seeded by the controlled sample boundary.
+  sampleKind: v.optional(v.string()),
+  sampleLabel: v.optional(v.string()),
   createdAt: v.number(),
 });
 
@@ -176,6 +188,49 @@ const quoteTaxBasisValidator = v.union(
   v.object({ kind: v.literal("unknown"), reason: v.string() }),
 );
 
+/**
+ * F2 comparison contract: the complete recorded comparison scope leaves
+ * the backend unpruned so the UI can prove what a verdict was computed
+ * over instead of inferring a basis from line rows.
+ */
+const quoteComparisonScopeProjectionValidator = v.object({
+  requirementId: v.string(),
+  scopeId: v.string(),
+  items: v.array(
+    v.object({
+      itemId: v.string(),
+      lineId: v.string(),
+      unit: v.string(),
+      requiredQuantity: v.string(),
+    }),
+  ),
+});
+
+/**
+ * F2 authoritative pairwise verdict. Every machine status carries a
+ * truthful reason; `differenceMinorUnits` and `cheaper` exist only for
+ * `comparable` verdicts, and the estimated delta range only for
+ * `estimated` verdicts. The UI must never rank or subtract offers whose
+ * pair verdict is absent or not `comparable`.
+ */
+const offerComparisonValidator = v.object({
+  againstCandidateId: v.id("candidates"),
+  againstQuoteId: v.union(v.id("quotes"), v.null()),
+  status: v.union(
+    v.literal("comparable"),
+    v.literal("estimated"),
+    v.literal("incompatible"),
+    v.literal("incomplete"),
+  ),
+  reason: v.string(),
+  differenceMinorUnits: v.union(v.number(), v.null()),
+  cheaper: v.union(v.literal("self"), v.literal("other"), v.literal("equal"), v.null()),
+  estimatedDeltaMinorUnits: v.union(
+    v.object({ minimum: v.number(), maximum: v.number() }),
+    v.null(),
+  ),
+});
+
 const quoteValidator = v.object({
   id: v.id("quotes"),
   version: v.string(),
@@ -189,6 +244,8 @@ const quoteValidator = v.object({
   superseded: v.literal(false),
   totalMinorUnits: v.union(v.number(), v.null()),
   comparableTotalMinorUnits: v.union(v.number(), v.null()),
+  total: v.union(moneyValidator, v.null()),
+  comparisonScope: v.union(quoteComparisonScopeProjectionValidator, v.null()),
 });
 
 const vendorValidator = v.object({
@@ -208,6 +265,7 @@ const candidateValidator = v.object({
   conversationState: v.string(),
   vendor: v.optional(vendorValidator),
   latestValidQuote: v.union(quoteValidator, v.null()),
+  comparisons: v.array(offerComparisonValidator),
   evidence: v.array(redactedEvidenceValidator),
   provenance: provenanceValidator,
 });
@@ -289,6 +347,46 @@ const activityItemValidator = v.object({
   createdAt: v.number(),
 });
 
+// E8 due-decision and recovery state. Impact assessments project only the
+// stored trigger, state, order impact, bounded reason text, and lineage
+// versions — never invented savings, availability, readiness, or delivery
+// delay (no assessment field expresses delay). Substitute proposals project
+// the stored requirement/quote lineage plus a server-computed stale/current
+// basis fence so the client can disable obsolete approvals with zero writes.
+const impactValidator = v.object({
+  id: v.id("impactAssessments"),
+  requirementId: v.id("requirements"),
+  trigger: v.union(v.literal("quoteRevision"), v.literal("watchObservation")),
+  state: v.union(v.literal("recorded"), v.literal("unknown"), v.literal("incomplete")),
+  orderImpact: v.union(
+    v.literal("none"),
+    v.literal("selectionOnly"),
+    v.literal("reviewRequired"),
+    v.literal("unknown"),
+  ),
+  reason: v.string(),
+  quoteVersion: v.optional(v.string()),
+  predecessorQuoteVersion: v.optional(v.string()),
+  watchResult: v.optional(v.union(v.literal("ok"), v.literal("stale"), v.literal("error"), v.literal("unknown"))),
+  placedOrderCount: v.number(),
+  createdAt: v.number(),
+});
+
+const substituteValidator = v.object({
+  id: v.id("substituteProposals"),
+  requirementId: v.id("requirements"),
+  assessmentId: v.id("impactAssessments"),
+  proposedCandidateId: v.id("candidates"),
+  proposedQuoteId: v.id("quotes"),
+  proposedQuoteVersion: v.string(),
+  state: v.union(v.literal("pending"), v.literal("approved"), v.literal("rejected")),
+  reason: v.string(),
+  basisStale: v.boolean(),
+  basisReason: v.string(),
+  createdAt: v.number(),
+  updatedAt: v.number(),
+});
+
 // E1 installed-equipment views project only real bounded rows from the
 // assets, assetDocuments, and serviceCases tables. Asset documents expose
 // exactly kind and createdAt: no document id, storageRef, idempotency key,
@@ -357,6 +455,10 @@ const projectionValidator = v.object({
   jobsTruncated: v.boolean(),
   decisions: v.array(decisionValidator),
   decisionsTruncated: v.boolean(),
+  impacts: v.array(impactValidator),
+  impactsTruncated: v.boolean(),
+  substitutes: v.array(substituteValidator),
+  substitutesTruncated: v.boolean(),
   equipment: equipmentValidator,
   activity: activityValidator,
   provenance: provenanceValidator,
@@ -385,6 +487,8 @@ type ProjectRow = {
   readonly currency?: string;
   readonly budgetMinorUnits?: number;
   readonly needByAt?: number;
+  readonly sampleKind?: string;
+  readonly sampleLabel?: string;
   readonly createdAt: number;
 };
 
@@ -429,11 +533,42 @@ type QuoteProjection = {
   readonly superseded: false;
   readonly totalMinorUnits: number | null;
   readonly comparableTotalMinorUnits: number | null;
+  /**
+   * F2: the exact total as native money. The currency is always the
+   * quote's own currency — no conversion is ever applied — and the minor
+   * units are the exact stored integer.
+   */
+  readonly total: { readonly currency: string; readonly minorUnits: number } | null;
+  /** F2: the complete recorded comparison scope, or null when none was recorded. */
+  readonly comparisonScope: {
+    readonly requirementId: string;
+    readonly scopeId: string;
+    readonly items: Array<{ readonly itemId: string; readonly lineId: string; readonly unit: string; readonly requiredQuantity: string }>;
+  } | null;
 };
 
 type QuoteSelection = {
   readonly view: QuoteProjection;
   readonly evidenceRefs: readonly { readonly sourceId: string; readonly version: string }[];
+  /** F2: the exact stored parts the verdicts are computed from. */
+  readonly stored: StoredComparableQuote;
+};
+
+type OfferComparison = {
+  readonly againstCandidateId: Id<"candidates">;
+  readonly againstQuoteId: Id<"quotes"> | null;
+  readonly status: "comparable" | "estimated" | "incompatible" | "incomplete";
+  readonly reason: string;
+  readonly differenceMinorUnits: number | null;
+  readonly cheaper: "self" | "other" | "equal" | null;
+  readonly estimatedDeltaMinorUnits: { readonly minimum: number; readonly maximum: number } | null;
+};
+
+type ComparableOffer = {
+  readonly candidateId: Id<"candidates">;
+  readonly quoteId: Id<"quotes">;
+  readonly requirementId: Id<"requirements">;
+  readonly stored: StoredComparableQuote;
 };
 
 function denialForProject(): {
@@ -617,8 +752,25 @@ function renderQuote(row: {
       superseded: false,
       totalMinorUnits: cost.totalMinorUnits,
       comparableTotalMinorUnits: cost.comparableTotalMinorUnits,
+      total: cost.totalMinorUnits === null ? null : { currency: row.currency, minorUnits: cost.totalMinorUnits },
+      comparisonScope: row.comparisonScope === undefined
+        ? null
+        : {
+          requirementId: row.comparisonScope.requirementId,
+          scopeId: row.comparisonScope.scopeId,
+          items: row.comparisonScope.items.map((item) => ({ ...item })),
+        },
     },
     evidenceRefs: row.evidenceRefs.map((ref) => ({ sourceId: ref.sourceId, version: ref.version })),
+    stored: {
+      version: row.version,
+      currency: row.currency,
+      lines: [...row.lines],
+      charges: [...row.charges],
+      taxBasis: row.taxBasis,
+      ...(row.comparisonScope === undefined ? {} : { comparisonScope: row.comparisonScope }),
+      evidenceRefs: [...row.evidenceRefs],
+    },
   };
 }
 
@@ -728,6 +880,11 @@ async function readProjectSummary(
     ...(project.currency === undefined ? {} : { currency: project.currency }),
     ...(project.budgetMinorUnits === undefined ? {} : { budgetMinorUnits: project.budgetMinorUnits }),
     ...(project.needByAt === undefined ? {} : { needByAt: project.needByAt }),
+    // E15: the durable controlled-sample marker travels with the project
+    // summary on every surface that uses it, so sample data is visibly
+    // identified and never leaks onto non-sample projects.
+    ...(project.sampleKind === undefined ? {} : { sampleKind: project.sampleKind }),
+    ...(project.sampleLabel === undefined ? {} : { sampleLabel: project.sampleLabel }),
     createdAt: project.createdAt,
   };
 }
@@ -796,6 +953,83 @@ async function latestQuotesForCandidates(
     result.set(key, current.length === 1 ? current[0] ?? null : null);
   }
   return result;
+}
+
+/**
+ * F2 authoritative pairwise comparison verdicts (P-03 / ADR-0003).
+ *
+ * For every unordered pair of current candidate quotes inside one
+ * requirement, the accepted shared comparison (compareStoredQuotes)
+ * produces the verdict before any UI can show rank or delta: comparable
+ * pairs carry the exact minor-unit difference and the cheaper side,
+ * while mixed currencies, incompatible tax bases, scope mismatches, and
+ * incomplete cost summaries carry a stable machine status plus the
+ * truthful reason. No currency conversion, invented rate, or browser
+ * arithmetic is involved. Offers without a current quote receive no
+ * verdict: there is nothing authoritative to compare. Pairs span
+ * different requirements are never compared — competing offers share a
+ * requirement and a comparison scope.
+ */
+function pairwiseOfferComparisons(
+  offers: readonly ComparableOffer[],
+): Map<Id<"candidates">, OfferComparison[]> {
+  const byCandidate = new Map<Id<"candidates">, OfferComparison[]>();
+  const attach = (candidateId: Id<"candidates">, comparison: OfferComparison): void => {
+    const list = byCandidate.get(candidateId);
+    if (list === undefined) byCandidate.set(candidateId, [comparison]);
+    else list.push(comparison);
+  };
+  let emitted = 0;
+  for (let left = 0; left < offers.length && emitted < MAX_COMPARISON_PAIRS; left += 1) {
+    for (let right = left + 1; right < offers.length && emitted < MAX_COMPARISON_PAIRS; right += 1) {
+      const leftOffer = offers[left];
+      const rightOffer = offers[right];
+      if (leftOffer === undefined || rightOffer === undefined) continue;
+      if (leftOffer.requirementId !== rightOffer.requirementId) continue;
+      const verdict = compareStoredQuotes(leftOffer.stored, rightOffer.stored);
+      const status = verdict.status === "complete" ? "comparable" as const : verdict.status;
+      const differenceMinorUnits = status === "comparable" ? verdict.differenceMinorUnits : null;
+      const cheaperLeft = status === "comparable"
+        ? verdict.cheaper === "left" ? "self" as const
+          : verdict.cheaper === "right" ? "other" as const
+            : "equal" as const
+        : null;
+      const cheaperRight = status === "comparable"
+        ? verdict.cheaper === "left" ? "other" as const
+          : verdict.cheaper === "right" ? "self" as const
+            : "equal" as const
+        : null;
+      const estimatedLeft = status === "estimated" && verdict.estimatedDeltaRange !== undefined
+        ? {
+          minimum: verdict.estimatedDeltaRange.minimum,
+          maximum: verdict.estimatedDeltaRange.maximum,
+        }
+        : null;
+      const estimatedRight = estimatedLeft === null
+        ? null
+        : { minimum: -estimatedLeft.maximum, maximum: -estimatedLeft.minimum };
+      attach(leftOffer.candidateId, {
+        againstCandidateId: rightOffer.candidateId,
+        againstQuoteId: rightOffer.quoteId,
+        status,
+        reason: verdict.reason,
+        differenceMinorUnits,
+        cheaper: cheaperLeft,
+        estimatedDeltaMinorUnits: estimatedLeft,
+      });
+      attach(rightOffer.candidateId, {
+        againstCandidateId: leftOffer.candidateId,
+        againstQuoteId: leftOffer.quoteId,
+        status,
+        reason: verdict.reason,
+        differenceMinorUnits,
+        cheaper: cheaperRight,
+        estimatedDeltaMinorUnits: estimatedRight,
+      });
+      emitted += 1;
+    }
+  }
+  return byCandidate;
 }
 
 function mapJobStatus(
@@ -929,6 +1163,245 @@ async function readEquipment(
     });
   }
   return { assets, assetsTruncated };
+}
+
+/**
+ * E8 changed-term impact projection (P-11, D-15). Reads only real bounded
+ * rows from impactAssessments inside the caller's project, newest first,
+ * one row past the bound so over-limit state is an explicit truncation
+ * flag. Reason text is stored-derived only; unknown/incomplete states and
+ * the selection/order distinction are preserved verbatim.
+ */
+async function readImpacts(
+  ctx: import("../server.js").F1QueryCtx,
+  organizationId: Id<"organizations">,
+  projectId: Id<"projects">,
+  bound: number,
+): Promise<{
+  readonly impacts: Array<{
+    readonly id: Id<"impactAssessments">;
+    readonly requirementId: Id<"requirements">;
+    readonly trigger: "quoteRevision" | "watchObservation";
+    readonly state: "recorded" | "unknown" | "incomplete";
+    readonly orderImpact: "none" | "selectionOnly" | "reviewRequired" | "unknown";
+    readonly reason: string;
+    readonly quoteVersion?: string;
+    readonly predecessorQuoteVersion?: string;
+    readonly watchResult?: "ok" | "stale" | "error" | "unknown";
+    readonly placedOrderCount: number;
+    readonly createdAt: number;
+  }>;
+  readonly impactsTruncated: boolean;
+}> {
+  const page = await ctx.db
+    .query("impactAssessments")
+    .withIndex("by_project", (q) => q.eq("projectId", projectId))
+    .order("desc")
+    .take(bound + 1);
+  const impactsTruncated = page.length > bound;
+  const impacts = page
+    .filter((row) => row.organizationId === organizationId && row.projectId === projectId)
+    .slice(0, bound)
+    .map((row) => ({
+      id: row._id,
+      requirementId: row.requirementId,
+      trigger: row.trigger,
+      state: row.state,
+      orderImpact: row.orderImpact,
+      reason: row.reason,
+      ...(row.quoteVersion === undefined ? {} : { quoteVersion: row.quoteVersion }),
+      ...(row.predecessorQuoteVersion === undefined ? {} : { predecessorQuoteVersion: row.predecessorQuoteVersion }),
+      ...(row.watchResult === undefined ? {} : { watchResult: row.watchResult }),
+      placedOrderCount: row.placedOrderCount,
+      createdAt: row.createdAt,
+    }));
+  return { impacts, impactsTruncated };
+}
+
+/**
+ * E8 substitute-proposal projection (P-12, P-13, D-15). Reads only real
+ * bounded rows from substituteProposals inside the caller's project. Each
+ * pending proposal carries a server-computed stale/current basis fence:
+ * the requirement version, proposed quote revision liveness (bounded
+ * successor probe), and current-selection identity are re-read, so a
+ * changed offer, edited requirement, or selection drift marks the basis
+ * stale before any approval. Decided proposals report their terminal
+ * state without a fence. No proposal ever implies an order or selection.
+ */
+async function readSubstitutes(
+  ctx: import("../server.js").F1QueryCtx,
+  organizationId: Id<"organizations">,
+  projectId: Id<"projects">,
+  bound: number,
+): Promise<{
+  readonly substitutes: Array<{
+    readonly id: Id<"substituteProposals">;
+    readonly requirementId: Id<"requirements">;
+    readonly assessmentId: Id<"impactAssessments">;
+    readonly proposedCandidateId: Id<"candidates">;
+    readonly proposedQuoteId: Id<"quotes">;
+    readonly proposedQuoteVersion: string;
+    readonly state: "pending" | "approved" | "rejected";
+    readonly reason: string;
+    readonly basisStale: boolean;
+    readonly basisReason: string;
+    readonly createdAt: number;
+    readonly updatedAt: number;
+  }>;
+  readonly substitutesTruncated: boolean;
+}> {
+  const page = await ctx.db
+    .query("substituteProposals")
+    .withIndex("by_project", (q) => q.eq("projectId", projectId))
+    .order("desc")
+    .take(bound + 1);
+  const substitutesTruncated = page.length > bound;
+  const rows = page
+    .filter((row) => row.organizationId === organizationId && row.projectId === projectId)
+    .slice(0, bound);
+  const substitutes: Awaited<ReturnType<typeof readSubstitutes>>["substitutes"] = [];
+  for (const row of rows) {
+    if (row.state !== "pending") {
+      substitutes.push({
+        id: row._id,
+        requirementId: row.requirementId,
+        assessmentId: row.assessmentId,
+        proposedCandidateId: row.proposedCandidateId,
+        proposedQuoteId: row.proposedQuoteId,
+        proposedQuoteVersion: row.proposedQuoteVersion,
+        state: row.state,
+        reason: row.reason,
+        basisStale: false,
+        basisReason: `Proposal ${row.state}; no fresh approval is required.`,
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt,
+      });
+      continue;
+    }
+    const requirement = await ctx.db.get(row.requirementId);
+    if (
+      requirement === null ||
+      requirement.organizationId !== organizationId ||
+      requirement.projectId !== projectId
+    ) {
+      substitutes.push({
+        id: row._id,
+        requirementId: row.requirementId,
+        assessmentId: row.assessmentId,
+        proposedCandidateId: row.proposedCandidateId,
+        proposedQuoteId: row.proposedQuoteId,
+        proposedQuoteVersion: row.proposedQuoteVersion,
+        state: row.state,
+        reason: row.reason,
+        basisStale: true,
+        basisReason: "Proposal requirement is not in this project; renewed authority required.",
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt,
+      });
+      continue;
+    }
+    if (requirement.version !== row.requirementVersion) {
+      substitutes.push({
+        id: row._id,
+        requirementId: row.requirementId,
+        assessmentId: row.assessmentId,
+        proposedCandidateId: row.proposedCandidateId,
+        proposedQuoteId: row.proposedQuoteId,
+        proposedQuoteVersion: row.proposedQuoteVersion,
+        state: row.state,
+        reason: row.reason,
+        basisStale: true,
+        basisReason: "Requirement changed since the proposal; renewed authority required.",
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt,
+      });
+      continue;
+    }
+    const quote = await ctx.db.get(row.proposedQuoteId);
+    if (
+      quote === null ||
+      quote.organizationId !== organizationId ||
+      quote.projectId !== projectId ||
+      quote.version !== row.proposedQuoteVersion
+    ) {
+      substitutes.push({
+        id: row._id,
+        requirementId: row.requirementId,
+        assessmentId: row.assessmentId,
+        proposedCandidateId: row.proposedCandidateId,
+        proposedQuoteId: row.proposedQuoteId,
+        proposedQuoteVersion: row.proposedQuoteVersion,
+        state: row.state,
+        reason: row.reason,
+        basisStale: true,
+        basisReason: "Proposed quote version changed; renewed authority required.",
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt,
+      });
+      continue;
+    }
+    const successor = await hasQuoteSuccessor(ctx, projectId, quote.contentHash);
+    if (successor) {
+      substitutes.push({
+        id: row._id,
+        requirementId: row.requirementId,
+        assessmentId: row.assessmentId,
+        proposedCandidateId: row.proposedCandidateId,
+        proposedQuoteId: row.proposedQuoteId,
+        proposedQuoteVersion: row.proposedQuoteVersion,
+        state: row.state,
+        reason: row.reason,
+        basisStale: true,
+        basisReason: "Proposed quote terms changed; renewed authority required.",
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt,
+      });
+      continue;
+    }
+    const latestSelection = await ctx.db
+      .query("selections")
+      .withIndex("by_requirement", (q) => q.eq("requirementId", row.requirementId))
+      .order("desc")
+      .take(1);
+    const current = latestSelection[0];
+    const currentId = current !== undefined &&
+      current.organizationId === organizationId &&
+      current.projectId === projectId
+      ? current._id
+      : undefined;
+    if ((currentId ?? undefined) !== row.currentSelectionId) {
+      substitutes.push({
+        id: row._id,
+        requirementId: row.requirementId,
+        assessmentId: row.assessmentId,
+        proposedCandidateId: row.proposedCandidateId,
+        proposedQuoteId: row.proposedQuoteId,
+        proposedQuoteVersion: row.proposedQuoteVersion,
+        state: row.state,
+        reason: row.reason,
+        basisStale: true,
+        basisReason: "The current selection changed since the proposal; renewed authority required.",
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt,
+      });
+      continue;
+    }
+    substitutes.push({
+      id: row._id,
+      requirementId: row.requirementId,
+      assessmentId: row.assessmentId,
+      proposedCandidateId: row.proposedCandidateId,
+      proposedQuoteId: row.proposedQuoteId,
+      proposedQuoteVersion: row.proposedQuoteVersion,
+      state: row.state,
+      reason: row.reason,
+      basisStale: false,
+      basisReason: "Proposed quote revision and requirement version are still current.",
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+    });
+  }
+  return { substitutes, substitutesTruncated };
 }
 
 /** List projects visible to the authenticated identity through authority pages. */
@@ -1105,6 +1578,7 @@ export const getProjection = f1Query({
       .order("desc")
       .take(MAX_EVIDENCE_SNAPSHOTS);
     const provenanceEntries: ProvenanceView[] = [];
+    const comparableOffers: ComparableOffer[] = [];
     for (const candidate of candidateRows) {
       const requirementRow = await ctx.db.get(candidate.requirementId);
       if (
@@ -1134,6 +1608,14 @@ export const getProjection = f1Query({
         ? null
         : latestQuotes.get(candidateQuoteKey(candidate.requirementId, candidate.vendorId)) ?? null;
       const quote = quoteSelection?.view ?? null;
+      if (quoteSelection !== null && quote !== null) {
+        comparableOffers.push({
+          candidateId: candidate._id,
+          quoteId: quote.id,
+          requirementId: candidate.requirementId,
+          stored: quoteSelection.stored,
+        });
+      }
       const quoteEvidence = quoteSelection === null
         ? []
         : quoteSelection.evidenceRefs.flatMap((ref) => {
@@ -1291,19 +1773,41 @@ export const getProjection = f1Query({
       continueCursor: activityPage.isDone ? null : activityPage.continueCursor,
     };
     const equipment = await readEquipment(ctx, project.organizationId, args.projectId);
+    const impactBound = Math.min(pageSize, MAX_IMPACTS);
+    const substituteBound = Math.min(pageSize, MAX_SUBSTITUTES);
+    const { impacts, impactsTruncated: impactsOverBound } = await readImpacts(
+      ctx,
+      project.organizationId,
+      args.projectId,
+      impactBound,
+    );
+    const { substitutes, substitutesTruncated: substitutesOverBound } = await readSubstitutes(
+      ctx,
+      project.organizationId,
+      args.projectId,
+      substituteBound,
+    );
     const summary = await readProjectSummary(ctx, project);
+    const comparisonsByCandidate = pairwiseOfferComparisons(comparableOffers);
     return {
       ok: true as const,
       project: summary,
       access: accessView(access.value),
       requirements,
       requirementsTruncated: requirementsPage.length > Math.min(pageSize, MAX_REQUIREMENTS),
-      candidates,
+      candidates: candidates.map((candidate) => ({
+        ...candidate,
+        comparisons: comparisonsByCandidate.get(candidate.id) ?? [],
+      })),
       candidatesTruncated: candidatesPage.length > Math.min(pageSize, MAX_CANDIDATES),
       jobs,
       jobsTruncated: jobsPage.length > Math.min(pageSize, MAX_JOBS),
       decisions,
       decisionsTruncated,
+      impacts,
+      impactsTruncated: impactsOverBound,
+      substitutes,
+      substitutesTruncated: substitutesOverBound,
       equipment,
       activity,
       provenance: uniqueModes(provenanceEntries),

@@ -55,6 +55,8 @@ export interface WorkbenchProject {
   readonly currency: string | null;
   readonly budgetMinorUnits: number | null;
   readonly needByAt: number | null;
+  readonly sampleKind?: "controlledSample" | null;
+  readonly sampleLabel?: string | null;
 }
 
 export interface WorkbenchAccess {
@@ -106,6 +108,45 @@ export interface WorkbenchQuoteCharge {
   readonly evidenceIds: readonly string[];
 }
 
+/** Exact native money: no conversion is ever applied in the browser. */
+export interface WorkbenchMoney {
+  readonly currency: string;
+  readonly minorUnits: number;
+}
+
+/** Complete recorded comparison scope retained verbatim from the backend. */
+export interface WorkbenchComparisonScopeItem {
+  readonly itemId: string;
+  readonly lineId: string;
+  readonly unit: string;
+  readonly requiredQuantity: string;
+}
+
+export interface WorkbenchComparisonScope {
+  readonly requirementId: string;
+  readonly scopeId: string;
+  readonly items: readonly WorkbenchComparisonScopeItem[];
+}
+
+/**
+ * F2 machine statuses for an authoritative pairwise verdict. Only
+ * `comparable` verdicts may drive rank or delta in the UI; `incompatible`,
+ * `estimated`, and `incomplete` verdicts carry a truthful reason and must
+ * be shown as not rankable.
+ */
+export type WorkbenchComparisonStatus = "comparable" | "estimated" | "incompatible" | "incomplete";
+
+/** Authoritative backend verdict for one offer against one other offer. */
+export interface WorkbenchOfferComparison {
+  readonly againstOfferId: string;
+  readonly againstQuoteId: string | null;
+  readonly status: WorkbenchComparisonStatus;
+  readonly reason: string;
+  readonly differenceMinorUnits: number | null;
+  readonly cheaper: "self" | "other" | "equal" | null;
+  readonly estimatedDeltaMinorUnits: { readonly minimum: number; readonly maximum: number } | null;
+}
+
 export interface WorkbenchQuote {
   readonly id: string;
   readonly version: string;
@@ -114,6 +155,11 @@ export interface WorkbenchQuote {
   readonly charges: readonly WorkbenchQuoteCharge[];
   readonly totalMinorUnits: number | null;
   readonly comparableTotalMinorUnits: number | null;
+  /** Native-currency exact total; never a converted amount. */
+  readonly total: WorkbenchMoney | null;
+  /** Exact tax-basis identity, or null when the basis is unknown. */
+  readonly taxBasisId: string | null;
+  readonly comparisonScope: WorkbenchComparisonScope | null;
   readonly validUntil: number | null;
   readonly taxBasis: "inclusive" | "exclusive" | "unknown";
   readonly superseded: boolean | null;
@@ -140,6 +186,12 @@ export interface WorkbenchOffer {
   readonly compatibility: Compatibility;
   readonly conversationState: string;
   readonly quote: WorkbenchQuote | null;
+  /**
+   * F2 authoritative pairwise verdicts from the backend. An offer with no
+   * verdict against another offer must never be ranked or differenced in
+   * the UI; only `status: "comparable"` verdicts carry a difference.
+   */
+  readonly comparisons: readonly WorkbenchOfferComparison[];
   readonly evidence: readonly WorkbenchEvidence[];
   readonly provenance: ProvenanceMode;
   readonly ownerAuthoredTerms: boolean;
@@ -222,6 +274,37 @@ export interface WorkbenchAsset {
   readonly serviceCasesTruncated: boolean;
 }
 
+/** E8 stored changed-term impact: reason and order impact only, never invented outcomes. */
+export interface WorkbenchImpact {
+  readonly id: string;
+  readonly requirementId: string;
+  readonly trigger: "quoteRevision" | "watchObservation";
+  readonly state: "recorded" | "unknown" | "incomplete";
+  readonly orderImpact: "none" | "selectionOnly" | "reviewRequired" | "unknown";
+  readonly reason: string;
+  readonly quoteVersion: string | null;
+  readonly predecessorQuoteVersion: string | null;
+  readonly watchResult: string | null;
+  readonly placedOrderCount: number;
+  readonly createdAt: number;
+}
+
+/** E8 substitute proposal: fresh approval required while pending and basis current. */
+export interface WorkbenchSubstitute {
+  readonly id: string;
+  readonly requirementId: string;
+  readonly assessmentId: string;
+  readonly proposedCandidateId: string;
+  readonly proposedQuoteId: string;
+  readonly proposedQuoteVersion: string;
+  readonly state: "pending" | "approved" | "rejected";
+  readonly reason: string;
+  readonly basisStale: boolean;
+  readonly basisReason: string;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+}
+
 export interface WorkbenchEquipment {
   readonly assets: readonly WorkbenchAsset[];
   readonly assetsTruncated: boolean;
@@ -243,6 +326,8 @@ export interface WorkbenchSnapshot {
   readonly activity: WorkbenchActivityPage;
   readonly provenance: WorkbenchProvenance;
   readonly equipment: WorkbenchEquipment;
+  readonly impacts: readonly WorkbenchImpact[];
+  readonly substitutes: readonly WorkbenchSubstitute[];
   readonly selectedOfferId: string | null;
   readonly selectedForecastMinorUnits: number | null;
   readonly committedMinorUnits: number | null;
@@ -253,6 +338,8 @@ export interface WorkbenchSnapshot {
     readonly offers: boolean;
     readonly jobs: boolean;
     readonly decisions: boolean;
+    readonly impacts: boolean;
+    readonly substitutes: boolean;
     readonly equipment: boolean;
   };
 }
@@ -263,6 +350,7 @@ export type WorkbenchAction =
   | { readonly type: "cancelJob"; readonly projectId: string; readonly jobId: string }
   | { readonly type: "selectOffer"; readonly projectId: string; readonly offerId: string; readonly quoteId: string; readonly quoteVersion: string }
   | { readonly type: "approveDecision"; readonly projectId: string; readonly decisionId: string }
+  | { readonly type: "decideSubstituteProposal"; readonly projectId: string; readonly proposalId: string; readonly decision: "approved" | "rejected" }
   | {
       readonly type: "openServiceCase";
       readonly projectId: string;
@@ -278,18 +366,58 @@ export interface WorkbenchActionResult {
   readonly message?: string;
 }
 
+/** P-01 intake modes: opening, quote comparison, or equipment case. */
+export type WorkbenchIntakeMode = "opening" | "quoteComparison" | "equipment";
+
+export type WorkbenchIntakeUrgency = "urgent" | "high" | "normal" | "low";
+
+export interface WorkbenchIntakeInput {
+  readonly mode: WorkbenchIntakeMode;
+  readonly projectName: string;
+  readonly workspaceKind: "guest" | "private";
+  readonly region?: string;
+  readonly currency?: string;
+  readonly needByAt?: number;
+  readonly budgetMinorUnits?: number;
+  readonly detailTitle?: string;
+  readonly detailCategory?: string;
+  readonly detailSummary?: string;
+  readonly urgency?: WorkbenchIntakeUrgency;
+  readonly idempotencyKey: string;
+}
+
+export interface WorkbenchIntakeResult {
+  readonly ok: boolean;
+  readonly projectId?: string;
+  readonly message?: string;
+}
+
+export interface WorkbenchSampleInput {
+  readonly idempotencyKey: string;
+}
+
+export interface WorkbenchSampleResult {
+  readonly ok: boolean;
+  readonly projectId?: string;
+  readonly message?: string;
+}
+
+export type WorkbenchSampleHandler = (input: WorkbenchSampleInput) => Promise<WorkbenchSampleResult>;
+
 export interface WorkbenchServerAdapter {
   readonly load: (projectId: string, cursor?: string | null) => Promise<unknown>;
   readonly subscribe?: (projectId: string, onSnapshot: (snapshot: unknown) => void, onError: (error: unknown) => void) => (() => void);
   readonly act: (action: WorkbenchAction) => Promise<WorkbenchActionResult>;
+  readonly createIntake?: (input: WorkbenchIntakeInput) => Promise<WorkbenchIntakeResult>;
+  readonly createSample?: (input: WorkbenchSampleInput) => Promise<WorkbenchSampleResult>;
 }
 
 export function formatMoney(minorUnits: number | null, currency: string | null, unknownLabel = "Unknown"): string {
   if (minorUnits === null || !Number.isFinite(minorUnits) || currency === null || currency.trim().length === 0) return unknownLabel;
   try {
-    return new Intl.NumberFormat("en-GB", { style: "currency", currency, maximumFractionDigits: 0 }).format(minorUnits / 100);
+    return new Intl.NumberFormat("en-GB", { style: "currency", currency, minimumFractionDigits: 0, maximumFractionDigits: 2 }).format(minorUnits / 100);
   } catch {
-    return `${currency} ${(minorUnits / 100).toFixed(0)}`;
+    return `${currency} ${(minorUnits / 100).toFixed(2).replace(/\.00$/, "")}`;
   }
 }
 
@@ -461,6 +589,87 @@ function parseExactTotal(value: unknown): number | null | undefined {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 }
 
+/**
+ * F2 comparison-scope parser: the complete recorded scope must be retained
+ * verbatim. A malformed block rejects the payload; an absent block parses
+ * as null (no recorded scope), matching the backend's null emission.
+ */
+function parseComparisonScope(value: unknown): WorkbenchComparisonScope | null | undefined {
+  if (value === undefined || value === null) return null;
+  if (!isRecord(value)) return undefined;
+  const requirementId = requiredString(value.requirementId);
+  const scopeId = requiredString(value.scopeId);
+  if (requirementId === null || scopeId === null || !Array.isArray(value.items)) return undefined;
+  const items: WorkbenchComparisonScopeItem[] = [];
+  for (const entry of value.items) {
+    if (!isRecord(entry)) return undefined;
+    const itemId = requiredString(entry.itemId);
+    const lineId = requiredString(entry.lineId);
+    const unit = requiredString(entry.unit);
+    const requiredQuantity = requiredString(entry.requiredQuantity);
+    if (itemId === null || lineId === null || unit === null || requiredQuantity === null) return undefined;
+    items.push({ itemId, lineId, unit, requiredQuantity });
+  }
+  return { requirementId, scopeId, items };
+}
+
+/**
+ * F2 pairwise-verdict parser. Each verdict is a backend-authored fact, so
+ * the shape must be internally consistent or the payload fails closed:
+ * `comparable` requires an exact non-negative difference and a cheaper
+ * side, `estimated` requires the signed delta range, and the other
+ * statuses carry neither. A present but malformed verdict rejects the
+ * snapshot instead of being dropped.
+ *
+ * E18 finding 3 (parser half): a verdict may only bind to the displayed
+ * comparison contract when it names the compared quote, so `againstQuoteId`
+ * is required on every emitted verdict. Minor-unit delta ranges must be
+ * safe integers (no fractional minor units) and correctly ordered
+ * (minimum <= maximum; a reversed or negative-width range is rejected).
+ * An exact `equal` verdict must carry a zero difference, and a zero
+ * difference must be claimed as `equal` — anything else is ambiguous
+ * rank data and rejects the payload.
+ */
+function parseOfferComparison(value: unknown): WorkbenchOfferComparison | null {
+  if (!isRecord(value)) return null;
+  const againstOfferId = requiredString(value.againstCandidateId);
+  const againstQuoteId = requiredString(value.againstQuoteId);
+  const reason = requiredString(value.reason);
+  const status = isOneOf(value.status, ["comparable", "estimated", "incompatible", "incomplete"] as const)
+    ? value.status
+    : null;
+  if (againstOfferId === null || againstQuoteId === null || reason === null || status === null) return null;
+  const differenceMinorUnits = parseExactTotal(value.differenceMinorUnits);
+  if (differenceMinorUnits === undefined) return null;
+  const cheaper = value.cheaper === null || value.cheaper === undefined
+    ? null
+    : isOneOf(value.cheaper, ["self", "other", "equal"] as const)
+      ? value.cheaper
+      : undefined;
+  if (cheaper === undefined) return null;
+  let estimatedDeltaMinorUnits: { readonly minimum: number; readonly maximum: number } | null;
+  if (value.estimatedDeltaMinorUnits === undefined || value.estimatedDeltaMinorUnits === null) {
+    estimatedDeltaMinorUnits = null;
+  } else if (isRecord(value.estimatedDeltaMinorUnits)) {
+    const minimum = nullableNumber(value.estimatedDeltaMinorUnits.minimum);
+    const maximum = nullableNumber(value.estimatedDeltaMinorUnits.maximum);
+    if (minimum === null || minimum === undefined || maximum === null || maximum === undefined) return null;
+    if (!Number.isSafeInteger(minimum) || !Number.isSafeInteger(maximum) || minimum > maximum) return null;
+    estimatedDeltaMinorUnits = { minimum, maximum };
+  } else {
+    return null;
+  }
+  if (status === "comparable") {
+    if (differenceMinorUnits === null || cheaper === null || estimatedDeltaMinorUnits !== null) return null;
+    if (cheaper === "equal" ? differenceMinorUnits !== 0 : differenceMinorUnits === 0) return null;
+  } else if (status === "estimated") {
+    if (estimatedDeltaMinorUnits === null || differenceMinorUnits !== null || cheaper !== null) return null;
+  } else if (differenceMinorUnits !== null || cheaper !== null || estimatedDeltaMinorUnits !== null) {
+    return null;
+  }
+  return { againstOfferId, againstQuoteId, status, reason, differenceMinorUnits, cheaper, estimatedDeltaMinorUnits };
+}
+
 function parseQuote(value: unknown): WorkbenchQuote | null {
   if (!isRecord(value)) return null;
   const id = requiredString(value.id);
@@ -480,6 +689,29 @@ function parseQuote(value: unknown): WorkbenchQuote | null {
   // complete-but-not-proven-comparable shape; any other relationship is
   // an ambiguous payload and fails closed.
   if (comparableTotalMinorUnits !== null && (totalMinorUnits === null || comparableTotalMinorUnits !== totalMinorUnits)) return null;
+  // F2 native money: the backend emits the exact total with its own
+  // currency. An absent block falls back to the proven quote currency
+  // with the exact scalar (no conversion is ever applied); a present
+  // block must agree exactly or the payload is ambiguous and fails
+  // closed.
+  const rawTotal = value.total;
+  let total: WorkbenchMoney | null;
+  if (rawTotal === undefined) {
+    total = totalMinorUnits === null ? null : { currency, minorUnits: totalMinorUnits };
+  } else if (rawTotal === null) {
+    if (totalMinorUnits !== null) return null;
+    total = null;
+  } else {
+    const money = parseMoney(rawTotal);
+    if (money === null || money.currency !== currency) return null;
+    if (totalMinorUnits === null || money.minorUnits !== totalMinorUnits) return null;
+    total = money;
+  }
+  // F2 tax-basis identity and comparison scope are retained, never
+  // discarded: the basis identity is already validated above, and a
+  // malformed scope block rejects the payload.
+  const comparisonScope = parseComparisonScope(value.comparisonScope);
+  if (comparisonScope === undefined) return null;
   const lines: WorkbenchQuoteLine[] = [];
   for (const entry of value.lines) {
     if (!isRecord(entry)) return null;
@@ -499,7 +731,21 @@ function parseQuote(value: unknown): WorkbenchQuote | null {
   }
   const provenance = parseProjectionProvenance(value.provenance);
   if (provenance === null) return null;
-  return { id, version, currency, lines, charges, totalMinorUnits, comparableTotalMinorUnits, validUntil: null, taxBasis: value.taxBasis.kind, superseded: false };
+  return {
+    id,
+    version,
+    currency,
+    lines,
+    charges,
+    totalMinorUnits,
+    comparableTotalMinorUnits,
+    total,
+    taxBasisId: basisId,
+    comparisonScope,
+    validUntil: null,
+    taxBasis: value.taxBasis.kind,
+    superseded: false,
+  };
 }
 
 function parseVendor(value: unknown): WorkbenchVendor | null {
@@ -523,10 +769,56 @@ function parseOffer(value: unknown): WorkbenchOffer | null {
   const conversationState = typeof value.conversationState === "string" ? value.conversationState : null;
   const vendor = parseVendor(value.vendor);
   const quote = value.latestValidQuote === null ? null : parseQuote(value.latestValidQuote);
+  // F2: authoritative pairwise verdicts are optional only for servers
+  // that predate the block (parsed as empty — the UI must then not rank
+  // anything); a present but malformed verdict rejects the payload.
+  let comparisons: WorkbenchOfferComparison[] | null;
+  if (value.comparisons === undefined) {
+    comparisons = [];
+  } else if (!Array.isArray(value.comparisons)) {
+    comparisons = null;
+  } else {
+    comparisons = [];
+    for (const entry of value.comparisons) {
+      const parsed = parseOfferComparison(entry);
+      if (parsed === null) {
+        comparisons = null;
+        break;
+      }
+      comparisons.push(parsed);
+    }
+  }
   const evidence = Array.isArray(value.evidence) ? value.evidence.map(parseEvidence) : null;
   const provenance = parseProjectionProvenance(value.provenance);
-  if (id === null || requirementId === null || productModel === null || variant === null || compatibility === null || conversationState === null || (vendor === null && value.vendor !== undefined) || (quote === null && value.latestValidQuote !== null) || evidence === null || evidence.some((entry) => entry === null) || provenance === null) return null;
-  return { id, requirementId, vendor, productModel, variant, compatibility, conversationState, quote, evidence: evidence.filter((entry): entry is WorkbenchEvidence => entry !== null), provenance: provenance.mode, ownerAuthoredTerms: provenance.ownerAuthoredTerms, recommendationNote: null };
+  if (
+    id === null ||
+    requirementId === null ||
+    productModel === null ||
+    variant === null ||
+    compatibility === null ||
+    conversationState === null ||
+    comparisons === null ||
+    (vendor === null && value.vendor !== undefined) ||
+    (quote === null && value.latestValidQuote !== null) ||
+    evidence === null ||
+    evidence.some((entry) => entry === null) ||
+    provenance === null
+  ) return null;
+  return {
+    id,
+    requirementId,
+    vendor,
+    productModel,
+    variant,
+    compatibility,
+    conversationState,
+    quote,
+    comparisons,
+    evidence: evidence.filter((entry): entry is WorkbenchEvidence => entry !== null),
+    provenance: provenance.mode,
+    ownerAuthoredTerms: provenance.ownerAuthoredTerms,
+    recommendationNote: null,
+  };
 }
 
 function parseRequirement(value: unknown): WorkbenchRequirement | null {
@@ -592,6 +884,20 @@ function parseActivityItem(value: unknown): WorkbenchActivityItem | null {
   return { id, type, occurredAt: value.createdAt, actorLabel: null, state: "unknown", summary: null, evidenceIds: [] };
 }
 
+const CONTROLLED_SAMPLE_KIND = "controlledSample" as const;
+const SAMPLE_LABEL_MAX_LENGTH = 200;
+
+function parseSampleMarker(value: Record<string, unknown>): { readonly sampleKind: "controlledSample" | null; readonly sampleLabel: string | null } | null {
+  const rawKind = value.sampleKind;
+  const rawLabel = value.sampleLabel;
+  if (rawKind === undefined && rawLabel === undefined) return { sampleKind: null, sampleLabel: null };
+  if (typeof rawKind !== "string" || typeof rawLabel !== "string") return null;
+  if (rawKind !== CONTROLLED_SAMPLE_KIND) return null;
+  if (rawLabel.trim().length === 0 || rawLabel.length > SAMPLE_LABEL_MAX_LENGTH) return null;
+  if (rawLabel !== rawLabel.trim()) return null;
+  return { sampleKind: CONTROLLED_SAMPLE_KIND, sampleLabel: rawLabel };
+}
+
 function parseProject(value: unknown): WorkbenchProject | null {
   if (!isRecord(value)) return null;
   const id = requiredString(value.id);
@@ -600,6 +906,8 @@ function parseProject(value: unknown): WorkbenchProject | null {
   const needByAt = nullableNumber(value.needByAt);
   const organizationId = requiredString(value.organizationId);
   if (id === null || organizationId === null || name === null || !isOneOf(value.visibility, ["open", "restricted"] as const) || !isFiniteNumber(value.createdAt) || budgetMinorUnits === undefined || needByAt === undefined) return null;
+  const sample = parseSampleMarker(value);
+  if (sample === null) return null;
   let region: string | null = null;
   let locationCurrency: string | null = null;
   if (value.location !== undefined) {
@@ -612,7 +920,7 @@ function parseProject(value: unknown): WorkbenchProject | null {
   }
   const currency = nullableString(value.currency);
   if (currency === undefined) return null;
-  return { id, organizationId, name, region, currency: currency ?? locationCurrency, budgetMinorUnits, needByAt };
+  return { id, organizationId, name, region, currency: currency ?? locationCurrency, budgetMinorUnits, needByAt, sampleKind: sample.sampleKind, sampleLabel: sample.sampleLabel };
 }
 
 function parseAccess(value: unknown): WorkbenchAccess | null {
@@ -742,6 +1050,96 @@ function parseEquipment(value: unknown): WorkbenchEquipment | null {
 }
 
 /**
+ * E8 impact parser: stored trigger/state/order-impact plus bounded reason
+ * text only. Unknown charges, savings, availability, readiness, or delivery
+ * outcomes are never inferred here.
+ */
+function parseImpact(value: unknown): WorkbenchImpact | null {
+  if (!isRecord(value)) return null;
+  const id = requiredString(value.id);
+  const requirementId = requiredString(value.requirementId);
+  const reason = requiredString(value.reason);
+  const quoteVersion = optionalNonEmptyString(value.quoteVersion);
+  const predecessorQuoteVersion = optionalNonEmptyString(value.predecessorQuoteVersion);
+  const watchResult = optionalNonEmptyString(value.watchResult);
+  if (
+    id === null ||
+    requirementId === null ||
+    reason === null ||
+    reason.length > 2000 ||
+    quoteVersion === undefined ||
+    predecessorQuoteVersion === undefined ||
+    watchResult === undefined ||
+    !isOneOf(value.trigger, ["quoteRevision", "watchObservation"] as const) ||
+    !isOneOf(value.state, ["recorded", "unknown", "incomplete"] as const) ||
+    !isOneOf(value.orderImpact, ["none", "selectionOnly", "reviewRequired", "unknown"] as const) ||
+    !isFiniteNumber(value.placedOrderCount) ||
+    !Number.isSafeInteger(value.placedOrderCount) ||
+    (value.placedOrderCount as number) < 0 ||
+    !isFiniteNumber(value.createdAt)
+  ) return null;
+  return {
+    id,
+    requirementId,
+    trigger: value.trigger,
+    state: value.state,
+    orderImpact: value.orderImpact,
+    reason,
+    quoteVersion,
+    predecessorQuoteVersion,
+    watchResult,
+    placedOrderCount: value.placedOrderCount,
+    createdAt: value.createdAt,
+  };
+}
+
+/**
+ * E8 substitute parser: pending proposals require fresh approval while the
+ * server-projected basis is current. A stale basis disables approval with
+ * zero writes; decided proposals are terminal history.
+ */
+function parseSubstitute(value: unknown): WorkbenchSubstitute | null {
+  if (!isRecord(value)) return null;
+  const id = requiredString(value.id);
+  const requirementId = requiredString(value.requirementId);
+  const assessmentId = requiredString(value.assessmentId);
+  const proposedCandidateId = requiredString(value.proposedCandidateId);
+  const proposedQuoteId = requiredString(value.proposedQuoteId);
+  const proposedQuoteVersion = requiredString(value.proposedQuoteVersion);
+  const reason = requiredString(value.reason);
+  const basisReason = requiredString(value.basisReason);
+  if (
+    id === null ||
+    requirementId === null ||
+    assessmentId === null ||
+    proposedCandidateId === null ||
+    proposedQuoteId === null ||
+    proposedQuoteVersion === null ||
+    reason === null ||
+    reason.length > 2000 ||
+    basisReason === null ||
+    !isOneOf(value.state, ["pending", "approved", "rejected"] as const) ||
+    typeof value.basisStale !== "boolean" ||
+    !isFiniteNumber(value.createdAt) ||
+    !isFiniteNumber(value.updatedAt)
+  ) return null;
+  return {
+    id,
+    requirementId,
+    assessmentId,
+    proposedCandidateId,
+    proposedQuoteId,
+    proposedQuoteVersion,
+    state: value.state,
+    reason,
+    basisStale: value.basisStale,
+    basisReason,
+    createdAt: value.createdAt,
+    updatedAt: value.updatedAt,
+  };
+}
+
+/**
  * Transform and validate the exact W1 `workbench/getProjection` result.
  * Unsupported aggregate facts remain null instead of being inferred from
  * candidate, quote, job, decision, or activity rows.
@@ -754,6 +1152,14 @@ export function parseWorkbenchSnapshot(value: unknown, expectedProjectId?: strin
   if (project === null || access === null || provenance === null || expectedProjectId !== undefined && project.id !== expectedProjectId) return null;
   if (!Array.isArray(value.requirements) || !Array.isArray(value.candidates) || !Array.isArray(value.jobs) || !Array.isArray(value.decisions)) return null;
   if (typeof value.requirementsTruncated !== "boolean" || typeof value.candidatesTruncated !== "boolean" || typeof value.jobsTruncated !== "boolean" || typeof value.decisionsTruncated !== "boolean") return null;
+  // E8 blocks are backward compatible: servers that predate them omit the
+  // arrays, which parse as empty without inventing due decisions.
+  const rawImpacts = value.impacts === undefined ? [] : value.impacts;
+  const rawSubstitutes = value.substitutes === undefined ? [] : value.substitutes;
+  if (!Array.isArray(rawImpacts) || !Array.isArray(rawSubstitutes)) return null;
+  const rawImpactsTruncated = value.impactsTruncated === undefined ? false : value.impactsTruncated;
+  const rawSubstitutesTruncated = value.substitutesTruncated === undefined ? false : value.substitutesTruncated;
+  if (typeof rawImpactsTruncated !== "boolean" || typeof rawSubstitutesTruncated !== "boolean") return null;
   if (!isRecord(value.activity) || !Array.isArray(value.activity.page) || typeof value.activity.isDone !== "boolean") return null;
   const continueCursor = nullableString(value.activity.continueCursor);
   if (continueCursor === undefined) return null;
@@ -764,11 +1170,28 @@ export function parseWorkbenchSnapshot(value: unknown, expectedProjectId?: strin
   const jobs: WorkbenchJob[] = [];
   const decisions: WorkbenchDecision[] = [];
   const activity: WorkbenchActivityItem[] = [];
+  const impacts: WorkbenchImpact[] = [];
+  const substitutes: WorkbenchSubstitute[] = [];
   for (const entry of value.requirements) { const parsed = parseRequirement(entry); if (parsed === null) return null; requirements.push(parsed); }
   for (const entry of value.candidates) { const parsed = parseOffer(entry); if (parsed === null) return null; offers.push(parsed); }
   for (const entry of value.jobs) { const parsed = parseJob(entry); if (parsed === null) return null; jobs.push(parsed); }
   for (const entry of value.decisions) { const parsed = parseDecision(entry); if (parsed === null) return null; decisions.push(parsed); }
   for (const entry of value.activity.page) { const parsed = parseActivityItem(entry); if (parsed === null) return null; activity.push(parsed); }
+  for (const entry of rawImpacts) { const parsed = parseImpact(entry); if (parsed === null) return null; impacts.push(parsed); }
+  for (const entry of rawSubstitutes) { const parsed = parseSubstitute(entry); if (parsed === null) return null; substitutes.push(parsed); }
+  // E18 finding 3: each verdict must bind to the displayed comparison
+  // contract. The compared offer has to exist in this same snapshot and the
+  // verdict's againstQuoteId must equal that offer's current quote identity;
+  // an unresolvable or stale quote reference is not a displayable
+  // comparison and fails closed.
+  const offersById = new Map(offers.map((offer) => [offer.id, offer]));
+  for (const offer of offers) {
+    for (const verdict of offer.comparisons) {
+      const other = offersById.get(verdict.againstOfferId);
+      if (other === undefined || other.id === offer.id) return null;
+      if (other.quote === null || other.quote.id !== verdict.againstQuoteId) return null;
+    }
+  }
   return {
     project,
     access,
@@ -779,11 +1202,13 @@ export function parseWorkbenchSnapshot(value: unknown, expectedProjectId?: strin
     activity: { items: activity, continueCursor, isDone: value.activity.isDone },
     provenance,
     equipment,
+    impacts,
+    substitutes,
     selectedOfferId: null,
     selectedForecastMinorUnits: null,
     committedMinorUnits: null,
     paidMinorUnits: null,
     deliveredQuantityByRequirement: {},
-    truncation: { requirements: value.requirementsTruncated, offers: value.candidatesTruncated, jobs: value.jobsTruncated, decisions: value.decisionsTruncated, equipment: equipment.assetsTruncated },
+    truncation: { requirements: value.requirementsTruncated, offers: value.candidatesTruncated, jobs: value.jobsTruncated, decisions: value.decisionsTruncated, impacts: rawImpactsTruncated, substitutes: rawSubstitutesTruncated, equipment: equipment.assetsTruncated },
   };
 }

@@ -3,6 +3,7 @@ import type { Watch } from "convex/react";
 import { getFunctionName, type FunctionReference } from "convex/server";
 import {
   createConvexWorkbenchAdapter,
+  createSampleIdempotencyKey,
   researchStartIdempotencyKey,
   type ConvexWorkbenchClient,
 } from "../convex-workbench-adapter";
@@ -997,4 +998,270 @@ test("rejects defined non-string optional display metadata", async () => {
   await expect(loadWithAssets([assetFixture({
     serviceCases: [{ ...seededCase[0], outcome: 42 }],
   })])).resolves.toBeNull();
+});
+
+function substituteFixture(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: "proposal-1",
+    requirementId: "requirement-1",
+    assessmentId: "assessment-1",
+    proposedCandidateId: "candidate-1",
+    proposedQuoteId: "quote-1",
+    proposedQuoteVersion: "v1",
+    state: "pending",
+    reason: "Selected revision was superseded; candidate B keeps current terms",
+    basisStale: false,
+    basisReason: "Proposed quote revision and requirement version are still current.",
+    createdAt: 2,
+    updatedAt: 2,
+    ...overrides,
+  };
+}
+
+function impactFixture(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: "assessment-1",
+    requirementId: "requirement-1",
+    trigger: "quoteRevision",
+    state: "recorded",
+    orderImpact: "reviewRequired",
+    reason: "Quote v1 was superseded by v2; 1 placed order(s) keep their history and need fresh approval before any substitute",
+    quoteVersion: "v2",
+    predecessorQuoteVersion: "v1",
+    placedOrderCount: 1,
+    createdAt: 1,
+    ...overrides,
+  };
+}
+
+function substituteProjection(substitute: Record<string, unknown>, impact: Record<string, unknown>): Record<string, unknown> {
+  return {
+    ...actionProjection(),
+    impacts: [impact],
+    impactsTruncated: false,
+    substitutes: [substitute],
+    substitutesTruncated: false,
+  };
+}
+
+test("decides a current pending substitute through the authorized impact mutation", async () => {
+  const calls: MutationCall[] = [];
+  const controls = controlledWatch(() => substituteProjection(substituteFixture(), impactFixture()));
+  const adapter = createConvexWorkbenchAdapter(actionClient(
+    substituteProjection(substituteFixture(), impactFixture()),
+    controls.watch,
+    calls,
+    { ok: true, decisionApprovalId: "approval-sub-1" },
+  ));
+
+  await adapter.load("project-1");
+  await expect(adapter.act({ type: "decideSubstituteProposal", projectId: "project-1", proposalId: "proposal-1", decision: "approved" })).resolves.toEqual({
+    ok: true,
+    message: "Substitute approved by the server; execute it as an explicit new selection.",
+  });
+  expect(calls).toHaveLength(1);
+  expect(getFunctionName(calls[0]?.reference as FunctionReference<"mutation">)).toBe("domain/impact:decideSubstituteProposal");
+  expect(calls[0]?.args).toEqual({
+    organizationId: "organization-1",
+    projectId: "project-1",
+    proposalId: "proposal-1",
+    decision: "approved",
+  });
+});
+
+test("stale-basis, decided, viewer, and missing substitute inputs make zero writes", async () => {
+  const loadAdapter = async (value: Record<string, unknown>, calls: MutationCall[]) => {
+    const controls = controlledWatch(() => value);
+    const adapter = createConvexWorkbenchAdapter(actionClient(value, controls.watch, calls, { ok: true }));
+    await adapter.load("project-1");
+    return adapter;
+  };
+
+  const staleCalls: MutationCall[] = [];
+  const stale = await loadAdapter(substituteProjection(substituteFixture({ basisStale: true, basisReason: "Proposed quote terms changed; renewed authority required." }), impactFixture()), staleCalls);
+  await expect(stale.act({ type: "decideSubstituteProposal", projectId: "project-1", proposalId: "proposal-1", decision: "approved" })).resolves.toMatchObject({ ok: false, message: expect.stringContaining("basis changed") });
+  expect(staleCalls).toHaveLength(0);
+  // Rejection closes the proposal without relying on the changed terms, so a
+  // stale basis still routes the rejection to the authorized backend action.
+  const staleRejectCalls: MutationCall[] = [];
+  const staleReject = await loadAdapter(substituteProjection(substituteFixture({ basisStale: true, basisReason: "Proposed quote terms changed; renewed authority required." }), impactFixture()), staleRejectCalls);
+  await expect(staleReject.act({ type: "decideSubstituteProposal", projectId: "project-1", proposalId: "proposal-1", decision: "rejected" })).resolves.toMatchObject({ ok: true });
+  expect(staleRejectCalls).toHaveLength(1);
+  expect(staleRejectCalls[0]?.args).toMatchObject({ proposalId: "proposal-1", decision: "rejected" });
+
+  const decidedCalls: MutationCall[] = [];
+  const decided = await loadAdapter(substituteProjection(substituteFixture({ state: "approved" }), impactFixture()), decidedCalls);
+  await expect(decided.act({ type: "decideSubstituteProposal", projectId: "project-1", proposalId: "proposal-1", decision: "approved" })).resolves.toEqual({ ok: false, message: "This substitute proposal is already approved. Nothing was sent." });
+  expect(decidedCalls).toHaveLength(0);
+
+  const viewerCalls: MutationCall[] = [];
+  const viewerValue = { ...substituteProjection(substituteFixture(), impactFixture()), access: projection().access };
+  const viewer = await loadAdapter(viewerValue, viewerCalls);
+  await expect(viewer.act({ type: "decideSubstituteProposal", projectId: "project-1", proposalId: "proposal-1", decision: "rejected" })).resolves.toMatchObject({ ok: false, message: expect.stringContaining("not authorized") });
+  expect(viewerCalls).toHaveLength(0);
+
+  const missingCalls: MutationCall[] = [];
+  const missing = await loadAdapter(substituteProjection(substituteFixture(), impactFixture()), missingCalls);
+  await expect(missing.act({ type: "decideSubstituteProposal", projectId: "project-1", proposalId: "proposal-missing", decision: "approved" })).resolves.toMatchObject({ ok: false });
+  expect(missingCalls).toHaveLength(0);
+});
+
+test("parses stored impacts and substitutes without inventing outcomes", async () => {
+  const payload = substituteProjection(
+    substituteFixture(),
+    impactFixture({ state: "unknown", orderImpact: "unknown" }),
+  );
+  const snapshot = parseWorkbenchSnapshot(payload, "project-1");
+  if (snapshot === null) throw new Error("E8 projection should parse");
+  expect(snapshot.impacts).toHaveLength(1);
+  expect(snapshot.impacts[0]?.orderImpact).toBe("unknown");
+  expect(snapshot.impacts[0]?.reason).toContain("keep their history");
+  expect(snapshot.substitutes[0]?.basisStale).toBe(false);
+  expect(snapshot.truncation.impacts).toBe(false);
+  expect(snapshot.truncation.substitutes).toBe(false);
+  expect(parseWorkbenchSnapshot({ ...payload, impacts: [{ ...impactFixture(), reason: "" }] }, "project-1")).toBeNull();
+  expect(parseWorkbenchSnapshot({ ...payload, substitutes: "pending" }, "project-1")).toBeNull();
+});
+
+test("routes the exact sample mutation with the bounded opaque key", async () => {
+  const calls: MutationCall[] = [];
+  const controls = controlledWatch(() => projection());
+  const adapter = createConvexWorkbenchAdapter(actionClient(
+    projection(),
+    controls.watch,
+    calls,
+    { ok: true, projectId: "project-sample-1", organizationId: "organization-sample-1", deduplicated: false },
+  ));
+  const result = await adapter.createSample({ idempotencyKey: "sample-key-1" });
+  expect(result).toEqual({ ok: true, projectId: "project-sample-1", message: "Sample project created by the server." });
+  expect(calls).toHaveLength(1);
+  expect(getFunctionName(calls[0]?.reference as FunctionReference<"mutation">)).toBe("domain/sampleProject:createSampleGuestProject");
+  expect(calls[0]?.args).toEqual({ idempotencyKey: "sample-key-1" });
+});
+
+test("rejects empty and overlong sample keys locally without mutation", async () => {
+  const calls: MutationCall[] = [];
+  const controls = controlledWatch(() => projection());
+  const adapter = createConvexWorkbenchAdapter(actionClient(projection(), controls.watch, calls, { ok: true }));
+  await expect(adapter.createSample({ idempotencyKey: "   " })).resolves.toMatchObject({ ok: false });
+  await expect(adapter.createSample({ idempotencyKey: `k${"x".repeat(128)}` })).resolves.toMatchObject({ ok: false });
+  expect(calls).toHaveLength(0);
+});
+
+test("surfaces sample denial text and malformed project ids truthfully", async () => {
+  const deniedCalls: MutationCall[] = [];
+  const deniedControls = controlledWatch(() => projection());
+  const denied = createConvexWorkbenchAdapter(actionClient(
+    projection(),
+    deniedControls.watch,
+    deniedCalls,
+    { ok: false, code: "invalid-payload", message: "controlled sample denial" },
+  ));
+  await expect(denied.createSample({ idempotencyKey: "sample-denied" })).resolves.toEqual({
+    ok: false,
+    message: "controlled sample denial",
+  });
+  expect(deniedCalls).toHaveLength(1);
+
+  const malformedCalls: MutationCall[] = [];
+  const malformedControls = controlledWatch(() => projection());
+  const malformed = createConvexWorkbenchAdapter(actionClient(
+    projection(),
+    malformedControls.watch,
+    malformedCalls,
+    { ok: true },
+  ));
+  await expect(malformed.createSample({ idempotencyKey: "sample-malformed" })).resolves.toMatchObject({ ok: false });
+  expect(malformedCalls).toHaveLength(1);
+});
+
+test("fences concurrent sample submissions on the same opaque key", async () => {
+  const calls: MutationCall[] = [];
+  const controls = controlledWatch(() => projection());
+  let resolveMutation: ((value: unknown) => void) | undefined;
+  const pendingMutation = new Promise<unknown>((resolve) => { resolveMutation = resolve; });
+  const adapter = createConvexWorkbenchAdapter({
+    query: async () => projection(),
+    watchQuery: () => controls.watch,
+    mutation: async (reference: unknown, args: unknown) => {
+      calls.push({ reference, args });
+      return pendingMutation;
+    },
+  } as unknown as ConvexWorkbenchClient);
+  const first = adapter.createSample({ idempotencyKey: "sample-flight" });
+  const second = await adapter.createSample({ idempotencyKey: "sample-flight" });
+  expect(second).toEqual({
+    ok: false,
+    message: "This action is already in progress. Wait for the current server response.",
+  });
+  expect(calls).toHaveLength(1);
+  resolveMutation?.({ ok: true, projectId: "project-sample-flight", organizationId: "organization-1", deduplicated: false });
+  await expect(first).resolves.toMatchObject({ ok: true, projectId: "project-sample-flight" });
+  await expect(adapter.createSample({ idempotencyKey: "sample-flight" })).resolves.toMatchObject({ ok: true });
+  expect(calls).toHaveLength(2);
+});
+
+test("exposes an opaque browser safe sample key without client identifiers", async () => {
+  const first = createSampleIdempotencyKey();
+  const second = createSampleIdempotencyKey();
+  expect(first.trim().length).toBeGreaterThan(0);
+  expect(first).not.toContain("organization");
+  expect(first).not.toContain("project-1");
+  expect(first).not.toBe(second);
+  expect(first).toMatch(/^[A-Za-z0-9:_-]{8,160}$/);
+  expect(second).toMatch(/^[A-Za-z0-9:_-]{8,160}$/);
+});
+
+test("a server discovery denial rejects as a recoverable error, never an empty workspace", async () => {
+  const queryArgs: unknown[] = [];
+  const adapter = createConvexWorkbenchAdapter({
+    query: async (_reference: unknown, args: unknown) => {
+      queryArgs.push(args);
+      return { ok: false, code: "forged-identity", message: "unauthenticated" };
+    },
+    watchQuery: () => controlledWatch(() => projection()).watch,
+  } as unknown as ConvexWorkbenchClient);
+
+  await expect(adapter.discoverProject()).rejects.toThrow(
+    "Authorized projects could not be discovered (forged-identity: unauthenticated). Retry to re-establish the backend identity.",
+  );
+  expect(queryArgs).toEqual([{ limit: 1 }]);
+});
+
+test("a denial on a later discovery page rejects instead of hiding behind pagination", async () => {
+  const pages: unknown[] = [
+    { ok: true, projects: [], continueCursor: "project-cursor-1", isDone: false },
+    { ok: false, code: "forged-identity", message: "unauthenticated" },
+  ];
+  const adapter = createConvexWorkbenchAdapter({
+    query: async () => pages.shift() ?? null,
+    watchQuery: () => controlledWatch(() => projection()).watch,
+  } as unknown as ConvexWorkbenchClient);
+
+  await expect(adapter.discoverProject()).rejects.toThrow(/could not be discovered.*forged-identity/);
+});
+
+test("retry after a discovery denial succeeds once the server confirms the identity", async () => {
+  const pages: unknown[] = [
+    { ok: false, code: "forged-identity", message: "unauthenticated" },
+    accessibleProjects("project-recovered"),
+  ];
+  const adapter = createConvexWorkbenchAdapter({
+    query: async () => pages.shift() ?? null,
+    watchQuery: () => controlledWatch(() => projection()).watch,
+  } as unknown as ConvexWorkbenchClient);
+
+  await expect(adapter.discoverProject()).rejects.toThrow(/Retry to re-establish the backend identity/);
+  await expect(adapter.discoverProject()).resolves.toBe("project-recovered");
+});
+
+test("a denied projection load throws instead of returning an empty projection", async () => {
+  const adapter = createConvexWorkbenchAdapter({
+    query: async () => ({ ok: false, code: "forged-identity", message: "unauthenticated" }),
+    watchQuery: () => controlledWatch(() => projection()).watch,
+  } as unknown as ConvexWorkbenchClient);
+
+  await expect(adapter.load("project-1")).rejects.toThrow(
+    "The project projection could not be read (forged-identity: unauthenticated). Retry to re-establish the backend identity.",
+  );
 });

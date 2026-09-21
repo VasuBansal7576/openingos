@@ -10,7 +10,9 @@
 
 import { describe, expect, test } from "bun:test";
 import {
+  COMMISSIONING_ASSET_KEY_PREFIX,
   CONTROLLED_COUNTERPARTY_ROLES,
+  SERVICE_OUTCOME_MAX_LENGTH,
   TEMPLATE_REUSE_COLLECTIONS,
   acceptanceLineInputValidator,
   approvalInputValidator,
@@ -19,6 +21,8 @@ import {
   browserObservationValidator,
   candidateInputValidator,
   candidateVariantKey,
+  commissioningAssetIdempotencyKey,
+  commissioningAssetInputValidator,
   compatibilityVerificationInputValidator,
   costEntryInputValidator,
   dependencyCreatesCycle,
@@ -29,11 +33,15 @@ import {
   isReusableFreshness,
   isTerminalFulfillmentState,
   isTerminalRequirementState,
+  isValidServiceCaseTransition,
   jevDecisionValidator,
   locationInputValidator,
   negotiationInputValidator,
+  normalizeCommissioningLabel,
   normalizeLineQuantity,
   normalizeLineUnit,
+  normalizeOptionalCommissioningText,
+  normalizeServiceOutcome,
   openAIDraftValidator,
   openAIExtractionValidator,
   orderEventInputValidator,
@@ -47,6 +55,7 @@ import {
   requirementInputValidator,
   requirementEditInputValidator,
   requirementMilestoneValidator,
+  requiresServiceOutcome,
   normalizeBoundedText,
   normalizeRequirementDate,
   normalizeRequirementIdempotencyKey,
@@ -416,6 +425,78 @@ describe("every named core record has a creation contract", () => {
     expect("status" in inboundClassificationValidator.fields).toBe(true);
     expect("contentHash" in quoteUpdateValidator.fields).toBe(true);
     expect("status" in uiProjectionValidator.fields).toBe(true);
+  });
+
+  test("order events carry an explicit optional commissioning asset payload", () => {
+    expect("commissioningAsset" in orderEventInputValidator.fields).toBe(true);
+    expect(commissioningAssetInputValidator.fields.label).toBeDefined();
+    expect(commissioningAssetInputValidator.fields.serial).toBeDefined();
+    expect(commissioningAssetInputValidator.fields.locationId).toBeDefined();
+    expect(commissioningAssetInputValidator.fields.constraints).toBeDefined();
+    expect(commissioningAssetInputValidator.fields.purchaseProvenance).toBeDefined();
+    const fields = Object.keys(commissioningAssetInputValidator.fields);
+    // No inferred facts ride the payload: warranty, vendor outcome, or
+    // success claims have no field to travel through.
+    expect(fields).not.toContain("warranty");
+    expect(fields).not.toContain("vendorOutcome");
+    expect(fields).not.toContain("successful");
+  });
+
+  test("commissioning asset replay keys are deterministic and bound to the event key", () => {
+    expect(commissioningAssetIdempotencyKey("evt-1")).toBe(
+      `${COMMISSIONING_ASSET_KEY_PREFIX}evt-1`,
+    );
+    expect(commissioningAssetIdempotencyKey("evt-1")).toBe(
+      commissioningAssetIdempotencyKey("evt-1"),
+    );
+    expect(commissioningAssetIdempotencyKey("evt-1")).not.toBe(
+      commissioningAssetIdempotencyKey("evt-2"),
+    );
+    expect(() => commissioningAssetIdempotencyKey("   ")).toThrow();
+  });
+
+  test("commissioning asset text normalizes explicitly and never infers", () => {
+    expect(normalizeCommissioningLabel("  Linea Mini #1  ")).toBe("Linea Mini #1");
+    expect(() => normalizeCommissioningLabel("   ")).toThrow();
+    expect(() =>
+      normalizeOptionalCommissioningText("   ", "serial", 256),
+    ).toThrow();
+    expect(normalizeOptionalCommissioningText(undefined, "serial", 256)).toBeUndefined();
+    expect(normalizeOptionalCommissioningText(" SN-1 ", "serial", 256)).toBe("SN-1");
+    expect(() =>
+      normalizeOptionalCommissioningText("x".repeat(257), "serial", 256),
+    ).toThrow();
+  });
+
+  test("service outcomes are explicit and bounded", () => {
+    expect(normalizeServiceOutcome("  replaced heating element  ")).toBe(
+      "replaced heating element",
+    );
+    expect(() => normalizeServiceOutcome("   ")).toThrow();
+    expect(() => normalizeServiceOutcome("x".repeat(SERVICE_OUTCOME_MAX_LENGTH + 1))).toThrow();
+    expect(requiresServiceOutcome("resolved")).toBe(true);
+    expect(requiresServiceOutcome("closed")).toBe(true);
+    expect(requiresServiceOutcome("open")).toBe(false);
+    expect(requiresServiceOutcome("inProgress")).toBe(false);
+    expect(requiresServiceOutcome("waitingForSupplier")).toBe(false);
+  });
+
+  test("service case transitions close terminal cases and keep the rest stable", () => {
+    expect(isValidServiceCaseTransition("open", "inProgress")).toBe(true);
+    expect(isValidServiceCaseTransition("inProgress", "waitingForSupplier")).toBe(true);
+    expect(isValidServiceCaseTransition("waitingForSupplier", "open")).toBe(true);
+    expect(isValidServiceCaseTransition("open", "resolved")).toBe(true);
+    expect(isValidServiceCaseTransition("open", "closed")).toBe(true);
+    expect(isValidServiceCaseTransition("open", "open")).toBe(true);
+    expect(isValidServiceCaseTransition("resolved", "closed")).toBe(true);
+    expect(isValidServiceCaseTransition("resolved", "resolved")).toBe(true);
+    expect(isValidServiceCaseTransition("closed", "closed")).toBe(true);
+    expect(isValidServiceCaseTransition("resolved", "open")).toBe(false);
+    expect(isValidServiceCaseTransition("resolved", "inProgress")).toBe(false);
+    expect(isValidServiceCaseTransition("resolved", "waitingForSupplier")).toBe(false);
+    expect(isValidServiceCaseTransition("closed", "open")).toBe(false);
+    expect(isValidServiceCaseTransition("closed", "resolved")).toBe(false);
+    expect(isValidServiceCaseTransition("closed", "inProgress")).toBe(false);
   });
 
   test("rfq vendors are scenario context with line items and binding", () => {

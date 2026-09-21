@@ -1603,6 +1603,7 @@ describe("direct provenance and reuse boundaries", () => {
       projectId: project.projectId,
       caseId: serviceCase.caseId,
       state: "closed",
+      outcome: "Burr inspection completed",
     });
     expect(closed.ok).toBe(true);
     const reopened = await asOwner.mutation(updateServiceCaseRef, {

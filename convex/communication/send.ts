@@ -3,7 +3,10 @@
  *
  * The action is intentionally thin: prepare an immutable app-owned snapshot,
  * call the F1 atomic claim, make one REST request, then record the provider
- * outcome. It never uses AgentMail's independent outbound queue.
+ * outcome. It never uses AgentMail's independent outbound queue. Snapshot
+ * preparation additionally requires negotiation-bound operations to name the
+ * server-owned bound project inbox exactly; anything else fails closed
+ * before the claim or transport.
  */
 
 import { AgentMail, type AgentMailComponent } from "@agentmail/convex";
@@ -116,6 +119,118 @@ function denial(code: CommunicationDenial["code"], message: string): { ok: false
   return { ok: false, code, message };
 }
 
+/**
+ * Server-owned sender-inbox resolution for negotiation-bound sends (Astra F1
+ * repair). Mirrors the negotiation orchestrator's gate: the bound
+ * conversation's single provider inbox, else the project's single
+ * established inbox, read from the existing protected provider-binding
+ * contract (`threadBindings`). Missing, foreign, stale, ambiguous, or
+ * cross-project bindings fail closed before any snapshot, claim, or
+ * transport. Generic C1 operations without negotiation authority keep the
+ * syntax-only contract.
+ */
+const SENDER_BINDING_SCAN_WINDOW = 65;
+
+async function collectNegotiationConversationInbox(
+  ctx: F1MutationCtx,
+  scope: {
+    readonly organizationId: Id<"organizations">;
+    readonly projectId: Id<"projects">;
+  },
+  conversation: {
+    readonly _id: Id<"conversations">;
+    readonly organizationId: Id<"organizations">;
+    readonly projectId: Id<"projects">;
+    readonly state: string;
+  },
+  inboxes: Set<string>,
+): Promise<{ readonly ok: true; readonly sawBinding: boolean } | { readonly ok: false; readonly message: string }> {
+  const rows = await ctx.db
+    .query("threadBindings")
+    .withIndex("by_conversation", (q) => q.eq("conversationId", conversation._id))
+    .take(SENDER_BINDING_SCAN_WINDOW + 1);
+  if (rows.length > SENDER_BINDING_SCAN_WINDOW) {
+    return { ok: false as const, message: "sender binding search exceeded its bounded window without proving unanimity" };
+  }
+  let sawBinding = false;
+  for (const row of rows) {
+    if (row.provider !== "agentmail-binding" || row.environment !== "live") continue;
+    if (row.organizationId !== scope.organizationId || row.projectId !== scope.projectId) {
+      return { ok: false as const, message: "sender binding belongs to another organization or project" };
+    }
+    sawBinding = true;
+    inboxes.add(row.providerInboxId);
+  }
+  return { ok: true as const, sawBinding };
+}
+
+async function resolveNegotiationSenderInbox(
+  ctx: F1MutationCtx,
+  scope: {
+    readonly organizationId: Id<"organizations">;
+    readonly projectId: Id<"projects">;
+    readonly conversationId: Id<"conversations"> | undefined;
+  },
+): Promise<{ readonly ok: true; readonly inboxId: string } | { readonly ok: false; readonly message: string }> {
+  if (scope.conversationId !== undefined) {
+    const conversation = await ctx.db.get(scope.conversationId);
+    if (
+      conversation === null ||
+      conversation.organizationId !== scope.organizationId ||
+      conversation.projectId !== scope.projectId
+    ) {
+      return { ok: false as const, message: "sender binding conversation is not in this organization and project" };
+    }
+    if (conversation.state === "closed" || conversation.state === "cancelled") {
+      return { ok: false as const, message: "sender binding conversation is closed; re-approval must establish a live binding" };
+    }
+    const inboxes = new Set<string>();
+    const collected = await collectNegotiationConversationInbox(ctx, scope, conversation, inboxes);
+    if (!collected.ok) return collected;
+    if (inboxes.size === 0) {
+      return { ok: false as const, message: "no bound provider sender inbox authorizes this project conversation" };
+    }
+    if (inboxes.size > 1) {
+      return { ok: false as const, message: "sender binding is ambiguous for this project conversation" };
+    }
+    return { ok: true as const, inboxId: [...inboxes][0] as string };
+  }
+  const conversations = await ctx.db
+    .query("conversations")
+    .withIndex("by_project", (q) => q.eq("projectId", scope.projectId))
+    .take(SENDER_BINDING_SCAN_WINDOW + 1);
+  if (conversations.length > SENDER_BINDING_SCAN_WINDOW) {
+    return { ok: false as const, message: "sender binding search exceeded its bounded window without proving unanimity" };
+  }
+  const inboxes = new Set<string>();
+  let sawBinding = false;
+  for (const conversation of conversations) {
+    if (conversation.organizationId !== scope.organizationId) {
+      return { ok: false as const, message: "sender binding belongs to another organization" };
+    }
+    if (conversation.state === "closed" || conversation.state === "cancelled") {
+      const probe = new Set<string>();
+      const collected = await collectNegotiationConversationInbox(ctx, scope, conversation, probe);
+      if (!collected.ok) return collected;
+      if (collected.sawBinding) sawBinding = true;
+      continue;
+    }
+    const collected = await collectNegotiationConversationInbox(ctx, scope, conversation, inboxes);
+    if (!collected.ok) return collected;
+    if (collected.sawBinding) sawBinding = true;
+  }
+  if (inboxes.size === 1) {
+    return { ok: true as const, inboxId: [...inboxes][0] as string };
+  }
+  if (inboxes.size > 1) {
+    return { ok: false as const, message: "sender binding is ambiguous for this project" };
+  }
+  if (sawBinding) {
+    return { ok: false as const, message: "project sender bindings exist only on closed conversations" };
+  }
+  return { ok: false as const, message: "no bound provider sender inbox authorizes this project" };
+}
+
 function normalizedProviderId(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   const normalized = value.trim();
@@ -194,6 +309,23 @@ export const prepareOutboundSnapshot = f1InternalMutation({
     }
     if (operation.normalizedPayload !== grant.canonicalPayload || validated.normalizedPayloadHash !== operation.normalizedPayloadHash) {
       return denial("invalid-payload", "approved communication draft changed");
+    }
+    // Negotiation-bound sends must use the server-owned provider inbox.
+    // This runs before any snapshot write, claim, or transport, so a
+    // missing, foreign, stale, ambiguous, or cross-project binding fails
+    // closed here even if an upper layer passed a different inbox through.
+    if (operation.negotiationAuthority !== undefined) {
+      const sender = await resolveNegotiationSenderInbox(ctx, {
+        organizationId: operation.organizationId,
+        projectId: operation.projectId,
+        conversationId: operation.negotiationAuthority.conversationId,
+      });
+      if (!sender.ok) {
+        return denial("alternate-channel-denied", sender.message);
+      }
+      if (sender.inboxId !== args.inboxId) {
+        return denial("alternate-channel-denied", "provider sender inbox is not the bound project inbox");
+      }
     }
     const existingRows = await ctx.db
       .query("outboundSnapshots")

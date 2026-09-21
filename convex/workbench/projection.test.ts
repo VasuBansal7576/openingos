@@ -7,6 +7,7 @@ import type { Id } from "../_generated/dataModel.js";
 import type { Doc as SchemaDoc } from "../_generated/dataModel.js";
 import * as memberships from "../access/memberships.js";
 import * as requirements from "../domain/requirements.js";
+import * as sampleProject from "../domain/sampleProject.js";
 import * as sourcing from "../domain/sourcing.js";
 import * as projection from "./projection.js";
 import schema from "../schema.js";
@@ -77,6 +78,11 @@ const createRequirementRef = makeFunctionReference<
   MutationArgs<typeof requirements.create>,
   MutationReturn<typeof requirements.create>
 >("domain/requirements:create");
+const createSampleGuestProjectRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof sampleProject.createSampleGuestProject>,
+  MutationReturn<typeof sampleProject.createSampleGuestProject>
+>("domain/sampleProject:createSampleGuestProject");
 const recordVendorRef = makeFunctionReference<
   "mutation",
   MutationArgs<typeof sourcing.recordVendor>,
@@ -843,6 +849,7 @@ async function insertQuote(
     readonly supersedes?: string;
     readonly createdAt: number;
     readonly organizationId?: Id<"organizations">;
+    readonly currency?: string;
     readonly lines?: readonly QuoteLineRow[];
     readonly charges?: readonly QuoteChargeRow[];
     readonly taxBasis?: QuoteTaxBasisRow;
@@ -857,12 +864,12 @@ async function insertQuote(
       vendorId: graph.vendorId,
       version: options.version,
       contentHash: options.contentHash,
-      currency: "EUR",
+      currency: options.currency ?? "EUR",
       lines: [...(options.lines ?? [{
         lineId: "machine",
         description: "Machine",
         quantity: "1",
-        unitPrice: { currency: "EUR", minorUnits: 750000 },
+        unitPrice: { currency: options.currency ?? "EUR", minorUnits: 750000 },
         evidenceRefs: [],
       }])],
       charges: [...(options.charges ?? [])],
@@ -1214,5 +1221,482 @@ describe("W1 scheduled membership expiry", () => {
       ok: true,
       expired: false,
     });
+  });
+});
+
+describe("E8 changed-term impact and substitute projection", () => {
+  async function insertImpact(
+    t: ReturnType<typeof convexTest>,
+    project: { organizationId: Id<"organizations">; projectId: Id<"projects"> },
+    requirementId: Id<"requirements">,
+    suffix: string,
+    overrides: Record<string, unknown> = {},
+  ) {
+    return await t.run(async (ctx) =>
+      ctx.db.insert("impactAssessments", {
+        organizationId: project.organizationId,
+        projectId: project.projectId,
+        idempotencyKey: `impact-${suffix}`,
+        requirementId,
+        trigger: "quoteRevision",
+        quoteVersion: "v2",
+        predecessorQuoteVersion: "v1",
+        orderImpact: "selectionOnly",
+        state: "recorded",
+        placedOrderCount: 0,
+        reason: "Quote v1 was superseded by v2; the unplaced selection basis changed and can be re-decided",
+        alternatives: [],
+        createdAt: 100,
+        ...overrides,
+      }),
+    );
+  }
+
+  async function insertProposal(
+    t: ReturnType<typeof convexTest>,
+    project: { organizationId: Id<"organizations">; projectId: Id<"projects"> },
+    requirementId: Id<"requirements">,
+    assessmentId: Id<"impactAssessments">,
+    candidateId: Id<"candidates">,
+    quoteId: Id<"quotes">,
+    suffix: string,
+    overrides: Record<string, unknown> = {},
+  ) {
+    const requirement = await t.run(async (ctx) => ctx.db.get(requirementId));
+    if (requirement === null) throw new Error("requirement missing for proposal");
+    return await t.run(async (ctx) =>
+      ctx.db.insert("substituteProposals", {
+        organizationId: project.organizationId,
+        projectId: project.projectId,
+        idempotencyKey: `proposal-${suffix}`,
+        assessmentId,
+        requirementId,
+        requirementVersion: requirement.version,
+        proposedCandidateId: candidateId,
+        proposedQuoteId: quoteId,
+        proposedQuoteVersion: "v1",
+        proposedLines: [{ quoteLineId: "machine", quantity: "1", unit: "piece" }],
+        reason: "Selected revision was superseded; candidate B keeps current terms",
+        state: "pending",
+        createdAt: 200,
+        updatedAt: 200,
+        ...overrides,
+      }),
+    );
+  }
+
+  test("projects stored impacts and a current-basis pending substitute with lineage", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, OWNER, "e8-current");
+    const graph = await setupCandidate(t, project, "e8");
+    await insertOwnerQuote(t, project, graph, "v1", "e8-hash-1", undefined, 100);
+    const assessmentId = await insertImpact(t, project, graph.requirementId, "current", {
+      orderImpact: "selectionOnly",
+      state: "recorded",
+    });
+    const quoteId = await t.run(async (ctx) => {
+      const rows = await ctx.db
+        .query("quotes")
+        .withIndex("by_project_and_contentHash", (q) =>
+          q.eq("projectId", project.projectId).eq("contentHash", "e8-hash-1"),
+        )
+        .take(1);
+      return rows[0]!._id;
+    });
+    await insertProposal(t, project, graph.requirementId, assessmentId, graph.candidateId, quoteId, "current", {
+      proposedQuoteVersion: "v1",
+    });
+
+    const result = await t.withIdentity(OWNER).query(getProjectionRef, { projectId: project.projectId });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("projection denied");
+    expect(result.impacts).toHaveLength(1);
+    expect(result.impacts[0]?.trigger).toBe("quoteRevision");
+    expect(result.impacts[0]?.state).toBe("recorded");
+    expect(result.impacts[0]?.orderImpact).toBe("selectionOnly");
+    expect(result.impacts[0]?.reason).toContain("unplaced selection basis changed");
+    expect(result.impacts[0]?.quoteVersion).toBe("v2");
+    expect(result.impacts[0]?.predecessorQuoteVersion).toBe("v1");
+    expect(result.impactsTruncated).toBe(false);
+    expect(result.substitutes).toHaveLength(1);
+    expect(result.substitutes[0]?.state).toBe("pending");
+    expect(result.substitutes[0]?.basisStale).toBe(false);
+    expect(result.substitutes[0]?.basisReason).toContain("still current");
+    expect(result.substitutes[0]?.reason).toContain("keeps current terms");
+    expect(result.substitutesTruncated).toBe(false);
+    const serialized = JSON.stringify(result);
+    expect(serialized).not.toContain("owner@example.test");
+    expect(serialized).not.toContain("secret");
+  });
+
+  test("stale quote, requirement, and selection bases fence pending approval", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, OWNER, "e8-stale");
+    const graph = await setupCandidate(t, project, "stale");
+    await insertOwnerQuote(t, project, graph, "v1", "e8-stale-1", undefined, 100);
+    const assessmentId = await insertImpact(t, project, graph.requirementId, "stale");
+    const quoteId = await t.run(async (ctx) => {
+      const rows = await ctx.db
+        .query("quotes")
+        .withIndex("by_project_and_contentHash", (q) =>
+          q.eq("projectId", project.projectId).eq("contentHash", "e8-stale-1"),
+        )
+        .take(1);
+      return rows[0]!._id;
+    });
+    await insertProposal(t, project, graph.requirementId, assessmentId, graph.candidateId, quoteId, "stale", {
+      proposedQuoteVersion: "v1",
+    });
+
+    // A recorded successor revision fences the basis.
+    await insertOwnerQuote(t, project, graph, "v2", "e8-stale-2", "e8-stale-1", 200);
+    const superseded = await t.withIdentity(OWNER).query(getProjectionRef, { projectId: project.projectId });
+    expect(superseded.ok).toBe(true);
+    if (!superseded.ok) throw new Error("projection denied");
+    expect(superseded.substitutes[0]?.basisStale).toBe(true);
+    expect(superseded.substitutes[0]?.basisReason).toContain("terms changed");
+    expect(superseded.substitutes[0]?.state).toBe("pending");
+  });
+
+  test("decided proposals are terminal history and over-bound pages truncate explicitly", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, OWNER, "e8-decided");
+    const graph = await setupCandidate(t, project, "decided");
+    const assessmentId = await insertImpact(t, project, graph.requirementId, "decided");
+    const quoteId = await t.run(async (ctx) => {
+      const rows = await ctx.db.query("quotes").withIndex("by_project", (q) => q.eq("projectId", project.projectId)).take(1);
+      return rows[0]?._id;
+    });
+    void quoteId;
+    const candidateQuote = await insertOwnerQuote(t, project, graph, "v1", "e8-decided-1", undefined, 100);
+    await insertProposal(t, project, graph.requirementId, assessmentId, graph.candidateId, candidateQuote, "decided", {
+      proposedQuoteVersion: "v1",
+      state: "approved",
+    });
+    for (let index = 0; index < projection.MAX_IMPACTS + 2; index += 1) {
+      await insertImpact(t, project, graph.requirementId, `overflow-${index}`);
+    }
+
+    const result = await t.withIdentity(OWNER).query(getProjectionRef, { projectId: project.projectId, limit: 12 });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("projection denied");
+    const decided = result.substitutes.find((proposal) => proposal.state === "approved");
+    expect(decided?.basisStale).toBe(false);
+    expect(decided?.basisReason).toContain("no fresh approval is required");
+    expect(result.impacts).toHaveLength(projection.MAX_IMPACTS);
+    expect(result.impactsTruncated).toBe(true);
+  });
+
+  test("excludes cross-project impact and substitute rows and denies foreign readers", async () => {
+    const t = convexTest(schema, modules);
+    const home = await setupProject(t, OWNER, "e8-home");
+    const away = await setupProject(t, OWNER, "e8-away", "restricted");
+    const graph = await setupCandidate(t, away, "foreign");
+    const assessmentId = await insertImpact(t, away, graph.requirementId, "foreign");
+
+    const denied = await t.withIdentity(OTHER).query(getProjectionRef, { projectId: away.projectId });
+    expect(denied).toEqual({ ok: false, code: "denied-membership", message: "not authorized for this project" });
+
+    const isolated = await t.withIdentity(OWNER).query(getProjectionRef, { projectId: home.projectId });
+    expect(isolated.ok).toBe(true);
+    if (!isolated.ok) throw new Error("projection denied");
+    expect(isolated.impacts).toEqual([]);
+    expect(isolated.substitutes).toEqual([]);
+    expect(isolated.impactsTruncated).toBe(false);
+    expect(isolated.substitutesTruncated).toBe(false);
+    expect(assessmentId).toBeDefined();
+  });
+
+  test("returns empty impact and substitute state for a fresh project", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, OWNER, "e8-bare");
+    const result = await t.withIdentity(OWNER).query(getProjectionRef, { projectId: project.projectId });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("projection denied");
+    expect(result.impacts).toEqual([]);
+    expect(result.substitutes).toEqual([]);
+    expect(result.impactsTruncated).toBe(false);
+    expect(result.substitutesTruncated).toBe(false);
+  });
+});
+
+describe("F2 authoritative pairwise comparison verdicts", () => {
+  async function setupCompetingCandidates(
+    t: ReturnType<typeof convexTest>,
+    project: { organizationId: Id<"organizations">; projectId: Id<"projects"> },
+    suffix: string,
+  ) {
+    const asOwner = t.withIdentity(OWNER);
+    const requirement = await asOwner.mutation(createRequirementRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      key: `competing-${suffix}`,
+      title: `Competing offer ${suffix}`,
+      category: "coffee",
+      quantity: "1",
+      unit: "piece",
+      priority: "P0",
+    });
+    if (!requirement.ok) throw new Error(`requirement setup failed: ${JSON.stringify(requirement)}`);
+    const candidates: { candidateId: Id<"candidates">; vendorId: Id<"vendors"> }[] = [];
+    for (const name of ["alpha", "beta"]) {
+      const vendor = await asOwner.mutation(recordVendorRef, {
+        organizationId: project.organizationId,
+        name: `Vendor ${suffix}-${name}`,
+        regions: ["NL"],
+        serviceCoverage: "Netherlands",
+      });
+      if (!vendor.ok) throw new Error(`vendor setup failed: ${JSON.stringify(vendor)}`);
+      const candidate = await asOwner.mutation(recordCandidateRef, {
+        organizationId: project.organizationId,
+        projectId: project.projectId,
+        requirementId: requirement.requirementId,
+        vendorId: vendor.vendorId,
+        productModel: `Model ${suffix}-${name}`,
+        variant: "220V",
+        conversationState: "quoteReceived",
+      });
+      if (!candidate.ok) throw new Error(`candidate setup failed: ${JSON.stringify(candidate)}`);
+      candidates.push({ candidateId: candidate.candidateId, vendorId: vendor.vendorId });
+    }
+    return { requirementId: requirement.requirementId, candidates };
+  }
+
+  const scopeFor = (requirementId: string, items: readonly { readonly itemId: string; readonly lineId: string; readonly requiredQuantity: string }[]) => ({
+    requirementId,
+    scopeId: "scope-f2",
+    items: items.map((item) => ({ ...item, unit: "piece" })),
+  });
+  const singleLine = (currency: string, minorUnits: number) => [
+    {
+      lineId: "machine",
+      description: "Machine",
+      quantity: "1",
+      unitPrice: { currency, minorUnits },
+      evidenceRefs: [],
+    },
+  ];
+  const inclusiveBasis = (currency: string) =>
+    currency === "EUR"
+      ? ({ kind: "inclusive", basisId: "NL-EUR-INCLUSIVE", evidenceRefs: [] } as const)
+      : ({ kind: "inclusive", basisId: "US-USD-INCLUSIVE", evidenceRefs: [] } as const);
+
+  async function comparisonPairFor(
+    t: ReturnType<typeof convexTest>,
+    project: { organizationId: Id<"organizations">; projectId: Id<"projects"> },
+    options: {
+      readonly alpha: {
+        readonly currency: string;
+        readonly minorUnits: number;
+        readonly taxBasis?: QuoteTaxBasisRow;
+        readonly lines?: readonly QuoteLineRow[];
+        readonly scopeItems?: readonly { readonly itemId: string; readonly lineId: string; readonly requiredQuantity: string }[];
+      };
+      readonly beta: {
+        readonly currency: string;
+        readonly minorUnits: number;
+        readonly taxBasis?: QuoteTaxBasisRow;
+        readonly lines?: readonly QuoteLineRow[];
+        readonly scopeItems?: readonly { readonly itemId: string; readonly lineId: string; readonly requiredQuantity: string }[];
+      };
+    },
+  ) {
+    const graph = await setupCompetingCandidates(t, project, "f2");
+    const [alpha, beta] = graph.candidates;
+    if (alpha === undefined || beta === undefined) throw new Error("candidate setup failed");
+    await insertQuote(t, project, { requirementId: graph.requirementId, vendorId: alpha.vendorId }, {
+      version: "v1",
+      contentHash: "f2-hash-alpha",
+      createdAt: 100,
+      currency: options.alpha.currency,
+      lines: options.alpha.lines ?? singleLine(options.alpha.currency, options.alpha.minorUnits),
+      taxBasis: options.alpha.taxBasis ?? inclusiveBasis(options.alpha.currency),
+      comparisonScope: scopeFor(graph.requirementId, options.alpha.scopeItems ?? [
+        { itemId: "item-f2", lineId: "machine", requiredQuantity: "1" },
+      ]),
+    });
+    await insertQuote(t, project, { requirementId: graph.requirementId, vendorId: beta.vendorId }, {
+      version: "v1",
+      contentHash: "f2-hash-beta",
+      createdAt: 110,
+      currency: options.beta.currency,
+      lines: options.beta.lines ?? singleLine(options.beta.currency, options.beta.minorUnits),
+      taxBasis: options.beta.taxBasis ?? inclusiveBasis(options.beta.currency),
+      comparisonScope: scopeFor(graph.requirementId, options.beta.scopeItems ?? [
+        { itemId: "item-f2", lineId: "machine", requiredQuantity: "1" },
+      ]),
+    });
+    const result = await t.withIdentity(OWNER).query(getProjectionRef, { projectId: project.projectId });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("projection denied");
+    const alphaOffer = result.candidates.find((candidate) => candidate.id === alpha.candidateId);
+    const betaOffer = result.candidates.find((candidate) => candidate.id === beta.candidateId);
+    if (alphaOffer === undefined || betaOffer === undefined) throw new Error("offers missing from projection");
+    return { alphaOffer, betaOffer };
+  }
+
+  test("mixed currencies stay incomparable with the machine reason and both offers stay visible", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, OWNER, "f2-currency");
+    const { alphaOffer, betaOffer } = await comparisonPairFor(t, project, {
+      alpha: { currency: "USD", minorUnits: 795049 },
+      beta: { currency: "EUR", minorUnits: 850000 },
+    });
+    expect(alphaOffer.latestValidQuote).not.toBeNull();
+    expect(betaOffer.latestValidQuote).not.toBeNull();
+    const verdict = alphaOffer.comparisons.find((entry) => entry.againstCandidateId === betaOffer.id);
+    expect(verdict).toBeDefined();
+    expect(verdict?.status).toBe("incompatible");
+    expect(verdict?.reason).toBe("mixed-currency-requires-accepted-conversion-basis");
+    expect(verdict?.differenceMinorUnits).toBeNull();
+    expect(verdict?.cheaper).toBeNull();
+    expect(verdict?.estimatedDeltaMinorUnits).toBeNull();
+    const mirror = betaOffer.comparisons.find((entry) => entry.againstCandidateId === alphaOffer.id);
+    expect(mirror?.status).toBe("incompatible");
+    expect(mirror?.reason).toBe("mixed-currency-requires-accepted-conversion-basis");
+  });
+
+  test("inclusive versus exclusive tax bases stay incompatible with the machine reason", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, OWNER, "f2-tax");
+    const { alphaOffer, betaOffer } = await comparisonPairFor(t, project, {
+      alpha: { currency: "EUR", minorUnits: 750000, taxBasis: { kind: "inclusive", basisId: "NL-EUR-INCLUSIVE", evidenceRefs: [] } },
+      beta: { currency: "EUR", minorUnits: 850000, taxBasis: { kind: "exclusive", basisId: "DE-EUR-EXCLUSIVE", evidenceRefs: [] } },
+    });
+    const verdict = alphaOffer.comparisons.find((entry) => entry.againstCandidateId === betaOffer.id);
+    expect(verdict?.status).toBe("incompatible");
+    expect(verdict?.reason).toBe("tax bases are not compatible");
+    expect(verdict?.differenceMinorUnits).toBeNull();
+  });
+
+  test("two required units versus one stays incompatible with the scope reason", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, OWNER, "f2-scope");
+    const { alphaOffer, betaOffer } = await comparisonPairFor(t, project, {
+      alpha: {
+        currency: "EUR",
+        minorUnits: 750000,
+        lines: [
+          { lineId: "machine-a", description: "Machine A", quantity: "1", unitPrice: { currency: "EUR", minorUnits: 500000 }, evidenceRefs: [] },
+          { lineId: "machine-b", description: "Machine B", quantity: "1", unitPrice: { currency: "EUR", minorUnits: 250000 }, evidenceRefs: [] },
+        ],
+        scopeItems: [
+          { itemId: "item-a", lineId: "machine-a", requiredQuantity: "1" },
+          { itemId: "item-b", lineId: "machine-b", requiredQuantity: "1" },
+        ],
+      },
+      beta: { currency: "EUR", minorUnits: 750000 },
+    });
+    expect(alphaOffer.latestValidQuote?.comparisonScope?.items).toHaveLength(2);
+    expect(betaOffer.latestValidQuote?.comparisonScope?.items).toHaveLength(1);
+    const verdict = alphaOffer.comparisons.find((entry) => entry.againstCandidateId === betaOffer.id);
+    expect(verdict?.status).toBe("incompatible");
+    expect(verdict?.reason).toContain("comparison scopes are not compatible");
+    expect(verdict?.differenceMinorUnits).toBeNull();
+    expect(verdict?.cheaper).toBeNull();
+  });
+
+  test("an equivalent pair is comparable with the exact 54951 minor-unit difference", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, OWNER, "f2-comparable");
+    const { alphaOffer, betaOffer } = await comparisonPairFor(t, project, {
+      alpha: { currency: "EUR", minorUnits: 795049 },
+      beta: { currency: "EUR", minorUnits: 850000 },
+    });
+    const alphaQuote = alphaOffer.latestValidQuote;
+    const betaQuote = betaOffer.latestValidQuote;
+    expect(alphaQuote).not.toBeNull();
+    expect(betaQuote).not.toBeNull();
+    // Exact minor units are preserved without rounding, with the native
+    // currency carried on the total.
+    expect(alphaQuote?.totalMinorUnits).toBe(795049);
+    expect(alphaQuote?.total).toEqual({ currency: "EUR", minorUnits: 795049 });
+    expect(betaQuote?.total).toEqual({ currency: "EUR", minorUnits: 850000 });
+    // Tax-basis identity and the complete recorded comparison scope are
+    // retained by the projection.
+    expect(alphaQuote?.taxBasis).toEqual({ kind: "inclusive", basisId: "NL-EUR-INCLUSIVE" });
+    expect(alphaQuote?.comparisonScope?.scopeId).toBe("scope-f2");
+    expect(alphaQuote?.comparisonScope?.items).toEqual([
+      { itemId: "item-f2", lineId: "machine", unit: "piece", requiredQuantity: "1" },
+    ]);
+    const verdict = alphaOffer.comparisons.find((entry) => entry.againstCandidateId === betaOffer.id);
+    expect(verdict?.status).toBe("comparable");
+    expect(verdict?.reason).toBe("equivalent-scope");
+    expect(verdict?.differenceMinorUnits).toBe(54951);
+    expect(verdict?.cheaper).toBe("self");
+    expect(verdict?.estimatedDeltaMinorUnits).toBeNull();
+    const mirror = betaOffer.comparisons.find((entry) => entry.againstCandidateId === alphaOffer.id);
+    expect(mirror?.status).toBe("comparable");
+    expect(mirror?.differenceMinorUnits).toBe(54951);
+    expect(mirror?.cheaper).toBe("other");
+  });
+});
+
+describe("E15 controlled sample metadata and isolation", () => {
+  test("projects the durable sample marker on the sample project only", async () => {
+    const t = convexTest(schema, modules);
+    const plain = await setupProject(t, OWNER, "plain");
+    const created = await t.withIdentity(OWNER).mutation(createSampleGuestProjectRef, {
+      idempotencyKey: "projection-sample-1",
+    });
+    if (!created.ok) throw new Error(`sample creation failed: ${JSON.stringify(created)}`);
+
+    const sample = await t.withIdentity(OWNER).query(getProjectionRef, {
+      projectId: created.projectId,
+      limit: 4,
+    });
+    expect(sample.ok).toBe(true);
+    if (!sample.ok) throw new Error("sample projection denied");
+    expect(sample.project.sampleKind).toBe("controlledSample");
+    expect(sample.project.sampleLabel).toBe("Controlled sample data");
+    expect(sample.project.currency).toBe("EUR");
+
+    const listed = await t.withIdentity(OWNER).query(listProjectsRef, { limit: 10 });
+    expect(listed.ok).toBe(true);
+    if (!listed.ok) throw new Error("sample list denied");
+    const listedSample = listed.projects.find((entry) => entry.id === created.projectId);
+    expect(listedSample?.sampleKind).toBe("controlledSample");
+    expect(listedSample?.sampleLabel).toBe("Controlled sample data");
+    const listedPlain = listed.projects.find((entry) => entry.id === plain.projectId);
+    expect(listedPlain).toBeDefined();
+    expect("sampleKind" in (listedPlain as object)).toBe(false);
+    expect("sampleLabel" in (listedPlain as object)).toBe(false);
+
+    const plainView = await t.withIdentity(OWNER).query(getProjectionRef, {
+      projectId: plain.projectId,
+      limit: 1,
+    });
+    expect(plainView.ok).toBe(true);
+    if (!plainView.ok) throw new Error("plain projection denied");
+    expect("sampleKind" in plainView.project).toBe(false);
+    expect("sampleLabel" in plainView.project).toBe(false);
+  });
+
+  test("denies a second identity the sample projection and listing", async () => {
+    const t = convexTest(schema, modules);
+    const created = await t.withIdentity(OWNER).mutation(createSampleGuestProjectRef, {
+      idempotencyKey: "projection-sample-2",
+    });
+    if (!created.ok) throw new Error(`sample creation failed: ${JSON.stringify(created)}`);
+
+    const denied = await t.withIdentity(OTHER).query(getProjectionRef, {
+      projectId: created.projectId,
+      limit: 1,
+    });
+    expect(denied).toEqual({
+      ok: false,
+      code: "denied-membership",
+      message: "not authorized for this project",
+    });
+
+    const otherList = await t.withIdentity(OTHER).query(listProjectsRef, { limit: 10 });
+    expect(otherList.ok).toBe(true);
+    if (!otherList.ok) throw new Error("other list denied");
+    expect(otherList.projects.map((entry) => entry.id)).not.toContain(created.projectId);
+
+    const ownerList = await t.withIdentity(OWNER).query(listProjectsRef, { limit: 10 });
+    expect(ownerList.ok).toBe(true);
+    if (!ownerList.ok) throw new Error("owner list denied");
+    expect(ownerList.projects.map((entry) => entry.id)).toContain(created.projectId);
   });
 });

@@ -7,6 +7,10 @@ import {
   parseWorkbenchSnapshot,
   type WorkbenchAction,
   type WorkbenchActionResult,
+  type WorkbenchIntakeInput,
+  type WorkbenchIntakeResult,
+  type WorkbenchSampleInput,
+  type WorkbenchSampleResult,
   type WorkbenchServerAdapter,
   type WorkbenchSnapshot,
 } from "./workbench-state";
@@ -46,6 +50,13 @@ type W1DecideApprovalArgs = Record<string, unknown> & {
   readonly decision: "approved" | "rejected";
 };
 
+type W1DecideSubstituteProposalArgs = Record<string, unknown> & {
+  readonly organizationId: Id<"organizations">;
+  readonly projectId: Id<"projects">;
+  readonly proposalId: Id<"substituteProposals">;
+  readonly decision: "approved" | "rejected";
+};
+
 type W1CancelJobArgs = Record<string, unknown> & {
   readonly jobId: Id<"jobs">;
   readonly reason: string;
@@ -66,6 +77,25 @@ type W1OpenServiceCaseArgs = Record<string, unknown> & {
   readonly assetId: Id<"assets">;
   readonly urgency: "urgent" | "high" | "normal" | "low";
   readonly summary: string;
+  readonly idempotencyKey: string;
+};
+
+type W1CreateIntakeArgs = Record<string, unknown> & {
+  readonly idempotencyKey: string;
+  readonly mode: "opening" | "quoteComparison" | "equipment";
+  readonly projectName: string;
+  readonly workspaceKind?: "guest" | "private";
+  readonly region?: string;
+  readonly currency?: string;
+  readonly needByAt?: number;
+  readonly budgetMinorUnits?: number;
+  readonly detailTitle?: string;
+  readonly detailCategory?: string;
+  readonly detailSummary?: string;
+  readonly urgency?: "urgent" | "high" | "normal" | "low";
+};
+
+type W1CreateSampleArgs = Record<string, unknown> & {
   readonly idempotencyKey: string;
 };
 
@@ -90,6 +120,15 @@ type W1PublicApi = {
   readonly "domain/fulfillment": {
     readonly openServiceCase: FunctionReference<"mutation", "public", W1OpenServiceCaseArgs, unknown>;
   };
+  readonly "domain/impact": {
+    readonly decideSubstituteProposal: FunctionReference<"mutation", "public", W1DecideSubstituteProposalArgs, unknown>;
+  };
+  readonly "domain/intake": {
+    readonly createWorkspace: FunctionReference<"mutation", "public", W1CreateIntakeArgs, unknown>;
+  };
+  readonly "domain/sampleProject": {
+    readonly createSampleGuestProject: FunctionReference<"mutation", "public", W1CreateSampleArgs, unknown>;
+  };
 };
 
 /**
@@ -109,6 +148,12 @@ const cancelJobReference = jobsApi.cancel;
 const startJobReference = jobsApi.start;
 const fulfillmentApi = (api as unknown as W1PublicApi)["domain/fulfillment"];
 const openServiceCaseReference = fulfillmentApi.openServiceCase;
+const impactApi = (api as unknown as W1PublicApi)["domain/impact"];
+const decideSubstituteProposalReference = impactApi.decideSubstituteProposal;
+const intakeApi = (api as unknown as W1PublicApi)["domain/intake"];
+const createWorkspaceReference = intakeApi.createWorkspace;
+const sampleApi = (api as unknown as W1PublicApi)["domain/sampleProject"];
+const createSampleGuestProjectReference = sampleApi.createSampleGuestProject;
 
 const WORKBENCH_PROJECTION_LIMIT = 12;
 const PROJECT_DISCOVERY_LIMIT = 1;
@@ -120,6 +165,28 @@ export type ConvexWorkbenchClient = Pick<ConvexReactClient, "query" | "watchQuer
 export interface ConvexWorkbenchAdapter extends WorkbenchServerAdapter {
   readonly discoverProject: () => Promise<string | null>;
   readonly dispose: () => void;
+  readonly createIntake: (input: WorkbenchIntakeInput) => Promise<WorkbenchIntakeResult>;
+  readonly createSample: (input: WorkbenchSampleInput) => Promise<WorkbenchSampleResult>;
+}
+
+/** Browser-safe intake key: one stable opaque key per logical submission. */
+export function createIntakeIdempotencyKey(): string {
+  try {
+    if (typeof globalThis.crypto?.randomUUID === "function") return globalThis.crypto.randomUUID();
+  } catch {
+    // Fall through to a local opaque key in runtimes without Web Crypto.
+  }
+  return `intake-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+/** Browser-safe sample key: one stable opaque key per logical demo attempt. */
+export function createSampleIdempotencyKey(): string {
+  try {
+    if (typeof globalThis.crypto?.randomUUID === "function") return globalThis.crypto.randomUUID();
+  } catch {
+    // Fall through to a local opaque key in runtimes without Web Crypto.
+  }
+  return `sample-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
 type WorkbenchWatch = Watch<unknown>;
@@ -177,6 +244,7 @@ const ACTION_ALREADY_IN_FLIGHT = "This action is already in progress. Wait for t
 const RETRY_UNAVAILABLE = "Retry is unavailable because no safe retry contract is configured. Nothing was sent.";
 const SERVICE_CASE_SUMMARY_MAX_LENGTH = 800;
 const IDEMPOTENCY_KEY_MAX_LENGTH = 160;
+const SAMPLE_IDEMPOTENCY_KEY_MAX_LENGTH = 128;
 const SERVICE_CASE_URGENCIES = ["urgent", "high", "normal", "low"] as const;
 
 const RESEARCH_COLLECT_OPERATION_ID = "research.collect" as const;
@@ -227,7 +295,15 @@ interface AccessibleProjectPage {
 function parseAccessibleProjectPage(value: unknown): AccessibleProjectPage {
   if (!isRecord(value)) throw new Error("Convex returned an invalid accessible-project response.");
   if (containsPrivateProjectionKey(value)) throw new Error("Convex returned an invalid accessible-project response.");
-  if (value.ok === false) return { projectId: null, continueCursor: null, isDone: true };
+  // A server denial (for example forged-identity/unauthenticated after a
+  // rejected token) is an explicit recoverable error, never an empty
+  // workspace. Callers surface this with a retry path instead of enabling a
+  // creation flow that would hide the denial.
+  if (value.ok === false) {
+    const code = typeof value.code === "string" && value.code.trim().length > 0 ? value.code : "denied";
+    const detail = typeof value.message === "string" && value.message.trim().length > 0 ? value.message : "the server denied project discovery";
+    throw new Error(`Authorized projects could not be discovered (${code}: ${detail}). Retry to re-establish the backend identity.`);
+  }
   if (value.ok !== true) throw new Error("Convex returned an invalid accessible-project response.");
   if (
     !Array.isArray(value.projects) ||
@@ -302,6 +378,8 @@ export function createConvexWorkbenchAdapter(client: ConvexWorkbenchClient): Con
         return `${projectId}:selectOffer:${action.offerId}:${action.quoteId}:${action.quoteVersion}`;
       case "approveDecision":
         return `${projectId}:approveDecision:${action.decisionId}`;
+      case "decideSubstituteProposal":
+        return `${projectId}:decideSubstituteProposal:${action.proposalId}:${action.decision}`;
       case "cancelJob":
         return `${projectId}:cancelJob:${action.jobId}`;
       case "startResearch":
@@ -421,6 +499,15 @@ export function createConvexWorkbenchAdapter(client: ConvexWorkbenchClient): Con
     }
     if (disposed) return null;
     if (readVersions.get(projectId) !== version) return null;
+    // A server denial (for example forged-identity/unauthenticated after a
+    // revoked or rejected token) is an explicit recoverable error, never an
+    // empty projection that would hide the denial behind a creation flow.
+    if (isRecord(result) && result.ok === false) {
+      invalidateProjection(projectId);
+      const code = typeof result.code === "string" && result.code.trim().length > 0 ? result.code : "denied";
+      const detail = typeof result.message === "string" && result.message.trim().length > 0 ? result.message : "the server denied this projection";
+      throw new Error(`The project projection could not be read (${code}: ${detail}). Retry to re-establish the backend identity.`);
+    }
     const snapshot = parseWorkbenchSnapshot(result, projectId);
     if (snapshot === null) {
       invalidateProjection(projectId);
@@ -595,6 +682,54 @@ export function createConvexWorkbenchAdapter(client: ConvexWorkbenchClient): Con
       }
     }
 
+    if (action.type === "decideSubstituteProposal") {
+      const proposal = current.substitutes.find((candidate) => candidate.id === action.proposalId);
+      if (proposal === undefined) {
+        return { ok: false, message: ACTION_REQUIRES_CURRENT_PROJECTION };
+      }
+      if (proposal.state !== "pending") {
+        return { ok: false, message: `This substitute proposal is already ${proposal.state}. Nothing was sent.` };
+      }
+      if (current.access.capabilities.canApprove !== true) {
+        return { ok: false, message: "Substitute approval is not authorized for this project role. Nothing was sent." };
+      }
+      if (!isOneOf(action.decision, ["approved", "rejected"] as const)) {
+        return { ok: false, message: ACTION_REQUIRES_CURRENT_PROJECTION };
+      }
+      // Approval acts on the proposed terms, so a changed basis blocks it
+      // with zero writes. Rejection closes the proposal without relying on
+      // those terms, so it still routes while the proposal is pending.
+      if (action.decision === "approved" && proposal.basisStale) {
+        return { ok: false, message: `This substitute basis changed (${proposal.basisReason}); renewed authority required. Nothing was sent.` };
+      }
+      const args: W1DecideSubstituteProposalArgs = {
+        organizationId,
+        projectId,
+        proposalId: proposal.id as Id<"substituteProposals">,
+        decision: action.decision,
+      };
+      const mutationKey = claimMutation(projectId, action);
+      if (mutationKey === null) return { ok: false, message: ACTION_ALREADY_IN_FLIGHT };
+      const mutationGeneration = readVersions.get(projectId) ?? 0;
+      let settlement: MutationSettlement = "uncertain";
+      try {
+        const result = await client.mutation(decideSubstituteProposalReference, args);
+        settlement = mutationSettlement(result);
+        const failure = mutationFailure(result, "The server did not decide this substitute proposal.");
+        if (failure !== null) return failure;
+        return {
+          ok: true,
+          message: action.decision === "approved"
+            ? "Substitute approved by the server; execute it as an explicit new selection."
+            : "Substitute rejection recorded by the server.",
+        };
+      } catch (error) {
+        return { ok: false, message: error instanceof Error ? error.message : "The server did not decide this substitute proposal." };
+      } finally {
+        await finishMutation(projectId, mutationKey, mutationGeneration, settlement);
+      }
+    }
+
     if (action.type === "openServiceCase") {
       if (current.access.capabilities.canOpenServiceCase !== true) {
         return { ok: false, message: "Service-case creation is not authorized for this project. Nothing was sent." };
@@ -735,5 +870,74 @@ export function createConvexWorkbenchAdapter(client: ConvexWorkbenchClient): Con
     return { ok: false, message: ACTION_UNAVAILABLE };
   };
 
-  return { load, subscribe, act, discoverProject, dispose };
+  const createIntake = async (input: WorkbenchIntakeInput): Promise<WorkbenchIntakeResult> => {
+    if (disposed) return { ok: false, message: "The workbench connection is no longer active. Nothing was sent." };
+    if (!isOneOf(input.mode, ["opening", "quoteComparison", "equipment"] as const)) {
+      return { ok: false, message: "Choose opening, quote comparison, or equipment case. Nothing was sent." };
+    }
+    const projectName = input.projectName.trim();
+    const idempotencyKey = input.idempotencyKey.trim();
+    if (projectName.length === 0 || idempotencyKey.length === 0) {
+      return { ok: false, message: "A project name and submission key are required. Nothing was sent." };
+    }
+    const key = `intake:${idempotencyKey}`;
+    if (inFlightMutations.has(key)) return { ok: false, message: ACTION_ALREADY_IN_FLIGHT };
+    inFlightMutations.add(key);
+    try {
+      const args: W1CreateIntakeArgs = {
+        idempotencyKey,
+        mode: input.mode,
+        projectName,
+        ...(input.workspaceKind === undefined ? {} : { workspaceKind: input.workspaceKind }),
+        ...(input.region === undefined ? {} : { region: input.region }),
+        ...(input.currency === undefined ? {} : { currency: input.currency }),
+        ...(input.needByAt === undefined ? {} : { needByAt: input.needByAt }),
+        ...(input.budgetMinorUnits === undefined ? {} : { budgetMinorUnits: input.budgetMinorUnits }),
+        ...(input.detailTitle === undefined ? {} : { detailTitle: input.detailTitle }),
+        ...(input.detailCategory === undefined ? {} : { detailCategory: input.detailCategory }),
+        ...(input.detailSummary === undefined ? {} : { detailSummary: input.detailSummary }),
+        ...(input.urgency === undefined ? {} : { urgency: input.urgency }),
+      };
+      const result = await client.mutation(createWorkspaceReference, args);
+      const failure = mutationFailure(result, "The server did not create this workspace.");
+      if (failure !== null) return failure;
+      const projectId = isRecord(result) ? requiredString(result.projectId) : null;
+      if (projectId === null) return { ok: false, message: "The server did not return a valid workspace." };
+      // No eager projection load here: the parent owns the connection/auth
+      // epoch and adapter fence, and decides whether this success may adopt
+      // and load the returned project. An eager load would let a stale-epoch
+      // success populate the cache before that fence runs.
+      return { ok: true, projectId, message: "Workspace created by the server." };
+    } catch (error) {
+      return { ok: false, message: error instanceof Error ? error.message : "The server did not create this workspace." };
+    } finally {
+      inFlightMutations.delete(key);
+    }
+  };
+
+  const createSample = async (input: WorkbenchSampleInput): Promise<WorkbenchSampleResult> => {
+    if (disposed) return { ok: false, message: "The workbench connection is no longer active. Nothing was sent." };
+    const idempotencyKey = input.idempotencyKey.trim();
+    if (idempotencyKey.length === 0 || idempotencyKey.length > SAMPLE_IDEMPOTENCY_KEY_MAX_LENGTH) {
+      return { ok: false, message: "A submission key is required. Nothing was sent." };
+    }
+    const key = `sample:${idempotencyKey}`;
+    if (inFlightMutations.has(key)) return { ok: false, message: ACTION_ALREADY_IN_FLIGHT };
+    inFlightMutations.add(key);
+    try {
+      const args: W1CreateSampleArgs = { idempotencyKey };
+      const result = await client.mutation(createSampleGuestProjectReference, args);
+      const failure = mutationFailure(result, "The server did not create this sample project.");
+      if (failure !== null) return failure;
+      const projectId = isRecord(result) ? requiredString(result.projectId) : null;
+      if (projectId === null) return { ok: false, message: "The server did not return a valid sample project." };
+      return { ok: true, projectId, message: "Sample project created by the server." };
+    } catch (error) {
+      return { ok: false, message: error instanceof Error ? error.message : "The server did not create this sample project." };
+    } finally {
+      inFlightMutations.delete(key);
+    }
+  };
+
+  return { load, subscribe, act, discoverProject, dispose, createIntake, createSample };
 }

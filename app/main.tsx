@@ -1,4 +1,4 @@
-import { ConvexAuthProvider, useConvexAuth } from "@convex-dev/auth/react";
+import { ConvexAuthProvider, useAuthActions, useConvexAuth } from "@convex-dev/auth/react";
 import { ConvexReactClient, useConvexConnectionState } from "convex/react";
 import React, { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
@@ -9,7 +9,11 @@ import {
   parseWorkbenchSnapshot,
   type WorkbenchActionResult,
   type WorkbenchActivityItem,
+  type WorkbenchIntakeInput,
+  type WorkbenchIntakeResult,
   type WorkbenchLoadState,
+  type WorkbenchSampleInput,
+  type WorkbenchSampleResult,
   type WorkbenchServerAdapter,
   type WorkbenchSnapshot,
 } from "./workbench-state";
@@ -105,9 +109,64 @@ export function applyLiveWorkbenchSnapshot(current: WorkbenchSnapshot, live: Wor
   };
 }
 
+/**
+ * Logical intake fingerprint for reconnect reconciliation: the stable payload
+ * identity without the transport idempotency key. An unchanged retry across a
+ * disconnect/remount must reuse the original server key; a changed payload
+ * must use its fresh key so the server never sees a duplicate-conflict.
+ */
+export function intakePayloadFingerprint(input: WorkbenchIntakeInput): string {
+  return JSON.stringify({
+    mode: input.mode,
+    projectName: input.projectName,
+    workspaceKind: input.workspaceKind,
+    region: input.region ?? null,
+    currency: input.currency ?? null,
+    needByAt: input.needByAt ?? null,
+    budgetMinorUnits: input.budgetMinorUnits ?? null,
+    detailTitle: input.detailTitle ?? null,
+    detailCategory: input.detailCategory ?? null,
+    detailSummary: input.detailSummary ?? null,
+    urgency: input.urgency ?? null,
+  });
+}
+
+const ANONYMOUS_SIGN_IN_FAILED =
+  "Anonymous sign-in failed, so this browser has no authorized backend identity. No project state was read and nothing was sent. Retry to sign in again.";
+
 function ConnectionAwareApp({ onRetry, projectId, workbenchAdapter }: { readonly onRetry: () => void; readonly projectId?: string | undefined; readonly workbenchAdapter?: RuntimeWorkbenchAdapter | undefined }) {
   const connection = useConvexConnectionState();
   const auth = useConvexAuth();
+  const authActions = useAuthActions();
+  const [anonymousSignIn, setAnonymousSignIn] = useState<"idle" | "establishing" | "failed">("idle");
+  const attemptedAnonymousRef = useRef(false);
+  // A server-side denial (for example a rejected token discovered by project
+  // discovery) clears the stale local session on retry so the remounted
+  // session re-establishes a fresh identity instead of replaying the denial.
+  const authDenialRef = useRef(false);
+
+  // A fresh visitor holds no session. Establish the real anonymous identity
+  // through the registered Convex Auth provider before any discovery, load,
+  // or creation mutation runs, so the backend sees an authenticated caller.
+  // Without this, the backend denies forged-identity requests and project
+  // discovery would disguise that denial as an empty project list.
+  // Readiness keys on the Convex Auth session flag, never on a locally
+  // stored token alone: a token can exist locally while the server still
+  // rejects it, and only a successful server round-trip confirms the backend
+  // identity.
+  useEffect(() => {
+    if (auth.isLoading || auth.isAuthenticated || attemptedAnonymousRef.current) return;
+    attemptedAnonymousRef.current = true;
+    setAnonymousSignIn("establishing");
+    authActions.signIn("anonymous").then((result) => {
+      // The anonymous provider signs in immediately; the stored token flips
+      // the auth context. A non-signing result created no session.
+      setAnonymousSignIn(result.signingIn ? "idle" : "failed");
+    }).catch(() => {
+      setAnonymousSignIn("failed");
+    });
+  }, [auth.isLoading, auth.isAuthenticated, authActions]);
+
   const backendStatus = statusFromConnection({
     isWebSocketConnected: connection.isWebSocketConnected,
     hasEverConnected: connection.hasEverConnected,
@@ -115,7 +174,29 @@ function ConnectionAwareApp({ onRetry, projectId, workbenchAdapter }: { readonly
     authLoading: auth.isLoading,
   });
 
-  return <AdapterAwareApp backendStatus={backendStatus} onRetry={onRetry} projectId={projectId} workbenchAdapter={workbenchAdapter} />;
+  // Auth failure stays honest: an explicit error with a retry path, never a
+  // fake identity and never an "empty" project list that hides the denial.
+  if (backendStatus === "connected" && !auth.isAuthenticated && anonymousSignIn === "failed") {
+    return <App backendStatus="connected" onRetry={onRetry} workbench={{ state: "error", message: ANONYMOUS_SIGN_IN_FAILED }} />;
+  }
+  // Discovery and creation wait for the established session; the honest
+  // authenticating state replaces "connected" while the identity is pending.
+  // A locally stored token alone is not enough: the session flag flips only
+  // after the provider stored the identity, and creation additionally waits
+  // for a successful server round-trip (tracked inside AdapterAwareApp).
+  const connectedWithoutIdentity = backendStatus === "connected" && !auth.isAuthenticated;
+  const handleRetry = () => {
+    if (!authDenialRef.current) {
+      onRetry();
+      return;
+    }
+    authDenialRef.current = false;
+    // The server rejected the stored token, so drop the stale local session
+    // before remounting; the fresh mount then establishes a new identity
+    // instead of replaying the same denial.
+    Promise.resolve(authActions.signOut()).then(onRetry, onRetry);
+  };
+  return <AdapterAwareApp backendStatus={connectedWithoutIdentity ? "authenticating" : backendStatus} onRetry={handleRetry} projectId={projectId} workbenchAdapter={workbenchAdapter} onAuthDenial={() => { authDenialRef.current = true; }} />;
 }
 
 export function AdapterAwareApp({
@@ -123,11 +204,13 @@ export function AdapterAwareApp({
   onRetry,
   projectId,
   workbenchAdapter,
+  onAuthDenial,
 }: {
   readonly backendStatus: ReturnType<typeof statusFromConnection>;
   readonly onRetry: () => void;
   readonly projectId?: string | undefined;
   readonly workbenchAdapter?: RuntimeWorkbenchAdapter | undefined;
+  readonly onAuthDenial?: (() => void) | undefined;
 }) {
   const [workbench, setWorkbench] = useState<WorkbenchLoadState | undefined>(undefined);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -135,6 +218,45 @@ export function AdapterAwareApp({
   const previousContext = useRef<{ readonly projectId: string | undefined; readonly adapter: RuntimeWorkbenchAdapter | undefined }>({ projectId: undefined, adapter: undefined });
   const backendStatusRef = useRef(backendStatus);
   backendStatusRef.current = backendStatus;
+  const adapterRef = useRef(workbenchAdapter);
+  adapterRef.current = workbenchAdapter;
+  const workbenchRef = useRef(workbench);
+  workbenchRef.current = workbench;
+  // Server-confirmed authentication bound to the current connection/auth
+  // generation: a locally established session is not enough to send creation
+  // mutations. This latch flips only after a discovery or projection
+  // round-trip succeeds against the backend for the current epoch, so a
+  // rejected token can never reach intake/sample creation. It invalidates on
+  // disconnect, auth/token generation change, rejection, adapter replacement
+  // or reconnect, until a fresh discovery succeeds in the new epoch.
+  // Retryable errors are preserved: a denial clears the latch but keeps the
+  // explicit error with its retry path.
+  const connectionEpochRef = useRef(0);
+  const serverConfirmedEpochRef = useRef<number | null>(null);
+  const discoveryGenerationRef = useRef(0);
+  const previousBackendStatusRef = useRef(backendStatus);
+  const isServerConfirmedForCurrentEpoch = (): boolean =>
+    serverConfirmedEpochRef.current !== null && serverConfirmedEpochRef.current === connectionEpochRef.current;
+  const confirmServerForCurrentEpoch = (): void => {
+    serverConfirmedEpochRef.current = connectionEpochRef.current;
+  };
+  const invalidateServerConfirmation = (): void => {
+    serverConfirmedEpochRef.current = null;
+  };
+  const rollConnectionEpoch = (): void => {
+    connectionEpochRef.current += 1;
+    serverConfirmedEpochRef.current = null;
+    // Bump the discovery fence so an older in-flight discovery success can
+    // never confirm the new epoch even if its effect cleanup races.
+    discoveryGenerationRef.current += 1;
+  };
+  const onAuthDenialRef = useRef(onAuthDenial);
+  onAuthDenialRef.current = onAuthDenial;
+  // Reconnect-safe intake key: the intake form remounts when the empty state
+  // leaves during disconnect, so a fresh mount would mint a fresh random key
+  // even for an unchanged logical retry. This remembers the last logical
+  // payload fingerprint and its original server key across epochs/remounts.
+  const lastIntakeAttemptRef = useRef<{ readonly fingerprint: string; readonly key: string } | null>(null);
   // A request context is tied to one project, adapter and connected client
   // generation. Reconnects, revocations and adapter replacement invalidate the
   // context before an old load can apply to a fresh snapshot for the same ID.
@@ -149,24 +271,72 @@ export function AdapterAwareApp({
   const isCurrentContext = (context: WorkbenchRequestContext): boolean =>
     activeContextRef.current === context && !context.disposed && backendStatusRef.current === "connected";
 
+  // Leaving a connected socket invalidates cached confirmation immediately.
+  // The latch stays cleared across reconnect until a fresh discovery in the
+  // new epoch succeeds, so a pending reconnect never reuses the old epoch.
+  useEffect(() => {
+    if (previousBackendStatusRef.current === backendStatus) return;
+    const wasConnected = previousBackendStatusRef.current === "connected";
+    previousBackendStatusRef.current = backendStatus;
+    if (wasConnected || backendStatus !== "connected") {
+      rollConnectionEpoch();
+    }
+  }, [backendStatus]);
+
   useEffect(() => {
     let disposed = false;
     const configuredProjectId = normaliseProjectId(projectId);
     const contextChanged = previousContext.current.projectId !== configuredProjectId || previousContext.current.adapter !== workbenchAdapter;
     previousContext.current = { projectId: configuredProjectId, adapter: workbenchAdapter };
-    if (contextChanged) setWorkbench(undefined);
+    if (contextChanged) {
+      setWorkbench(undefined);
+      // Adapter replacement or an explicit project change starts a new auth
+      // generation: old async success must not re-enable creation.
+      rollConnectionEpoch();
+    }
     setResolvedProjectId(configuredProjectId);
     if (configuredProjectId !== undefined) return () => { disposed = true; };
-    if (workbenchAdapter?.discoverProject === undefined || backendStatus !== "connected") return () => { disposed = true; };
+    if (workbenchAdapter?.discoverProject === undefined || backendStatus !== "connected") {
+      if (backendStatus !== "connected") invalidateServerConfirmation();
+      return () => { disposed = true; };
+    }
 
+    const dispatchEpoch = connectionEpochRef.current;
+    const dispatchAdapter = workbenchAdapter;
+    const dispatchGeneration = discoveryGenerationRef.current + 1;
+    discoveryGenerationRef.current = dispatchGeneration;
     void workbenchAdapter.discoverProject().then((discoveredProjectId) => {
       if (disposed) return;
+      // Stale fence: a newer discovery, disconnect, adapter replacement or
+      // reconnect started after this dispatch, so this success belongs to an
+      // older generation and must not re-enable creation.
+      if (dispatchGeneration !== discoveryGenerationRef.current) return;
+      if (dispatchEpoch !== connectionEpochRef.current) return;
+      if (backendStatusRef.current !== "connected") return;
+      if (adapterRef.current !== dispatchAdapter) return;
+      // Any resolved discovery (a project id or an authenticated empty
+      // result) is the server confirmation for this epoch. A denial rejects
+      // and lands in the error branch below instead of masquerading as an
+      // empty list.
+      confirmServerForCurrentEpoch();
       setResolvedProjectId(discoveredProjectId ?? undefined);
       if (discoveredProjectId === null) {
         setWorkbench({ state: "empty", message: "No authorized project projection is available yet." });
       }
     }).catch((error: unknown) => {
       if (disposed) return;
+      if (dispatchGeneration !== discoveryGenerationRef.current) return;
+      if (dispatchEpoch !== connectionEpochRef.current) return;
+      const isAuthDenial = error instanceof Error && /forged-identity|unauthenticated/i.test(error.message);
+      if (isAuthDenial) {
+        // A rejected token clears the latch and rolls the epoch so a racing
+        // older success cannot re-enable creation; the explicit denial error
+        // below stays retryable.
+        rollConnectionEpoch();
+        onAuthDenialRef.current?.();
+      } else {
+        invalidateServerConfirmation();
+      }
       setWorkbench({ state: "error", message: error instanceof Error ? error.message : "Authorized projects could not be discovered." });
     });
     return () => { disposed = true; };
@@ -193,7 +363,13 @@ export function AdapterAwareApp({
     };
     contextGenerationRef.current = context.generation;
     activeContextRef.current = context;
-    const isCurrent = () => !disposed && isCurrentContext(context);
+    // Bind projection confirmation to the connection/auth epoch that
+    // dispatched this context. A success from an older epoch (disconnect,
+    // denial, or replacement racing a slow query) must not confirm the new
+    // epoch.
+    const contextEpoch = connectionEpochRef.current;
+    const isCurrentEpoch = (): boolean => contextEpoch === connectionEpochRef.current;
+    const isCurrent = () => !disposed && isCurrentContext(context) && isCurrentEpoch();
     const nextRequestGeneration = () => {
       context.fence.requested += 1;
       return context.fence.requested;
@@ -217,6 +393,9 @@ export function AdapterAwareApp({
           return;
         }
         context.fence.applied = loadGeneration;
+        if (isCurrentEpoch() && backendStatusRef.current === "connected" && adapterRef.current === context.adapter) {
+          confirmServerForCurrentEpoch();
+        }
         setWorkbench((current) => {
           if (current?.state !== "ready" || current.snapshot.project.id !== context.projectId) return { state: "ready", snapshot };
           return { state: "ready", snapshot: applyLiveWorkbenchSnapshot(current.snapshot, snapshot) };
@@ -226,6 +405,12 @@ export function AdapterAwareApp({
         // A newer request superseded this head load: a stale failure must not
         // overwrite a newer successful projection with an error.
         if (loadGeneration < context.fence.requested) return;
+        if (error instanceof Error && /forged-identity|unauthenticated/i.test(error.message)) {
+          rollConnectionEpoch();
+          onAuthDenialRef.current?.();
+        } else {
+          invalidateServerConfirmation();
+        }
         setWorkbench((current) => ({
           state: "error",
           message: error instanceof Error ? error.message : "The project projection could not be read.",
@@ -241,6 +426,9 @@ export function AdapterAwareApp({
         const snapshot = response === null ? null : parseWorkbenchSnapshot(response, context.projectId);
         const updateGeneration = nextRequestGeneration();
         context.fence.applied = updateGeneration;
+        if (snapshot !== null && isCurrentEpoch() && backendStatusRef.current === "connected" && adapterRef.current === context.adapter) {
+          confirmServerForCurrentEpoch();
+        }
         setWorkbench((current) => {
           if (snapshot === null) return { state: "empty", message: "No authorized project projection is available yet." };
           if (current?.state !== "ready" || current.snapshot.project.id !== context.projectId) return { state: "ready", snapshot };
@@ -251,6 +439,9 @@ export function AdapterAwareApp({
         if (!isCurrent()) return;
         // A revoked or malformed subscription invalidates all in-flight loads
         // for this client generation. A later reconnect creates a new context.
+        // The failed subscription cannot confirm this epoch, so creation
+        // stays blocked until a fresh round-trip succeeds.
+        invalidateServerConfirmation();
         context.disposed = true;
         if (activeContextRef.current === context) activeContextRef.current = null;
         setWorkbench({ state: "error", message: error instanceof Error ? error.message : "The project projection could not be refreshed." });
@@ -315,11 +506,114 @@ export function AdapterAwareApp({
     });
   };
 
+  const handleIntake = async (input: WorkbenchIntakeInput): Promise<WorkbenchIntakeResult> => {
+    if (backendStatusRef.current !== "connected") {
+      return { ok: false, message: "Intake waits for a live backend connection. Nothing was sent." };
+    }
+    // Creation mutations additionally wait for server-confirmed
+    // authentication in the current connection/auth generation: a locally
+    // stored session alone never authorizes a send.
+    if (!isServerConfirmedForCurrentEpoch()) {
+      return { ok: false, message: "Intake waits for server-confirmed authentication. Nothing was sent." };
+    }
+    const callingAdapter = adapterRef.current;
+    if (callingAdapter?.createIntake === undefined) {
+      return { ok: false, message: "No server intake route is configured. Nothing was sent." };
+    }
+    // Reconnect reconciliation: an unchanged logical payload reuses its
+    // original server key so the retry replays idempotently; a changed
+    // payload keeps its fresh key so the server never sees a
+    // duplicate-conflict. The mapping survives disconnect/remount epochs.
+    const fingerprint = intakePayloadFingerprint(input);
+    const remembered = lastIntakeAttemptRef.current;
+    const effectiveInput = remembered !== null && remembered.fingerprint === fingerprint
+      ? { ...input, idempotencyKey: remembered.key }
+      : input;
+    if (remembered === null || remembered.fingerprint !== fingerprint) {
+      lastIntakeAttemptRef.current = { fingerprint, key: input.idempotencyKey };
+    }
+    // Bind this creation to the connection/auth epoch that dispatched it. A
+    // completion from an older epoch (disconnect/reconnect, denial, or
+    // adapter replacement racing a slow mutation) must not adopt the
+    // returned project. See P-17, D-06, D-14.
+    const dispatchEpoch = connectionEpochRef.current;
+    try {
+      const result = await callingAdapter.createIntake(effectiveInput);
+      if (result.ok && result.projectId !== undefined) {
+        if (dispatchEpoch !== connectionEpochRef.current || backendStatusRef.current !== "connected" || adapterRef.current !== callingAdapter) {
+          const message = "The workspace may have been created but could not be loaded in this session. Reconnect or discovery can find authorized projects.";
+          setActionError(message);
+          return { ok: false, message };
+        }
+        setResolvedProjectId(result.projectId);
+      } else if (!result.ok) {
+        setActionError(result.message ?? "The server did not create this workspace.");
+      }
+      return result;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "The server did not create this workspace.";
+      setActionError(message);
+      return { ok: false, message };
+    }
+  };
+
+  const handleSample = async (input: WorkbenchSampleInput): Promise<WorkbenchSampleResult> => {
+    if (backendStatusRef.current !== "connected") {
+      return { ok: false, message: "Sample creation waits for a live backend connection. Nothing was sent." };
+    }
+    // Creation mutations additionally wait for server-confirmed
+    // authentication in the current connection/auth generation: a locally
+    // stored session alone never authorizes a send.
+    if (!isServerConfirmedForCurrentEpoch()) {
+      return { ok: false, message: "Sample creation waits for server-confirmed authentication. Nothing was sent." };
+    }
+    if (workbenchRef.current?.state !== "empty") {
+      return { ok: false, message: "Sample creation is available only with no authorized project. Nothing was sent." };
+    }
+    const callingAdapter = adapterRef.current;
+    if (callingAdapter?.createSample === undefined) {
+      return { ok: false, message: "No server sample route is configured. Nothing was sent." };
+    }
+    // Bind this creation to the connection/auth epoch that dispatched it. A
+    // completion from an older epoch (disconnect/reconnect, denial, or
+    // adapter replacement racing a slow mutation) must not adopt or load the
+    // returned project. See P-17, D-06, D-14.
+    const dispatchEpoch = connectionEpochRef.current;
+    try {
+      const result = await callingAdapter.createSample(input);
+      if (result.ok && result.projectId !== undefined) {
+        if (dispatchEpoch !== connectionEpochRef.current || backendStatusRef.current !== "connected" || adapterRef.current !== callingAdapter || workbenchRef.current?.state !== "empty") {
+          const message = "The sample project may have been created but could not be loaded in this session. Reconnect or discovery can find authorized projects.";
+          setActionError(message);
+          return { ok: false, message };
+        }
+        setResolvedProjectId(result.projectId);
+      } else if (!result.ok) {
+        setActionError(result.message ?? "The server did not create this sample project.");
+      }
+      return result;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "The server did not create this sample project.";
+      setActionError(message);
+      return { ok: false, message };
+    }
+  };
+
   const connectedLoadMore = workbench?.state === "ready" && backendStatus === "connected" ? handleLoadMore : undefined;
+  // Creation flows are offered only after server-confirmed authentication in
+  // the current connection/auth generation, never on a merely connected
+  // socket with a local-only session. An empty state produced without a
+  // successful server round-trip keeps the honest empty message with no
+  // enabled creation flow. The epoch check disables creation immediately on
+  // disconnect and keeps it blocked across reconnect until fresh discovery
+  // succeeds.
+  const serverConfirmedCreation = backendStatus === "connected" && isServerConfirmedForCurrentEpoch();
+  const connectedIntake = workbench?.state === "empty" && serverConfirmedCreation ? handleIntake : undefined;
+  const connectedSample = workbench?.state === "empty" && serverConfirmedCreation ? handleSample : undefined;
   const appWorkbench = backendStatus === "reconnecting" && workbench?.state === "ready"
     ? { state: "reconnecting" as const, lastKnown: workbench.snapshot }
     : workbench;
-  return <><App backendStatus={backendStatus} onRetry={onRetry} workbench={appWorkbench} onAction={handleAction} onLoadMore={connectedLoadMore} />{actionError ? <span className="wb-visually-hidden" role="alert">{actionError}</span> : null}</>;
+  return <><App backendStatus={backendStatus} onRetry={onRetry} workbench={appWorkbench} onAction={handleAction} onLoadMore={connectedLoadMore} onIntake={connectedIntake} onSample={connectedSample} />{actionError ? <span className="wb-visually-hidden" role="alert">{actionError}</span> : null}</>;
 }
 
 function normaliseProjectId(value: string | undefined): string | undefined {

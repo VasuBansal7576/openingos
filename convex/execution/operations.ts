@@ -453,6 +453,35 @@ export const create = f1Mutation({
     payloadJson: v.string(),
     grantId: v.id("grants"),
     reservationId: v.optional(v.id("reservations")),
+    negotiationId: v.optional(v.id("negotiations")),
+    /**
+     * Exact saved-draft authority for a negotiation send (Astra repair:
+     * concurrent different-request dispatches reusing one round-0 draft).
+     *
+     * The orchestrator resolves the opaque draft bundle server-side and
+     * passes its pins here; this mutation verifies every pin against the
+     * live rows inside the same atomic transaction that inserts the
+     * operation, then pins the live values as the operation's
+     * `negotiationAuthority`. A stale draft (advanced round, changed quote
+     * or conversation, mismatched payload) denies here with zero new
+     * effect — even when the action-level pre-check raced it. The atomic
+     * `claim` rechecks the pinned authority against the live rows again
+     * immediately before provider effect, so two operations created from
+     * one draft under different request ids serialize on the mandate round:
+     * the first claim consumes it and the stale loser denies with no
+     * effect. Reply drift rides the same pins: an accepted reply bumps the
+     * live conversation version (or supersedes the quote), which the claim
+     * recheck denies; quarantined replies never enter workloads and hold
+     * the action before creation.
+     */
+    negotiationDraft: v.optional(v.object({
+      quoteVersion: v.string(),
+      quoteContentHash: v.string(),
+      roundsUsed: v.number(),
+      conversationVersion: v.optional(v.number()),
+      conversationState: v.optional(v.string()),
+      payloadHash: v.string(),
+    })),
   },
   returns: createResultValidator,
   handler: async (ctx, args) => {
@@ -807,6 +836,125 @@ export const create = f1Mutation({
       }
     }
 
+    // Negotiation authority binding (Devin findings 4060796830/4060796928):
+    // every pinned value is read server-side from the live rows at
+    // preparation and stored immutably on the operation. An old bound
+    // mandate without the approved conversation pin, a dead mandate, or a
+    // stale/superseded quote cannot produce a binding; the atomic claim
+    // rechecks every pin again immediately before provider effect.
+    let negotiationAuthority: {
+      negotiationId: Id<"negotiations">;
+      quoteId: Id<"quotes">;
+      quoteVersion: string;
+      quoteContentHash: string;
+      roundsUsed: number;
+      conversationId?: Id<"conversations">;
+      conversationVersion?: number;
+      conversationState?: "draft" | "queued" | "awaitingReply" | "replyReceived" | "closed" | "cancelled";
+    } | undefined;
+    if (args.negotiationId !== undefined) {
+      const negotiation = await ctx.db.get(args.negotiationId);
+      if (
+        negotiation === null ||
+        negotiation.organizationId !== args.organizationId ||
+        negotiation.projectId !== args.projectId
+      ) {
+        return { ok: false as const, code: "denied-membership", message: "negotiation mandate is not in this project" };
+      }
+      if (negotiation.state === "revoked") {
+        return { ok: false as const, code: "mandate-revoked", message: "negotiation mandate was revoked before preparation" };
+      }
+      if (negotiation.state !== "active") {
+        return { ok: false as const, code: "mandate-not-active", message: "negotiation mandate is not active" };
+      }
+      if (negotiation.expiresAt <= now) {
+        return { ok: false as const, code: "mandate-expired", message: "negotiation mandate expired before preparation" };
+      }
+      if (negotiation.roundsUsed >= negotiation.roundLimit) {
+        return { ok: false as const, code: "mandate-round-limit-reached", message: "negotiation mandate has no remaining rounds" };
+      }
+      const mandateQuote = await ctx.db.get(negotiation.quoteId);
+      if (
+        mandateQuote === null ||
+        mandateQuote.organizationId !== args.organizationId ||
+        mandateQuote.projectId !== args.projectId ||
+        mandateQuote.version !== negotiation.quoteVersion
+      ) {
+        return { ok: false as const, code: "mandate-quote-stale", message: "negotiation quote is no longer the mandate's exact version" };
+      }
+      const successorProbe = await ctx.db
+        .query("quotes")
+        .withIndex("by_project_and_supersedes", (q) =>
+          q.eq("projectId", args.projectId).eq("supersedes", mandateQuote.contentHash),
+        )
+        .first();
+      if (successorProbe !== null) {
+        return { ok: false as const, code: "mandate-quote-superseded", message: "negotiation quote version has been superseded" };
+      }
+      if (negotiation.conversationId !== undefined) {
+        const boundConversation = await ctx.db.get(negotiation.conversationId);
+        if (boundConversation === null) {
+          return { ok: false as const, code: "mandate-conversation-stale", message: "bound conversation is unavailable" };
+        }
+        if (negotiation.conversationVersion === undefined || negotiation.conversationState === undefined) {
+          return { ok: false as const, code: "mandate-approval-unpinned", message: "bound mandate lacks the approved conversation version" };
+        }
+        if (
+          negotiation.conversationState === "closed" ||
+          negotiation.conversationState === "cancelled"
+        ) {
+          return { ok: false as const, code: "mandate-conversation-closed", message: "bound conversation is closed or cancelled" };
+        }
+      }
+      // Atomic saved-draft binding: the exact draft pins must equal the live
+      // mandate rows inside this same transaction. A draft prepared under an
+      // older round, quote version, or conversation (or carrying a different
+      // payload than submitted here) denies before any operation row is
+      // inserted or allowance is bound.
+      if (args.negotiationDraft !== undefined) {
+        const draft = args.negotiationDraft;
+        if (!Number.isSafeInteger(draft.roundsUsed) || draft.roundsUsed < 0) {
+          return { ok: false as const, code: "invalid-payload", message: "saved draft round is not a usable bound" };
+        }
+        if (
+          draft.quoteVersion !== negotiation.quoteVersion ||
+          draft.quoteContentHash !== mandateQuote.contentHash
+        ) {
+          return { ok: false as const, code: "draft-quote-stale", message: "prepared draft quote version is no longer current" };
+        }
+        if (draft.roundsUsed !== negotiation.roundsUsed) {
+          return { ok: false as const, code: "draft-round-stale", message: "negotiation round advanced after this draft was prepared" };
+        }
+        const draftConversationVersion = draft.conversationVersion ?? null;
+        const liveConversationVersion = negotiation.conversationVersion ?? null;
+        if (draftConversationVersion !== liveConversationVersion) {
+          return { ok: false as const, code: "draft-conversation-changed", message: "prepared draft conversation version is no longer current" };
+        }
+        const draftConversationState = draft.conversationState ?? null;
+        const liveConversationState = negotiation.conversationState ?? null;
+        if (draftConversationState !== liveConversationState) {
+          return { ok: false as const, code: "draft-conversation-changed", message: "prepared draft conversation state is no longer current" };
+        }
+        if (draft.payloadHash !== hash && draft.payloadHash !== submittedHash) {
+          return { ok: false as const, code: "draft-payload-mismatch", message: "prepared draft payload no longer matches its approved hash" };
+        }
+      }
+      negotiationAuthority = {
+        negotiationId: args.negotiationId,
+        quoteId: negotiation.quoteId,
+        quoteVersion: negotiation.quoteVersion,
+        quoteContentHash: mandateQuote.contentHash,
+        roundsUsed: negotiation.roundsUsed,
+        ...(negotiation.conversationId === undefined ? {} : { conversationId: negotiation.conversationId }),
+        ...(negotiation.conversationVersion === undefined
+          ? {}
+          : { conversationVersion: negotiation.conversationVersion }),
+        ...(negotiation.conversationState === undefined
+          ? {}
+          : { conversationState: negotiation.conversationState }),
+      };
+    }
+
     let reservationRef: Id<"reservations"> | undefined;
     if (args.reservationId !== undefined) {
       const reservation = await ctx.db.get(args.reservationId);
@@ -857,6 +1005,7 @@ export const create = f1Mutation({
         : {}),
       ...(conversationVersion === undefined ? {} : { conversationVersion }),
       workflowAuthority: operationAuthority,
+      ...(negotiationAuthority === undefined ? {} : { negotiationAuthority }),
       state: "prepared",
       ...(reservationRef === undefined ? {} : { reservationId: reservationRef }),
       createdAt: now,
@@ -1239,10 +1388,109 @@ export const claim = f1InternalMutation({
       }
     }
 
+    // Negotiation authority recheck (Devin findings 4060796830/4060796928):
+    // runs inside the same atomic mutation that consumes the unique mandate
+    // round and mints the attempt token, immediately before provider effect.
+    // A revoked, expired, superseded, reply-changed, or round-moved mandate
+    // denies the claim with zero provider transport, and the prepared
+    // operation stays intact.
+    let negotiationRoundConsumed = false;
+    if (operation.negotiationAuthority !== undefined) {
+      const authority = operation.negotiationAuthority;
+      const negotiation = await ctx.db.get(authority.negotiationId);
+      if (
+        negotiation === null ||
+        negotiation.organizationId !== operation.organizationId ||
+        negotiation.projectId !== operation.projectId ||
+        negotiation.quoteId !== authority.quoteId ||
+        negotiation.quoteVersion !== authority.quoteVersion
+      ) {
+        return { ok: false as const, code: "mandate-not-current", message: "negotiation mandate is not current for this operation" };
+      }
+      if (negotiation.state === "revoked") {
+        return { ok: false as const, code: "mandate-revoked", message: "negotiation mandate was revoked after preparation" };
+      }
+      if (negotiation.state === "concluded") {
+        return { ok: false as const, code: "mandate-concluded", message: "negotiation mandate concluded after preparation" };
+      }
+      if (negotiation.state === "paused") {
+        return { ok: false as const, code: "mandate-paused", message: "negotiation mandate is paused" };
+      }
+      if (negotiation.state !== "active") {
+        return { ok: false as const, code: "mandate-not-active", message: "negotiation mandate is not active" };
+      }
+      if (negotiation.expiresAt <= now) {
+        return { ok: false as const, code: "mandate-expired", message: "negotiation mandate expired after preparation" };
+      }
+      if (negotiation.roundsUsed >= negotiation.roundLimit) {
+        return { ok: false as const, code: "mandate-round-limit-reached", message: "negotiation mandate has no remaining rounds" };
+      }
+      if (negotiation.roundsUsed !== authority.roundsUsed) {
+        return { ok: false as const, code: "mandate-round-changed", message: "negotiation round advanced after this operation was prepared" };
+      }
+      const mandateQuote = await ctx.db.get(authority.quoteId);
+      if (
+        mandateQuote === null ||
+        mandateQuote.organizationId !== operation.organizationId ||
+        mandateQuote.projectId !== operation.projectId
+      ) {
+        return { ok: false as const, code: "mandate-quote-stale", message: "negotiation quote is unavailable for this project" };
+      }
+      if (mandateQuote.version !== authority.quoteVersion || mandateQuote.contentHash !== authority.quoteContentHash) {
+        return { ok: false as const, code: "mandate-quote-changed", message: "negotiation quote changed after preparation" };
+      }
+      const quoteSuccessor = await ctx.db
+        .query("quotes")
+        .withIndex("by_project_and_supersedes", (q) =>
+          q.eq("projectId", operation.projectId).eq("supersedes", mandateQuote.contentHash),
+        )
+        .first();
+      if (quoteSuccessor !== null) {
+        return { ok: false as const, code: "mandate-quote-superseded", message: "negotiation quote version has been superseded" };
+      }
+      const boundConversationId = authority.conversationId;
+      if (boundConversationId !== undefined) {
+        if (authority.conversationVersion === undefined || authority.conversationState === undefined) {
+          // An old bound mandate without the approved conversation pins has
+          // no current approval basis; it stays fail-closed until an
+          // explicit reply-incorporation transition exists.
+          return { ok: false as const, code: "mandate-approval-unpinned", message: "bound mandate lacks the approved conversation version" };
+        }
+        const boundConversation = await ctx.db.get(boundConversationId);
+        if (
+          boundConversation === null ||
+          boundConversation.organizationId !== operation.organizationId ||
+          boundConversation.projectId !== operation.projectId
+        ) {
+          return { ok: false as const, code: "mandate-conversation-stale", message: "bound conversation is unavailable" };
+        }
+        if (boundConversation.state === "closed" || boundConversation.state === "cancelled") {
+          return { ok: false as const, code: "mandate-conversation-closed", message: "bound conversation is closed or cancelled" };
+        }
+        if (
+          boundConversation.version !== authority.conversationVersion ||
+          boundConversation.state !== authority.conversationState
+        ) {
+          // Covers both version drift (a recorded reply ingested by the
+          // callback) and same-version state drift until an explicit
+          // reply-incorporation transition exists.
+          return { ok: false as const, code: "mandate-conversation-changed", message: "bound conversation changed after mandate approval" };
+        }
+      }
+      await ctx.db.patch(authority.negotiationId, {
+        roundsUsed: negotiation.roundsUsed + 1,
+        updatedAt: now,
+      });
+      negotiationRoundConsumed = true;
+    }
+
     const token = crypto.randomUUID();
     await ctx.db.patch(args.operationId, {
       state: "dispatching",
       attemptToken: token,
+      ...(negotiationRoundConsumed
+        ? { negotiationRoundConsumed: true, negotiationRoundRefunded: false }
+        : {}),
       updatedAt: now,
     });
     await ctx.db.insert("attempts", {
