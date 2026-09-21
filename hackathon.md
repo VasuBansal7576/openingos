@@ -478,3 +478,18 @@ Completed E2, E5, E7, E9, E10, U1 and E11 task worktrees were verified clean and
 Greptile still supplies quota notices only, which are recorded as a review blocker rather than approval.
 All cited browser, model and provider evidence is controlled.
 No hosted Convex deployment, live provider call, owner-mailbox exchange, genuine supplier response, public origin, purchase, realized saving or commercial outcome was observed.
+
+### 2026-09-21 - Prototype-fidelity integration and exact-head CI checkpoint
+
+PR #14 now points to pushed head `ed0979c` and GitHub reports it conflict-free and mergeable.
+All nine expected application, foundation, workbench and delivery checks pass on that exact head.
+The selected purchasing-desk visual system now owns every honest connection state, including unconfigured, authenticating, loading, empty, error and reconnecting paths, instead of falling back to the rejected generic dark screen.
+Controlled Chrome DevTools inspection at 1440 by 1200 and exact 390 by 844 viewports found no console errors or horizontal overflow, while showing no fabricated suppliers, quotes, prices or provider outcomes.
+The full populated authorized journey still requires Playwright or Orca Computer Use against a real backend projection and is not claimed complete.
+The user-path CI failure introduced by the visual repair was reproduced and fixed by preserving the established retry control hook; the focused user path and application suites then passed and the replacement exact-head Actions run is green.
+Both PR #14 Devin findings have code and regression-test repairs with evidence replies.
+Greptile remains unavailable because the connected trial exhausted 50 credits, and Devin's current status is a skipped trial-expiry result rather than review acceptance.
+The separate fixed-head GPT-6 Astra review remains mandatory before merge.
+Orca 1.4.205 briefly reported ready and then became runtime-unavailable again, so no replacement worker was dispatched and no broad OpenCode permission was granted.
+All cited browser and provider evidence is controlled.
+No hosted Convex deployment, live provider call, owner-mailbox exchange, genuine supplier response, public origin, purchase, realized saving or commercial outcome was observed.
