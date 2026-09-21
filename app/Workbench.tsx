@@ -507,6 +507,15 @@ function comparisonTapeFor(offers: readonly WorkbenchOffer[]): ComparisonTape | 
     for (const verdict of offer.comparisons) {
       const other = offers.find((candidate) => candidate.id === verdict.againstOfferId);
       if (other === undefined) continue;
+      // Strict consumer binding: a verdict is displayable only when it names
+      // both the opposing candidate and the exact opposing quote currently
+      // shown. A null, missing, or mismatched quote identity fails closed so
+      // a stale verdict for the same candidate but an unrelated quote is
+      // never rendered as the current comparison.
+      const displayedOpposingQuoteId = other.quote?.id ?? null;
+      if (displayedOpposingQuoteId === null) continue;
+      if (verdict.againstQuoteId === null) continue;
+      if (verdict.againstQuoteId !== displayedOpposingQuoteId) continue;
       const offerName = offer.vendor?.name ?? "First offer";
       const otherName = other.vendor?.name ?? "Second offer";
       if (verdict.status === "comparable") {
@@ -1002,6 +1011,30 @@ function intakeFingerprint(values: {
 }
 
 /**
+ * Exact decimal-string to minor-unit parsing for the intake budget. The
+ * shape is digits with at most two fractional digits; the magnitude is
+ * computed with BigInt so values near the safe-integer boundary are exact
+ * and never pass through floating-point multiplication. Anything else —
+ * exponents, signs, extra precision, NaN/Infinity text, or a magnitude
+ * above Number.MAX_SAFE_INTEGER — returns null and the caller fails closed
+ * without reaching the intake route.
+ */
+function parseIntakeBudgetMinorUnits(text: string): number | null {
+  const match = /^(\d+)(?:\.(\d{1,2}))?$/.exec(text.trim());
+  if (!match) return null;
+  const euros = match[1]!;
+  const cents = (match[2] ?? "").padEnd(2, "0");
+  let minor: bigint;
+  try {
+    minor = BigInt(euros) * 100n + BigInt(cents);
+  } catch {
+    return null;
+  }
+  if (minor < 0n || minor > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+  return Number(minor);
+}
+
+/**
  * P-01 connected intake inside the purchasing-desk visual system. The form
  * collects only the immediately relevant minimum facts for the chosen
  * entry point and submits once through the real Convex intake mutation.
@@ -1101,11 +1134,10 @@ export function WorkbenchIntakeView({ onIntake, onBack }: { readonly onIntake: W
       if (!/^\d+(?:\.\d{1,2})?$/.test(values.budget.trim())) {
         return "Enter the budget as whole euros and cents, for example 45000 or 45000.50.";
       }
-      // Over-precision is rejected by the pattern above; an unsafe integer
-      // (magnitude beyond the safe minor-unit range) must also fail closed
-      // here so the submission below can never silently omit it.
-      const budgetMinorUnits = Math.round(Number.parseFloat(values.budget.trim()) * 100);
-      if (!Number.isSafeInteger(budgetMinorUnits) || budgetMinorUnits < 0) {
+      // Exact decimal-string parsing (no floating-point multiplication); an
+      // unsafe magnitude fails closed here so the submission below can never
+      // silently omit it.
+      if (parseIntakeBudgetMinorUnits(values.budget) === null) {
         return "That budget is too large to record safely. Enter a smaller amount.";
       }
     }
@@ -1159,10 +1191,10 @@ export function WorkbenchIntakeView({ onIntake, onBack }: { readonly onIntake: W
       const trimmedCurrency = values.currency.trim();
       const budgetMinorUnits = values.budget.trim().length === 0
         ? undefined
-        : Math.round(Number.parseFloat(values.budget.trim()) * 100);
-      if (budgetMinorUnits !== undefined && (!Number.isSafeInteger(budgetMinorUnits) || budgetMinorUnits < 0)) {
-        // Fail closed: an unsafe or over-precision budget keeps the entered
-        // values in place and never reaches the intake route with an omission.
+        : parseIntakeBudgetMinorUnits(values.budget);
+      if (budgetMinorUnits === null) {
+        // Fail closed: an unsafe budget keeps the entered values in place
+        // and never reaches the intake route with an omission.
         setError("That budget is too large to record safely. Enter a smaller amount.");
         return;
       }

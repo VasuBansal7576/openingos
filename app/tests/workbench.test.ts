@@ -2485,3 +2485,146 @@ test("E16 responsive CSS keeps desk density without horizontal overflow", async 
   expect(narrow).toContain(".wb-desk-layout > .wb-empty { grid-column: 1;");
   expect(narrow).toContain("transform: none;");
 });
+
+// -- E16 repair: strict comparison consumer binding --------------------------
+
+function twoOfferProjectionWithVerdicts(
+  rewrite: (verdict: Record<string, unknown>, index: number) => Record<string, unknown>,
+): Record<string, unknown> {
+  const value = twoOfferProjection();
+  const candidates = value.candidates as readonly Record<string, unknown>[];
+  return {
+    ...value,
+    candidates: candidates.map((candidate, index) => ({
+      ...candidate,
+      comparisons: (candidate.comparisons as readonly Record<string, unknown>[]).map((verdict) => rewrite(verdict, index)),
+    })),
+  };
+}
+
+test("a verdict for the same candidate but an unrelated quote is never displayed", () => {
+  // Control: the backend-named opposing quote ids bind and the exact delta renders.
+  const control = parseWorkbenchSnapshot(twoOfferProjection(), projection.project.id);
+  if (control === null) throw new Error("Two-offer projection should parse");
+  const controlHtml = renderToStaticMarkup(createElement(WorkbenchView, { loadState: { state: "ready", snapshot: control } }));
+  expect(controlHtml).toContain("wb-comparison-tape");
+  expect(controlHtml).toContain("549.51");
+
+  // Same candidate ids, but the verdict names a quote that is not displayed.
+  const stale = parseWorkbenchSnapshot(
+    twoOfferProjectionWithVerdicts((verdict) => ({ ...verdict, againstQuoteId: "quote-stale-unrelated" })),
+    projection.project.id,
+  );
+  if (stale === null) throw new Error("Stale-quote projection should still parse");
+  const staleHtml = renderToStaticMarkup(createElement(WorkbenchView, { loadState: { state: "ready", snapshot: stale } }));
+  expect(staleHtml).not.toContain("wb-comparison-tape");
+  expect(staleHtml).not.toContain("549.51");
+  expect(staleHtml).not.toContain("lower than");
+  // Both offers stay visible with their own honest terms; nothing is ranked.
+  expect(staleHtml).toContain("Harbor Equipment");
+  expect(staleHtml).toContain("Elm Supply");
+  expect(staleHtml).toContain("Total (EUR)");
+
+  // A verdict with no quote binding fails closed as well.
+  const unbound = parseWorkbenchSnapshot(
+    twoOfferProjectionWithVerdicts((verdict) => ({ ...verdict, againstQuoteId: null })),
+    projection.project.id,
+  );
+  if (unbound === null) throw new Error("Unbound-quote projection should still parse");
+  const unboundHtml = renderToStaticMarkup(createElement(WorkbenchView, { loadState: { state: "ready", snapshot: unbound } }));
+  expect(unboundHtml).not.toContain("wb-comparison-tape");
+  expect(unboundHtml).not.toContain("lower than");
+});
+
+test("a verdict is never displayed when the opposing quote is absent", () => {
+  const value = twoOfferProjection();
+  const candidates = value.candidates as readonly Record<string, unknown>[];
+  const withoutOpposingQuote = parseWorkbenchSnapshot({
+    ...value,
+    candidates: candidates.map((candidate, index) => index === 1
+      ? { ...candidate, latestValidQuote: null }
+      : candidate),
+  }, projection.project.id);
+  if (withoutOpposingQuote === null) throw new Error("Missing-quote projection should still parse");
+  const html = renderToStaticMarkup(createElement(WorkbenchView, { loadState: { state: "ready", snapshot: withoutOpposingQuote } }));
+  expect(html).not.toContain("wb-comparison-tape");
+  expect(html).not.toContain("lower than");
+  expect(html).toContain("Harbor Equipment");
+  expect(html).toContain("No quote yet");
+});
+
+// -- E16 repair (F7): exact decimal-string intake budget parsing --------------
+
+test("the safe-limit budget parses to exact minor units and is accepted", async () => {
+  const seen: import("../workbench-state").WorkbenchIntakeInput[] = [];
+  const mounted = await mountIntakeView(async (input) => {
+    seen.push(input);
+    return { ok: true, projectId: "project-safe-limit" };
+  });
+  try {
+    await submitIntakeBudget(mounted.container, mounted.dom, {
+      projectName: "Northside café",
+      region: "Amsterdam",
+      budget: "90071992547409.90",
+    });
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.budgetMinorUnits).toBe(9007199254740990);
+    expect(mounted.container.textContent).toContain("Workspace created. Loading the persisted project.");
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("the exact safe-integer boundary budget is accepted without float drift", async () => {
+  const seen: import("../workbench-state").WorkbenchIntakeInput[] = [];
+  const mounted = await mountIntakeView(async (input) => {
+    seen.push(input);
+    return { ok: true, projectId: "project-boundary" };
+  });
+  try {
+    await submitIntakeBudget(mounted.container, mounted.dom, {
+      projectName: "Northside café",
+      region: "Amsterdam",
+      budget: "90071992547409.91",
+    });
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.budgetMinorUnits).toBe(Number.MAX_SAFE_INTEGER);
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("unsafe, malformed, and ambiguous budgets never reach the intake route", async () => {
+  const rejected: readonly string[] = [
+    "90071992547409.92",
+    "99999999999999999.99",
+    "45000.555",
+    "1e3",
+    "1E6",
+    "+45000",
+    "-45000",
+    "NaN",
+    "Infinity",
+    "45 000",
+    "$45000",
+  ];
+  for (const budget of rejected) {
+    const seen: unknown[] = [];
+    const mounted = await mountIntakeView(async (input) => {
+      seen.push(input);
+      return { ok: true, projectId: "project-rejected" };
+    });
+    try {
+      await submitIntakeBudget(mounted.container, mounted.dom, {
+        projectName: "Northside café",
+        region: "Amsterdam",
+        budget,
+      });
+      expect(seen).toHaveLength(0);
+      const text = mounted.container.textContent ?? "";
+      expect(text.includes("whole euros and cents") || text.includes("too large to record safely")).toBe(true);
+    } finally {
+      await mounted.cleanup();
+    }
+  }
+});

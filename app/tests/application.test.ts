@@ -213,4 +213,42 @@ describe("public landing fidelity", () => {
     expect(phone).toContain(".wb-bench-heading h1");
     expect(phone).toContain("overflow-wrap: break-word");
   });
+
+  test("canvas instructional copy resolves to a high-contrast token per selector", async () => {
+    const css = await Bun.file(new URL("../styles.css", import.meta.url)).text();
+    const luminance = (hex: string): number => {
+      const channels = [1, 3, 5].map((at) => {
+        const value = Number.parseInt(hex.slice(at, at + 2), 16) / 255;
+        return value <= 0.03928 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+      });
+      return 0.2126 * channels[0]! + 0.7152 * channels[1]! + 0.0722 * channels[2]!;
+    };
+    const ratio = (foreground: string, background: string): number => {
+      const lighter = Math.max(luminance(foreground), luminance(background));
+      const darker = Math.min(luminance(foreground), luminance(background));
+      return (lighter + 0.05) / (darker + 0.05);
+    };
+    // Effective token = the last hex color assigned to the selector in
+    // source order (later same-specificity rules win the cascade).
+    const effectiveToken = (selector: string): string | null => {
+      let token: string | null = null;
+      for (const block of css.split("}")) {
+        const brace = block.indexOf("{");
+        if (brace === -1) continue;
+        const selectors = block.slice(0, brace);
+        const declarations = block.slice(brace + 1);
+        if (!selectors.split(",").some((entry) => entry.trim() === selector)) continue;
+        const color = declarations.match(/color\s*:\s*(#[0-9a-fA-F]{6})/);
+        if (color?.[1]) token = color[1].toLowerCase();
+      }
+      return token;
+    };
+    for (const selector of [".wb-section-heading p", ".wb-bench-heading p", ".wb-page-heading p"]) {
+      const token = effectiveToken(selector);
+      expect(token).not.toBeNull();
+      expect(ratio(token!, "#abbda7")).toBeGreaterThanOrEqual(4.5);
+    }
+    expect(effectiveToken(".wb-section-heading p")).toBe("#1e3a2c");
+    expect(effectiveToken(".wb-bench-heading p")).toBe("#1e3a2c");
+  });
 });
