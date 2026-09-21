@@ -2,6 +2,7 @@ import type { ConvexReactClient, Watch } from "convex/react";
 import type { FunctionReference } from "convex/server";
 import { api } from "../convex/_generated/api";
 import type { Id } from "../convex/_generated/dataModel";
+import { payloadHash } from "../convex/shared/hashing.js";
 import {
   parseWorkbenchSnapshot,
   type WorkbenchAction,
@@ -56,6 +57,7 @@ type W1StartJobArgs = Record<string, unknown> & {
   readonly text: string;
   readonly operationId: "research.collect";
   readonly kind: "research";
+  readonly idempotencyKey: string;
 };
 
 type W1OpenServiceCaseArgs = Record<string, unknown> & {
@@ -176,6 +178,29 @@ const RETRY_UNAVAILABLE = "Retry is unavailable because no safe retry contract i
 const SERVICE_CASE_SUMMARY_MAX_LENGTH = 800;
 const IDEMPOTENCY_KEY_MAX_LENGTH = 160;
 const SERVICE_CASE_URGENCIES = ["urgent", "high", "normal", "low"] as const;
+
+const RESEARCH_COLLECT_OPERATION_ID = "research.collect" as const;
+
+/**
+ * Deterministic browser-safe automatic-start key for one logical research
+ * start. It binds the stable validated projection authority the server
+ * replays on: project, unique current requirement id/version, and the
+ * research.collect operation. The shared payloadHash helper keeps the
+ * derivation identical across browser, Bun, and Convex, while the
+ * `research:` prefix keeps the server key pattern.
+ */
+export function researchStartIdempotencyKey(
+  projectId: string,
+  requirementId: string,
+  requirementVersion: number,
+): string {
+  return `research:${payloadHash({
+    operationId: RESEARCH_COLLECT_OPERATION_ID,
+    projectId,
+    requirementId,
+    requirementVersion,
+  })}`;
+}
 
 function positiveDecimal(value: string): boolean {
   if (!/^\d+(?:\.\d+)?$/.test(value)) return false;
@@ -681,6 +706,11 @@ export function createConvexWorkbenchAdapter(client: ConvexWorkbenchClient): Con
         text,
         operationId: "research.collect",
         kind: "research",
+        idempotencyKey: researchStartIdempotencyKey(
+          current.project.id,
+          requirement.id,
+          requirement.version,
+        ),
       };
       const mutationKey = claimMutation(projectId, action);
       if (mutationKey === null) return { ok: false, message: ACTION_ALREADY_IN_FLIGHT };

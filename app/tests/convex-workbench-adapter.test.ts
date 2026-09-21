@@ -3,9 +3,11 @@ import type { Watch } from "convex/react";
 import { getFunctionName, type FunctionReference } from "convex/server";
 import {
   createConvexWorkbenchAdapter,
+  researchStartIdempotencyKey,
   type ConvexWorkbenchClient,
 } from "../convex-workbench-adapter";
 import { parseWorkbenchSnapshot, type WorkbenchAction } from "../workbench-state";
+import { payloadHash } from "../../convex/shared/hashing.js";
 
 function projection(projectId = "project-1"): Record<string, unknown> {
   return {
@@ -470,8 +472,80 @@ test("starts only one supported purchasing research brief and reports queued bac
     text: "Research suppliers for purchasing requirement REQ-1: Two-group espresso machine (equipment).",
     operationId: "research.collect",
     kind: "research",
+    idempotencyKey: researchStartIdempotencyKey("project-1", "requirement-1", 4),
   });
   expect(result.message).not.toContain("provider succeeded");
+});
+
+test("research start payload and key are stable across separate adapter instances", async () => {
+  const firstCalls: MutationCall[] = [];
+  const secondCalls: MutationCall[] = [];
+  const firstControls = controlledWatch(() => actionProjection());
+  const secondControls = controlledWatch(() => actionProjection());
+  const queued = { ok: true, jobId: "job-2", state: "queued", supportedSegment: "research suppliers", refusedSegments: [] };
+  const first = createConvexWorkbenchAdapter(actionClient(actionProjection(), firstControls.watch, firstCalls, queued));
+  const second = createConvexWorkbenchAdapter(actionClient(actionProjection(), secondControls.watch, secondCalls, queued));
+
+  await first.load("project-1");
+  await second.load("project-1");
+  await expect(first.act({ type: "startResearch", projectId: "project-1" })).resolves.toMatchObject({ ok: true });
+  await expect(second.act({ type: "startResearch", projectId: "project-1" })).resolves.toMatchObject({ ok: true });
+
+  expect(firstCalls).toHaveLength(1);
+  expect(secondCalls).toHaveLength(1);
+  expect(secondCalls[0]?.args).toEqual(firstCalls[0]?.args);
+  const firstArgs = firstCalls[0]?.args as Record<string, unknown>;
+  const secondArgs = secondCalls[0]?.args as Record<string, unknown>;
+  const expectedKey = researchStartIdempotencyKey("project-1", "requirement-1", 4);
+  expect(firstArgs["idempotencyKey"]).toBe(expectedKey);
+  expect(secondArgs["idempotencyKey"]).toBe(expectedKey);
+  expect(expectedKey).toBe(`research:${payloadHash({ operationId: "research.collect", projectId: "project-1", requirementId: "requirement-1", requirementVersion: 4 })}`);
+  expect(expectedKey).toMatch(/^[A-Za-z0-9:_-]{8,128}$/);
+});
+
+test("research start key changes on requirement version or project change", async () => {
+  const baseCalls: MutationCall[] = [];
+  const versionedCalls: MutationCall[] = [];
+  const projectCalls: MutationCall[] = [];
+  const queued = { ok: true, jobId: "job-2", state: "queued", supportedSegment: "research suppliers", refusedSegments: [] };
+  const base = createConvexWorkbenchAdapter(actionClient(
+    actionProjection("project-1", 4),
+    controlledWatch(() => actionProjection("project-1", 4)).watch,
+    baseCalls,
+    queued,
+  ));
+  const versioned = createConvexWorkbenchAdapter(actionClient(
+    actionProjection("project-1", 5),
+    controlledWatch(() => actionProjection("project-1", 5)).watch,
+    versionedCalls,
+    queued,
+  ));
+  const otherProject = createConvexWorkbenchAdapter(actionClient(
+    actionProjection("project-2", 4),
+    controlledWatch(() => actionProjection("project-2", 4)).watch,
+    projectCalls,
+    queued,
+  ));
+
+  await base.load("project-1");
+  await versioned.load("project-1");
+  await otherProject.load("project-2");
+  await expect(base.act({ type: "startResearch", projectId: "project-1" })).resolves.toMatchObject({ ok: true });
+  await expect(versioned.act({ type: "startResearch", projectId: "project-1" })).resolves.toMatchObject({ ok: true });
+  await expect(otherProject.act({ type: "startResearch", projectId: "project-2" })).resolves.toMatchObject({ ok: true });
+
+  const baseKey = (baseCalls[0]?.args as Record<string, unknown>)["idempotencyKey"];
+  const versionedKey = (versionedCalls[0]?.args as Record<string, unknown>)["idempotencyKey"];
+  const projectKey = (projectCalls[0]?.args as Record<string, unknown>)["idempotencyKey"];
+  expect(typeof baseKey).toBe("string");
+  expect(typeof versionedKey).toBe("string");
+  expect(typeof projectKey).toBe("string");
+  expect(versionedKey).not.toBe(baseKey);
+  expect(projectKey).not.toBe(baseKey);
+  expect(versionedKey).toBe(researchStartIdempotencyKey("project-1", "requirement-1", 5));
+  expect(projectKey).toBe(researchStartIdempotencyKey("project-2", "requirement-1", 4));
+  expect(versionedKey).toMatch(/^[A-Za-z0-9:_-]{8,128}$/);
+  expect(projectKey).toMatch(/^[A-Za-z0-9:_-]{8,128}$/);
 });
 
 test("rejects generic research when requirements are truncated without mutation", async () => {
