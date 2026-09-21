@@ -175,7 +175,10 @@ async function membershipStatus(
  */
 async function settleScheduledExpiries(t: Kit): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 1500));
-  await t.finishInProgressScheduledFunctions();
+  // A due real-clock timer can be between the timer queue and the scheduler's
+  // in-flight set when CI is busy. Pump the scheduler until every due callback
+  // settles instead of sampling only the callbacks already marked in flight.
+  await t.finishAllScheduledFunctions(() => undefined);
 }
 
 test("temporary approvers cannot grant access beyond their authority expiry", async () => {
