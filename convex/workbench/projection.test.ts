@@ -162,6 +162,16 @@ async function insertOwnerQuote(
   supersedes: string | undefined,
   createdAt: number,
   sourceId = "private-message-id",
+  comparisonScope?: {
+    readonly requirementId: string;
+    readonly scopeId: string;
+    readonly items: readonly {
+      readonly itemId: string;
+      readonly lineId: string;
+      readonly unit: string;
+      readonly requiredQuantity: string;
+    }[];
+  },
 ) {
   return await t.run(async (ctx) =>
     ctx.db.insert("quotes", {
@@ -187,6 +197,7 @@ async function insertOwnerQuote(
         evidenceRefs: [],
       }],
       taxBasis: { kind: "inclusive", basisId: "NL-EUR-INCLUSIVE", evidenceRefs: [] },
+      ...(comparisonScope === undefined ? {} : { comparisonScope }),
       evidenceRefs: [{ sourceId, version, locator: "raw headers" }],
       counterpartyRole: "ownerStandIn",
       executionMode: "recorded",
@@ -467,6 +478,49 @@ describe("U1 workbench projection", () => {
     expect(JSON.stringify(result)).not.toContain("secret-token");
     expect(JSON.stringify(result)).not.toContain("provider-event");
     expect(result.jobs.every((job) => job.attempts.every((attempt) => !Object.prototype.hasOwnProperty.call(attempt, "token")))).toBe(true);
+  });
+
+  test("projects action authority fields and normalizes pending approvals", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, OWNER, "actions");
+    const graph = await setupCandidate(t, project, "actions");
+    await insertOwnerQuote(
+      t,
+      project,
+      graph,
+      "v1",
+      "actions-quote",
+      undefined,
+      100,
+      "actions-source",
+      {
+        requirementId: graph.requirementId,
+        scopeId: "actions-scope",
+        items: [{ itemId: "machine", lineId: "machine", unit: "piece", requiredQuantity: "1" }],
+      },
+    );
+    await seedJobState(t, project, "queued", undefined, false, "actions-queued");
+    await seedJobState(t, project, "completed", "observedSuccess", false, "actions-completed");
+    await t.run(async (ctx) => {
+      await ctx.db.insert("approvals", {
+        organizationId: project.organizationId,
+        projectId: project.projectId,
+        scope: "selection",
+        snapshotCanonical: "{}",
+        snapshotHash: "actions-approval",
+        state: "pending",
+        approver: OWNER.tokenIdentifier,
+        createdAt: 100,
+      });
+    });
+
+    const result = await t.withIdentity(OWNER).query(getProjectionRef, { projectId: project.projectId, limit: 12 });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("projection denied");
+    expect(result.candidates[0]?.latestValidQuote?.lines[0]?.unit).toBe("piece");
+    expect(result.jobs.some((job) => job.status === "queued" && job.cancellable)).toBe(true);
+    expect(result.jobs.some((job) => job.status === "sent" && !job.cancellable)).toBe(true);
+    expect(result.decisions.some((decision) => decision.kind === "approval" && decision.state === "requested")).toBe(true);
   });
 
   test("caps every visible collection under high-volume data and paginates activity", async () => {

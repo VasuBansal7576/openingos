@@ -45,6 +45,78 @@ function projection(projectId = "project-1"): Record<string, unknown> {
   };
 }
 
+function actionProjection(projectId = "project-1", requirementVersion = 4): Record<string, unknown> {
+  return {
+    ...projection(projectId),
+    access: {
+      role: "approver",
+      capabilities: {
+        canResearch: true,
+        canRecordEvidence: false,
+        canRecordQuote: false,
+        canCompare: true,
+        canCommunicate: false,
+        canClarify: false,
+      },
+    },
+    requirements: [{
+      id: "requirement-1",
+      key: "REQ-1",
+      title: "Two-group espresso machine",
+      category: "equipment",
+      quantity: "2",
+      unit: "piece",
+      priority: "P0",
+      state: "readyForDecision",
+      fulfillment: "notOrdered",
+      version: requirementVersion,
+      budgetMinorUnits: null,
+      needByAt: null,
+    }],
+    candidates: [{
+      id: "candidate-1",
+      requirementId: "requirement-1",
+      productModel: "Atlas 2G",
+      variant: "new",
+      compatibility: "pass",
+      conversationState: "quoteReceived",
+      vendor: { id: "vendor-1", name: "Harbor Equipment", regions: ["NL"], serviceCoverage: "NL" },
+      latestValidQuote: {
+        id: "quote-1",
+        version: "v1",
+        currency: "EUR",
+        lines: [{ lineId: "machine", description: "Atlas 2G", quantity: "2", unit: "piece", unitPrice: { currency: "EUR", minorUnits: 795000 } }],
+        charges: [],
+        taxBasis: { kind: "inclusive", basisId: "tax-1" },
+        createdAt: 1,
+        provenance: { mode: "recorded", label: "Recorded terms", ownerAuthoredTerms: false },
+      },
+      evidence: [],
+      provenance: { mode: "recorded", label: "Recorded terms", ownerAuthoredTerms: false },
+    }],
+    jobs: [{ id: "job-1", kind: "research", status: "queued", cancellable: true, createdAt: 1, updatedAt: 1, grantVersion: 1, attempts: [] }],
+    decisions: [{ id: "approval-1", kind: "approval", state: "pending", createdAt: 1 }],
+  };
+}
+
+type MutationCall = { readonly reference: unknown; readonly args: unknown };
+
+function actionClient(
+  queryResult: unknown,
+  watch: Watch<unknown>,
+  calls: MutationCall[],
+  mutationResult: unknown,
+): ConvexWorkbenchClient {
+  return {
+    query: async () => queryResult,
+    watchQuery: () => watch,
+    mutation: async (reference: unknown, args: unknown) => {
+      calls.push({ reference, args });
+      return mutationResult;
+    },
+  } as unknown as ConvexWorkbenchClient;
+}
+
 function accessibleProjects(projectId = "project-1"): Record<string, unknown> {
   return {
     ok: true,
@@ -268,10 +340,296 @@ test("keeps unsupported actions explicitly unavailable without querying or sendi
 
   await expect(adapter.act({ type: "startResearch", projectId: "project-1" })).resolves.toEqual({
     ok: false,
-    message: "This workbench action is unavailable until an authority-bearing backend command is configured. Nothing was sent.",
+    message: "This action requires a current validated project projection. Nothing was sent.",
+  });
+  await expect(adapter.act({ type: "retryJob", projectId: "project-1", jobId: "job-1" })).resolves.toEqual({
+    ok: false,
+    message: "Retry is unavailable because no safe retry contract is configured. Nothing was sent.",
   });
   expect(queryArgs).toHaveLength(0);
   expect(watchArgs).toHaveLength(0);
+});
+
+test("records the exact selection payload and invalidates the basis after a mutation attempt", async () => {
+  const calls: MutationCall[] = [];
+  const controls = controlledWatch(() => actionProjection());
+  const adapter = createConvexWorkbenchAdapter(actionClient(
+    actionProjection(),
+    controls.watch,
+    calls,
+    { ok: true, selectionId: "selection-1", deduplicated: false },
+  ));
+
+  await adapter.load("project-1");
+  await expect(adapter.act({ type: "selectOffer", projectId: "project-1", offerId: "candidate-1", quoteId: "quote-1", quoteVersion: "v1" })).resolves.toEqual({
+    ok: true,
+    message: "Selection recorded by the server; no order was placed.",
+  });
+  expect(calls).toHaveLength(1);
+  expect(getFunctionName(calls[0]?.reference as FunctionReference<"mutation">)).toBe("domain/decisions:recordSelection");
+  expect(calls[0]?.args).toEqual({
+    organizationId: "organization-1",
+    projectId: "project-1",
+    requirementId: "requirement-1",
+    candidateId: "candidate-1",
+    quoteId: "quote-1",
+    quoteVersion: "v1",
+    selectionLines: [{ quoteLineId: "machine", quantity: "2", unit: "piece" }],
+    requirementVersion: 4,
+  });
+
+  await expect(adapter.act({ type: "selectOffer", projectId: "project-1", offerId: "candidate-1", quoteId: "quote-1", quoteVersion: "v1" })).resolves.toEqual({
+    ok: false,
+    message: "This action requires a current validated project projection. Nothing was sent.",
+  });
+  expect(calls).toHaveLength(1);
+
+  await adapter.load("project-1");
+  await adapter.act({ type: "selectOffer", projectId: "project-1", offerId: "candidate-1", quoteId: "quote-1", quoteVersion: "v1" });
+  expect(calls).toHaveLength(2);
+});
+
+test("approves only a normalized pending approval and surfaces server denial text", async () => {
+  const calls: MutationCall[] = [];
+  const controls = controlledWatch(() => actionProjection());
+  const adapter = createConvexWorkbenchAdapter(actionClient(
+    actionProjection(),
+    controls.watch,
+    calls,
+    { ok: false, code: "denied-capability", message: "approval denied by server" },
+  ));
+
+  await adapter.load("project-1");
+  await expect(adapter.act({ type: "approveDecision", projectId: "project-1", decisionId: "approval-1" })).resolves.toEqual({
+    ok: false,
+    message: "approval denied by server",
+  });
+  expect(calls).toHaveLength(1);
+  expect(getFunctionName(calls[0]?.reference as FunctionReference<"mutation">)).toBe("domain/decisions:decideApproval");
+  expect(calls[0]?.args).toEqual({
+    organizationId: "organization-1",
+    projectId: "project-1",
+    approvalId: "approval-1",
+    decision: "approved",
+  });
+});
+
+test("cancels only a projected cancellable job", async () => {
+  const calls: MutationCall[] = [];
+  const controls = controlledWatch(() => actionProjection());
+  const adapter = createConvexWorkbenchAdapter(actionClient(
+    actionProjection(),
+    controls.watch,
+    calls,
+    { ok: true, state: "cancelling", complete: false },
+  ));
+
+  await adapter.load("project-1");
+  await expect(adapter.act({ type: "cancelJob", projectId: "project-1", jobId: "job-1" })).resolves.toEqual({
+    ok: true,
+    message: "Cancellation queued by the server.",
+  });
+  expect(calls).toHaveLength(1);
+  expect(getFunctionName(calls[0]?.reference as FunctionReference<"mutation">)).toBe("execution/jobs:cancel");
+  expect(calls[0]?.args).toEqual({ jobId: "job-1", reason: "Cancelled from the purchasing workbench" });
+
+  await expect(adapter.act({ type: "cancelJob", projectId: "project-1", jobId: "job-1" })).resolves.toEqual({
+    ok: false,
+    message: "This action requires a current validated project projection. Nothing was sent.",
+  });
+  expect(calls).toHaveLength(1);
+});
+
+test("starts only one supported purchasing research brief and reports queued backend state", async () => {
+  const calls: MutationCall[] = [];
+  const controls = controlledWatch(() => actionProjection());
+  const adapter = createConvexWorkbenchAdapter(actionClient(
+    actionProjection(),
+    controls.watch,
+    calls,
+    { ok: true, jobId: "job-2", state: "queued", supportedSegment: "research suppliers", refusedSegments: [] },
+  ));
+
+  await adapter.load("project-1");
+  const result = await adapter.act({ type: "startResearch", projectId: "project-1" });
+  expect(result).toEqual({
+    ok: true,
+    message: "Research queued by the server; provider outcome is still pending.",
+  });
+  expect(calls).toHaveLength(1);
+  expect(getFunctionName(calls[0]?.reference as FunctionReference<"mutation">)).toBe("execution/jobs:start");
+  expect(calls[0]?.args).toEqual({
+    organizationId: "organization-1",
+    projectId: "project-1",
+    text: "Research suppliers for purchasing requirement REQ-1: Two-group espresso machine (equipment).",
+    operationId: "research.collect",
+    kind: "research",
+  });
+  expect(result.message).not.toContain("provider succeeded");
+});
+
+test("rejects missing, stale, cross-project, and malformed action inputs without mutation", async () => {
+  const calls: MutationCall[] = [];
+  const controls = controlledWatch(() => actionProjection());
+  let current: unknown = actionProjection();
+  const adapter = createConvexWorkbenchAdapter({
+    query: async () => current,
+    watchQuery: () => controls.watch,
+    mutation: async (reference: unknown, args: unknown) => {
+      calls.push({ reference, args });
+      return { ok: true };
+    },
+  } as unknown as ConvexWorkbenchClient);
+
+  await expect(adapter.act({ type: "selectOffer", projectId: "project-1", offerId: "candidate-1", quoteId: "quote-1", quoteVersion: "v1" })).resolves.toEqual({
+    ok: false,
+    message: "This action requires a current validated project projection. Nothing was sent.",
+  });
+  await adapter.load("project-1");
+  await expect(adapter.act({ type: "selectOffer", projectId: "project-2", offerId: "candidate-1", quoteId: "quote-1", quoteVersion: "v1" })).resolves.toEqual({
+    ok: false,
+    message: "This action requires a current validated project projection. Nothing was sent.",
+  });
+  current = { ...actionProjection(), activity: { page: [{ id: "event-1", kind: "bad", createdAt: "not-a-time" }], continueCursor: null, isDone: true } };
+  await expect(adapter.load("project-1")).resolves.toBeNull();
+  await expect(adapter.act({ type: "startResearch", projectId: "project-1" })).resolves.toEqual({
+    ok: false,
+    message: "This action requires a current validated project projection. Nothing was sent.",
+  });
+  expect(calls).toHaveLength(0);
+});
+
+test("action-specific stale and authority fences make zero mutations", async () => {
+  const loadActionAdapter = async (
+    value: Record<string, unknown>,
+    calls: MutationCall[],
+  ): Promise<ReturnType<typeof createConvexWorkbenchAdapter>> => {
+    const controls = controlledWatch(() => value);
+    const adapter = createConvexWorkbenchAdapter(actionClient(value, controls.watch, calls, { ok: true }));
+    await adapter.load("project-1");
+    return adapter;
+  };
+
+  const staleCalls: MutationCall[] = [];
+  const staleAdapter = await loadActionAdapter(actionProjection(), staleCalls);
+  await staleAdapter.act({ type: "selectOffer", projectId: "project-1", offerId: "candidate-1", quoteId: "quote-1", quoteVersion: "old-version" });
+  await staleAdapter.act({ type: "selectOffer", projectId: "project-1", offerId: "candidate-1", quoteId: "old-quote", quoteVersion: "v1" });
+  expect(staleCalls).toHaveLength(0);
+
+  const nonPendingProjection = {
+    ...actionProjection(),
+    decisions: [{ id: "approval-1", kind: "approval", state: "approved", createdAt: 1 }],
+  };
+  const approvalCalls: MutationCall[] = [];
+  const approvalAdapter = await loadActionAdapter(nonPendingProjection, approvalCalls);
+  await approvalAdapter.act({ type: "approveDecision", projectId: "project-1", decisionId: "approval-1" });
+  expect(approvalCalls).toHaveLength(0);
+
+  const nonCancellableProjection = {
+    ...actionProjection(),
+    jobs: [{ id: "job-1", kind: "research", status: "queued", cancellable: false, createdAt: 1, updatedAt: 1, grantVersion: 1, attempts: [] }],
+  };
+  const cancelCalls: MutationCall[] = [];
+  const cancelAdapter = await loadActionAdapter(nonCancellableProjection, cancelCalls);
+  await cancelAdapter.act({ type: "cancelJob", projectId: "project-1", jobId: "job-1" });
+  expect(cancelCalls).toHaveLength(0);
+
+  const baseProjection = actionProjection();
+  const firstRequirement = (baseProjection.requirements as readonly Record<string, unknown>[])[0];
+  if (firstRequirement === undefined) throw new Error("action fixture requirement missing");
+  const ambiguousProjection = {
+    ...baseProjection,
+    requirements: [firstRequirement, { ...firstRequirement, id: "requirement-2", key: "REQ-2" }],
+  };
+  const researchCalls: MutationCall[] = [];
+  const researchAdapter = await loadActionAdapter(ambiguousProjection, researchCalls);
+  await researchAdapter.act({ type: "startResearch", projectId: "project-1" });
+  expect(researchCalls).toHaveLength(0);
+});
+
+test("invalidates action cache on watch errors and unsubscribe while preserving an empty initial watch", async () => {
+  let current: unknown = undefined;
+  let watchError = false;
+  const calls: MutationCall[] = [];
+  const controls = controlledWatch(() => {
+    if (watchError) throw new Error("reconnect failed");
+    return current;
+  });
+  const adapter = createConvexWorkbenchAdapter(actionClient(actionProjection(), controls.watch, calls, { ok: true }));
+  await adapter.load("project-1");
+  const errors: unknown[] = [];
+  const unsubscribe = adapter.subscribe?.("project-1", () => {}, (error) => errors.push(error));
+  expect(errors).toHaveLength(0);
+  await expect(adapter.act({ type: "selectOffer", projectId: "project-1", offerId: "candidate-1", quoteId: "quote-1", quoteVersion: "v1" })).resolves.toMatchObject({ ok: true });
+  expect(calls).toHaveLength(1);
+
+  await adapter.load("project-1");
+  current = actionProjection();
+  controls.emit();
+  expect(calls).toHaveLength(1);
+
+  await adapter.load("project-1");
+  watchError = true;
+  controls.emit();
+  expect(errors).toHaveLength(1);
+  await expect(adapter.act({ type: "startResearch", projectId: "project-1" })).resolves.toMatchObject({ ok: false });
+  expect(calls).toHaveLength(1);
+
+  watchError = false;
+  current = actionProjection();
+  controls.emit();
+  const secondUnsubscribe = unsubscribe;
+  if (secondUnsubscribe === undefined) throw new Error("subscription should be available");
+  secondUnsubscribe();
+  await expect(adapter.act({ type: "startResearch", projectId: "project-1" })).resolves.toMatchObject({ ok: false });
+  expect(calls).toHaveLength(1);
+});
+
+test("a failed subscription setup fences a previously loaded mutation basis", async () => {
+  const calls: MutationCall[] = [];
+  const errors: unknown[] = [];
+  const adapter = createConvexWorkbenchAdapter({
+    query: async () => actionProjection(),
+    watchQuery: () => {
+      throw new Error("watch setup failed");
+    },
+    mutation: async (reference: unknown, args: unknown) => {
+      calls.push({ reference, args });
+      return { ok: true };
+    },
+  } as unknown as ConvexWorkbenchClient);
+
+  await adapter.load("project-1");
+  adapter.subscribe?.("project-1", () => {}, (error) => errors.push(error));
+  expect(errors).toHaveLength(1);
+  await expect(adapter.act({ type: "selectOffer", projectId: "project-1", offerId: "candidate-1", quoteId: "quote-1", quoteVersion: "v1" })).resolves.toMatchObject({ ok: false });
+  expect(calls).toHaveLength(0);
+});
+
+test("a newer watched projection wins over a late load result", async () => {
+  let resolveQuery: ((value: unknown) => void) | undefined;
+  const query = new Promise<unknown>((resolve) => { resolveQuery = resolve; });
+  let current: unknown = actionProjection("project-1", 4);
+  const controls = controlledWatch(() => current);
+  const calls: MutationCall[] = [];
+  const adapter = createConvexWorkbenchAdapter({
+    query: async () => query,
+    watchQuery: () => controls.watch,
+    mutation: async (reference: unknown, args: unknown) => {
+      calls.push({ reference, args });
+      return { ok: true };
+    },
+  } as unknown as ConvexWorkbenchClient);
+
+  const lateLoad = adapter.load("project-1");
+  const unsubscribe = adapter.subscribe?.("project-1", () => {}, () => {});
+  current = actionProjection("project-1", 5);
+  controls.emit();
+  resolveQuery?.(actionProjection("project-1", 4));
+  await expect(lateLoad).resolves.toBeNull();
+  await adapter.act({ type: "selectOffer", projectId: "project-1", offerId: "candidate-1", quoteId: "quote-1", quoteVersion: "v1" });
+  expect(calls[0]?.args).toMatchObject({ requirementVersion: 5 });
+  unsubscribe?.();
 });
 
 function assetFixture(overrides: Record<string, unknown> = {}): Record<string, unknown> {

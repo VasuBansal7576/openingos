@@ -33,6 +33,7 @@ export interface WorkbenchCapabilities {
 
 export interface WorkbenchProject {
   readonly id: string;
+  readonly organizationId: string;
   readonly name: string;
   readonly region: string | null;
   readonly currency: string | null;
@@ -49,6 +50,7 @@ export interface WorkbenchRequirement {
   readonly id: string;
   readonly key: string;
   readonly title: string;
+  readonly category: string;
   readonly quantity: string;
   readonly unit: string;
   readonly priority: string;
@@ -131,6 +133,7 @@ export interface WorkbenchOffer {
 export interface WorkbenchJob {
   readonly id: string;
   readonly kind: string;
+  readonly cancellable: boolean;
   readonly state: string;
   readonly delivery: DeliveryState;
   readonly progress: number | null;
@@ -436,9 +439,10 @@ function parseQuote(value: unknown): WorkbenchQuote | null {
     const lineId = requiredString(entry.lineId);
     const description = requiredString(entry.description);
     const quantity = requiredString(entry.quantity);
+    const unit = nullableString(entry.unit);
     const unitPrice = parseMoney(entry.unitPrice);
-    if (lineId === null || description === null || quantity === null || unitPrice === null || unitPrice.currency !== currency) return null;
-    lines.push({ lineId, description, quantity, unit: null, unitMinorUnits: unitPrice.minorUnits, evidenceIds: [] });
+    if (lineId === null || description === null || quantity === null || (unit === undefined && Object.prototype.hasOwnProperty.call(entry, "unit")) || unitPrice === null || unitPrice.currency !== currency) return null;
+    lines.push({ lineId, description, quantity, unit: unit ?? null, unitMinorUnits: unitPrice.minorUnits, evidenceIds: [] });
   }
   const charges: WorkbenchQuoteCharge[] = [];
   for (const entry of value.charges) {
@@ -483,21 +487,23 @@ function parseRequirement(value: unknown): WorkbenchRequirement | null {
   const id = requiredString(value.id);
   const key = requiredString(value.key);
   const title = requiredString(value.title);
+  const category = requiredString(value.category);
   const quantity = requiredString(value.quantity);
   const unit = requiredString(value.unit);
   const budgetMinorUnits = nullableNumber(value.budgetMinorUnits);
   const needByAt = nullableNumber(value.needByAt);
-  if (id === null || key === null || title === null || quantity === null || unit === null || typeof value.priority !== "string" || typeof value.state !== "string" || typeof value.fulfillment !== "string" || !isFiniteNumber(value.version) || budgetMinorUnits === undefined || needByAt === undefined) return null;
-  return { id, key, title, quantity, unit, priority: value.priority, state: value.state, fulfillment: value.fulfillment, version: value.version, budgetMinorUnits, needByAt };
+  if (id === null || key === null || title === null || category === null || quantity === null || unit === null || typeof value.priority !== "string" || typeof value.state !== "string" || typeof value.fulfillment !== "string" || !isFiniteNumber(value.version) || budgetMinorUnits === undefined || needByAt === undefined) return null;
+  return { id, key, title, category, quantity, unit, priority: value.priority, state: value.state, fulfillment: value.fulfillment, version: value.version, budgetMinorUnits, needByAt };
 }
 
 function parseJob(value: unknown): WorkbenchJob | null {
   if (!isRecord(value)) return null;
   const id = requiredString(value.id);
   const kind = typeof value.kind === "string" ? value.kind : null;
+  const cancellable = value.cancellable;
   const status = isOneOf(value.status, ["queued", "sent", "delivered", "unknown", "partial", "paused"] as const) ? value.status : null;
   const attempts = Array.isArray(value.attempts) ? value.attempts : null;
-  if (id === null || kind === null || status === null || !isFiniteNumber(value.createdAt) || !isFiniteNumber(value.updatedAt) || !isFiniteNumber(value.grantVersion) || attempts === null) return null;
+  if (id === null || kind === null || typeof cancellable !== "boolean" || status === null || !isFiniteNumber(value.createdAt) || !isFiniteNumber(value.updatedAt) || !isFiniteNumber(value.grantVersion) || attempts === null) return null;
   let lastCheckedAt: number | null = null;
   for (const attempt of attempts) {
     if (!isRecord(attempt) || typeof attempt.state !== "string" || !isFiniteNumber(attempt.createdAt)) return null;
@@ -505,7 +511,7 @@ function parseJob(value: unknown): WorkbenchJob | null {
     if (observedAt === undefined) return null;
     if (observedAt !== null && (lastCheckedAt === null || observedAt > lastCheckedAt)) lastCheckedAt = observedAt;
   }
-  return { id, kind, state: "unknown", delivery: status, progress: null, attempts: attempts.length, updatedAt: value.updatedAt, failureCode: null, lastCheckedAt, summary: null, evidenceIds: [] };
+  return { id, kind, cancellable, state: "unknown", delivery: status, progress: null, attempts: attempts.length, updatedAt: value.updatedAt, failureCode: null, lastCheckedAt, summary: null, evidenceIds: [] };
 }
 
 function optionalId(value: unknown): string | null | undefined {
@@ -517,13 +523,14 @@ function parseDecision(value: unknown): WorkbenchDecision | null {
   if (!isRecord(value)) return null;
   const id = requiredString(value.id);
   const type = typeof value.kind === "string" ? value.kind : null;
-  const state = typeof value.state === "string" ? value.state : null;
+  const rawState = typeof value.state === "string" ? value.state : null;
   const requirementId = optionalId(value.requirementId);
   const offerId = optionalId(value.candidateId);
   const quoteId = optionalId(value.quoteId);
   const quoteVersion = nullableString(value.quoteVersion);
   const decidedAt = nullableNumber(value.decidedAt);
-  if (id === null || type === null || state === null || requirementId === undefined || offerId === undefined || quoteId === undefined || quoteVersion === undefined || decidedAt === undefined || !isFiniteNumber(value.createdAt)) return null;
+  if (id === null || type === null || rawState === null || requirementId === undefined || offerId === undefined || quoteId === undefined || quoteVersion === undefined || decidedAt === undefined || !isFiniteNumber(value.createdAt)) return null;
+  const state = type === "approval" && rawState === "pending" ? "requested" : rawState;
   return { id, type, state, requirementId, offerId, quoteId, quoteVersion, requestedAt: value.createdAt, evidenceIds: [], summary: null, authorizationRequired: null };
 }
 
@@ -541,7 +548,8 @@ function parseProject(value: unknown): WorkbenchProject | null {
   const name = requiredString(value.name);
   const budgetMinorUnits = nullableNumber(value.budgetMinorUnits);
   const needByAt = nullableNumber(value.needByAt);
-  if (id === null || name === null || !isOneOf(value.visibility, ["open", "restricted"] as const) || typeof value.organizationId !== "string" || !isFiniteNumber(value.createdAt) || budgetMinorUnits === undefined || needByAt === undefined) return null;
+  const organizationId = requiredString(value.organizationId);
+  if (id === null || organizationId === null || name === null || !isOneOf(value.visibility, ["open", "restricted"] as const) || !isFiniteNumber(value.createdAt) || budgetMinorUnits === undefined || needByAt === undefined) return null;
   let region: string | null = null;
   let locationCurrency: string | null = null;
   if (value.location !== undefined) {
@@ -554,7 +562,7 @@ function parseProject(value: unknown): WorkbenchProject | null {
   }
   const currency = nullableString(value.currency);
   if (currency === undefined) return null;
-  return { id, name, region, currency: currency ?? locationCurrency, budgetMinorUnits, needByAt };
+  return { id, organizationId, name, region, currency: currency ?? locationCurrency, budgetMinorUnits, needByAt };
 }
 
 function parseAccess(value: unknown): WorkbenchAccess | null {

@@ -14,6 +14,7 @@ import { f1Query } from "../server.js";
 import { provenanceLabel, type ExecutionMode } from "../shared/provenance.js";
 import type {
   StoredChargeState,
+  StoredComparisonScope,
   StoredQuoteCharge,
   StoredQuoteLine,
   StoredTaxBasis,
@@ -155,6 +156,7 @@ const quoteLineValidator = v.object({
   description: v.string(),
   quantity: v.string(),
   unitPrice: moneyValidator,
+  unit: v.optional(v.string()),
 });
 
 const quoteChargeValidator = v.object({
@@ -221,6 +223,7 @@ const jobValidator = v.object({
   id: v.id("jobs"),
   kind: v.string(),
   status: jobStatusValidator,
+  cancellable: v.boolean(),
   createdAt: v.number(),
   updatedAt: v.number(),
   grantVersion: v.number(),
@@ -362,6 +365,7 @@ type QuoteProjection = {
     readonly lineId: string;
     readonly description: string;
     readonly quantity: string;
+    readonly unit?: string;
     readonly unitPrice: { readonly currency: string; readonly minorUnits: number };
   }>;
   readonly charges: Array<{
@@ -494,6 +498,7 @@ function renderQuote(row: {
   readonly counterpartyRole: string;
   readonly executionMode: string;
   readonly createdAt: number;
+  readonly comparisonScope?: StoredComparisonScope;
 }): QuoteSelection | null {
   if (
     row.currency.trim().length === 0 ||
@@ -511,10 +516,12 @@ function renderQuote(row: {
       line.description.trim().length === 0 ||
       line.quantity.trim().length === 0
     ) return null;
+    const scopeItem = row.comparisonScope?.items.find((item) => item.lineId === line.lineId);
     lines.push({
       lineId: line.lineId,
       description: line.description,
       quantity: line.quantity,
+      ...(scopeItem === undefined ? {} : { unit: scopeItem.unit }),
       unitPrice,
     });
   }
@@ -1107,6 +1114,7 @@ export const getProjection = f1Query({
       readonly id: Id<"jobs">;
       readonly kind: string;
       readonly status: "queued" | "sent" | "delivered" | "unknown" | "partial" | "paused";
+      readonly cancellable: boolean;
       readonly createdAt: number;
       readonly updatedAt: number;
       readonly grantVersion: number;
@@ -1154,6 +1162,13 @@ export const getProjection = f1Query({
           hasReply,
           rawOperations.length > MAX_OPERATIONS_PER_JOB || attemptsTruncated,
         ),
+        cancellable:
+          job.state === "queued" ||
+          job.state === "running" ||
+          job.state === "waitingForSupplier" ||
+          job.state === "waitingForUser" ||
+          job.state === "pausedBudget" ||
+          job.state === "partial",
         createdAt: job.createdAt,
         updatedAt: job.updatedAt,
         grantVersion: job.grantVersion,
@@ -1186,7 +1201,7 @@ export const getProjection = f1Query({
       ...approvalRows.filter((row) => row.organizationId === project.organizationId && row.projectId === args.projectId).map((row) => ({
         id: row._id,
         kind: "approval" as const,
-        state: row.state,
+        state: row.state === "pending" ? "requested" : row.state,
         ...(row.quoteId === undefined ? {} : { quoteId: row.quoteId }),
         createdAt: row.createdAt,
         ...(row.decidedAt === undefined ? {} : { decidedAt: row.decidedAt }),
