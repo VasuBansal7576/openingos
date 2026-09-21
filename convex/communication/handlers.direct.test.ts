@@ -9,6 +9,7 @@ import * as cleanup from "./cleanup.js";
 import * as send from "./send.js";
 import * as attempts from "../execution/attempts.js";
 import { canonicalJson, payloadHash } from "../shared/hashing.js";
+import { provenanceLabel } from "../shared/provenance.js";
 import { OUTBOUND_RETENTION_MS, reconciliationPricingBasis } from "./contracts.js";
 import { RECOVERY_READ_MAX_COST_ENV_VAR } from "./recoveryPolicy.js";
 
@@ -2921,4 +2922,166 @@ describe("C1 Greptile P1 replay/scale repairs (r4058523015/r4058523016/r40585230
       restoreKey();
     }
   }, 60_000);
+
+  test("blocked prefix rows do not hide a later valid reply", async () => {
+    const f = await fixture();
+    // Eight permanently unprocessable rows: malformed outcomes that are
+    // neither snapshots nor oversized markers, stuck as outcomeUnknown.
+    await f.t.run(async (ctx) => {
+      const now = Date.now();
+      for (let index = 0; index < 8; index += 1) {
+        const messageId = `blocked-${index}`;
+        await ctx.db.insert("processedEvents", {
+          provider: "agentmail-inbound",
+          environment: "live",
+          eventId: `blocked-event-${index}`,
+          processingVersion: 1,
+          outcome: JSON.stringify({ messageId, threadId: "blocked-thread", inboxId: "owner-inbox", reason: "foreign" }),
+          providerMessageId: messageId,
+          providerThreadId: "blocked-thread",
+          providerInboxId: "owner-inbox",
+          applicationOutcome: "unknown",
+          applicationState: "outcomeUnknown",
+          createdAt: now + index,
+        });
+      }
+    });
+    // A valid reply arrives behind the blocked prefix.
+    const early = await f.t.mutation(ingestMessageRef, {
+      message: inbound("blocked-valid", "blocked-thread", "<p>Behind terms</p>"),
+      thread: { thread_id: "blocked-thread" },
+      eventId: "blocked-valid-early",
+    });
+    expect(early).toMatchObject({ ok: true, state: "waitingForBinding" });
+    const bound = await f.t.mutation(bindingRef, {
+      operationId: f.operationId,
+      messageId: "blocked-outbound",
+      threadId: "blocked-thread",
+      inboxId: "owner-inbox",
+    });
+    expect(bound).toMatchObject({ ok: true });
+    // The bind-time trigger pages the blocked prefix; the next trigger
+    // resumes past it and applies the valid reply.
+    const replayed = await f.t.mutation(replayRef, { threadId: "blocked-thread", inboxId: "owner-inbox" });
+    expect(replayed).toEqual({ ok: true, replayed: 1, stillWaiting: 0 });
+    expect(await projectEvidenceRows(f)).toHaveLength(1);
+    const drained = await f.t.mutation(replayRef, { threadId: "blocked-thread", inboxId: "owner-inbox" });
+    // The valid work is done; the eight blocked rows honestly remain
+    // waiting (never applied, never relabeled, never deleted).
+    expect(drained).toEqual({ ok: true, replayed: 0, stillWaiting: 8 });
+    // Blocked rows keep their honest unknown state: never applied, never
+    // relabeled as success, never deleted.
+    const blocked = await f.t.run(async (ctx) =>
+      await ctx.db
+        .query("processedEvents")
+        .withIndex("by_provider_environment_and_provider_message_and_thread_and_inbox", (q) =>
+          q
+            .eq("provider", "agentmail-inbound")
+            .eq("environment", "live")
+            .eq("providerMessageId", "blocked-0")
+            .eq("providerThreadId", "blocked-thread")
+            .eq("providerInboxId", "owner-inbox"),
+        )
+        .take(2),
+    );
+    expect(blocked).toHaveLength(1);
+    expect(blocked[0]?.applicationState).toBe("outcomeUnknown");
+  });
+
+  test("owner-authored content is stored as controlled demo evidence", async () => {
+    const f = await fixture();
+    await f.t.mutation(bindingRef, {
+      operationId: f.operationId,
+      messageId: "demo-outbound",
+      threadId: "demo-thread",
+      inboxId: "owner-inbox",
+    });
+    const reply = await f.t.mutation(ingestMessageRef, {
+      message: inbound("demo-reply", "demo-thread", "<p>Demo terms</p>"),
+      thread: { thread_id: "demo-thread" },
+      eventId: "demo-inbound",
+    });
+    expect(reply).toMatchObject({ ok: true, state: "replyReceived" });
+    const evidence = await projectEvidenceRows(f);
+    expect(evidence).toHaveLength(1);
+    expect(evidence[0]?.counterpartyRole).toBe("ownerStandIn");
+    expect(evidence[0]?.executionMode).toBe("recorded");
+    const markers = (await projectMarkerRows(f)).filter((row) => row.field === "agentmail.message");
+    expect(markers).toHaveLength(1);
+    expect(markers[0]?.counterpartyRole).toBe("ownerStandIn");
+    expect(markers[0]?.executionMode).toBe("recorded");
+    expect(
+      provenanceLabel({ counterpartyRole: "ownerStandIn", executionMode: "recorded" }),
+    ).toBe("Recorded demo exchange");
+  });
+
+  test("attachment markers inherit controlled demo evidence", async () => {
+    const f = await fixture();
+    await f.t.mutation(bindingRef, {
+      operationId: f.operationId,
+      messageId: "demo-attach-outbound",
+      threadId: "demo-attach-thread",
+      inboxId: "owner-inbox",
+    });
+    const reply = await f.t.mutation(ingestMessageRef, {
+      message: {
+        ...inbound("demo-attach-reply", "demo-attach-thread", "<p>Terms with file</p>"),
+        attachments: [{ filename: "terms.pdf" }],
+      },
+      thread: { thread_id: "demo-attach-thread" },
+      eventId: "demo-attach-inbound",
+    });
+    expect(reply).toMatchObject({ ok: true, state: "replyReceived" });
+    const markers = (await projectMarkerRows(f)).filter((row) => row.idempotencyKey.endsWith(":missing:attachment"));
+    expect(markers).toHaveLength(1);
+    expect(markers[0]?.counterpartyRole).toBe("ownerStandIn");
+    expect(markers[0]?.executionMode).toBe("recorded");
+  });
+
+  test("quote ingestion coerces owner terms to controlled demo mode", async () => {
+    const f = await fixture();
+    await f.t.mutation(bindingRef, {
+      operationId: f.operationId,
+      messageId: "demo-quote-outbound",
+      threadId: "demo-quote-thread",
+      inboxId: "owner-inbox",
+    });
+    await f.t.mutation(ingestMessageRef, {
+      message: inbound("demo-quote-reply", "demo-quote-thread", "<p>Quoted demo terms</p>"),
+      thread: { thread_id: "demo-quote-thread" },
+      eventId: "demo-quote-inbound",
+    });
+    const quoteJson = JSON.stringify({
+      version: "demo-quote-v1",
+      currency: "EUR",
+      lines: [{
+        lineId: "machine",
+        description: "Machine",
+        quantity: "1",
+        unitPrice: { currency: "EUR", minorUnits: 1_000 },
+        evidenceRefs: [{ sourceId: "agentmail:demo-quote-reply", version: "extract-v1", locator: "message:demo-quote-reply" }],
+      }],
+      charges: [],
+      taxBasis: { kind: "exclusive", basisId: "controlled-exclusive", evidenceRefs: [] },
+    });
+    // Even when the caller observed live transport, extracted owner terms
+    // are stored as controlled demo evidence, never genuine vendor terms.
+    const quote = await f.t.mutation(ingestQuoteRef, {
+      organizationId: f.organizationId,
+      projectId: f.projectId,
+      conversationId: f.conversationId,
+      providerMessageId: "demo-quote-reply",
+      extractionVersion: "extract-v1",
+      quoteJson,
+      executionMode: "live",
+    });
+    expect(quote).toMatchObject({ ok: true, deduplicated: false, executionMode: "recorded" });
+    const stored = await f.t.run(async (ctx) => {
+      if (!quote.ok) throw new Error("quote denied");
+      const row = await ctx.db.get(quote.quoteId);
+      if (row === null) throw new Error("quote missing");
+      return { counterpartyRole: row.counterpartyRole, executionMode: row.executionMode };
+    });
+    expect(stored).toEqual({ counterpartyRole: "ownerStandIn", executionMode: "recorded" });
+  });
 });
