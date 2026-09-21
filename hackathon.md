@@ -400,7 +400,7 @@ PR #2 still requires exact-head CI, direct Greptile thread closure, separate Ast
 
 ### 2026-09-21 - post-1a1bf7d controlled delivery wave
 
-The integration branch remains at `1a1bf7d`, which includes server-side cross-client research-start idempotency and authoritative quote total/currentness projection in addition to the earlier R1, C1, U1 and E1 work.
+The integration branch application-code baseline remains `1a1bf7d`, which includes server-side cross-client research-start idempotency and authoritative quote total/currentness projection in addition to the earlier R1, C1, U1 and E1 work; the later `24d4c70` checkpoint changes only this log and `ROADMAP.md`.
 Four ready, non-draft child PRs now expose further progress without claiming it is integrated: PR #7 at `e73277c` adds commissioning-to-asset and service outcomes, PR #8 at `f4c9177` adds changed-term impact and substitute approval fencing, PR #9 at `bc8bcfe` adds truthful usage/outcome metrics with explicit overflow unavailability, and PR #10 at `c6e6f76` repairs 390px navigation/heading fit and nested-dialog background inertness.
 Every one of those exact heads is conflict-free and passes the nine expected application and repository CI checks.
 Coordinator reruns passed 332 E11 direct tests plus 38 domain-contract tests, 13 focused E5 tests, 53 E10 direct-handler tests, 37 U1 workbench tests, strict TypeScript checks and production builds where applicable.
