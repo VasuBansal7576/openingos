@@ -234,7 +234,7 @@ export default function LandingView({ backendStatus, onRetry, workbench, onIntak
                 <p>
                   The Northside caf&eacute; demo needs a real isolated backend-created sample guest project.
                   This backend does not provide a sample-project route, so the demo cannot start without
-                  inventing fixture vendors, quotes, or savings &mdash; which OpeningOS will not do.
+                  inventing fixture vendors, quotes, or savings, which OpeningOS will not do.
                 </p>
                 <p className="wb-micro">
                   Missing backend contract: isolated sample-guest-project creation. Only workspace creation
@@ -293,7 +293,7 @@ export default function LandingView({ backendStatus, onRetry, workbench, onIntak
       <footer className="wb-landing-footer">
         <span className="wb-brand">OpeningOS<span className="wb-brand-dot">.</span></span>
         <p>Made for your opening. Useful long after.</p>
-        <span>Real backend state &middot; nothing simulated</span>
+        <span>Connected views use authorized backend state</span>
       </footer>
     </div>
   );

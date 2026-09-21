@@ -82,7 +82,8 @@
   simulated inbox/recovery/equipment states are not reproduced as content:
   every workbench route still renders only real authorized backend state.
 - The prototype footer label ("Interactive prototype · simulated data and
-  actions") is replaced with "Real backend state · nothing simulated".
+  actions") is replaced with "Connected views use authorized backend state".
+  This avoids claiming that the static public landing itself is live data.
 - The prototype's "Pull up a chair" paper button enters the real brief flow
   instead of the fixture comparison.
 - The prototype's demo button enters the fixture flow; production shows the
@@ -143,6 +144,9 @@
 
 **Final result**
 
-final result: passed with one open verification item (browser pixel capture,
-per blocker above). All P0/P1/P2 code findings are fixed with passing
-regression coverage; no fixture data was introduced.
+final result: pending browser verification. The sample-project backend route
+also remains an open product dependency. The implementation must not be marked
+passed until same-state desktop and mobile browser captures have been compared
+with the accepted prototype, all resulting P0/P1/P2 issues are fixed, and the
+real isolated sample-project path has been verified. No fixture data was
+introduced in this checkpoint.
