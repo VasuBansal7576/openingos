@@ -23,9 +23,15 @@
  */
 
 import { v } from "convex/values";
+import { makeFunctionReference } from "convex/server";
 import type { Id } from "../_generated/dataModel.js";
 import { f1Mutation, type F1MutationCtx } from "../server.js";
-import { denialValidator, identityOf, membershipScopeKey } from "../access/checks.js";
+import {
+  denialValidator,
+  identityOf,
+  membershipScopeKey,
+  PERMANENT_AUTHORITY_UNTIL,
+} from "../access/checks.js";
 import { recordCurrentAuthority } from "../access/memberships.js";
 import { canonicalJson } from "../shared/hashing.js";
 import {
@@ -93,6 +99,19 @@ const SERVICE_SUMMARY_MAX_LENGTH = 800;
 const ORG_NAME_MAX_LENGTH = 128;
 const LOCATION_NAME_MAX_LENGTH = 128;
 const MAX_OWNED_AUTHORITY_SCAN = 64;
+
+/**
+ * Typed scheduler reference to the shared idempotent membership expiry
+ * transition (access/memberships:expireMembership), exactly as
+ * access/memberships:createProject and grantProjectAccess schedule it.
+ * The generated API proxy stays untouched, so the reference is built by
+ * path with exact argument/result types.
+ */
+const expireMembershipRef = makeFunctionReference<
+  "mutation",
+  { membershipId: Id<"memberships"> },
+  { ok: true; expired: boolean }
+>("access/memberships:expireMembership");
 
 type IntakeMode = "opening" | "quoteComparison" | "equipment";
 type WorkspaceKind = "guest" | "private";
@@ -231,17 +250,30 @@ function normalizedPayloadOf(input: NormalizedIntake): string {
 }
 
 /**
+ * The caller's own organization of the requested kind, reused for a new
+ * project, together with the authority horizon that authorizes the reuse.
+ */
+interface OwnedOrganization {
+  readonly organizationId: Id<"organizations">;
+  readonly authorityUntil: number;
+}
+
+/**
  * Reuse the caller's own organization of the requested kind when one
  * exists: the newest currently valid org-scoped owner authority row wins.
- * The scan reads only the caller's own authority rows through the exact
- * identity index, so another tenant's organizations are never visible.
+ * The authority horizon is preserved: when an organization holds both a
+ * temporary and a stronger permanent owner row, the maximum horizon wins
+ * and the reuse is permanent; a purely temporary owner keeps the reuse
+ * temporary. The scan reads only the caller's own authority rows through
+ * the exact identity index, so another tenant's organizations are never
+ * visible.
  */
 async function findCallerOwnedOrganization(
   ctx: F1MutationCtx,
   identity: string,
   kind: WorkspaceKind,
   now: number,
-): Promise<Id<"organizations"> | null> {
+): Promise<OwnedOrganization | null> {
   const rows = await ctx.db
     .query("membershipAuthorities")
     .withIndex("by_identity_and_authority_until_and_organization_and_project", (q) =>
@@ -249,7 +281,7 @@ async function findCallerOwnedOrganization(
     )
     .order("desc")
     .take(MAX_OWNED_AUTHORITY_SCAN);
-  const candidates: { readonly organizationId: Id<"organizations">; readonly authorityUntil: number }[] = [];
+  const horizons = new Map<Id<"organizations">, number>();
   for (const row of rows) {
     if (
       row.scopeKey !== membershipScopeKey(undefined) ||
@@ -260,13 +292,17 @@ async function findCallerOwnedOrganization(
     ) {
       continue;
     }
-    candidates.push({ organizationId: row.organizationId, authorityUntil: row.authorityUntil });
+    const current = horizons.get(row.organizationId);
+    horizons.set(
+      row.organizationId,
+      current === undefined ? row.authorityUntil : Math.max(current, row.authorityUntil),
+    );
   }
-  candidates.sort((left, right) => right.authorityUntil - left.authorityUntil);
-  for (const candidate of candidates) {
-    const organization = await ctx.db.get(candidate.organizationId);
+  const candidates = [...horizons.entries()].sort((left, right) => right[1] - left[1]);
+  for (const [organizationId, authorityUntil] of candidates) {
+    const organization = await ctx.db.get(organizationId);
     if (organization === null || organization.kind !== kind) continue;
-    return organization._id;
+    return { organizationId, authorityUntil };
   }
   return null;
 }
@@ -400,8 +436,19 @@ export const createWorkspace = f1Mutation({
     }
 
     const now = Date.now();
+    const reuse = await findCallerOwnedOrganization(ctx, identity, input.workspaceKind, now);
+    if (
+      reuse !== null &&
+      reuse.authorityUntil !== PERMANENT_AUTHORITY_UNTIL &&
+      reuse.authorityUntil <= now
+    ) {
+      // The reuse-authorizing horizon lapsed mid-transaction: deny the
+      // temporary reuse whole rather than minting permanent project
+      // ownership from it. Nothing has been written yet.
+      return deny("expired-membership", "organization owner authority expired");
+    }
     const organizationId =
-      (await findCallerOwnedOrganization(ctx, identity, input.workspaceKind, now)) ??
+      reuse?.organizationId ??
       (await (async (): Promise<Id<"organizations">> => {
         const name = normalizeBoundedText(
           `${input.projectName} workspace`.slice(0, ORG_NAME_MAX_LENGTH),
@@ -433,6 +480,16 @@ export const createWorkspace = f1Mutation({
         );
         return created;
       })());
+    // The project ownership derives from the authorizing organization
+    // ownership: a temporary org owner grants an equally temporary
+    // project-owner authority, while a permanent org owner (including a
+    // stronger permanent row coexisting with a temporary one) stays
+    // permanent. Temporary grants schedule the same idempotent
+    // membership-expiry transition as access/memberships:createProject.
+    const ownerExpiresAt =
+      reuse === null || reuse.authorityUntil === PERMANENT_AUTHORITY_UNTIL
+        ? undefined
+        : reuse.authorityUntil;
 
     let locationId: Id<"locations"> | undefined;
     if (input.region !== undefined) {
@@ -460,6 +517,7 @@ export const createWorkspace = f1Mutation({
       ...(input.needByAt === undefined ? {} : { needByAt: input.needByAt }),
       createdAt: now,
     });
+    const grantedAt = Date.now();
     const projectMembershipId = await ctx.db.insert("memberships", {
       organizationId,
       projectId,
@@ -467,7 +525,8 @@ export const createWorkspace = f1Mutation({
       role: "owner",
       status: "active",
       version: 1,
-      updatedAt: now,
+      ...(ownerExpiresAt === undefined ? {} : { expiresAt: ownerExpiresAt }),
+      updatedAt: grantedAt,
     });
     await recordCurrentAuthority(
       ctx,
@@ -476,9 +535,16 @@ export const createWorkspace = f1Mutation({
       identity,
       "owner",
       projectMembershipId,
-      undefined,
-      now,
+      ownerExpiresAt,
+      grantedAt,
     );
+    if (ownerExpiresAt !== undefined) {
+      await ctx.scheduler.runAfter(
+        Math.max(0, ownerExpiresAt - grantedAt),
+        expireMembershipRef,
+        { membershipId: projectMembershipId },
+      );
+    }
 
     const requirementId = await ctx.db.insert("requirements", {
       organizationId,

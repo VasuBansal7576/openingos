@@ -114,6 +114,12 @@ export default defineSchema({
     budgetMinorUnits: v.optional(v.number()),
     needByAt: v.optional(v.number()),
     createdAt: v.number(),
+    // E15 controlled sample marker (P-16, H-06). Absent on every
+    // non-sample project; present only on projects seeded by the
+    // controlled sample boundary. The workbench projection surfaces
+    // both fields so the sample-data label is durable, not UI text.
+    sampleKind: v.optional(v.string()),
+    sampleLabel: v.optional(v.string()),
   }).index("by_organization", ["organizationId"]),
 
   locations: defineTable({
@@ -1325,6 +1331,24 @@ export default defineSchema({
    * caller's own identity, so no existence oracle leaks across tenants.
    */
   intakeRequests: defineTable({
+    identity: v.string(),
+    idempotencyKey: v.string(),
+    normalizedPayload: v.string(),
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    createdAt: v.number(),
+  }).index("by_identity_and_key", ["identity", "idempotencyKey"]),
+
+  /**
+   * E15 controlled sample idempotency (PRD 11 evaluator path, P-16, H-06).
+   * One row per caller identity and client-supplied key binds the fixed
+   * sample dataset marker to the created guest organization/project.
+   * Exact replay returns the stored workspace; each distinct key creates
+   * a distinct fresh guest organization and project. The compound index
+   * scopes the lookup to the caller's own identity, so no existence
+   * oracle leaks across tenants.
+   */
+  sampleProjectRequests: defineTable({
     identity: v.string(),
     idempotencyKey: v.string(),
     normalizedPayload: v.string(),

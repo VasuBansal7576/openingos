@@ -178,12 +178,16 @@ test("keeps a connected app honest when no projection is available", () => {
     backendStatus: "connected",
     workbench: { state: "empty", message: "No authorized project projection is available yet." },
   }));
-  expect(html).toContain("Waiting for an authorized project.");
+  expect(html).toContain("NO AUTHORIZED PROJECT");
+  expect(html).toContain("No authorized project projection is available yet.");
   expect(html).toContain("No vendors, quotes or provider outcomes are shown");
-  expect(html).toContain("Everything on the table.");
-  expect(html).toContain("wb-connection-paper");
+  expect(html).toContain("Less chasing.");
+  expect(html).toContain("Try the Northside");
+  expect(html).toContain("Start your own brief");
+  expect(html).toContain("wb-landing-status");
   expect(html).not.toContain("wb-connected-empty");
   expect(html).not.toContain("Harbor Equipment");
+  expect(html).not.toContain("OpeningOS is ready to connect");
 });
 
 test("rejects malformed, cross-project, and private W1 projection payloads", () => {
@@ -1718,16 +1722,16 @@ function candidateWithCompleteQuote(overrides: Record<string, unknown>): Record<
   return { ...template, compatibility: "pass", ...overrides };
 }
 
-function completeQuote(totalMinorUnits: number): Record<string, unknown> {
+function completeQuote(totalMinorUnits: number, currency = "EUR"): Record<string, unknown> {
   return {
     id: `quote-complete-${totalMinorUnits}`,
     version: "2",
-    currency: "EUR",
-    lines: [{ lineId: "machine", description: "Atlas 2G", quantity: "1", unitPrice: { currency: "EUR", minorUnits: totalMinorUnits - 100000 } }],
+    currency,
+    lines: [{ lineId: "machine", description: "Atlas 2G", quantity: "1", unitPrice: { currency, minorUnits: totalMinorUnits - 100000 } }],
     charges: [
-      { chargeId: "charge-freight", label: "freight", scope: { kind: "quote" }, state: { kind: "known", amount: { currency: "EUR", minorUnits: 60000 } } },
-      { chargeId: "charge-installation", label: "installation", scope: { kind: "quote" }, state: { kind: "known", amount: { currency: "EUR", minorUnits: 40000 } } },
-      { chargeId: "charge-machine", label: "machine", scope: { kind: "line", lineId: "machine" }, state: { kind: "known", amount: { currency: "EUR", minorUnits: totalMinorUnits - 100000 } } },
+      { chargeId: "charge-freight", label: "freight", scope: { kind: "quote" }, state: { kind: "known", amount: { currency, minorUnits: 60000 } } },
+      { chargeId: "charge-installation", label: "installation", scope: { kind: "quote" }, state: { kind: "known", amount: { currency, minorUnits: 40000 } } },
+      { chargeId: "charge-machine", label: "machine", scope: { kind: "line", lineId: "machine" }, state: { kind: "known", amount: { currency, minorUnits: totalMinorUnits - 100000 } } },
     ],
     taxBasis: { kind: "inclusive", basisId: "tax-w1-1" },
     createdAt: Date.UTC(2026, 8, 20),
@@ -1736,6 +1740,12 @@ function completeQuote(totalMinorUnits: number): Record<string, unknown> {
     superseded: false,
     totalMinorUnits,
     comparableTotalMinorUnits: totalMinorUnits,
+    total: { currency, minorUnits: totalMinorUnits },
+    comparisonScope: {
+      requirementId: "requirement-w1-1",
+      scopeId: "scope-w1-espresso",
+      items: [{ itemId: "item-w1-machine", lineId: "machine", unit: "unit", requiredQuantity: "1" }],
+    },
   };
 }
 
@@ -1750,11 +1760,13 @@ function twoOfferProjection(): Record<string, unknown> {
         id: "candidate-w1-1",
         vendor: { id: "vendor-w1-1", name: "Harbor Equipment", regions: ["NL"], serviceCoverage: "Service coverage reported for this inquiry" },
         latestValidQuote: { ...firstQuote, ...completeQuote(850000), id: "quote-w1-complete" },
+        comparisons: [{ againstCandidateId: "candidate-w1-2", againstQuoteId: "quote-w1-2-complete", status: "comparable", reason: "equivalent-scope", differenceMinorUnits: 54951, cheaper: "other", estimatedDeltaMinorUnits: null }],
       }),
       candidateWithCompleteQuote({
         id: "candidate-w1-2",
         vendor: { id: "vendor-w1-2", name: "Elm Supply", regions: ["NL"], serviceCoverage: "Service coverage reported for this inquiry" },
-        latestValidQuote: { ...firstQuote, ...completeQuote(795000), id: "quote-w1-2-complete" },
+        latestValidQuote: { ...firstQuote, ...completeQuote(795049), id: "quote-w1-2-complete" },
+        comparisons: [{ againstCandidateId: "candidate-w1-1", againstQuoteId: "quote-w1-complete", status: "comparable", reason: "equivalent-scope", differenceMinorUnits: 54951, cheaper: "self", estimatedDeltaMinorUnits: null }],
       }),
     ],
   };
@@ -1782,7 +1794,7 @@ test("renders the decision desk from real requirement and offer records", async 
   }
 });
 
-test("shows an honest comparable-total difference only for complete papers", async () => {
+test("shows the exact backend 549.51 EUR delta without recomputing a rank", async () => {
   const snapshot = parseWorkbenchSnapshot(twoOfferProjection(), projection.project.id);
   if (snapshot === null) throw new Error("Two-offer projection should parse");
   const mounted = await mountE8Tab({ state: "ready", snapshot }, () => ({ ok: false, message: "controlled test refusal" }));
@@ -1791,8 +1803,90 @@ test("shows an honest comparable-total difference only for complete papers", asy
     if (tape === null) throw new Error("Comparison tape should render for two complete offers");
     expect(tape.textContent).toContain("Elm Supply");
     expect(tape.textContent).toContain("Harbor Equipment");
-    expect(tape.textContent).toContain("apart in comparable totals");
+    expect(tape.textContent).toContain("549.51");
+    expect(tape.textContent).toContain("lower than");
+    expect(tape.textContent).toContain("accepted comparison scope");
     expect(tape.textContent).not.toContain("saving");
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+function projectionWithPairStatus(
+  status: "estimated" | "incompatible" | "incomplete",
+  reason: string,
+): Record<string, unknown> {
+  const value = twoOfferProjection();
+  const candidates = value.candidates as readonly Record<string, unknown>[];
+  return {
+    ...value,
+    candidates: candidates.map((candidate, index) => ({
+      ...candidate,
+      comparisons: [{
+        againstCandidateId: index === 0 ? "candidate-w1-2" : "candidate-w1-1",
+        againstQuoteId: index === 0 ? "quote-w1-2-complete" : "quote-w1-complete",
+        status,
+        reason,
+        differenceMinorUnits: null,
+        cheaper: null,
+        estimatedDeltaMinorUnits: status === "estimated" ? { minimum: -60000, maximum: -50000 } : null,
+      }],
+    })),
+  };
+}
+
+test("mixed native currencies stay visible without a frontend rank", async () => {
+  const value = projectionWithPairStatus("incompatible", "mixed-currency-requires-accepted-conversion-basis");
+  const candidates = value.candidates as readonly Record<string, unknown>[];
+  const first = candidates[0];
+  const second = candidates[1];
+  if (first === undefined || second === undefined) throw new Error("Both offers are required");
+  value.candidates = [
+    first,
+    { ...second, latestValidQuote: { ...completeQuote(795049, "USD"), id: "quote-w1-2-complete" } },
+  ];
+  const snapshot = parseWorkbenchSnapshot(value, projection.project.id);
+  if (snapshot === null) throw new Error("Mixed-currency projection should parse");
+  const mounted = await mountE8Tab({ state: "ready", snapshot }, () => ({ ok: false, message: "controlled test refusal" }));
+  try {
+    const tape = mounted.container.querySelector(".wb-comparison-tape.not-ranked");
+    if (tape === null) throw new Error("Non-ranking comparison tape should render");
+    expect(tape.textContent).toContain("Not comparable");
+    expect(tape.textContent).toContain("No offer is ranked");
+    expect(tape.textContent).not.toContain("lower than");
+    await mounted.clickTab("Suppliers");
+    const prices = [...mounted.container.querySelectorAll(".wb-supplier-price strong")].map((node) => node.textContent ?? "");
+    expect(prices.some((price) => price.includes("€"))).toBe(true);
+    expect(prices.some((price) => price.includes("$"))).toBe(true);
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("tax and scope incompatibility reasons remain non-ranking", async () => {
+  for (const reason of ["tax bases are not compatible", "comparison scopes are not compatible"]) {
+    const snapshot = parseWorkbenchSnapshot(projectionWithPairStatus("incompatible", reason), projection.project.id);
+    if (snapshot === null) throw new Error("Incompatible projection should parse");
+    const mounted = await mountE8Tab({ state: "ready", snapshot }, () => ({ ok: false, message: "controlled test refusal" }));
+    try {
+      const tape = mounted.container.querySelector(".wb-comparison-tape.not-ranked");
+      expect(tape?.textContent).toContain(reason);
+      expect(tape?.textContent).toContain("No offer is ranked");
+    } finally {
+      await mounted.cleanup();
+    }
+  }
+});
+
+test("an incomplete pair stays visible with no exact difference", async () => {
+  const snapshot = parseWorkbenchSnapshot(projectionWithPairStatus("incomplete", "Freight is unknown"), projection.project.id);
+  if (snapshot === null) throw new Error("Incomplete projection should parse");
+  const mounted = await mountE8Tab({ state: "ready", snapshot }, () => ({ ok: false, message: "controlled test refusal" }));
+  try {
+    const tape = mounted.container.querySelector(".wb-comparison-tape.not-ranked");
+    expect(tape?.textContent).toContain("Comparison incomplete");
+    expect(tape?.textContent).toContain("Freight is unknown");
+    expect(tape?.textContent).not.toContain("549.51");
   } finally {
     await mounted.cleanup();
   }
@@ -1821,5 +1915,484 @@ test("bench actions open the real review dialog and assistant rail", async () =>
     expect(mounted.container.textContent).toContain("Ask about this decision.");
   } finally {
     await mounted.cleanup();
+  }
+});
+
+// -- F4 projected evidence source -------------------------------------------
+
+async function mountProjectView(
+  loadState: Parameters<typeof WorkbenchView>[0]["loadState"],
+): Promise<{
+  readonly container: HTMLElement;
+  readonly dom: HappyWindow;
+  readonly cleanup: () => Promise<void>;
+}> {
+  const dom = new HappyWindow({ url: "https://openingos.test/" });
+  const previousWindow = globalThis.window;
+  const previousDocument = globalThis.document;
+  const previousNavigator = globalThis.navigator;
+  const actEnvironment = globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean };
+  const previousActEnvironment = actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+  const browserGlobals = globalThis as unknown as { window: unknown; document: unknown; navigator: unknown };
+  browserGlobals.window = dom as unknown as globalThis.Window;
+  browserGlobals.document = dom.document as unknown as globalThis.Document;
+  browserGlobals.navigator = dom.navigator as unknown as globalThis.Navigator;
+  actEnvironment.IS_REACT_ACT_ENVIRONMENT = true;
+  const happyElement = dom.document.createElement("div");
+  dom.document.body.append(happyElement);
+  const container = happyElement as unknown as HTMLElement;
+  const root = createRoot(container as unknown as globalThis.Element);
+  await act(async () => {
+    root.render(createElement(WorkbenchView, { loadState }));
+  });
+  return {
+    container,
+    dom,
+    cleanup: async () => {
+      await act(async () => {
+        root.unmount();
+      });
+      browserGlobals.window = previousWindow;
+      browserGlobals.document = previousDocument;
+      browserGlobals.navigator = previousNavigator;
+      if (previousActEnvironment === undefined) delete actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+      else actEnvironment.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment;
+    },
+  };
+}
+
+function projectionWithEvidenceSource(sourceUrl: string | undefined): Record<string, unknown> {
+  const base = projection as unknown as Record<string, unknown>;
+  const candidates = base.candidates as readonly Record<string, unknown>[];
+  const candidate = candidates[0]!;
+  const evidence = candidate.evidence as readonly Record<string, unknown>[];
+  return {
+    ...base,
+    candidates: [{
+      ...candidate,
+      evidence: [{ ...evidence[0]!, ...(sourceUrl === undefined ? {} : { sourceUrl }) }],
+    }],
+  };
+}
+
+test("view original opens the validated projected source URL without private material", async () => {
+  const snapshot = parseWorkbenchSnapshot(projectionWithEvidenceSource("https://supplier.example.test/quote.pdf"), projection.project.id);
+  if (snapshot === null) throw new Error("Evidence projection should parse");
+  const mounted = await mountProjectView({ state: "ready", snapshot });
+  try {
+    const opener = mounted.container.querySelector(".wb-paper-source");
+    if (!(opener instanceof mounted.dom.window.HTMLButtonElement)) throw new Error("View original button not found");
+    await act(async () => {
+      (opener as unknown as HTMLButtonElement).click();
+    });
+    const dialog = mounted.container.querySelector('.wb-evidence-panel[role="dialog"]');
+    expect(dialog).not.toBeNull();
+    const link = mounted.container.querySelector('.wb-evidence-panel a[href="https://supplier.example.test/quote.pdf"]');
+    if (!(link instanceof mounted.dom.window.HTMLAnchorElement)) throw new Error("Projected source link not found");
+    expect((link as unknown as HTMLAnchorElement).target).toBe("_blank");
+    expect(mounted.container.textContent).toContain("PRIVATE HEADERS REDACTED");
+    expect(mounted.container.textContent).not.toContain("providerId");
+    expect(mounted.container.textContent).not.toContain("rawHeaders");
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("evidence without a projected source URL stays a truthful unavailable state", async () => {
+  const snapshot = parseWorkbenchSnapshot(projectionWithEvidenceSource(undefined), projection.project.id);
+  if (snapshot === null) throw new Error("Evidence projection should parse");
+  const mounted = await mountProjectView({ state: "ready", snapshot });
+  try {
+    const opener = mounted.container.querySelector(".wb-paper-source");
+    if (!(opener instanceof mounted.dom.window.HTMLButtonElement)) throw new Error("View original button not found");
+    await act(async () => {
+      (opener as unknown as HTMLButtonElement).click();
+    });
+    expect(mounted.container.textContent).toContain("No public source URL was included in this projection.");
+    expect(mounted.container.querySelector('.wb-evidence-panel a[href]')).toBeNull();
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+// -- F7 unsafe intake budget -------------------------------------------------
+
+async function mountIntakeView(
+  onIntake: (input: import("../workbench-state").WorkbenchIntakeInput) => Promise<import("../workbench-state").WorkbenchIntakeResult>,
+): Promise<{
+  readonly container: HTMLElement;
+  readonly dom: HappyWindow;
+  readonly cleanup: () => Promise<void>;
+}> {
+  const { WorkbenchIntakeView } = await import("../Workbench");
+  const dom = new HappyWindow({ url: "https://openingos.test/" });
+  const previousWindow = globalThis.window;
+  const previousDocument = globalThis.document;
+  const previousNavigator = globalThis.navigator;
+  const actEnvironment = globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean };
+  const previousActEnvironment = actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+  const browserGlobals = globalThis as unknown as { window: unknown; document: unknown; navigator: unknown };
+  browserGlobals.window = dom as unknown as globalThis.Window;
+  browserGlobals.document = dom.document as unknown as globalThis.Document;
+  browserGlobals.navigator = dom.navigator as unknown as globalThis.Navigator;
+  actEnvironment.IS_REACT_ACT_ENVIRONMENT = true;
+  const happyElement = dom.document.createElement("div");
+  dom.document.body.append(happyElement);
+  const container = happyElement as unknown as HTMLElement;
+  const root = createRoot(container as unknown as globalThis.Element);
+  await act(async () => {
+    root.render(createElement(WorkbenchIntakeView, { onIntake }));
+  });
+  return {
+    container,
+    dom,
+    cleanup: async () => {
+      await act(async () => {
+        root.unmount();
+      });
+      browserGlobals.window = previousWindow;
+      browserGlobals.document = previousDocument;
+      browserGlobals.navigator = previousNavigator;
+      if (previousActEnvironment === undefined) delete actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+      else actEnvironment.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment;
+    },
+  };
+}
+
+async function submitIntakeBudget(
+  container: HTMLElement,
+  dom: HappyWindow,
+  values: { readonly projectName: string; readonly region: string; readonly budget: string },
+): Promise<void> {
+  const set = (name: string, value: string) => {
+    const control = container.querySelector(`[name="${name}"]`);
+    if (!(control instanceof dom.window.HTMLInputElement)) throw new Error(`Control not found: ${name}`);
+    (control as unknown as HTMLInputElement).value = value;
+  };
+  set("projectName", values.projectName);
+  set("region", values.region);
+  set("budget", values.budget);
+  const button = Array.from(container.querySelectorAll("button")).find((candidate) =>
+    candidate.textContent?.includes("Create workspace"),
+  );
+  if (!(button instanceof dom.window.HTMLButtonElement)) throw new Error("Submit button not found");
+  await act(async () => {
+    (button as unknown as HTMLButtonElement).click();
+  });
+}
+
+test("an unsafe intake budget shows an error, retains input, and never reaches intake", async () => {
+  const seen: unknown[] = [];
+  const mounted = await mountIntakeView(async (input) => {
+    seen.push(input);
+    return { ok: true, projectId: "project-unsafe" };
+  });
+  try {
+    await submitIntakeBudget(mounted.container, mounted.dom, {
+      projectName: "Northside café",
+      region: "Amsterdam",
+      budget: "99999999999999999.99",
+    });
+    expect(seen).toHaveLength(0);
+    expect(mounted.container.textContent).toContain("too large to record safely");
+    const budget = mounted.container.querySelector('[name="budget"]') as unknown as HTMLInputElement;
+    expect(budget.value).toBe("99999999999999999.99");
+    const project = mounted.container.querySelector('[name="projectName"]') as unknown as HTMLInputElement;
+    expect(project.value).toBe("Northside café");
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("an over-precision intake budget is rejected before the intake route", async () => {
+  const seen: unknown[] = [];
+  const mounted = await mountIntakeView(async (input) => {
+    seen.push(input);
+    return { ok: true, projectId: "project-precision" };
+  });
+  try {
+    await submitIntakeBudget(mounted.container, mounted.dom, {
+      projectName: "Northside café",
+      region: "Amsterdam",
+      budget: "45000.555",
+    });
+    expect(seen).toHaveLength(0);
+    expect(mounted.container.textContent).toContain("whole euros and cents");
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("a valid intake budget still reaches the intake route in minor units", async () => {
+  const seen: import("../workbench-state").WorkbenchIntakeInput[] = [];
+  const mounted = await mountIntakeView(async (input) => {
+    seen.push(input);
+    return { ok: true, projectId: "project-valid" };
+  });
+  try {
+    await submitIntakeBudget(mounted.container, mounted.dom, {
+      projectName: "Northside café",
+      region: "Amsterdam",
+      budget: "45000.50",
+    });
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({ budgetMinorUnits: 4500050 });
+    expect(mounted.container.textContent).toContain("Workspace created. Loading the persisted project.");
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("rejects malformed or partial controlled sample markers at the browser boundary", async () => {
+  const projectId = projection.project.id;
+  const valid = parseWorkbenchSnapshot({
+    ...projection,
+    project: { ...projection.project, sampleKind: "controlledSample", sampleLabel: "Controlled sample data" },
+  }, projectId);
+  if (valid === null) throw new Error("Controlled sample projection should parse");
+  expect(valid.project.sampleKind).toBe("controlledSample");
+  expect(valid.project.sampleLabel).toBe("Controlled sample data");
+  expect(parseWorkbenchSnapshot({
+    ...projection,
+    project: { ...projection.project, sampleKind: "controlledSample" },
+  }, projectId)).toBeNull();
+  expect(parseWorkbenchSnapshot({
+    ...projection,
+    project: { ...projection.project, sampleLabel: "Controlled sample data" },
+  }, projectId)).toBeNull();
+  expect(parseWorkbenchSnapshot({
+    ...projection,
+    project: { ...projection.project, sampleKind: "liveSample", sampleLabel: "Controlled sample data" },
+  }, projectId)).toBeNull();
+  expect(parseWorkbenchSnapshot({
+    ...projection,
+    project: { ...projection.project, sampleKind: "controlledSample", sampleLabel: "   " },
+  }, projectId)).toBeNull();
+  expect(parseWorkbenchSnapshot({
+    ...projection,
+    project: { ...projection.project, sampleKind: "controlledSample", sampleLabel: 42 },
+  }, projectId)).toBeNull();
+  expect(parseWorkbenchSnapshot(projection, projectId)?.project.sampleKind ?? null).toBeNull();
+});
+
+test("renders the durable sample label for controlled projects and never for normal projects", async () => {
+  const sampleSnapshot = parseWorkbenchSnapshot({
+    ...projection,
+    project: { ...projection.project, sampleKind: "controlledSample", sampleLabel: "Controlled sample data" },
+  }, projection.project.id);
+  if (sampleSnapshot === null) throw new Error("Sample projection should parse");
+  const sampleHtml = renderToStaticMarkup(createElement(WorkbenchView, {
+    loadState: { state: "ready", snapshot: sampleSnapshot },
+  }));
+  expect(sampleHtml).toContain("Controlled sample data");
+  expect(sampleHtml).not.toContain("Live vendor");
+  expect(sampleHtml).not.toContain("genuine quote");
+  expect(sampleHtml).not.toContain("realized savings");
+
+  const normalSnapshot = parseWorkbenchSnapshot(projection, projection.project.id);
+  if (normalSnapshot === null) throw new Error("Normal projection should parse");
+  const normalHtml = renderToStaticMarkup(createElement(WorkbenchView, {
+    loadState: { state: "ready", snapshot: normalSnapshot },
+  }));
+  expect(normalHtml).not.toContain("Controlled sample data");
+});
+
+test("sample creation transitions an empty connected app to the returned project load", async () => {
+  const sampleProjection = {
+    ...projection,
+    project: { ...projection.project, id: "project-sample-1", sampleKind: "controlledSample", sampleLabel: "Controlled sample data" },
+  };
+  const loads: string[] = [];
+  const sampleCalls: { idempotencyKey: string }[] = [];
+  const adapter = {
+    load: async (projectId: string) => {
+      loads.push(projectId);
+      if (projectId === "project-sample-1") return sampleProjection;
+      return null;
+    },
+    subscribe: (_projectId: string, onSnapshot: (snapshot: unknown) => void) => {
+      onSnapshot(sampleProjection);
+      return () => undefined;
+    },
+    act: async () => ({ ok: true }),
+    discoverProject: async () => null,
+    createSample: async (input: { idempotencyKey: string }) => {
+      sampleCalls.push(input);
+      return { ok: true, projectId: "project-sample-1", message: "Sample project created by the server." };
+    },
+  };
+  const dom = new HappyWindow({ url: "https://openingos.test/" });
+  const previousWindow = globalThis.window;
+  const previousDocument = globalThis.document;
+  const previousNavigator = globalThis.navigator;
+  const actEnvironment = globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean };
+  const previousActEnvironment = actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+  const browserGlobals = globalThis as unknown as { window: unknown; document: unknown; navigator: unknown };
+  browserGlobals.window = dom as unknown as globalThis.Window;
+  browserGlobals.document = dom.document as unknown as globalThis.Document;
+  browserGlobals.navigator = dom.navigator as unknown as globalThis.Navigator;
+  actEnvironment.IS_REACT_ACT_ENVIRONMENT = true;
+  const container = dom.document.createElement("div");
+  dom.document.body.append(container);
+  const root = createRoot(container as unknown as globalThis.Element);
+  const findButton = (label: string): HTMLButtonElement => {
+    const button = Array.from(container.querySelectorAll("button")).find((candidate) => candidate.textContent?.includes(label));
+    if (!(button instanceof dom.window.HTMLButtonElement)) throw new Error(`Button not found: ${label}`);
+    return button as unknown as HTMLButtonElement;
+  };
+  try {
+    await act(async () => {
+      root.render(createElement(AdapterAwareApp, {
+        backendStatus: "connected",
+        onRetry: () => undefined,
+        workbenchAdapter: adapter,
+      }));
+    });
+    const deadline = Date.now() + 1500;
+    while (!container.textContent?.includes("NO AUTHORIZED PROJECT") && Date.now() < deadline) {
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      });
+    }
+    expect(container.textContent).toContain("NO AUTHORIZED PROJECT");
+    expect(sampleCalls).toHaveLength(0);
+    await act(async () => {
+      findButton("Try the Northside").click();
+    });
+    const loadedDeadline = Date.now() + 1500;
+    while (!loads.includes("project-sample-1") && Date.now() < loadedDeadline) {
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      });
+    }
+    expect(sampleCalls).toHaveLength(1);
+    expect(sampleCalls[0]?.idempotencyKey.trim().length).toBeGreaterThan(0);
+    expect(loads).toContain("project-sample-1");
+    const viewDeadline = Date.now() + 1500;
+    while (!container.textContent?.includes("Controlled sample data") && Date.now() < viewDeadline) {
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      });
+    }
+    expect(container.textContent).toContain("Controlled sample data");
+    expect(container.textContent).not.toContain("Live vendor");
+  } finally {
+    await act(async () => {
+      root.unmount();
+    });
+    browserGlobals.window = previousWindow;
+    browserGlobals.document = previousDocument;
+    browserGlobals.navigator = previousNavigator;
+    if (previousActEnvironment === undefined) delete actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+    else actEnvironment.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment;
+  }
+});
+
+test("stale sample success never overwrites a newer project context", async () => {
+  const newerProjection = {
+    ...projection,
+    project: { ...projection.project, id: "project-newer-1", name: "Newer authorized project" },
+  };
+  const loads: string[] = [];
+  const sampleCalls: { idempotencyKey: string }[] = [];
+  let resolveSample: ((value: { ok: boolean; projectId?: string; message?: string }) => void) | undefined;
+  const sampleGate = new Promise<{ ok: boolean; projectId?: string; message?: string }>((resolve) => {
+    resolveSample = resolve;
+  });
+  const adapter = {
+    load: async (projectId: string) => {
+      loads.push(projectId);
+      if (projectId === "project-newer-1") return newerProjection;
+      return null;
+    },
+    subscribe: (_projectId: string, _onSnapshot: (snapshot: unknown) => void, _onError: (error: unknown) => void) => () => undefined,
+    act: async () => ({ ok: true }),
+    discoverProject: async () => null,
+    createSample: async (input: { idempotencyKey: string }) => {
+      sampleCalls.push(input);
+      return sampleGate;
+    },
+  };
+  const dom = new HappyWindow({ url: "https://openingos.test/" });
+  const previousWindow = globalThis.window;
+  const previousDocument = globalThis.document;
+  const previousNavigator = globalThis.navigator;
+  const actEnvironment = globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean };
+  const previousActEnvironment = actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+  const browserGlobals = globalThis as unknown as { window: unknown; document: unknown; navigator: unknown };
+  browserGlobals.window = dom as unknown as globalThis.Window;
+  browserGlobals.document = dom.document as unknown as globalThis.Document;
+  browserGlobals.navigator = dom.navigator as unknown as globalThis.Navigator;
+  actEnvironment.IS_REACT_ACT_ENVIRONMENT = true;
+  const container = dom.document.createElement("div");
+  dom.document.body.append(container);
+  const root = createRoot(container as unknown as globalThis.Element);
+  const findButton = (label: string): HTMLButtonElement => {
+    const button = Array.from(container.querySelectorAll("button")).find((candidate) => candidate.textContent?.includes(label));
+    if (!(button instanceof dom.window.HTMLButtonElement)) throw new Error(`Button not found: ${label}`);
+    return button as unknown as HTMLButtonElement;
+  };
+  try {
+    await act(async () => {
+      root.render(createElement(AdapterAwareApp, {
+        backendStatus: "connected",
+        onRetry: () => undefined,
+        workbenchAdapter: adapter,
+      }));
+    });
+    const emptyDeadline = Date.now() + 1500;
+    while (!container.textContent?.includes("NO AUTHORIZED PROJECT") && Date.now() < emptyDeadline) {
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      });
+    }
+    expect(container.textContent).toContain("NO AUTHORIZED PROJECT");
+    await act(async () => {
+      findButton("Try the Northside").click();
+    });
+    const startedDeadline = Date.now() + 1500;
+    while (sampleCalls.length === 0 && Date.now() < startedDeadline) {
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      });
+    }
+    expect(sampleCalls).toHaveLength(1);
+    await act(async () => {
+      root.render(createElement(AdapterAwareApp, {
+        backendStatus: "connected",
+        onRetry: () => undefined,
+        projectId: "project-newer-1",
+        workbenchAdapter: adapter,
+      }));
+    });
+    const newerDeadline = Date.now() + 1500;
+    while (!container.textContent?.includes("Newer authorized project") && Date.now() < newerDeadline) {
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      });
+    }
+    expect(container.textContent).toContain("Newer authorized project");
+    await act(async () => {
+      resolveSample?.({ ok: true, projectId: "project-sample-stale" });
+      await sampleGate;
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+    expect(sampleCalls).toHaveLength(1);
+    expect(loads).not.toContain("project-sample-stale");
+    expect(container.textContent).toContain("Newer authorized project");
+    expect(container.textContent).not.toContain("Controlled sample data");
+    const alert = container.querySelector('[role="alert"]');
+    expect(alert?.textContent ?? "").toContain("may have been created");
+  } finally {
+    await act(async () => {
+      root.unmount();
+    });
+    browserGlobals.window = previousWindow;
+    browserGlobals.document = previousDocument;
+    browserGlobals.navigator = previousNavigator;
+    if (previousActEnvironment === undefined) delete actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+    else actEnvironment.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment;
   }
 });

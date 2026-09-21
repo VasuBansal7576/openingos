@@ -12,6 +12,8 @@ import {
   type WorkbenchIntakeInput,
   type WorkbenchIntakeResult,
   type WorkbenchLoadState,
+  type WorkbenchSampleInput,
+  type WorkbenchSampleResult,
   type WorkbenchServerAdapter,
   type WorkbenchSnapshot,
 } from "./workbench-state";
@@ -137,6 +139,10 @@ export function AdapterAwareApp({
   const previousContext = useRef<{ readonly projectId: string | undefined; readonly adapter: RuntimeWorkbenchAdapter | undefined }>({ projectId: undefined, adapter: undefined });
   const backendStatusRef = useRef(backendStatus);
   backendStatusRef.current = backendStatus;
+  const adapterRef = useRef(workbenchAdapter);
+  adapterRef.current = workbenchAdapter;
+  const workbenchRef = useRef(workbench);
+  workbenchRef.current = workbench;
   // A request context is tied to one project, adapter and connected client
   // generation. Reconnects, revocations and adapter replacement invalidate the
   // context before an old load can apply to a fresh snapshot for the same ID.
@@ -339,12 +345,44 @@ export function AdapterAwareApp({
     }
   };
 
+  const handleSample = async (input: WorkbenchSampleInput): Promise<WorkbenchSampleResult> => {
+    if (backendStatusRef.current !== "connected") {
+      return { ok: false, message: "Sample creation waits for a live backend connection. Nothing was sent." };
+    }
+    if (workbenchRef.current?.state !== "empty") {
+      return { ok: false, message: "Sample creation is available only with no authorized project. Nothing was sent." };
+    }
+    const callingAdapter = adapterRef.current;
+    if (callingAdapter?.createSample === undefined) {
+      return { ok: false, message: "No server sample route is configured. Nothing was sent." };
+    }
+    try {
+      const result = await callingAdapter.createSample(input);
+      if (result.ok && result.projectId !== undefined) {
+        if (backendStatusRef.current !== "connected" || adapterRef.current !== callingAdapter || workbenchRef.current?.state !== "empty") {
+          const message = "The sample project may have been created but could not be loaded in this session. Reconnect or discovery can find authorized projects.";
+          setActionError(message);
+          return { ok: false, message };
+        }
+        setResolvedProjectId(result.projectId);
+      } else if (!result.ok) {
+        setActionError(result.message ?? "The server did not create this sample project.");
+      }
+      return result;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "The server did not create this sample project.";
+      setActionError(message);
+      return { ok: false, message };
+    }
+  };
+
   const connectedLoadMore = workbench?.state === "ready" && backendStatus === "connected" ? handleLoadMore : undefined;
   const connectedIntake = workbench?.state === "empty" && backendStatus === "connected" ? handleIntake : undefined;
+  const connectedSample = workbench?.state === "empty" && backendStatus === "connected" ? handleSample : undefined;
   const appWorkbench = backendStatus === "reconnecting" && workbench?.state === "ready"
     ? { state: "reconnecting" as const, lastKnown: workbench.snapshot }
     : workbench;
-  return <><App backendStatus={backendStatus} onRetry={onRetry} workbench={appWorkbench} onAction={handleAction} onLoadMore={connectedLoadMore} onIntake={connectedIntake} />{actionError ? <span className="wb-visually-hidden" role="alert">{actionError}</span> : null}</>;
+  return <><App backendStatus={backendStatus} onRetry={onRetry} workbench={appWorkbench} onAction={handleAction} onLoadMore={connectedLoadMore} onIntake={connectedIntake} onSample={connectedSample} />{actionError ? <span className="wb-visually-hidden" role="alert">{actionError}</span> : null}</>;
 }
 
 function normaliseProjectId(value: string | undefined): string | undefined {

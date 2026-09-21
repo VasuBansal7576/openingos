@@ -13,10 +13,14 @@ import { checkProjectAccess, denialValidator, identityOf, requireCapability, typ
 import { f1Query } from "../server.js";
 import { provenanceLabel, type ExecutionMode } from "../shared/provenance.js";
 import { roleSatisfies } from "../shared/scope.js";
-import { storedQuoteCost } from "../shared/quoteSemantics.js";
+import {
+  compareStoredQuotes,
+  storedQuoteCost,
+  type StoredComparableQuote,
+  type StoredComparisonScope,
+} from "../shared/quoteSemantics.js";
 import {
   type StoredChargeState,
-  type StoredComparisonScope,
   type StoredQuoteCharge,
   type StoredQuoteLine,
   type StoredTaxBasis,
@@ -43,6 +47,8 @@ export const MAX_ACTIVITY_PAGE = 24;
 export const MAX_EQUIPMENT_ASSETS = 12;
 export const MAX_ASSET_DOCUMENTS = 8;
 export const MAX_ASSET_CASES = 8;
+/** Worst-case unordered pairs among the bounded candidate page. */
+export const MAX_COMPARISON_PAIRS = (MAX_CANDIDATES * (MAX_CANDIDATES - 1)) / 2;
 
 const roleValidator = v.union(
   v.literal("owner"),
@@ -87,6 +93,10 @@ const projectValidator = v.object({
   currency: v.optional(v.string()),
   budgetMinorUnits: v.optional(v.number()),
   needByAt: v.optional(v.number()),
+  // E15 controlled sample marker. Absent on every non-sample project;
+  // present only on projects seeded by the controlled sample boundary.
+  sampleKind: v.optional(v.string()),
+  sampleLabel: v.optional(v.string()),
   createdAt: v.number(),
 });
 
@@ -178,6 +188,49 @@ const quoteTaxBasisValidator = v.union(
   v.object({ kind: v.literal("unknown"), reason: v.string() }),
 );
 
+/**
+ * F2 comparison contract: the complete recorded comparison scope leaves
+ * the backend unpruned so the UI can prove what a verdict was computed
+ * over instead of inferring a basis from line rows.
+ */
+const quoteComparisonScopeProjectionValidator = v.object({
+  requirementId: v.string(),
+  scopeId: v.string(),
+  items: v.array(
+    v.object({
+      itemId: v.string(),
+      lineId: v.string(),
+      unit: v.string(),
+      requiredQuantity: v.string(),
+    }),
+  ),
+});
+
+/**
+ * F2 authoritative pairwise verdict. Every machine status carries a
+ * truthful reason; `differenceMinorUnits` and `cheaper` exist only for
+ * `comparable` verdicts, and the estimated delta range only for
+ * `estimated` verdicts. The UI must never rank or subtract offers whose
+ * pair verdict is absent or not `comparable`.
+ */
+const offerComparisonValidator = v.object({
+  againstCandidateId: v.id("candidates"),
+  againstQuoteId: v.union(v.id("quotes"), v.null()),
+  status: v.union(
+    v.literal("comparable"),
+    v.literal("estimated"),
+    v.literal("incompatible"),
+    v.literal("incomplete"),
+  ),
+  reason: v.string(),
+  differenceMinorUnits: v.union(v.number(), v.null()),
+  cheaper: v.union(v.literal("self"), v.literal("other"), v.literal("equal"), v.null()),
+  estimatedDeltaMinorUnits: v.union(
+    v.object({ minimum: v.number(), maximum: v.number() }),
+    v.null(),
+  ),
+});
+
 const quoteValidator = v.object({
   id: v.id("quotes"),
   version: v.string(),
@@ -191,6 +244,8 @@ const quoteValidator = v.object({
   superseded: v.literal(false),
   totalMinorUnits: v.union(v.number(), v.null()),
   comparableTotalMinorUnits: v.union(v.number(), v.null()),
+  total: v.union(moneyValidator, v.null()),
+  comparisonScope: v.union(quoteComparisonScopeProjectionValidator, v.null()),
 });
 
 const vendorValidator = v.object({
@@ -210,6 +265,7 @@ const candidateValidator = v.object({
   conversationState: v.string(),
   vendor: v.optional(vendorValidator),
   latestValidQuote: v.union(quoteValidator, v.null()),
+  comparisons: v.array(offerComparisonValidator),
   evidence: v.array(redactedEvidenceValidator),
   provenance: provenanceValidator,
 });
@@ -431,6 +487,8 @@ type ProjectRow = {
   readonly currency?: string;
   readonly budgetMinorUnits?: number;
   readonly needByAt?: number;
+  readonly sampleKind?: string;
+  readonly sampleLabel?: string;
   readonly createdAt: number;
 };
 
@@ -475,11 +533,42 @@ type QuoteProjection = {
   readonly superseded: false;
   readonly totalMinorUnits: number | null;
   readonly comparableTotalMinorUnits: number | null;
+  /**
+   * F2: the exact total as native money. The currency is always the
+   * quote's own currency — no conversion is ever applied — and the minor
+   * units are the exact stored integer.
+   */
+  readonly total: { readonly currency: string; readonly minorUnits: number } | null;
+  /** F2: the complete recorded comparison scope, or null when none was recorded. */
+  readonly comparisonScope: {
+    readonly requirementId: string;
+    readonly scopeId: string;
+    readonly items: Array<{ readonly itemId: string; readonly lineId: string; readonly unit: string; readonly requiredQuantity: string }>;
+  } | null;
 };
 
 type QuoteSelection = {
   readonly view: QuoteProjection;
   readonly evidenceRefs: readonly { readonly sourceId: string; readonly version: string }[];
+  /** F2: the exact stored parts the verdicts are computed from. */
+  readonly stored: StoredComparableQuote;
+};
+
+type OfferComparison = {
+  readonly againstCandidateId: Id<"candidates">;
+  readonly againstQuoteId: Id<"quotes"> | null;
+  readonly status: "comparable" | "estimated" | "incompatible" | "incomplete";
+  readonly reason: string;
+  readonly differenceMinorUnits: number | null;
+  readonly cheaper: "self" | "other" | "equal" | null;
+  readonly estimatedDeltaMinorUnits: { readonly minimum: number; readonly maximum: number } | null;
+};
+
+type ComparableOffer = {
+  readonly candidateId: Id<"candidates">;
+  readonly quoteId: Id<"quotes">;
+  readonly requirementId: Id<"requirements">;
+  readonly stored: StoredComparableQuote;
 };
 
 function denialForProject(): {
@@ -663,8 +752,25 @@ function renderQuote(row: {
       superseded: false,
       totalMinorUnits: cost.totalMinorUnits,
       comparableTotalMinorUnits: cost.comparableTotalMinorUnits,
+      total: cost.totalMinorUnits === null ? null : { currency: row.currency, minorUnits: cost.totalMinorUnits },
+      comparisonScope: row.comparisonScope === undefined
+        ? null
+        : {
+          requirementId: row.comparisonScope.requirementId,
+          scopeId: row.comparisonScope.scopeId,
+          items: row.comparisonScope.items.map((item) => ({ ...item })),
+        },
     },
     evidenceRefs: row.evidenceRefs.map((ref) => ({ sourceId: ref.sourceId, version: ref.version })),
+    stored: {
+      version: row.version,
+      currency: row.currency,
+      lines: [...row.lines],
+      charges: [...row.charges],
+      taxBasis: row.taxBasis,
+      ...(row.comparisonScope === undefined ? {} : { comparisonScope: row.comparisonScope }),
+      evidenceRefs: [...row.evidenceRefs],
+    },
   };
 }
 
@@ -774,6 +880,11 @@ async function readProjectSummary(
     ...(project.currency === undefined ? {} : { currency: project.currency }),
     ...(project.budgetMinorUnits === undefined ? {} : { budgetMinorUnits: project.budgetMinorUnits }),
     ...(project.needByAt === undefined ? {} : { needByAt: project.needByAt }),
+    // E15: the durable controlled-sample marker travels with the project
+    // summary on every surface that uses it, so sample data is visibly
+    // identified and never leaks onto non-sample projects.
+    ...(project.sampleKind === undefined ? {} : { sampleKind: project.sampleKind }),
+    ...(project.sampleLabel === undefined ? {} : { sampleLabel: project.sampleLabel }),
     createdAt: project.createdAt,
   };
 }
@@ -842,6 +953,83 @@ async function latestQuotesForCandidates(
     result.set(key, current.length === 1 ? current[0] ?? null : null);
   }
   return result;
+}
+
+/**
+ * F2 authoritative pairwise comparison verdicts (P-03 / ADR-0003).
+ *
+ * For every unordered pair of current candidate quotes inside one
+ * requirement, the accepted shared comparison (compareStoredQuotes)
+ * produces the verdict before any UI can show rank or delta: comparable
+ * pairs carry the exact minor-unit difference and the cheaper side,
+ * while mixed currencies, incompatible tax bases, scope mismatches, and
+ * incomplete cost summaries carry a stable machine status plus the
+ * truthful reason. No currency conversion, invented rate, or browser
+ * arithmetic is involved. Offers without a current quote receive no
+ * verdict: there is nothing authoritative to compare. Pairs span
+ * different requirements are never compared — competing offers share a
+ * requirement and a comparison scope.
+ */
+function pairwiseOfferComparisons(
+  offers: readonly ComparableOffer[],
+): Map<Id<"candidates">, OfferComparison[]> {
+  const byCandidate = new Map<Id<"candidates">, OfferComparison[]>();
+  const attach = (candidateId: Id<"candidates">, comparison: OfferComparison): void => {
+    const list = byCandidate.get(candidateId);
+    if (list === undefined) byCandidate.set(candidateId, [comparison]);
+    else list.push(comparison);
+  };
+  let emitted = 0;
+  for (let left = 0; left < offers.length && emitted < MAX_COMPARISON_PAIRS; left += 1) {
+    for (let right = left + 1; right < offers.length && emitted < MAX_COMPARISON_PAIRS; right += 1) {
+      const leftOffer = offers[left];
+      const rightOffer = offers[right];
+      if (leftOffer === undefined || rightOffer === undefined) continue;
+      if (leftOffer.requirementId !== rightOffer.requirementId) continue;
+      const verdict = compareStoredQuotes(leftOffer.stored, rightOffer.stored);
+      const status = verdict.status === "complete" ? "comparable" as const : verdict.status;
+      const differenceMinorUnits = status === "comparable" ? verdict.differenceMinorUnits : null;
+      const cheaperLeft = status === "comparable"
+        ? verdict.cheaper === "left" ? "self" as const
+          : verdict.cheaper === "right" ? "other" as const
+            : "equal" as const
+        : null;
+      const cheaperRight = status === "comparable"
+        ? verdict.cheaper === "left" ? "other" as const
+          : verdict.cheaper === "right" ? "self" as const
+            : "equal" as const
+        : null;
+      const estimatedLeft = status === "estimated" && verdict.estimatedDeltaRange !== undefined
+        ? {
+          minimum: verdict.estimatedDeltaRange.minimum,
+          maximum: verdict.estimatedDeltaRange.maximum,
+        }
+        : null;
+      const estimatedRight = estimatedLeft === null
+        ? null
+        : { minimum: -estimatedLeft.maximum, maximum: -estimatedLeft.minimum };
+      attach(leftOffer.candidateId, {
+        againstCandidateId: rightOffer.candidateId,
+        againstQuoteId: rightOffer.quoteId,
+        status,
+        reason: verdict.reason,
+        differenceMinorUnits,
+        cheaper: cheaperLeft,
+        estimatedDeltaMinorUnits: estimatedLeft,
+      });
+      attach(rightOffer.candidateId, {
+        againstCandidateId: leftOffer.candidateId,
+        againstQuoteId: leftOffer.quoteId,
+        status,
+        reason: verdict.reason,
+        differenceMinorUnits,
+        cheaper: cheaperRight,
+        estimatedDeltaMinorUnits: estimatedRight,
+      });
+      emitted += 1;
+    }
+  }
+  return byCandidate;
 }
 
 function mapJobStatus(
@@ -1390,6 +1578,7 @@ export const getProjection = f1Query({
       .order("desc")
       .take(MAX_EVIDENCE_SNAPSHOTS);
     const provenanceEntries: ProvenanceView[] = [];
+    const comparableOffers: ComparableOffer[] = [];
     for (const candidate of candidateRows) {
       const requirementRow = await ctx.db.get(candidate.requirementId);
       if (
@@ -1419,6 +1608,14 @@ export const getProjection = f1Query({
         ? null
         : latestQuotes.get(candidateQuoteKey(candidate.requirementId, candidate.vendorId)) ?? null;
       const quote = quoteSelection?.view ?? null;
+      if (quoteSelection !== null && quote !== null) {
+        comparableOffers.push({
+          candidateId: candidate._id,
+          quoteId: quote.id,
+          requirementId: candidate.requirementId,
+          stored: quoteSelection.stored,
+        });
+      }
       const quoteEvidence = quoteSelection === null
         ? []
         : quoteSelection.evidenceRefs.flatMap((ref) => {
@@ -1591,13 +1788,17 @@ export const getProjection = f1Query({
       substituteBound,
     );
     const summary = await readProjectSummary(ctx, project);
+    const comparisonsByCandidate = pairwiseOfferComparisons(comparableOffers);
     return {
       ok: true as const,
       project: summary,
       access: accessView(access.value),
       requirements,
       requirementsTruncated: requirementsPage.length > Math.min(pageSize, MAX_REQUIREMENTS),
-      candidates,
+      candidates: candidates.map((candidate) => ({
+        ...candidate,
+        comparisons: comparisonsByCandidate.get(candidate.id) ?? [],
+      })),
       candidatesTruncated: candidatesPage.length > Math.min(pageSize, MAX_CANDIDATES),
       jobs,
       jobsTruncated: jobsPage.length > Math.min(pageSize, MAX_JOBS),

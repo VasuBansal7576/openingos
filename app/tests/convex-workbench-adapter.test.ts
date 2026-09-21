@@ -3,6 +3,7 @@ import type { Watch } from "convex/react";
 import { getFunctionName, type FunctionReference } from "convex/server";
 import {
   createConvexWorkbenchAdapter,
+  createSampleIdempotencyKey,
   researchStartIdempotencyKey,
   type ConvexWorkbenchClient,
 } from "../convex-workbench-adapter";
@@ -1120,4 +1121,93 @@ test("parses stored impacts and substitutes without inventing outcomes", async (
   expect(snapshot.truncation.substitutes).toBe(false);
   expect(parseWorkbenchSnapshot({ ...payload, impacts: [{ ...impactFixture(), reason: "" }] }, "project-1")).toBeNull();
   expect(parseWorkbenchSnapshot({ ...payload, substitutes: "pending" }, "project-1")).toBeNull();
+});
+
+test("routes the exact sample mutation with the bounded opaque key", async () => {
+  const calls: MutationCall[] = [];
+  const controls = controlledWatch(() => projection());
+  const adapter = createConvexWorkbenchAdapter(actionClient(
+    projection(),
+    controls.watch,
+    calls,
+    { ok: true, projectId: "project-sample-1", organizationId: "organization-sample-1", deduplicated: false },
+  ));
+  const result = await adapter.createSample({ idempotencyKey: "sample-key-1" });
+  expect(result).toEqual({ ok: true, projectId: "project-sample-1", message: "Sample project created by the server." });
+  expect(calls).toHaveLength(1);
+  expect(getFunctionName(calls[0]?.reference as FunctionReference<"mutation">)).toBe("domain/sampleProject:createSampleGuestProject");
+  expect(calls[0]?.args).toEqual({ idempotencyKey: "sample-key-1" });
+});
+
+test("rejects empty and overlong sample keys locally without mutation", async () => {
+  const calls: MutationCall[] = [];
+  const controls = controlledWatch(() => projection());
+  const adapter = createConvexWorkbenchAdapter(actionClient(projection(), controls.watch, calls, { ok: true }));
+  await expect(adapter.createSample({ idempotencyKey: "   " })).resolves.toMatchObject({ ok: false });
+  await expect(adapter.createSample({ idempotencyKey: `k${"x".repeat(128)}` })).resolves.toMatchObject({ ok: false });
+  expect(calls).toHaveLength(0);
+});
+
+test("surfaces sample denial text and malformed project ids truthfully", async () => {
+  const deniedCalls: MutationCall[] = [];
+  const deniedControls = controlledWatch(() => projection());
+  const denied = createConvexWorkbenchAdapter(actionClient(
+    projection(),
+    deniedControls.watch,
+    deniedCalls,
+    { ok: false, code: "invalid-payload", message: "controlled sample denial" },
+  ));
+  await expect(denied.createSample({ idempotencyKey: "sample-denied" })).resolves.toEqual({
+    ok: false,
+    message: "controlled sample denial",
+  });
+  expect(deniedCalls).toHaveLength(1);
+
+  const malformedCalls: MutationCall[] = [];
+  const malformedControls = controlledWatch(() => projection());
+  const malformed = createConvexWorkbenchAdapter(actionClient(
+    projection(),
+    malformedControls.watch,
+    malformedCalls,
+    { ok: true },
+  ));
+  await expect(malformed.createSample({ idempotencyKey: "sample-malformed" })).resolves.toMatchObject({ ok: false });
+  expect(malformedCalls).toHaveLength(1);
+});
+
+test("fences concurrent sample submissions on the same opaque key", async () => {
+  const calls: MutationCall[] = [];
+  const controls = controlledWatch(() => projection());
+  let resolveMutation: ((value: unknown) => void) | undefined;
+  const pendingMutation = new Promise<unknown>((resolve) => { resolveMutation = resolve; });
+  const adapter = createConvexWorkbenchAdapter({
+    query: async () => projection(),
+    watchQuery: () => controls.watch,
+    mutation: async (reference: unknown, args: unknown) => {
+      calls.push({ reference, args });
+      return pendingMutation;
+    },
+  } as unknown as ConvexWorkbenchClient);
+  const first = adapter.createSample({ idempotencyKey: "sample-flight" });
+  const second = await adapter.createSample({ idempotencyKey: "sample-flight" });
+  expect(second).toEqual({
+    ok: false,
+    message: "This action is already in progress. Wait for the current server response.",
+  });
+  expect(calls).toHaveLength(1);
+  resolveMutation?.({ ok: true, projectId: "project-sample-flight", organizationId: "organization-1", deduplicated: false });
+  await expect(first).resolves.toMatchObject({ ok: true, projectId: "project-sample-flight" });
+  await expect(adapter.createSample({ idempotencyKey: "sample-flight" })).resolves.toMatchObject({ ok: true });
+  expect(calls).toHaveLength(2);
+});
+
+test("exposes an opaque browser safe sample key without client identifiers", async () => {
+  const first = createSampleIdempotencyKey();
+  const second = createSampleIdempotencyKey();
+  expect(first.trim().length).toBeGreaterThan(0);
+  expect(first).not.toContain("organization");
+  expect(first).not.toContain("project-1");
+  expect(first).not.toBe(second);
+  expect(first).toMatch(/^[A-Za-z0-9:_-]{8,160}$/);
+  expect(second).toMatch(/^[A-Za-z0-9:_-]{8,160}$/);
 });
