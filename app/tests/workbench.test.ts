@@ -37,6 +37,8 @@ const projection = {
       canCompare: true,
       canCommunicate: true,
       canClarify: true,
+      canApprove: true,
+      canOpenServiceCase: true,
     },
   },
   requirements: [{
@@ -91,14 +93,14 @@ const projection = {
     provenance: { mode: "recorded", label: "Recorded owner exchange", ownerAuthoredTerms: true },
   }],
   jobs: [
-    { id: "job-queued", kind: "research", status: "queued", createdAt: Date.UTC(2026, 8, 20), updatedAt: Date.UTC(2026, 8, 20), grantVersion: 1, attempts: [] },
-    { id: "job-sent", kind: "communication", status: "sent", createdAt: Date.UTC(2026, 8, 20), updatedAt: Date.UTC(2026, 8, 20), grantVersion: 1, attempts: [{ state: "observedSuccess", createdAt: Date.UTC(2026, 8, 20) }] },
-    { id: "job-delivered", kind: "communication", status: "delivered", createdAt: Date.UTC(2026, 8, 20), updatedAt: Date.UTC(2026, 8, 20), grantVersion: 1, attempts: [{ state: "observedSuccess", createdAt: Date.UTC(2026, 8, 20), observedAt: Date.UTC(2026, 8, 20) }] },
-    { id: "job-unknown", kind: "communication", status: "unknown", createdAt: Date.UTC(2026, 8, 20), updatedAt: Date.UTC(2026, 8, 20), grantVersion: 1, attempts: [{ state: "outcomeUnknown", createdAt: Date.UTC(2026, 8, 20) }] },
-    { id: "job-partial", kind: "recovery", status: "partial", createdAt: Date.UTC(2026, 8, 20), updatedAt: Date.UTC(2026, 8, 20), grantVersion: 1, attempts: [{ state: "observedSuccess", createdAt: Date.UTC(2026, 8, 20) }] },
-    { id: "job-paused", kind: "recovery", status: "paused", createdAt: Date.UTC(2026, 8, 20), updatedAt: Date.UTC(2026, 8, 20), grantVersion: 1, attempts: [] },
+    { id: "job-queued", kind: "research", state: "queued", status: "queued", cancellable: true, createdAt: Date.UTC(2026, 8, 20), updatedAt: Date.UTC(2026, 8, 20), grantVersion: 1, attempts: [] },
+    { id: "job-sent", kind: "communication", state: "completed", status: "sent", cancellable: false, createdAt: Date.UTC(2026, 8, 20), updatedAt: Date.UTC(2026, 8, 20), grantVersion: 1, attempts: [{ state: "observedSuccess", createdAt: Date.UTC(2026, 8, 20) }] },
+    { id: "job-delivered", kind: "communication", state: "completed", status: "delivered", cancellable: false, createdAt: Date.UTC(2026, 8, 20), updatedAt: Date.UTC(2026, 8, 20), grantVersion: 1, attempts: [{ state: "observedSuccess", createdAt: Date.UTC(2026, 8, 20), observedAt: Date.UTC(2026, 8, 20) }] },
+    { id: "job-unknown", kind: "communication", state: "failed", status: "unknown", cancellable: false, createdAt: Date.UTC(2026, 8, 20), updatedAt: Date.UTC(2026, 8, 20), grantVersion: 1, attempts: [{ state: "outcomeUnknown", createdAt: Date.UTC(2026, 8, 20) }] },
+    { id: "job-partial", kind: "recovery", state: "partial", status: "partial", cancellable: true, createdAt: Date.UTC(2026, 8, 20), updatedAt: Date.UTC(2026, 8, 20), grantVersion: 1, attempts: [{ state: "observedSuccess", createdAt: Date.UTC(2026, 8, 20) }] },
+    { id: "job-paused", kind: "recovery", state: "pausedBudget", status: "paused", cancellable: true, createdAt: Date.UTC(2026, 8, 20), updatedAt: Date.UTC(2026, 8, 20), grantVersion: 1, attempts: [] },
   ],
-  decisions: [{ id: "approval-w1-1", kind: "approval", state: "requested", quoteId: "quote-w1-1", createdAt: Date.UTC(2026, 8, 20) }],
+  decisions: [{ id: "approval-w1-1", kind: "approval", state: "requested", scope: "selection:quote-w1-1", snapshotHash: "snapshot-hash-w1-1", quoteId: "quote-w1-1", createdAt: Date.UTC(2026, 8, 20) }],
   activity: { page: [{ id: "event-w1-1", kind: "quoteRecorded", createdAt: Date.UTC(2026, 8, 20) }], continueCursor: null, isDone: true },
   equipment: { assets: [], assetsTruncated: false },
   requirementsTruncated: false,
@@ -113,7 +115,10 @@ test("accepts the exact W1 projection without inventing aggregates or authority"
   expect(snapshot?.project.id).toBe(projection.project.id);
   expect(snapshot?.offers[0]?.quote?.comparableTotalMinorUnits).toBeNull();
   expect(snapshot?.committedMinorUnits).toBeNull();
-  expect(snapshot?.access.capabilities.canApprove).toBeNull();
+  expect(snapshot?.access.capabilities.canApprove).toBe(true);
+  expect(snapshot?.access.capabilities.canOpenServiceCase).toBe(true);
+  expect(snapshot?.decisions[0]?.scope).toBe("selection:quote-w1-1");
+  expect(snapshot?.decisions[0]?.snapshotHash).toBe("snapshot-hash-w1-1");
   expect(snapshot?.jobs.map((job) => job.delivery)).toEqual(["queued", "sent", "delivered", "unknown", "partial", "paused"]);
   expect(snapshot?.activity.items[0]?.summary).toBeNull();
 });
@@ -149,6 +154,21 @@ test("does not claim project-wide readiness from a truncated requirement page", 
   expect(html).not.toContain("P0 blockers stay visible");
 });
 
+test("does not display an equal-count readiness percentage without an authoritative result", () => {
+  const snapshot = parseWorkbenchSnapshot({
+    ...projection,
+    requirements: [{ ...projection.requirements[0]!, fulfillment: "commissioned", state: "fulfilled" }],
+  }, projection.project.id);
+  if (snapshot === null) throw new Error("Completed W1 projection should parse");
+
+  const html = renderToStaticMarkup(createElement(WorkbenchView, {
+    loadState: { state: "ready", snapshot },
+  }));
+  expect(html).toContain("Not assessed");
+  expect(html).toContain("authoritative result not supplied");
+  expect(html).not.toContain("100%");
+});
+
 test("keeps a connected app honest when no projection is available", () => {
   const html = renderToStaticMarkup(createElement(App, {
     backendStatus: "connected",
@@ -163,12 +183,19 @@ test("rejects malformed, cross-project, and private W1 projection payloads", () 
   expect(parseWorkbenchSnapshot(projection, "different-project")).toBeNull();
   expect(parseWorkbenchSnapshot({ ...projection, project: { ...projection.project, ownerEmail: "private@example.test" } }, projection.project.id)).toBeNull();
   expect(parseWorkbenchSnapshot({ ...projection, candidates: [{ ...projection.candidates[0], latestValidQuote: { ...projection.candidates[0]!.latestValidQuote!, charges: [{ ...projection.candidates[0]!.latestValidQuote!.charges[0], state: { kind: "known", amount: null } }] } }] }, projection.project.id)).toBeNull();
+  expect(parseWorkbenchSnapshot({ ...projection, jobs: [{ ...projection.jobs[0]!, state: "not-a-server-lifecycle" }] }, projection.project.id)).toBeNull();
   expect(parseWorkbenchSnapshot({ ...projection, activity: { ...projection.activity, page: [{ id: "event-w1-1", kind: "quoteRecorded", createdAt: "not-a-time" }] } }, projection.project.id)).toBeNull();
 });
 
 test("rejects the obsolete top-level access fixture", () => {
   const { access: _access, ...legacyProjection } = projection;
   expect(parseWorkbenchSnapshot({ ...legacyProjection, effectiveRole: "approver", capabilities: projection.access.capabilities }, projection.project.id)).toBeNull();
+});
+
+test("fails closed when server authority flags are absent or malformed", () => {
+  const { canApprove: _canApprove, ...withoutApproval } = projection.access.capabilities;
+  expect(parseWorkbenchSnapshot({ ...projection, access: { ...projection.access, capabilities: withoutApproval } }, projection.project.id)).toBeNull();
+  expect(parseWorkbenchSnapshot({ ...projection, access: { ...projection.access, capabilities: { ...projection.access.capabilities, canOpenServiceCase: "yes" } } }, projection.project.id)).toBeNull();
 });
 
 test("formats unknown money without turning missing charges into zero", () => {
@@ -206,7 +233,7 @@ function projectionWithEquipment(equipment: unknown): Record<string, unknown> {
 
 async function mountEquipmentTab(
   loadState: Parameters<typeof WorkbenchView>[0]["loadState"],
-  onAction: (action: WorkbenchAction) => WorkbenchActionResult,
+  onAction: (action: WorkbenchAction) => WorkbenchActionResult | Promise<WorkbenchActionResult>,
 ): Promise<{
   readonly container: HTMLElement;
   readonly findButton: (label: string) => HTMLButtonElement;
@@ -800,7 +827,7 @@ test("never infers an installed asset from a fulfilled requirement", async () =>
   }
 });
 
-test("renders real assets with documents, cases, truncation, and a disabled service action", async () => {
+test("renders real assets with documents, cases, truncation, and opens the service dialog", async () => {
   const snapshot = parseWorkbenchSnapshot(projectionWithEquipment({
     assets: [assetFixture({ documentsTruncated: true, serviceCasesTruncated: true })],
     assetsTruncated: true,
@@ -823,12 +850,178 @@ test("renders real assets with documents, cases, truncation, and a disabled serv
     expect(text).toContain("More documents exist than this projection shows");
     expect(text).toContain("More service cases exist than this projection shows");
     const serviceButton = mounted.findButton("Open service case");
-    expect(serviceButton.disabled).toBe(true);
-    expect(serviceButton.title).toContain("no backend command route exists");
+    expect(serviceButton.disabled).toBe(false);
     await act(async () => {
       serviceButton.click();
     });
+    expect(mounted.container.querySelector('[role="dialog"]')).not.toBeNull();
+    expect(mounted.container.textContent).toContain("What needs attention?");
+    expect(mounted.container.textContent).toContain("0/800 characters");
     expect(actionCalls).toEqual([]);
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("clicks a projected cancellable queued job and dispatches one cancellation", async () => {
+  const snapshot = parseWorkbenchSnapshot(projection, projection.project.id);
+  if (snapshot === null) throw new Error("W1 projection should parse");
+  const actionCalls: WorkbenchAction[] = [];
+  const mounted = await mountEquipmentTab({ state: "ready", snapshot }, (action: WorkbenchAction) => {
+    actionCalls.push(action);
+    return { ok: true, message: "Cancellation queued by the server." };
+  });
+  try {
+    await mounted.clickTab("Inbox");
+    const cancel = mounted.findButton("Cancel");
+    expect(cancel.disabled).toBe(false);
+    await act(async () => { cancel.click(); });
+    expect(actionCalls).toEqual([{ type: "cancelJob", projectId: "project-w1-1", jobId: "job-queued" }]);
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("disables generic research and makes zero calls while requirements are truncated", async () => {
+  const snapshot = parseWorkbenchSnapshot({ ...projection, requirementsTruncated: true }, projection.project.id);
+  if (snapshot === null) throw new Error("Truncated W1 projection should parse");
+  const actionCalls: WorkbenchAction[] = [];
+  const mounted = await mountEquipmentTab({ state: "ready", snapshot }, (action: WorkbenchAction) => {
+    actionCalls.push(action);
+    return { ok: true };
+  });
+  try {
+    const start = mounted.findButton("Start bounded research");
+    expect(start.disabled).toBe(true);
+    await act(async () => { start.click(); });
+    expect(actionCalls).toEqual([]);
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("keeps concurrent mounted research clicks to one action request", async () => {
+  const snapshot = parseWorkbenchSnapshot(projection, projection.project.id);
+  if (snapshot === null) throw new Error("W1 projection should parse");
+  const actionCalls: WorkbenchAction[] = [];
+  let resolveAction: ((result: WorkbenchActionResult) => void) | undefined;
+  const actionResult = new Promise<WorkbenchActionResult>((resolve) => { resolveAction = resolve; });
+  const mounted = await mountEquipmentTab({ state: "ready", snapshot }, (action: WorkbenchAction) => {
+    actionCalls.push(action);
+    return actionResult;
+  });
+  try {
+    const start = mounted.findButton("Start bounded research");
+    await act(async () => {
+      start.click();
+      start.click();
+    });
+    expect(actionCalls).toEqual([{ type: "startResearch", projectId: "project-w1-1" }]);
+    resolveAction?.({ ok: true, message: "Research queued by the server." });
+    await act(async () => {});
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("contains service dialog focus, cycles first and last controls, handles Escape, and restores focus", async () => {
+  const snapshot = parseWorkbenchSnapshot(projectionWithEquipment({ assets: [assetFixture()], assetsTruncated: false }), projection.project.id);
+  if (snapshot === null) throw new Error("E1 equipment projection should parse");
+  const mounted = await mountEquipmentTab({ state: "ready", snapshot }, () => ({ ok: false, message: "controlled test refusal" }));
+  try {
+    await mounted.clickTab("Equipment");
+    const open = mounted.findButton("Open service case");
+    open.focus();
+    await act(async () => { open.click(); });
+    const dialog = mounted.container.querySelector('[role="dialog"]');
+    if (!(dialog instanceof Object)) throw new Error("Service dialog not found");
+    const controls = Array.from(dialog.querySelectorAll<HTMLElement>("button:not([disabled]), select:not([disabled]), textarea:not([disabled])"));
+    const first = controls[0];
+    const last = controls[controls.length - 1];
+    if (first === undefined || last === undefined) throw new Error("Service dialog controls not found");
+    expect(mounted.container.ownerDocument.activeElement).toBe(first);
+
+    last.focus();
+    last.dispatchEvent(new mounted.container.ownerDocument.defaultView!.KeyboardEvent("keydown", { bubbles: true, key: "Tab" }));
+    expect(mounted.container.ownerDocument.activeElement).toBe(first);
+    first.focus();
+    first.dispatchEvent(new mounted.container.ownerDocument.defaultView!.KeyboardEvent("keydown", { bubbles: true, key: "Tab", shiftKey: true }));
+    expect(mounted.container.ownerDocument.activeElement).toBe(last);
+
+    const background = mounted.findButton("Project");
+    background.focus();
+    background.dispatchEvent(new mounted.container.ownerDocument.defaultView!.Event("focusin", { bubbles: true }));
+    expect(mounted.container.ownerDocument.activeElement).toBe(first);
+
+    await act(async () => {
+      dialog.dispatchEvent(new mounted.container.ownerDocument.defaultView!.KeyboardEvent("keydown", { bubbles: true, key: "Escape" }));
+    });
+    expect(mounted.container.querySelector('[role="dialog"]')).toBeNull();
+    expect(mounted.container.ownerDocument.activeElement).toBe(open);
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("gives assistant, evidence, and selection dialogs the shared modal keyboard contract", async () => {
+  const snapshot = parseWorkbenchSnapshot(projection, projection.project.id);
+  if (snapshot === null) throw new Error("W1 projection should parse");
+  const mounted = await mountEquipmentTab({ state: "ready", snapshot }, () => ({ ok: false, message: "controlled test refusal" }));
+  const document = mounted.container.ownerDocument;
+  const keyboardEvent = (key: string, shiftKey = false) => new document.defaultView!.KeyboardEvent("keydown", { bubbles: true, key, shiftKey });
+  const modalControls = (dialog: Element): HTMLElement[] => Array.from(dialog.querySelectorAll<HTMLElement>("button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled])"));
+  const exerciseModal = async (opener: HTMLButtonElement, disabledButtonLabel?: string): Promise<void> => {
+    opener.focus();
+    await act(async () => { opener.click(); });
+    const dialog = mounted.container.querySelector('[role="dialog"]');
+    if (!(dialog instanceof document.defaultView!.HTMLElement)) throw new Error("Modal dialog not found");
+    const controls = modalControls(dialog);
+    const first = controls[0];
+    const last = controls[controls.length - 1];
+    if (first === undefined || last === undefined) throw new Error("Modal controls not found");
+    expect(document.activeElement).toBe(first);
+    expect(mounted.container.querySelector(".wb-header")?.hasAttribute("inert")).toBe(true);
+    expect(mounted.container.querySelector(".wb-header")?.getAttribute("aria-hidden")).toBe("true");
+    if (disabledButtonLabel !== undefined) {
+      const disabledButton = Array.from(dialog.querySelectorAll("button")).find((button) => button.textContent?.includes(disabledButtonLabel));
+      if (!(disabledButton instanceof document.defaultView!.HTMLButtonElement)) throw new Error(`${disabledButtonLabel} button not found`);
+      expect(disabledButton.disabled).toBe(true);
+    }
+
+    last.focus();
+    last.dispatchEvent(keyboardEvent("Tab"));
+    expect(document.activeElement).toBe(first);
+    first.focus();
+    first.dispatchEvent(keyboardEvent("Tab", true));
+    expect(document.activeElement).toBe(last);
+
+    const background = mounted.findButton("Project");
+    background.focus();
+    background.dispatchEvent(new document.defaultView!.Event("focusin", { bubbles: true }));
+    expect(document.activeElement).toBe(first);
+
+    await act(async () => {
+      dialog.dispatchEvent(keyboardEvent("Escape"));
+    });
+    expect(mounted.container.querySelector('[role="dialog"]')).toBeNull();
+    expect(document.activeElement).toBe(opener);
+    expect(mounted.container.querySelector(".wb-header")?.hasAttribute("inert")).toBe(false);
+    expect(mounted.container.querySelector(".wb-header")?.hasAttribute("aria-hidden")).toBe(false);
+  };
+
+  try {
+    const assistant = mounted.container.querySelector('button[aria-label="Open project assistant"]');
+    if (!(assistant instanceof document.defaultView!.HTMLButtonElement)) throw new Error("Assistant opener not found");
+    await exerciseModal(assistant as unknown as HTMLButtonElement);
+
+    await mounted.clickTab("Suppliers");
+    const evidence = mounted.container.querySelector('button[aria-label="Open evidence for Harbor Equipment"]');
+    if (!(evidence instanceof document.defaultView!.HTMLButtonElement)) throw new Error("Evidence opener not found");
+    await exerciseModal(evidence as unknown as HTMLButtonElement);
+
+    await mounted.clickTab("Project");
+    const review = mounted.findButton("Review quote");
+    await exerciseModal(review, "Select exact quote");
   } finally {
     await mounted.cleanup();
   }
@@ -855,6 +1048,27 @@ test("keeps the equipment service action disabled with zero adapter calls while 
   }
 });
 
+test("enables a pending approval from its safe basis without requiring an evidence array", async () => {
+  const snapshot = parseWorkbenchSnapshot(projection, projection.project.id);
+  if (snapshot === null) throw new Error("W1 projection should parse");
+  const actionCalls: WorkbenchAction[] = [];
+  const mounted = await mountEquipmentTab({ state: "ready", snapshot }, (action: WorkbenchAction) => {
+    actionCalls.push(action);
+    return { ok: true, message: "approval recorded by server" };
+  });
+  try {
+    await mounted.clickTab("Inbox");
+    const approve = mounted.findButton("Approve this decision");
+    expect(approve.disabled).toBe(false);
+    expect(mounted.container.textContent).toContain("Immutable decision basis");
+    expect(mounted.container.textContent).toContain("snapshot-hash-w1-1");
+    await act(async () => { approve.click(); });
+    expect(actionCalls).toEqual([{ type: "approveDecision", projectId: "project-w1-1", decisionId: "approval-w1-1" }]);
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
 test("disables every mutation control while reconnecting and resumes after a fresh snapshot", async () => {
   const parsed = parseWorkbenchSnapshot(projection, projection.project.id);
   if (parsed === null) throw new Error("W1 projection should parse");
@@ -869,7 +1083,7 @@ test("disables every mutation control while reconnecting and resumes after a fre
       },
     },
     decisions: parsed.decisions.map((decision) => ({ ...decision, evidenceIds: ["product-evidence-w1-1"] })),
-    jobs: parsed.jobs.map((job, index) => index === 0 ? { ...job, state: "queued" } : job),
+    jobs: parsed.jobs.map((job, index) => index === 0 ? { ...job, state: "queued" as const } : job),
   };
   const dom = new HappyWindow({ url: "https://openingos.test/" });
   const previousWindow = globalThis.window;

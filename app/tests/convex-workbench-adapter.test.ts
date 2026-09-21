@@ -3,9 +3,11 @@ import type { Watch } from "convex/react";
 import { getFunctionName, type FunctionReference } from "convex/server";
 import {
   createConvexWorkbenchAdapter,
+  researchStartIdempotencyKey,
   type ConvexWorkbenchClient,
 } from "../convex-workbench-adapter";
-import { parseWorkbenchSnapshot } from "../workbench-state";
+import { parseWorkbenchSnapshot, type WorkbenchAction } from "../workbench-state";
+import { payloadHash } from "../../convex/shared/hashing.js";
 
 function projection(projectId = "project-1"): Record<string, unknown> {
   return {
@@ -29,6 +31,8 @@ function projection(projectId = "project-1"): Record<string, unknown> {
         canCompare: true,
         canCommunicate: false,
         canClarify: false,
+        canApprove: false,
+        canOpenServiceCase: false,
       },
     },
     requirements: [],
@@ -43,6 +47,80 @@ function projection(projectId = "project-1"): Record<string, unknown> {
     activity: { page: [], continueCursor: null, isDone: true },
     provenance: { mode: "unknown", label: "No supplier terms", ownerAuthoredTerms: false },
   };
+}
+
+function actionProjection(projectId = "project-1", requirementVersion = 4): Record<string, unknown> {
+  return {
+    ...projection(projectId),
+    access: {
+      role: "approver",
+      capabilities: {
+        canResearch: true,
+        canRecordEvidence: false,
+        canRecordQuote: false,
+        canCompare: true,
+        canCommunicate: false,
+        canClarify: false,
+        canApprove: true,
+        canOpenServiceCase: true,
+      },
+    },
+    requirements: [{
+      id: "requirement-1",
+      key: "REQ-1",
+      title: "Two-group espresso machine",
+      category: "equipment",
+      quantity: "2",
+      unit: "piece",
+      priority: "P0",
+      state: "readyForDecision",
+      fulfillment: "notOrdered",
+      version: requirementVersion,
+      budgetMinorUnits: null,
+      needByAt: null,
+    }],
+    candidates: [{
+      id: "candidate-1",
+      requirementId: "requirement-1",
+      productModel: "Atlas 2G",
+      variant: "new",
+      compatibility: "pass",
+      conversationState: "quoteReceived",
+      vendor: { id: "vendor-1", name: "Harbor Equipment", regions: ["NL"], serviceCoverage: "NL" },
+      latestValidQuote: {
+        id: "quote-1",
+        version: "v1",
+        currency: "EUR",
+        lines: [{ lineId: "machine", description: "Atlas 2G", quantity: "2", unit: "piece", unitPrice: { currency: "EUR", minorUnits: 795000 } }],
+        charges: [],
+        taxBasis: { kind: "inclusive", basisId: "tax-1" },
+        createdAt: 1,
+        provenance: { mode: "recorded", label: "Recorded terms", ownerAuthoredTerms: false },
+      },
+      evidence: [],
+      provenance: { mode: "recorded", label: "Recorded terms", ownerAuthoredTerms: false },
+    }],
+    jobs: [{ id: "job-1", kind: "research", state: "queued", status: "queued", cancellable: true, createdAt: 1, updatedAt: 1, grantVersion: 1, attempts: [] }],
+    decisions: [{ id: "approval-1", kind: "approval", state: "pending", createdAt: 1 }],
+  };
+}
+
+type MutationCall = { readonly reference: unknown; readonly args: unknown };
+
+function actionClient(
+  queryResult: unknown,
+  watch: Watch<unknown>,
+  calls: MutationCall[],
+  mutationResult: unknown,
+): ConvexWorkbenchClient {
+  return {
+    query: async () => queryResult,
+    watchQuery: () => watch,
+    mutation: async (reference: unknown, args: unknown) => {
+      calls.push({ reference, args });
+      return mutationResult;
+    },
+  } as unknown as ConvexWorkbenchClient;
 }
 
 function accessibleProjects(projectId = "project-1"): Record<string, unknown> {
@@ -64,6 +142,8 @@ function accessibleProjects(projectId = "project-1"): Record<string, unknown> {
           canCompare: true,
           canCommunicate: false,
           canClarify: false,
+          canApprove: false,
+          canOpenServiceCase: false,
         },
       },
     }],
@@ -268,10 +348,566 @@ test("keeps unsupported actions explicitly unavailable without querying or sendi
 
   await expect(adapter.act({ type: "startResearch", projectId: "project-1" })).resolves.toEqual({
     ok: false,
-    message: "This workbench action is unavailable until an authority-bearing backend command is configured. Nothing was sent.",
+    message: "This action requires a current validated project projection. Nothing was sent.",
+  });
+  await expect(adapter.act({ type: "retryJob", projectId: "project-1", jobId: "job-1" })).resolves.toEqual({
+    ok: false,
+    message: "Retry is unavailable because no safe retry contract is configured. Nothing was sent.",
   });
   expect(queryArgs).toHaveLength(0);
   expect(watchArgs).toHaveLength(0);
+});
+
+test("records the exact selection payload and refreshes the basis after a mutation", async () => {
+  const calls: MutationCall[] = [];
+  const controls = controlledWatch(() => actionProjection());
+  const adapter = createConvexWorkbenchAdapter(actionClient(
+    actionProjection(),
+    controls.watch,
+    calls,
+    { ok: true, selectionId: "selection-1", deduplicated: false },
+  ));
+
+  await adapter.load("project-1");
+  await expect(adapter.act({ type: "selectOffer", projectId: "project-1", offerId: "candidate-1", quoteId: "quote-1", quoteVersion: "v1" })).resolves.toEqual({
+    ok: true,
+    message: "Selection recorded by the server; no order was placed.",
+  });
+  expect(calls).toHaveLength(1);
+  expect(getFunctionName(calls[0]?.reference as FunctionReference<"mutation">)).toBe("domain/decisions:recordSelection");
+  expect(calls[0]?.args).toEqual({
+    organizationId: "organization-1",
+    projectId: "project-1",
+    requirementId: "requirement-1",
+    candidateId: "candidate-1",
+    quoteId: "quote-1",
+    quoteVersion: "v1",
+    selectionLines: [{ quoteLineId: "machine", quantity: "2", unit: "piece" }],
+    requirementVersion: 4,
+  });
+
+  await expect(adapter.act({ type: "selectOffer", projectId: "project-1", offerId: "candidate-1", quoteId: "quote-1", quoteVersion: "v1" })).resolves.toEqual({
+    ok: true,
+    message: "Selection recorded by the server; no order was placed.",
+  });
+  expect(calls).toHaveLength(2);
+
+  await adapter.load("project-1");
+  await adapter.act({ type: "selectOffer", projectId: "project-1", offerId: "candidate-1", quoteId: "quote-1", quoteVersion: "v1" });
+  expect(calls).toHaveLength(3);
+});
+
+test("approves only a normalized pending approval and surfaces server denial text", async () => {
+  const calls: MutationCall[] = [];
+  const controls = controlledWatch(() => actionProjection());
+  const adapter = createConvexWorkbenchAdapter(actionClient(
+    actionProjection(),
+    controls.watch,
+    calls,
+    { ok: false, code: "denied-capability", message: "approval denied by server" },
+  ));
+
+  await adapter.load("project-1");
+  await expect(adapter.act({ type: "approveDecision", projectId: "project-1", decisionId: "approval-1" })).resolves.toEqual({
+    ok: false,
+    message: "approval denied by server",
+  });
+  expect(calls).toHaveLength(1);
+  expect(getFunctionName(calls[0]?.reference as FunctionReference<"mutation">)).toBe("domain/decisions:decideApproval");
+  expect(calls[0]?.args).toEqual({
+    organizationId: "organization-1",
+    projectId: "project-1",
+    approvalId: "approval-1",
+    decision: "approved",
+  });
+});
+
+test("cancels only a projected cancellable job", async () => {
+  const calls: MutationCall[] = [];
+  const controls = controlledWatch(() => actionProjection());
+  const adapter = createConvexWorkbenchAdapter(actionClient(
+    actionProjection(),
+    controls.watch,
+    calls,
+    { ok: true, state: "cancelling", complete: false },
+  ));
+
+  await adapter.load("project-1");
+  await expect(adapter.act({ type: "cancelJob", projectId: "project-1", jobId: "job-1" })).resolves.toEqual({
+    ok: true,
+    message: "Cancellation queued by the server.",
+  });
+  expect(calls).toHaveLength(1);
+  expect(getFunctionName(calls[0]?.reference as FunctionReference<"mutation">)).toBe("execution/jobs:cancel");
+  expect(calls[0]?.args).toEqual({ jobId: "job-1", reason: "Cancelled from the purchasing workbench" });
+
+  await expect(adapter.act({ type: "cancelJob", projectId: "project-1", jobId: "job-1" })).resolves.toEqual({
+    ok: true,
+    message: "Cancellation queued by the server.",
+  });
+  expect(calls).toHaveLength(2);
+});
+
+test("starts only one supported purchasing research brief and reports queued backend state", async () => {
+  const calls: MutationCall[] = [];
+  const controls = controlledWatch(() => actionProjection());
+  const adapter = createConvexWorkbenchAdapter(actionClient(
+    actionProjection(),
+    controls.watch,
+    calls,
+    { ok: true, jobId: "job-2", state: "queued", supportedSegment: "research suppliers", refusedSegments: [] },
+  ));
+
+  await adapter.load("project-1");
+  const result = await adapter.act({ type: "startResearch", projectId: "project-1" });
+  expect(result).toEqual({
+    ok: true,
+    message: "Research queued by the server; provider outcome is still pending.",
+  });
+  expect(calls).toHaveLength(1);
+  expect(getFunctionName(calls[0]?.reference as FunctionReference<"mutation">)).toBe("execution/jobs:start");
+  expect(calls[0]?.args).toEqual({
+    organizationId: "organization-1",
+    projectId: "project-1",
+    text: "Research suppliers for purchasing requirement REQ-1: Two-group espresso machine (equipment).",
+    operationId: "research.collect",
+    kind: "research",
+    idempotencyKey: researchStartIdempotencyKey("project-1", "requirement-1", 4),
+  });
+  expect(result.message).not.toContain("provider succeeded");
+});
+
+test("research start payload and key are stable across separate adapter instances", async () => {
+  const firstCalls: MutationCall[] = [];
+  const secondCalls: MutationCall[] = [];
+  const firstControls = controlledWatch(() => actionProjection());
+  const secondControls = controlledWatch(() => actionProjection());
+  const queued = { ok: true, jobId: "job-2", state: "queued", supportedSegment: "research suppliers", refusedSegments: [] };
+  const first = createConvexWorkbenchAdapter(actionClient(actionProjection(), firstControls.watch, firstCalls, queued));
+  const second = createConvexWorkbenchAdapter(actionClient(actionProjection(), secondControls.watch, secondCalls, queued));
+
+  await first.load("project-1");
+  await second.load("project-1");
+  await expect(first.act({ type: "startResearch", projectId: "project-1" })).resolves.toMatchObject({ ok: true });
+  await expect(second.act({ type: "startResearch", projectId: "project-1" })).resolves.toMatchObject({ ok: true });
+
+  expect(firstCalls).toHaveLength(1);
+  expect(secondCalls).toHaveLength(1);
+  expect(secondCalls[0]?.args).toEqual(firstCalls[0]?.args);
+  const firstArgs = firstCalls[0]?.args as Record<string, unknown>;
+  const secondArgs = secondCalls[0]?.args as Record<string, unknown>;
+  const expectedKey = researchStartIdempotencyKey("project-1", "requirement-1", 4);
+  expect(firstArgs["idempotencyKey"]).toBe(expectedKey);
+  expect(secondArgs["idempotencyKey"]).toBe(expectedKey);
+  expect(expectedKey).toBe(`research:${payloadHash({ operationId: "research.collect", projectId: "project-1", requirementId: "requirement-1", requirementVersion: 4 })}`);
+  expect(expectedKey).toMatch(/^[A-Za-z0-9:_-]{8,128}$/);
+});
+
+test("research start key changes on requirement version or project change", async () => {
+  const baseCalls: MutationCall[] = [];
+  const versionedCalls: MutationCall[] = [];
+  const projectCalls: MutationCall[] = [];
+  const queued = { ok: true, jobId: "job-2", state: "queued", supportedSegment: "research suppliers", refusedSegments: [] };
+  const base = createConvexWorkbenchAdapter(actionClient(
+    actionProjection("project-1", 4),
+    controlledWatch(() => actionProjection("project-1", 4)).watch,
+    baseCalls,
+    queued,
+  ));
+  const versioned = createConvexWorkbenchAdapter(actionClient(
+    actionProjection("project-1", 5),
+    controlledWatch(() => actionProjection("project-1", 5)).watch,
+    versionedCalls,
+    queued,
+  ));
+  const otherProject = createConvexWorkbenchAdapter(actionClient(
+    actionProjection("project-2", 4),
+    controlledWatch(() => actionProjection("project-2", 4)).watch,
+    projectCalls,
+    queued,
+  ));
+
+  await base.load("project-1");
+  await versioned.load("project-1");
+  await otherProject.load("project-2");
+  await expect(base.act({ type: "startResearch", projectId: "project-1" })).resolves.toMatchObject({ ok: true });
+  await expect(versioned.act({ type: "startResearch", projectId: "project-1" })).resolves.toMatchObject({ ok: true });
+  await expect(otherProject.act({ type: "startResearch", projectId: "project-2" })).resolves.toMatchObject({ ok: true });
+
+  const baseKey = (baseCalls[0]?.args as Record<string, unknown>)["idempotencyKey"];
+  const versionedKey = (versionedCalls[0]?.args as Record<string, unknown>)["idempotencyKey"];
+  const projectKey = (projectCalls[0]?.args as Record<string, unknown>)["idempotencyKey"];
+  expect(typeof baseKey).toBe("string");
+  expect(typeof versionedKey).toBe("string");
+  expect(typeof projectKey).toBe("string");
+  expect(versionedKey).not.toBe(baseKey);
+  expect(projectKey).not.toBe(baseKey);
+  expect(versionedKey).toBe(researchStartIdempotencyKey("project-1", "requirement-1", 5));
+  expect(projectKey).toBe(researchStartIdempotencyKey("project-2", "requirement-1", 4));
+  expect(versionedKey).toMatch(/^[A-Za-z0-9:_-]{8,128}$/);
+  expect(projectKey).toMatch(/^[A-Za-z0-9:_-]{8,128}$/);
+});
+
+test("rejects generic research when requirements are truncated without mutation", async () => {
+  const calls: MutationCall[] = [];
+  const truncated = { ...actionProjection(), requirementsTruncated: true };
+  const controls = controlledWatch(() => truncated);
+  const adapter = createConvexWorkbenchAdapter(actionClient(truncated, controls.watch, calls, { ok: true, state: "queued" }));
+  await adapter.load("project-1");
+  await expect(adapter.act({ type: "startResearch", projectId: "project-1" })).resolves.toEqual({
+    ok: false,
+    message: "Research is unavailable while the project requirements are truncated. Nothing was sent.",
+  });
+  expect(calls).toHaveLength(0);
+});
+
+test("fences concurrent research calls before the first mutation resolves", async () => {
+  const calls: MutationCall[] = [];
+  const controls = controlledWatch(() => actionProjection());
+  let resolveMutation: ((value: unknown) => void) | undefined;
+  const mutation = new Promise<unknown>((resolve) => { resolveMutation = resolve; });
+  const adapter = createConvexWorkbenchAdapter({
+    query: async () => actionProjection(),
+    watchQuery: () => controls.watch,
+    mutation: async (reference: unknown, args: unknown) => {
+      calls.push({ reference, args });
+      return mutation;
+    },
+  } as unknown as ConvexWorkbenchClient);
+  await adapter.load("project-1");
+
+  const action: WorkbenchAction = { type: "startResearch", projectId: "project-1" };
+  const first = adapter.act(action);
+  const second = adapter.act(action);
+  expect(calls).toHaveLength(1);
+  await expect(second).resolves.toEqual({
+    ok: false,
+    message: "This action is already in progress. Wait for the current server response.",
+  });
+  resolveMutation?.({ ok: true, jobId: "job-2", state: "queued", supportedSegment: "research suppliers", refusedSegments: [] });
+  await expect(first).resolves.toEqual({ ok: true, message: "Research queued by the server; provider outcome is still pending." });
+  await expect(adapter.act(action)).resolves.toMatchObject({ ok: true });
+  expect(calls).toHaveLength(2);
+});
+
+test("keeps a newer watched projection when a mutation resolves later", async () => {
+  let current: unknown = actionProjection("project-1", 4);
+  const controls = controlledWatch(() => current);
+  const queries: unknown[] = [];
+  const calls: MutationCall[] = [];
+  let resolveMutation: ((value: unknown) => void) | undefined;
+  const pendingMutation = new Promise<unknown>((resolve) => { resolveMutation = resolve; });
+  const adapter = createConvexWorkbenchAdapter({
+    query: async () => {
+      queries.push(current);
+      return current;
+    },
+    watchQuery: () => controls.watch,
+    mutation: async (reference: unknown, args: unknown) => {
+      calls.push({ reference, args });
+      return calls.length === 1
+        ? pendingMutation
+        : { ok: true, selectionId: `selection-${calls.length}`, deduplicated: false };
+    },
+  } as unknown as ConvexWorkbenchClient);
+
+  await adapter.load("project-1");
+  const unsubscribe = adapter.subscribe?.("project-1", () => {}, () => {});
+  const first = adapter.act({ type: "selectOffer", projectId: "project-1", offerId: "candidate-1", quoteId: "quote-1", quoteVersion: "v1" });
+
+  current = actionProjection("project-1", 5);
+  controls.emit();
+  resolveMutation?.({ ok: true, selectionId: "selection-1", deduplicated: false });
+  await expect(first).resolves.toMatchObject({ ok: true });
+
+  // The watch already supplied the newer mutation basis, so completion must
+  // not erase it or dispatch a redundant head query.
+  expect(queries).toHaveLength(1);
+
+  await expect(adapter.act({ type: "selectOffer", projectId: "project-1", offerId: "candidate-1", quoteId: "quote-1", quoteVersion: "v1" })).resolves.toMatchObject({ ok: true });
+  expect(calls[1]?.args).toMatchObject({ requirementVersion: 5 });
+  unsubscribe?.();
+});
+
+test("refetches after a successful mutation when no newer watch exists", async () => {
+  const responses: unknown[] = [actionProjection("project-1", 4), actionProjection("project-1", 5)];
+  const queries: unknown[] = [];
+  const calls: MutationCall[] = [];
+  const controls = controlledWatch(() => responses[responses.length - 1]);
+  const adapter = createConvexWorkbenchAdapter({
+    query: async () => {
+      queries.push(responses[0]);
+      return responses.shift() ?? null;
+    },
+    watchQuery: () => controls.watch,
+    mutation: async (reference: unknown, args: unknown) => {
+      calls.push({ reference, args });
+      return { ok: true, selectionId: "selection-1", deduplicated: false };
+    },
+  } as unknown as ConvexWorkbenchClient);
+
+  await adapter.load("project-1");
+  await expect(adapter.act({ type: "selectOffer", projectId: "project-1", offerId: "candidate-1", quoteId: "quote-1", quoteVersion: "v1" })).resolves.toMatchObject({ ok: true });
+  expect(queries).toHaveLength(2);
+
+  // The post-mutation refetch is the basis for the next action when no watch
+  // emission arrived during the mutation.
+  await expect(adapter.act({ type: "selectOffer", projectId: "project-1", offerId: "candidate-1", quoteId: "quote-1", quoteVersion: "v1" })).resolves.toMatchObject({ ok: true });
+  expect(calls[1]?.args).toMatchObject({ requirementVersion: 5 });
+});
+
+test("rejects missing, stale, cross-project, and malformed action inputs without mutation", async () => {
+  const calls: MutationCall[] = [];
+  const controls = controlledWatch(() => actionProjection());
+  let current: unknown = actionProjection();
+  const adapter = createConvexWorkbenchAdapter({
+    query: async () => current,
+    watchQuery: () => controls.watch,
+    mutation: async (reference: unknown, args: unknown) => {
+      calls.push({ reference, args });
+      return { ok: true };
+    },
+  } as unknown as ConvexWorkbenchClient);
+
+  await expect(adapter.act({ type: "selectOffer", projectId: "project-1", offerId: "candidate-1", quoteId: "quote-1", quoteVersion: "v1" })).resolves.toEqual({
+    ok: false,
+    message: "This action requires a current validated project projection. Nothing was sent.",
+  });
+  await adapter.load("project-1");
+  await expect(adapter.act({ type: "selectOffer", projectId: "project-2", offerId: "candidate-1", quoteId: "quote-1", quoteVersion: "v1" })).resolves.toEqual({
+    ok: false,
+    message: "This action requires a current validated project projection. Nothing was sent.",
+  });
+  current = { ...actionProjection(), activity: { page: [{ id: "event-1", kind: "bad", createdAt: "not-a-time" }], continueCursor: null, isDone: true } };
+  await expect(adapter.load("project-1")).resolves.toBeNull();
+  await expect(adapter.act({ type: "startResearch", projectId: "project-1" })).resolves.toEqual({
+    ok: false,
+    message: "This action requires a current validated project projection. Nothing was sent.",
+  });
+  expect(calls).toHaveLength(0);
+});
+
+test("action-specific stale and authority fences make zero mutations", async () => {
+  const loadActionAdapter = async (
+    value: Record<string, unknown>,
+    calls: MutationCall[],
+  ): Promise<ReturnType<typeof createConvexWorkbenchAdapter>> => {
+    const controls = controlledWatch(() => value);
+    const adapter = createConvexWorkbenchAdapter(actionClient(value, controls.watch, calls, { ok: true }));
+    await adapter.load("project-1");
+    return adapter;
+  };
+
+  const staleCalls: MutationCall[] = [];
+  const staleAdapter = await loadActionAdapter(actionProjection(), staleCalls);
+  await staleAdapter.act({ type: "selectOffer", projectId: "project-1", offerId: "candidate-1", quoteId: "quote-1", quoteVersion: "old-version" });
+  await staleAdapter.act({ type: "selectOffer", projectId: "project-1", offerId: "candidate-1", quoteId: "old-quote", quoteVersion: "v1" });
+  expect(staleCalls).toHaveLength(0);
+
+  const nonPendingProjection = {
+    ...actionProjection(),
+    decisions: [{ id: "approval-1", kind: "approval", state: "approved", createdAt: 1 }],
+  };
+  const approvalCalls: MutationCall[] = [];
+  const approvalAdapter = await loadActionAdapter(nonPendingProjection, approvalCalls);
+  await approvalAdapter.act({ type: "approveDecision", projectId: "project-1", decisionId: "approval-1" });
+  expect(approvalCalls).toHaveLength(0);
+
+  const nonCancellableProjection = {
+    ...actionProjection(),
+    jobs: [{ id: "job-1", kind: "research", state: "queued", status: "queued", cancellable: false, createdAt: 1, updatedAt: 1, grantVersion: 1, attempts: [] }],
+  };
+  const cancelCalls: MutationCall[] = [];
+  const cancelAdapter = await loadActionAdapter(nonCancellableProjection, cancelCalls);
+  await cancelAdapter.act({ type: "cancelJob", projectId: "project-1", jobId: "job-1" });
+  expect(cancelCalls).toHaveLength(0);
+
+  const baseProjection = actionProjection();
+  const firstRequirement = (baseProjection.requirements as readonly Record<string, unknown>[])[0];
+  if (firstRequirement === undefined) throw new Error("action fixture requirement missing");
+  const ambiguousProjection = {
+    ...baseProjection,
+    requirements: [firstRequirement, { ...firstRequirement, id: "requirement-2", key: "REQ-2" }],
+  };
+  const researchCalls: MutationCall[] = [];
+  const researchAdapter = await loadActionAdapter(ambiguousProjection, researchCalls);
+  await researchAdapter.act({ type: "startResearch", projectId: "project-1" });
+  expect(researchCalls).toHaveLength(0);
+
+  const truncatedProjection = { ...baseProjection, requirementsTruncated: true };
+  const truncatedCalls: MutationCall[] = [];
+  const truncatedAdapter = await loadActionAdapter(truncatedProjection, truncatedCalls);
+  await truncatedAdapter.act({ type: "startResearch", projectId: "project-1" });
+  expect(truncatedCalls).toHaveLength(0);
+});
+
+test("invalidates action cache on watch errors and unsubscribe while preserving an empty initial watch", async () => {
+  let current: unknown = undefined;
+  let watchError = false;
+  const calls: MutationCall[] = [];
+  const controls = controlledWatch(() => {
+    if (watchError) throw new Error("reconnect failed");
+    return current;
+  });
+  const adapter = createConvexWorkbenchAdapter(actionClient(actionProjection(), controls.watch, calls, { ok: true }));
+  await adapter.load("project-1");
+  const errors: unknown[] = [];
+  const unsubscribe = adapter.subscribe?.("project-1", () => {}, (error) => errors.push(error));
+  expect(errors).toHaveLength(0);
+  await expect(adapter.act({ type: "selectOffer", projectId: "project-1", offerId: "candidate-1", quoteId: "quote-1", quoteVersion: "v1" })).resolves.toMatchObject({ ok: true });
+  expect(calls).toHaveLength(1);
+
+  await adapter.load("project-1");
+  current = actionProjection();
+  controls.emit();
+  expect(calls).toHaveLength(1);
+
+  await adapter.load("project-1");
+  watchError = true;
+  controls.emit();
+  expect(errors).toHaveLength(1);
+  await expect(adapter.act({ type: "startResearch", projectId: "project-1" })).resolves.toMatchObject({ ok: false });
+  expect(calls).toHaveLength(1);
+
+  watchError = false;
+  current = actionProjection();
+  controls.emit();
+  const secondUnsubscribe = unsubscribe;
+  if (secondUnsubscribe === undefined) throw new Error("subscription should be available");
+  secondUnsubscribe();
+  await expect(adapter.act({ type: "startResearch", projectId: "project-1" })).resolves.toMatchObject({ ok: false });
+  expect(calls).toHaveLength(1);
+});
+
+test("a failed subscription setup fences a previously loaded mutation basis", async () => {
+  const calls: MutationCall[] = [];
+  const errors: unknown[] = [];
+  const adapter = createConvexWorkbenchAdapter({
+    query: async () => actionProjection(),
+    watchQuery: () => {
+      throw new Error("watch setup failed");
+    },
+    mutation: async (reference: unknown, args: unknown) => {
+      calls.push({ reference, args });
+      return { ok: true };
+    },
+  } as unknown as ConvexWorkbenchClient);
+
+  await adapter.load("project-1");
+  adapter.subscribe?.("project-1", () => {}, (error) => errors.push(error));
+  expect(errors).toHaveLength(1);
+  await expect(adapter.act({ type: "selectOffer", projectId: "project-1", offerId: "candidate-1", quoteId: "quote-1", quoteVersion: "v1" })).resolves.toMatchObject({ ok: false });
+  expect(calls).toHaveLength(0);
+});
+
+test("a newer watched projection wins over a late load result", async () => {
+  let resolveQuery: ((value: unknown) => void) | undefined;
+  const query = new Promise<unknown>((resolve) => { resolveQuery = resolve; });
+  let current: unknown = actionProjection("project-1", 4);
+  const controls = controlledWatch(() => current);
+  const calls: MutationCall[] = [];
+  const adapter = createConvexWorkbenchAdapter({
+    query: async () => query,
+    watchQuery: () => controls.watch,
+    mutation: async (reference: unknown, args: unknown) => {
+      calls.push({ reference, args });
+      return { ok: true };
+    },
+  } as unknown as ConvexWorkbenchClient);
+
+  const lateLoad = adapter.load("project-1");
+  const unsubscribe = adapter.subscribe?.("project-1", () => {}, () => {});
+  current = actionProjection("project-1", 5);
+  controls.emit();
+  resolveQuery?.(actionProjection("project-1", 4));
+  await expect(lateLoad).resolves.toBeNull();
+  await adapter.act({ type: "selectOffer", projectId: "project-1", offerId: "candidate-1", quoteId: "quote-1", quoteVersion: "v1" });
+  expect(calls[0]?.args).toMatchObject({ requirementVersion: 5 });
+  unsubscribe?.();
+});
+
+test("opens a current projected service case with exact authority and idempotency payload", async () => {
+  const calls: MutationCall[] = [];
+  const controls = controlledWatch(() => serviceActionProjection());
+  let mutationResult: unknown = { ok: false, code: "denied-project", message: "asset service access denied" };
+  const adapter = createConvexWorkbenchAdapter({
+    query: async () => serviceActionProjection(),
+    watchQuery: () => controls.watch,
+    mutation: async (reference: unknown, args: unknown) => {
+      calls.push({ reference, args });
+      return mutationResult;
+    },
+  } as unknown as ConvexWorkbenchClient);
+  const action: WorkbenchAction = {
+    type: "openServiceCase",
+    projectId: "project-1",
+    assetId: "asset-e1-1",
+    urgency: "high",
+    summary: "  Pressure fault on group head  ",
+    idempotencyKey: "case-key-1",
+  };
+
+  await adapter.load("project-1");
+  await expect(adapter.act(action)).resolves.toEqual({ ok: false, message: "asset service access denied" });
+  expect(getFunctionName(calls[0]?.reference as FunctionReference<"mutation">)).toBe("domain/fulfillment:openServiceCase");
+  expect(calls[0]?.args).toEqual({
+    organizationId: "organization-1",
+    projectId: "project-1",
+    assetId: "asset-e1-1",
+    urgency: "high",
+    summary: "Pressure fault on group head",
+    idempotencyKey: "case-key-1",
+  });
+
+  // An explicit server denial is no-write, so the validated basis remains
+  // available for a corrected or retried action without a forced reload.
+  await expect(adapter.act(action)).resolves.toMatchObject({ ok: false });
+  expect(calls).toHaveLength(2);
+
+  mutationResult = { ok: true, caseId: "case-e1-1", deduplicated: true };
+  await expect(adapter.act(action)).resolves.toEqual({
+    ok: true,
+    message: "Service case already recorded by the server; this submission was deduplicated.",
+  });
+  expect(calls).toHaveLength(3);
+  expect(calls[2]?.args).toEqual(calls[0]?.args);
+});
+
+test("rejects viewer, missing, stale, and cross-project service-case inputs without mutation", async () => {
+  const calls: MutationCall[] = [];
+  const controls = controlledWatch(() => serviceActionProjection());
+  const adapter = createConvexWorkbenchAdapter({
+    query: async () => serviceActionProjection(),
+    watchQuery: () => controls.watch,
+    mutation: async (reference: unknown, args: unknown) => {
+      calls.push({ reference, args });
+      return { ok: true, caseId: "case-e1-1", deduplicated: false };
+    },
+  } as unknown as ConvexWorkbenchClient);
+  const baseAction: WorkbenchAction = { type: "openServiceCase", projectId: "project-1", assetId: "asset-e1-1", urgency: "normal", summary: "Inspect pump", idempotencyKey: "case-key" };
+
+  await expect(adapter.act(baseAction)).resolves.toMatchObject({ ok: false });
+  await adapter.load("project-1");
+  await expect(adapter.act({ ...baseAction, assetId: "asset-missing" })).resolves.toMatchObject({ ok: false });
+  await expect(adapter.act({ ...baseAction, projectId: "project-2" })).resolves.toMatchObject({ ok: false });
+  await expect(adapter.act({ ...baseAction, summary: "   " })).resolves.toMatchObject({ ok: false });
+  await expect(adapter.act({ ...baseAction, summary: "x".repeat(801) })).resolves.toMatchObject({ ok: false });
+  await expect(adapter.act({ ...baseAction, idempotencyKey: "   " })).resolves.toMatchObject({ ok: false });
+  expect(calls).toHaveLength(0);
+
+  const viewerCalls: MutationCall[] = [];
+  const viewerProjection = { ...serviceActionProjection(), access: projection().access };
+  const viewerAdapter = createConvexWorkbenchAdapter({
+    query: async () => viewerProjection,
+    watchQuery: () => controls.watch,
+    mutation: async (reference: unknown, args: unknown) => {
+      viewerCalls.push({ reference, args });
+      return { ok: true, caseId: "case-e1-1", deduplicated: false };
+    },
+  } as unknown as ConvexWorkbenchClient);
+  await viewerAdapter.load("project-1");
+  await expect(viewerAdapter.act(baseAction)).resolves.toMatchObject({ ok: false });
+  expect(viewerCalls).toHaveLength(0);
 });
 
 function assetFixture(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -300,6 +936,13 @@ function assetFixture(overrides: Record<string, unknown> = {}): Record<string, u
 
 function projectionWithAssets(assets: unknown): Record<string, unknown> {
   return { ...projection(), equipment: { assets, assetsTruncated: false } };
+}
+
+function serviceActionProjection(projectId = "project-1"): Record<string, unknown> {
+  return {
+    ...actionProjection(projectId),
+    equipment: { assets: [assetFixture()], assetsTruncated: false },
+  };
 }
 
 async function loadWithAssets(assets: unknown): Promise<unknown> {

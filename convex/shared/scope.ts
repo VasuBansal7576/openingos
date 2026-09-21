@@ -552,20 +552,140 @@ const STOP_WORDS: ReadonlySet<string> = new Set([
   "would",
 ]);
 
+/**
+ * Words that make the text after `and`/`but` look like a new request rather
+ * than a coordinated object list.  This is intentionally a small grammar,
+ * not a general parser: product names and quantities remain opaque data.
+ */
+const INDEPENDENT_CLAUSE_STARTERS: ReadonlySet<string> = new Set([
+  "accept",
+  "ask",
+  "book",
+  "buy",
+  "calculate",
+  "check",
+  "compare",
+  "confirm",
+  "contact",
+  "create",
+  "draft",
+  "explain",
+  "find",
+  "fill",
+  "finance",
+  "give",
+  "identify",
+  "list",
+  "make",
+  "negotiate",
+  "open",
+  "pay",
+  "place",
+  "provide",
+  "purchase",
+  "research",
+  "review",
+  "schedule",
+  "send",
+  "show",
+  "sign",
+  "submit",
+  "tell",
+  "use",
+  "what",
+  "which",
+  "why",
+  "write",
+]);
+
+const CLAUSE_START_FILLERS: ReadonlySet<string> = new Set([
+  "also",
+  "could",
+  "have",
+  "has",
+  "he",
+  "i",
+  "instead",
+  "just",
+  "let",
+  "lets",
+  "like",
+  "may",
+  "might",
+  "must",
+  "need",
+  "next",
+  "now",
+  "please",
+  "she",
+  "should",
+  "then",
+  "they",
+  "want",
+  "we",
+  "will",
+  "would",
+  "you",
+]);
+
 function tokenize(text: string): string[] {
   return text.toLocaleLowerCase().match(/[a-z0-9]+/g) ?? [];
 }
 
 /**
- * Split only at explicit natural-language clause boundaries.  A clause is
- * admitted independently below, so a separator never creates authority by
- * itself and opaque product names remain payload data.
+ * Split at explicit natural-language clause boundaries without treating a
+ * decimal point as a sentence boundary or a coordinated object as a second
+ * request.  A clause is admitted independently below, so a separator never
+ * creates authority by itself and opaque product names remain payload data.
  */
 function requestClauses(text: string): string[] {
-  return text
-    .split(/\band\b|\bbut\b|[.!?;]|\n/i)
-    .map((clause) => clause.trim())
-    .filter((clause) => meaningfulTokens(tokenize(clause)).length > 0);
+  const clauses: string[] = [];
+  let start = 0;
+
+  const pushClause = (end: number, nextStart: number): void => {
+    const clause = text.slice(start, end).trim().replace(/^,+|,+$/g, "").trim();
+    if (meaningfulTokens(tokenize(clause)).length > 0) clauses.push(clause);
+    start = nextStart;
+  };
+
+  const startsIndependentClause = (wordStart: number, word: "and" | "but"): boolean => {
+    const remainder = text.slice(wordStart + word.length);
+    const tokens = tokenize(remainder);
+    if (tokens.length === 0) return false;
+    const firstMeaningfulToken = tokens.find((token) =>
+      INDEPENDENT_CLAUSE_STARTERS.has(token) || (!STOP_WORDS.has(token) && !CLAUSE_START_FILLERS.has(token)),
+    );
+    const firstClauseText = remainder.split(/\band\b|\bbut\b|[.!?;\n]/i)[0] ?? remainder;
+    if (unavailableCapabilityForClause(firstClauseText) !== null) return true;
+    return firstMeaningfulToken !== undefined && INDEPENDENT_CLAUSE_STARTERS.has(firstMeaningfulToken);
+  };
+
+  for (let index = 0; index < text.length; index += 1) {
+    const character = text[index];
+    if (character === ".") {
+      const previous = text[index - 1];
+      const next = text[index + 1];
+      if (previous !== undefined && next !== undefined && /\d/.test(previous) && /\d/.test(next)) continue;
+      pushClause(index, index + 1);
+      continue;
+    }
+    if (character === "!" || character === "?" || character === ";" || character === "\n") {
+      pushClause(index, index + 1);
+      continue;
+    }
+    if (character !== "a" && character !== "A" && character !== "b" && character !== "B") continue;
+    const word = text.slice(index, index + 3).toLocaleLowerCase();
+    if (word !== "and" && word !== "but") continue;
+    const before = text[index - 1];
+    const after = text[index + 3];
+    if ((before !== undefined && /[a-z0-9]/i.test(before)) || (after !== undefined && /[a-z0-9]/i.test(after))) continue;
+    if (startsIndependentClause(index, word)) {
+      pushClause(index, index + 3);
+      index += 2;
+    }
+  }
+  pushClause(text.length, text.length);
+  return clauses;
 }
 
 /**
@@ -803,11 +923,7 @@ function hasMixedUnsupportedReadClause(input: {
   readonly context: ReadonlySet<string>;
   readonly hasStructuredContext: boolean;
 }): boolean {
-  const clauses = input.text
-    .toLocaleLowerCase()
-    .split(/\band\b|\bbut\b|[.!?;]|\n/)
-    .map((clause) => meaningfulTokens(tokenize(clause)))
-    .filter((clause) => clause.length > 0);
+  const clauses = requestClauses(input.text).map((clause) => meaningfulTokens(tokenize(clause)));
   if (clauses.length < 2) return false;
   return clauses.some(
     (clause) =>
