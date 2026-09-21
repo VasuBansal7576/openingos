@@ -409,3 +409,60 @@ Greptile did not perform a code review on these latest heads because the connect
 The completed PRs therefore remain unmerged while E6 controlled negotiation, E7 import/review gating and E9 second-location revalidation continue in isolated OpenCode high workers.
 All cited implementation and browser evidence is controlled.
 No hosted Convex deployment, live provider call, owner-mailbox exchange, genuine supplier response, public ChatGPT Sites origin, purchase, realized saving or commercial outcome was observed.
+
+### 2026-09-21 - E6 delivery and combined validation checkpoint
+
+Ready PR #11 at `157d09d` now contains the repaired controlled E6 negotiation policy and adapter contract.
+It enforces exact quote, conversation and grant bindings, mandatory draft source pins, a fixed server-derived subject, disclosure screening, dispatch-shaped outcomes and round advancement only for recorded success with a provider message ID.
+The module remains a pure controlled contract with no Convex persistence and no Jev, OpenAI or AgentMail call; production negotiation orchestration and live P-05/D-12 evidence remain open.
+Coordinator reruns passed 58 focused tests, strict TypeScript, the production build and all nine exact-head GitHub checks.
+The isolated validation branch at `25c6064` combines ready PRs #7 through #11 without changing the protected integration branch and passes strict TypeScript, production build, the full existing test command and 71 additional E5/E6 tests omitted from the shared test script.
+The shared test-registration gap is assigned to E8.
+E8 is active on supervised OpenCode Muse Spark 1.3 Contributor high dispatch `ctx_52e359d1617d`, with exclusive workbench projection, adapter, UI and test ownership.
+E7 pushed initial import/review commit `62dd541`, but coordinator review returned exact-source/BOM replay, deduplicated-key binding, promotion-collision and attachment-metadata defects to its OpenCode GLM high owner.
+E9 opened ready PR #12 at `513b28f`, but coordinator review returned missing source-project separation and malformed query-limit handling to its OpenCode GLM high owner.
+Neither repair package is accepted until its new exact head passes focused checks, the full matrix and all expected CI jobs.
+Greptile again supplied quota notices rather than code review, so the review gate remains unresolved.
+All cited evidence is controlled local or CI execution.
+No hosted Convex deployment, live provider call, owner-mailbox exchange, genuine supplier response, public origin, purchase, realized saving or commercial outcome was observed.
+
+### 2026-09-21 - E8 correctness repair and visual rejection checkpoint
+
+Ready PR #14 is repaired at `b23f6a7` so stale substitute approval remains a zero-write denial while an authorized user may still reject the stale proposal and preserve its history.
+The worker-reported complete controlled suite passes, including 18 Jev tests and 438 direct tests.
+A same-viewport comparison against `design/purchasing-workbench.html#/compare` failed visual acceptance: the production surface used a generic pale dashboard, KPI strip and rounded cards instead of the selected photographic desk, paper-quote composition, serif hierarchy, compact ivory navigation and yellow decision language.
+That failure is not reported as polish or acceptance.
+Verified OpenCode Muse Spark 1.3 Contributor high dispatch `ctx_9f394f101e6b` now owns an isolated production UI rebuild from exact head `b23f6a7`, limited to the workbench component, styles, UI tests and extracted original prototype assets.
+The worker must retain real server-projected data and actions, honest unknown and recovery states, responsive and keyboard behavior, and may not ship the fixture prototype runtime or fake provider outcomes.
+E11 review repair `9edc444` also denies open-to-resolved or open-to-closed transitions without an explicit outcome; its owned regressions pass, while the coordinator still owes one shared legacy expectation update before claiming exact-head CI success.
+All cited browser and test evidence is controlled.
+No hosted Convex deployment, live provider call, owner-mailbox exchange, genuine supplier response, public origin, purchase, realized saving or commercial outcome was observed.
+
+### 2026-09-21 - E7 and E9 repaired delivery checkpoint
+
+Ready PR #13 at `c895461` now contains the repaired controlled E7 import and review boundary.
+It preserves exact CSV source bytes including a leading BOM, binds every accepted idempotency key on both fresh and byte-deduplicated paths, preflights all selected promotion rows before the first write, and records canonical attachment metadata as hashed protected source evidence.
+Coordinator reruns passed 32 Bun parser tests, 15 direct handler tests, strict TypeScript and all nine exact-head GitHub checks.
+The E7 test files are not yet registered in the shared test command; E8 owns that combined-validation repair.
+Ready PR #12 at `67df399` now contains the repaired controlled E9 second-location reuse boundary.
+It denies reuse into the source project before writes and exposes fail-closed, cursor-paged current-fact revalidation so reused rows remain reachable behind authored rows.
+Coordinator reruns passed 8 focused direct tests, strict TypeScript and all nine exact-head GitHub checks.
+The main integration PR #2 exact head `cd5ba57` also passes all nine expected checks.
+E8 remains active on the clean combined validation branch, and the new E12 production negotiation orchestrator is active in a clean Vasu-owned worktree on verified OpenCode Muse Spark 1.3 Contributor high.
+The E12 worker owns only new `convex/negotiation/**` files and must reuse the accepted Jev, OpenAI, AgentMail and execution contracts with zero live sends in tests.
+Greptile remains unavailable because its connected trial reports the 50-credit limit exhausted; that quota notice is not code-review approval, so the ready child PRs remain unmerged pending an explicitly resolved review gate and fixed-head Astra review.
+All cited evidence is controlled local or CI execution.
+No hosted Convex deployment, live provider call, owner-mailbox exchange, genuine supplier response, public origin, purchase, realized saving or commercial outcome was observed.
+
+### 2026-09-21 - E11 integration, shared-budget repair and supervised cleanup checkpoint
+
+E11 is repaired and remotely preserved at `662b7c9`; its focused 27-test suite and 333-test direct matrix pass, PR #7 has all nine exact-head checks green, and PR #14 carries the exact E11 history at `787c815` with 439 direct tests, strict TypeScript, production build and all nine exact-head checks green.
+The two posted Devin findings on PR #14 now have exact-head test and controlled-browser evidence replies.
+PR #14 is still not accepted: the selected purchasing-desk fidelity rebuild remains active, and GitHub reports a base conflict with the earlier generic U1 UI that will be resolved only after the fidelity branch lands without removing E8 behavior tests.
+Ready PR #15 at `71c7a69` contains the first production negotiation orchestrator, but Devin identified five substantive lifecycle and concurrency defects; a verified OpenCode Muse Spark 1.3 Contributor high repair dispatch owns those findings, so the green initial CI is not treated as acceptance.
+Ready PR #16 at cleaned head `dc08600` removes the impossible per-model basis demand from the shared organization budget while retaining exact per-reservation basis fences; five controlled multi-model regressions and all 18 exact-head checks pass.
+The analogous reconciliation check in `convex/execution/attempts.ts` remains under a separate verified OpenCode GLM-5.3-Flash high package before PR #16 or E12 can be accepted.
+Completed E2, E5, E7, E9, E10, U1 and E11 task worktrees were verified clean and remotely preserved, then removed through Orca without forced branch deletion; active E6, E8, E12 and budget-repair worktrees remain.
+Greptile still supplies quota notices only, which are recorded as a review blocker rather than approval.
+All cited browser, model and provider evidence is controlled.
+No hosted Convex deployment, live provider call, owner-mailbox exchange, genuine supplier response, public origin, purchase, realized saving or commercial outcome was observed.

@@ -1,5 +1,5 @@
 import type { BackendStatus } from "./backend-state";
-import WorkbenchView, { type WorkbenchViewProps } from "./Workbench";
+import WorkbenchView, { WorkbenchUnavailableView, type WorkbenchViewProps } from "./Workbench";
 import type { WorkbenchLoadState } from "./workbench-state";
 
 export interface AppProps extends Pick<WorkbenchViewProps, "onAction" | "onLoadMore"> {
@@ -65,29 +65,14 @@ function statusCopy(status: BackendStatus): StatusCopy {
   }
 }
 
-function FoundationStatus({ status, onRetry }: { readonly status: BackendStatus; readonly onRetry?: (() => void) | undefined }) {
+function WorkbenchConnectionStatus({ status, onRetry }: { readonly status: BackendStatus; readonly onRetry?: (() => void) | undefined }) {
   const copy = statusCopy(status);
-
-  return (
-    <main className="foundation-shell">
-      <section className="foundation-hero" aria-labelledby="page-title">
-        <div className="foundation-brand"><span className="foundation-mark">O<span>.</span></span><span>OpeningOS</span></div>
-        <div className="foundation-eyebrow">PURCHASING WORKBENCH / PRODUCTION FOUNDATION</div>
-        <h1 id="page-title">Turn supplier uncertainty into a clear next move.</h1>
-        <p className="foundation-lede">Evidence, authority and honest waiting for every purchasing decision that matters to opening day.</p>
-        <div className={`foundation-status ${copy.tone}`} role="status" aria-live="polite">
-          <span className={`foundation-status-dot ${copy.tone}`} aria-hidden="true" />
-          <div><div className="foundation-status-eyebrow">{copy.eyebrow}</div><strong>{copy.title}</strong><p>{copy.message}</p>{copy.action !== undefined && onRetry !== undefined ? <button type="button" className="foundation-retry retry-button" onClick={onRetry}>{copy.action}</button> : null}</div>
-        </div>
-      </section>
-      <section className="foundation-principles" aria-labelledby="principles-title"><div><div className="foundation-eyebrow">WORKBENCH PRINCIPLES</div><h2 id="principles-title">Built for evidence, authority, and honest waiting.</h2></div><div className="foundation-principle-grid"><article><span>01</span><h3>Evidence first</h3><p>Every comparison can point back to a bounded source and a reviewable state.</p></article><article><span>02</span><h3>Authority enforced</h3><p>Server-side capabilities and grants remain the source of truth for external effects.</p></article><article><span>03</span><h3>Waiting is visible</h3><p>Unavailable providers stay unavailable until real credentials and allowances exist.</p></article></div></section>
-    </main>
-  );
+  return <WorkbenchUnavailableView {...copy} onRetry={copy.action !== undefined ? onRetry : undefined} />;
 }
 
 export default function App({ backendStatus = "unconfigured", onRetry, workbench, onAction, onLoadMore }: AppProps) {
   if (workbench !== undefined && (backendStatus === "connected" || backendStatus === "reconnecting")) {
     return <WorkbenchView loadState={workbench} onRetry={onRetry} onAction={onAction} onLoadMore={onLoadMore} />;
   }
-  return <FoundationStatus status={backendStatus} onRetry={onRetry} />;
+  return <WorkbenchConnectionStatus status={backendStatus} onRetry={onRetry} />;
 }

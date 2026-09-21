@@ -24,6 +24,8 @@ import {
 
 type Tab = "project" | "suppliers" | "inbox" | "recovery" | "equipment";
 
+type WorkbenchConnectionTone = "neutral" | "pending" | "success" | "warning" | "error";
+
 export interface WorkbenchViewProps {
   readonly loadState: WorkbenchLoadState;
   readonly onRetry?: (() => void) | undefined;
@@ -132,6 +134,9 @@ function useModalAccessibility(dialogRef: ModalElementRef, onClose: () => void, 
     const dialog = dialogRef.current;
     if (dialog === null || typeof document === "undefined") return;
     const previousActiveElement = document.activeElement as HTMLElement | null;
+    // Walk from the overlay to the document body so deeply nested dialogs
+    // hide the header, navigation, and every sibling background layer while
+    // the dialog's own ancestor chain stays interactive.
     const modalRoot = dialog.closest<HTMLElement>(".wb-overlay") ?? dialog;
     const chain: HTMLElement[] = [];
     let cursor: HTMLElement | null = modalRoot;
@@ -252,7 +257,7 @@ function LoadNotice({ loadState, onRetry }: { readonly loadState: WorkbenchLoadS
   );
 }
 
-function Header({ activeTab, project, onTabChange, onOpenAssistant }: { readonly activeTab: Tab; readonly project: WorkbenchSnapshot["project"]; readonly onTabChange: (tab: Tab) => void; readonly onOpenAssistant: () => void }) {
+function Header({ activeTab, project, onTabChange, onOpenAssistant, disabled = false }: { readonly activeTab: Tab; readonly project: Pick<WorkbenchSnapshot["project"], "name" | "region" | "currency">; readonly onTabChange: (tab: Tab) => void; readonly onOpenAssistant: () => void; readonly disabled?: boolean }) {
   const tabs: readonly [Tab, string, string][] = [
     ["project", "Project", "compass"],
     ["suppliers", "Suppliers", "search"],
@@ -269,7 +274,6 @@ function Header({ activeTab, project, onTabChange, onOpenAssistant }: { readonly
       </div>
       <header className="wb-header">
         <button className="wb-brand" type="button" aria-label="OpeningOS project workbench" onClick={() => onTabChange("project")}>
-          <span className="wb-brand-mark">O<span>.</span></span>
           <span>OpeningOS<span className="wb-brand-dot">.</span></span>
         </button>
         <div className="wb-project-picker" aria-label="Current project">
@@ -279,14 +283,65 @@ function Header({ activeTab, project, onTabChange, onOpenAssistant }: { readonly
         </div>
         <nav className="wb-nav" aria-label="Project navigation">
           {tabs.map(([tab, label, icon]) => (
-            <button key={tab} className={activeTab === tab ? "active" : ""} type="button" aria-current={activeTab === tab ? "page" : undefined} onClick={() => onTabChange(tab)}>
+            <button key={tab} className={activeTab === tab ? "active" : ""} type="button" aria-current={activeTab === tab ? "page" : undefined} onClick={() => onTabChange(tab)} disabled={disabled}>
               <Icon name={icon} size={16} /><span>{label}</span>
             </button>
           ))}
         </nav>
-        <button className="wb-assistant-button" type="button" onClick={onOpenAssistant} aria-label="Open project assistant"><Icon name="spark" size={18} /></button>
+        <button className="wb-assistant-button" type="button" onClick={onOpenAssistant} aria-label="Open project assistant" disabled={disabled}><Icon name="spark" size={18} /></button>
       </header>
     </>
+  );
+}
+
+export interface WorkbenchUnavailableViewProps {
+  readonly eyebrow: string;
+  readonly title: string;
+  readonly message: string;
+  readonly tone: WorkbenchConnectionTone;
+  readonly action?: string | undefined;
+  readonly onRetry?: (() => void) | undefined;
+}
+
+/**
+ * Keep every connection and configuration state inside the selected purchasing
+ * workbench visual system. The shell contains no fixture project, supplier, or
+ * financial data, and all controls remain disabled until a real authorized
+ * projection is available.
+ */
+export function WorkbenchUnavailableView({ eyebrow, title, message, tone, action, onRetry }: WorkbenchUnavailableViewProps) {
+  const unavailableProject = { name: "No project connected", region: null, currency: null } as const;
+  return (
+    <div className="wb-app wb-connection-app">
+      <Header activeTab="project" project={unavailableProject} onTabChange={() => undefined} onOpenAssistant={() => undefined} disabled />
+      <main id="workbench-main" className="wb-page wb-connection-page" tabIndex={-1}>
+        <PageHeading
+          eyebrow="OPENINGOS / PURCHASING WORKBENCH"
+          title="Everything on the table."
+          description="Your requirements, suppliers, evidence and next move belong in one decision desk. OpeningOS will not invent any of them while the server record is unavailable."
+        />
+        <div className="wb-connection-layout">
+          <section className={`wb-connection-paper wb-connection-${tone}`} aria-labelledby="connection-title" role="status" aria-live="polite">
+            <div className="wb-connection-paper-head">
+              <span className={`wb-connection-dot wb-connection-dot-${tone}`} aria-hidden="true" />
+              <span className="wb-eyebrow">{eyebrow}</span>
+              <span className="wb-paper-version">SERVER STATE<br />NO SAMPLE DATA</span>
+            </div>
+            <h2 id="connection-title">{title}</h2>
+            <p>{message}</p>
+            <div className="wb-connection-rule"><span>Provider effects</span><strong>Unavailable</strong></div>
+            <div className="wb-connection-rule"><span>Customer data</span><strong>Not displayed</strong></div>
+            {action !== undefined && onRetry !== undefined ? <ActionButton kind="secondary" onClick={onRetry}><Icon name="refresh" size={15} /> {action}</ActionButton> : null}
+          </section>
+          <aside className="wb-connection-note" aria-label="What happens next">
+            <span className="wb-eyebrow">WHAT HAPPENS NEXT</span>
+            <h2>The workbench fills from server truth.</h2>
+            <p>Once an authorized project projection is connected, this same workspace shows comparable quotes, source evidence, delivery states and the next permitted action.</p>
+            <div className="wb-honesty-card"><Icon name="lock" size={18} /><div><strong>Private and fail-closed</strong><p>Missing configuration never falls back to sample vendors, invented prices, or simulated provider success.</p></div></div>
+          </aside>
+        </div>
+      </main>
+    </div>
   );
 }
 
@@ -846,7 +901,23 @@ export default function WorkbenchView({ loadState, onRetry, onAction, onLoadMore
   const snapshot = loadState.state === "ready" ? loadState.snapshot : "lastKnown" in loadState ? loadState.lastKnown : undefined;
   const connectedAction = loadState.state === "ready" ? onAction : undefined;
   if (!snapshot) {
-    return <main className="wb-connected-empty"><div className="wb-empty-hero"><span className="wb-brand-mark">O<span>.</span></span><span className="wb-eyebrow">OPENINGOS / PURCHASING WORKBENCH</span><h1>Waiting for an authorized project.</h1><p>{loadState.state === "empty" ? `${loadState.message} No vendors, quotes or provider outcomes are shown until server state is available.` : "The backend is connected, but no project-scoped projection has arrived yet. No vendors, quotes or provider outcomes are shown until server state is available."}</p><div className="wb-honesty-card"><Icon name="lock" size={18} /><div><strong>Private by default</strong><p>Project IDs, recipient details and raw provider headers stay out of the public projection. Ask the coordinator to wire the authorized project adapter before using this view.</p></div></div>{loadState.state !== "loading" && onRetry ? <ActionButton onClick={onRetry} kind="secondary"><Icon name="refresh" size={15} /> Retry project state</ActionButton> : null}</div></main>;
+    const message = loadState.state === "empty"
+      ? `${loadState.message} No vendors, quotes or provider outcomes are shown until server state is available.`
+      : loadState.state === "error"
+        ? loadState.message
+        : loadState.state === "reconnecting"
+          ? "The last backend connection was lost. Completed work remains on the server; new actions wait until the projection is current again."
+          : "The backend is connected, but no project-scoped projection has arrived yet. No vendors, quotes or provider outcomes are shown until server state is available.";
+    return (
+      <WorkbenchUnavailableView
+        eyebrow={loadState.state === "error" ? "PROJECT STATE UNAVAILABLE" : loadState.state === "reconnecting" ? "CONNECTION INTERRUPTED" : loadState.state === "loading" ? "LOADING AUTHORIZED PROJECT" : "NO AUTHORIZED PROJECT"}
+        title={loadState.state === "reconnecting" ? "Reconnecting to OpeningOS." : loadState.state === "error" ? "Project state needs another check." : "Waiting for an authorized project."}
+        message={message}
+        tone={loadState.state === "error" ? "error" : loadState.state === "reconnecting" ? "warning" : loadState.state === "loading" ? "pending" : "neutral"}
+        action={loadState.state !== "loading" && onRetry !== undefined ? "Retry project state" : undefined}
+        onRetry={onRetry}
+      />
+    );
   }
   const tabContent = activeTab === "project" ? <ProjectView snapshot={snapshot} onReview={setSelectedOffer} onAction={connectedAction} onLoadMore={onLoadMore} onTabChange={setActiveTab} onOpenAssistant={() => setAssistantOpen(true)} onOpenEvidence={setEvidence} onMessage={setMessage} /> : activeTab === "suppliers" ? <SuppliersView snapshot={snapshot} onReview={setSelectedOffer} onOpenEvidence={setEvidence} /> : activeTab === "inbox" ? <InboxView snapshot={snapshot} onAction={connectedAction} onMessage={setMessage} /> : activeTab === "recovery" ? <RecoveryView snapshot={snapshot} onAction={connectedAction} onMessage={setMessage} /> : <EquipmentView snapshot={snapshot} onAction={connectedAction} onMessage={setMessage} />;
   return <div className="wb-app"><Header activeTab={activeTab} project={snapshot.project} onTabChange={setActiveTab} onOpenAssistant={() => setAssistantOpen(true)} /><LoadNotice loadState={loadState} onRetry={onRetry} /><OverviewStrip snapshot={snapshot} /><main id="workbench-main" tabIndex={-1}>{tabContent}</main>{message ? <div className="wb-toast" role="status" aria-live="polite"><span>{message}</span><button type="button" onClick={() => setMessage(null)} aria-label="Dismiss message"><Icon name="close" size={14} /></button></div> : null}{assistantOpen ? <AssistantRail snapshot={snapshot} onClose={() => setAssistantOpen(false)} /> : null}{evidence ? <EvidencePanel evidence={evidence} onClose={() => setEvidence(null)} /> : null}{selectedOffer ? <SelectionPanel offer={selectedOffer} snapshot={snapshot} onClose={() => setSelectedOffer(null)} onAction={connectedAction} onMessage={setMessage} /> : null}</div>;
