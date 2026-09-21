@@ -7,6 +7,17 @@
  * orders, order events, payments, settled costs, refunds, and credits
  * are never copied, so reuse cannot inherit another project's
  * commitments or cash.
+ *
+ * P-19 second-location reuse: a template instantiated into a different
+ * target project keeps the reusable specification facts (key, title,
+ * category, quantity, unit) while every current commercial or
+ * operational fact is explicitly revalidation-required by construction.
+ * The reuse summary is derived from the template version and target
+ * project only: it never claims a price, availability, supplier reply,
+ * or service outcome, and never claims stale evidence exists when none
+ * was copied — each current fact states `revalidationRequired` with
+ * `checked: false` and a reason tied to the template version and target
+ * project.
  */
 
 import { v } from "convex/values";
@@ -558,6 +569,91 @@ interface SnapshotConstraint {
   readonly kind: "technical" | "scheduling";
 }
 
+// -- P-19 second-location reuse summary --------------------------------------
+
+/**
+ * Specification facts a template instantiation copies verbatim. They stay
+ * reusable because they describe WHAT the target project needs, never any
+ * supplier's current commercial terms.
+ */
+export const COPIED_SPECIFICATION_FIELDS = [
+  "key",
+  "title",
+  "category",
+  "quantity",
+  "unit",
+] as const;
+
+/**
+ * Current commercial or operational facts that a second location must
+ * re-verify. Instantiation copies none of them and never marks any of
+ * them checked: a truthful summary states `revalidationRequired` with
+ * `checked: false`, never a stale claim about evidence that was not
+ * copied.
+ */
+const REUSE_CURRENT_FACTS = [
+  "price",
+  "availabilityOrLeadTime",
+  "warrantyOrServiceCoverage",
+  "installationOrSiteCompatibility",
+  "supplierTerms",
+] as const;
+
+const reuseCurrentFactCheckValidator = v.object({
+  fact: v.string(),
+  state: v.literal("revalidationRequired"),
+  checked: v.literal(false),
+  reason: v.string(),
+});
+
+const reuseSummaryValidator = v.object({
+  templateId: v.id("templates"),
+  templateVersion: v.string(),
+  targetProjectId: v.id("projects"),
+  copiedSpecificationFields: v.array(v.string()),
+  currentFactChecks: v.array(reuseCurrentFactCheckValidator),
+});
+
+export const reuseSummaryFieldsValidator = reuseSummaryValidator.fields;
+
+interface ReuseSummary {
+  readonly templateId: Id<"templates">;
+  readonly templateVersion: string;
+  readonly targetProjectId: Id<"projects">;
+  readonly copiedSpecificationFields: string[];
+  readonly currentFactChecks: {
+    readonly fact: string;
+    readonly state: "revalidationRequired";
+    readonly checked: false;
+    readonly reason: string;
+  }[];
+}
+
+/**
+ * Derive the truthful reuse summary for one template instantiating into
+ * one target project. The summary is a pure function of the template
+ * identity/version and the target project, so an identical instantiation
+ * replay returns exactly the same summary without any write.
+ */
+function reuseSummaryFor(
+  templateId: Id<"templates">,
+  templateVersion: string,
+  targetProjectId: Id<"projects">,
+): ReuseSummary {
+  return {
+    templateId,
+    templateVersion,
+    targetProjectId,
+    copiedSpecificationFields: [...COPIED_SPECIFICATION_FIELDS],
+    currentFactChecks: REUSE_CURRENT_FACTS.map((fact) => ({
+      fact,
+      state: "revalidationRequired" as const,
+      checked: false as const,
+      reason: `${fact} is a current commercial or operational fact; template version ${templateVersion} copied specifications only, so target project ${targetProjectId} requires a fresh check and none has been performed`,
+    })),
+  };
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -628,6 +724,15 @@ function parseSnapshotConstraints(snapshot: string): SnapshotConstraint[] | null
  * and bound overruns are all denied whole, so a failed instantiation
  * leaves zero partial rows. Replaying an already-instantiated template
  * returns the stored requirement rows instead of duplicating them.
+ *
+ * P-19: the result carries a truthful reuse summary derived from the
+ * re-read template version and the target project — the copied
+ * specification fields plus the five current-fact rechecks (price,
+ * availability or lead time, warranty or service coverage, installation
+ * or site compatibility, supplier terms), each explicitly
+ * `revalidationRequired`/not checked. Template and target access are
+ * re-read at the start of the handler, before any replay decision or
+ * write.
  */
 export const instantiateTemplate = f1Mutation({
   args: {
@@ -641,6 +746,7 @@ export const instantiateTemplate = f1Mutation({
       requirementIds: v.array(v.id("requirements")),
       collections: v.array(v.string()),
       deduplicated: v.boolean(),
+      reuse: reuseSummaryValidator,
     }),
     denialValidator,
   ),
@@ -657,6 +763,12 @@ export const instantiateTemplate = f1Mutation({
     const template = await ctx.db.get(args.templateId);
     if (template === null || template.organizationId !== args.organizationId) {
       return { ok: false as const, code: "denied-project", message: "template is not in this organization" };
+    }
+    // P-19: second-location reuse targets a distinct project. The source
+    // project already holds its own live graph, so instantiating into it
+    // is denied before any replay lookup or write.
+    if (template.sourceProjectId === args.targetProjectId) {
+      return { ok: false as const, code: "invalid-payload", message: "template cannot instantiate into its own source project" };
     }
     const wanted = parseSnapshotRequirements(template.requirementSnapshot);
     const edges = parseSnapshotConstraints(template.constraintSnapshot);
@@ -745,6 +857,14 @@ export const instantiateTemplate = f1Mutation({
             requirementIds: replayed,
             collections: [...TEMPLATE_REUSE_COLLECTIONS],
             deduplicated: true,
+            // Identical replay: the summary derives only from the re-read
+            // template version and the target project, so it matches the
+            // original instantiation byte for byte without any write.
+            reuse: reuseSummaryFor(
+              template._id,
+              template.version,
+              args.targetProjectId,
+            ),
           };
         }
       }
@@ -801,6 +921,124 @@ export const instantiateTemplate = f1Mutation({
       requirementIds,
       collections: [...TEMPLATE_REUSE_COLLECTIONS],
       deduplicated: false,
+      reuse: reuseSummaryFor(template._id, template.version, args.targetProjectId),
+    };
+  },
+});
+
+/**
+ * P-19 second-location reuse revalidation state (bounded authorized read).
+ *
+ * Lists the template-reused requirements of one target project with a
+ * truthful per-requirement summary: the copied specification facts with
+ * their reused values (key, title, category, quantity, unit) and the five
+ * current-fact rechecks (price, availability or lead time, warranty or
+ * service coverage, installation or site compatibility, supplier terms),
+ * each `revalidationRequired` with `checked: false` and a reason tied to
+ * the template version and target project. No current commercial or
+ * operational fact is asserted, no stale evidence is claimed, and no
+ * source-project data is exposed: the read returns lineage as the
+ * template id and version only.
+ *
+ * Cursor paging over the project index keeps every reused row reachable
+ * no matter how many manually authored requirements precede it: each
+ * call scans at most `limit` project rows (a positive safe integer up
+ * to 200; anything else is denied) and returns every reused requirement
+ * inside that scanned window. `complete` is
+ * true only when the whole project has been scanned, so a page is never
+ * mistaken for the exhaustive set; when `complete` is false, the caller
+ * resumes from `continueCursor`, which continues exactly after the
+ * scanned window so no row is skipped.
+ */
+export const listTemplateReuseRevalidation = f1Query({
+  args: {
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    limit: v.number(),
+    cursor: v.optional(v.string()),
+  },
+  returns: v.union(
+    v.object({
+      ok: v.literal(true),
+      complete: v.boolean(),
+      continueCursor: v.optional(v.string()),
+      scanned: v.number(),
+      requirements: v.array(
+        v.object({
+          requirementId: v.id("requirements"),
+          key: v.string(),
+          title: v.string(),
+          category: v.string(),
+          quantity: v.string(),
+          unit: v.string(),
+          templateId: v.id("templates"),
+          templateVersion: v.string(),
+          copiedSpecificationFields: v.array(v.string()),
+          currentFactChecks: v.array(reuseCurrentFactCheckValidator),
+        }),
+      ),
+    }),
+    denialValidator,
+  ),
+  handler: async (ctx, args) => {
+    const access = await requireDomainAccess(
+      ctx,
+      args.organizationId,
+      args.projectId,
+      "viewer",
+    );
+    if (!access.ok) {
+      return { ok: false as const, code: access.code, message: access.message };
+    }
+    // Fail closed on malformed bounds: only a positive safe integer
+    // within the supported scan bound is accepted. Non-finite, fractional,
+    // zero/negative, and over-max values are denied, never clamped.
+    if (
+      !Number.isSafeInteger(args.limit) ||
+      args.limit <= 0 ||
+      args.limit > 200
+    ) {
+      return { ok: false as const, code: "invalid-payload", message: "limit must be a positive safe integer within the supported scan bound of 200" };
+    }
+    // `limit` bounds the rows scanned and returned per page, not an
+    // output cap beyond the scan: every reused requirement inside the
+    // scanned window is returned, so truncating output could never
+    // silently drop a reused row that the continuation cursor would
+    // otherwise skip.
+    const scanRows = args.limit;
+    const page = await ctx.db
+      .query("requirements")
+      .withIndex("by_project", (q) => q.eq("projectId", args.projectId))
+      .paginate({
+        cursor: args.cursor ?? null,
+        numItems: scanRows,
+        maximumRowsRead: scanRows,
+      });
+    const reused = page.page.filter(
+      (row): row is typeof row & { readonly templateId: Id<"templates"> } =>
+        row.organizationId === args.organizationId && row.templateId !== undefined,
+    );
+    return {
+      ok: true as const,
+      complete: page.isDone,
+      ...(page.isDone ? {} : { continueCursor: page.continueCursor }),
+      scanned: page.page.length,
+      requirements: reused.map((row) => ({
+        requirementId: row._id,
+        key: row.key,
+        title: row.title,
+        category: row.category,
+        quantity: row.quantity,
+        unit: row.unit,
+        templateId: row.templateId,
+        templateVersion: row.templateVersion ?? "unknown",
+        copiedSpecificationFields: [...COPIED_SPECIFICATION_FIELDS],
+        currentFactChecks: reuseSummaryFor(
+          row.templateId,
+          row.templateVersion ?? "unknown",
+          args.projectId,
+        ).currentFactChecks,
+      })),
     };
   },
 });
