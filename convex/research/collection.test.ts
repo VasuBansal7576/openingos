@@ -1044,6 +1044,89 @@ describe("R1 collection-target binding (F03)", () => {
     expect(await countRows()).toEqual({ jobs: 2, firstGrantOps: 2, secondGrantOps: 0 });
   });
 
+  test("concurrent cross-grant target submissions keep one effect set and reject the loser", async () => {
+    // Promise.all submits both top-level mutations without awaiting either
+    // winner. convex-test serializes those mutations at the same boundary as
+    // Convex, so the second transaction must observe the first exact-key
+    // commit and fail before creating a job, reservation, or operation.
+    const t = init();
+    const fixture = await createFixture(t, "concurrent-target-fixture");
+    const asOwner = t.withIdentity(OWNER);
+    const secondGrant = await asOwner.mutation(issueGrantRef, {
+      organizationId: fixture.organizationId,
+      projectId: fixture.projectId,
+      operations: ["research.collect"],
+      communicationProfile: "ownerRoleplay",
+      recipientConfigVersion: 0,
+      inputVersions: { brief: "r1-v1" },
+      payloadJson: canonicalJson({ query: INTENT }),
+      costCeilingMicroUsd: 250_000,
+      roundLimit: 8,
+      expiresAt: Date.now() + 60 * 60 * 1000,
+    });
+    if (!secondGrant.ok) throw new Error(`second concurrent grant setup failed: ${secondGrant.message}`);
+
+    const concurrent = await Promise.all([
+      asOwner.mutation(requestGrantedResearchRef, {
+        projectId: fixture.projectId,
+        researchIntent: INTENT,
+        requestId: "concurrent-target-request",
+        grantId: fixture.grantId,
+        mode: "search",
+      }),
+      asOwner.mutation(requestGrantedResearchRef, {
+        projectId: fixture.projectId,
+        researchIntent: INTENT,
+        requestId: "concurrent-target-request",
+        grantId: secondGrant.grantId,
+        mode: "scrape",
+        sourceUrl: "https://supplier.example.test/concurrent-target",
+      }),
+    ]);
+    const successes = concurrent.filter((result) => result.ok);
+    const conflicts = concurrent.filter((result) => !result.ok && result.code === "duplicate-conflict");
+    expect(successes).toHaveLength(1);
+    expect(conflicts).toHaveLength(1);
+    const winner = successes[0];
+    if (!winner || !winner.ok || winner.operationId === null) {
+      throw new Error("concurrent winner did not return an operation");
+    }
+    expect(await countProjectEffects(t, fixture.projectId)).toEqual({ jobs: 2, operations: 2, reservations: 2 });
+    const stored = await t.run(async (ctx) => await ctx.db.get(winner.operationId));
+    expect(stored?.requestId).toContain('"r":"concurrent-target-request"');
+    expect(stored?.requestKey).toContain(fixture.projectId);
+  });
+
+  test("legacy bare collection rows bridge to default search without target widening", async () => {
+    // createFixture writes the pre-F03 bare requestId/requestKey shape. The
+    // exact-key bridge must still return that operation for an identical
+    // default search retry, while a changed target remains a conflict.
+    const t = init();
+    const fixture = await createFixture(t, "legacy-bridge-request");
+    const asOwner = t.withIdentity(OWNER);
+    const before = await countProjectEffects(t, fixture.projectId);
+    const identical = await asOwner.mutation(requestGrantedResearchRef, {
+      projectId: fixture.projectId,
+      researchIntent: INTENT,
+      requestId: "legacy-bridge-request",
+      grantId: fixture.grantId,
+      mode: "search",
+    });
+    expect(identical).toMatchObject({ ok: true, jobId: fixture.jobId, operationId: fixture.operationId });
+    expect(await countProjectEffects(t, fixture.projectId)).toEqual(before);
+
+    const changedTarget = await asOwner.mutation(requestGrantedResearchRef, {
+      projectId: fixture.projectId,
+      researchIntent: INTENT,
+      requestId: "legacy-bridge-request",
+      grantId: fixture.grantId,
+      mode: "scrape",
+      sourceUrl: "https://supplier.example.test/legacy-target",
+    });
+    expect(changedTarget).toMatchObject({ ok: false, code: "duplicate-conflict" });
+    expect(await countProjectEffects(t, fixture.projectId)).toEqual(before);
+  });
+
   async function assertGrantRotation(status: RotatedGrantStatus): Promise<void> {
     const t = init();
     const fixture = await createFixture(t, `rotation-fixture-${status}`);
