@@ -564,8 +564,11 @@ export function normalizeProviderResponse(input: NormalizeProviderInput): Provid
  * Only globally routable unicast literals pass. Loopback, unspecified,
  * private, link-local, multicast, reserved, documentation, benchmark, TEST-NET
  * and CGNAT ranges are rejected, including when reached through an IPv6
- * transition form (IPv4-mapped, 6to4, NAT64 well-known prefix) whose embedded
- * IPv4 address falls in one of those ranges.
+ * transition form (IPv4-mapped, IPv4-compatible, IPv4-translated, 6to4,
+ * NAT64 well-known prefix) whose embedded IPv4 address falls in one of those
+ * ranges. IPv4-compatible (`::/96`) covers both dotted-quad spellings such
+ * as `::127.0.0.1` and their normalized hex equivalents such as `::7f00:1`,
+ * which the URL parser produces for the same address.
  *
  * DNS policy (honest limitation, not a guarantee): DNS names are allowed
  * without resolution. This guard performs no DNS lookup, offers no
@@ -707,6 +710,23 @@ function isPublicIpv6Literal(host: string): boolean {
   // loopback/private/CGNAT forms are rejected with their IPv4 meaning.
   const isMapped = isZeroRange(0, 10) && at(10) === 0xff && at(11) === 0xff;
   if (isMapped) {
+    return isPublicIpv4([at(12), at(13), at(14), at(15)]);
+  }
+  // ::ffff:0:0/96 IPv4-translated: bytes 8-9 carry the well-known prefix
+  // marker with zero translation bits, so the last 32 bits are the embedded
+  // IPv4 address with the same private/loopback meaning (for example
+  // ::ffff:0:127.0.0.1).
+  const isTranslated = isZeroRange(0, 8) && at(8) === 0xff && at(9) === 0xff && at(10) === 0x00 && at(11) === 0x00;
+  if (isTranslated) {
+    return isPublicIpv4([at(12), at(13), at(14), at(15)]);
+  }
+  // ::/96 IPv4-compatible (deprecated): the first 96 bits are zero and the
+  // last 32 bits are the embedded IPv4 address. This covers dotted-quad
+  // spellings (::127.0.0.1, ::10.0.0.1) and every normalized hex equivalent
+  // (::7f00:1, ::a00:1, full uncompressed forms), which all parse to the
+  // same bytes. Classify the embedded address so compatible loopback and
+  // private forms are rejected with their IPv4 meaning.
+  if (isZeroRange(0, 12)) {
     return isPublicIpv4([at(12), at(13), at(14), at(15)]);
   }
   // 2002::/16 6to4: bytes 2-5 carry the embedded IPv4 address.

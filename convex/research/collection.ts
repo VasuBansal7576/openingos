@@ -385,6 +385,82 @@ function collectionTargetsEqual(first: CollectionTarget, second: CollectionTarge
 }
 
 /**
+ * Maximum project grants examined by the cross-grant request fence below.
+ * Grants are approver-issued, so a caller holding one valid grant cannot
+ * inflate this list to push another grant's request out of the scan window.
+ */
+const MAX_PROJECT_GRANTS_SCANNED = 32;
+
+interface ProjectRequestSibling {
+  readonly operationId: Id<"operations">;
+  readonly jobId: Id<"jobs">;
+  readonly normalizedPayload: string;
+  readonly binding: CollectionTarget | undefined;
+}
+
+/**
+ * Cross-grant request lookup for one logical project/client request ID.
+ *
+ * The bound `by_requestKey` identity folds the collection target into the
+ * key, so a changed target misses that exact lookup by design. This helper
+ * finds the original operation under any grant of the same project instead,
+ * so presenting another valid grant with the same client request ID can
+ * never mint a second job, reservation, or provider exposure.
+ *
+ * Every read is indexed and bounded: grants enumerate through
+ * `by_project_and_status` and each grant's operations through `by_grant`.
+ * A bound overflow fails closed before any job, reservation, or dispatch
+ * side effect. Only rows in this organization, project, and operation kind
+ * participate, so no cross-project request identity is disclosed or blocked.
+ */
+async function lookupProjectRequest(
+  ctx: F1MutationCtx,
+  organizationId: Id<"organizations">,
+  projectId: Id<"projects">,
+  clientRequestId: string,
+): Promise<
+  | { readonly ok: true; readonly sibling: ProjectRequestSibling | null }
+  | { readonly ok: false; readonly code: "duplicate-conflict"; readonly message: string }
+> {
+  const unverifiable = {
+    ok: false as const,
+    code: "duplicate-conflict" as const,
+    message: "requestId could not be verified across project grants",
+  };
+  for (const status of ["active", "revoked", "expired"] as const) {
+    const projectGrants = await ctx.db
+      .query("grants")
+      .withIndex("by_project_and_status", (q) => q.eq("projectId", projectId).eq("status", status))
+      .take(MAX_PROJECT_GRANTS_SCANNED + 1);
+    if (projectGrants.length > MAX_PROJECT_GRANTS_SCANNED) return unverifiable;
+    for (const grant of projectGrants) {
+      if (grant.organizationId !== organizationId || grant.projectId !== projectId) continue;
+      const siblings = await ctx.db
+        .query("operations")
+        .withIndex("by_grant", (q) => q.eq("grantId", grant._id))
+        .take(MAX_OPERATIONS_PER_GRANT + 1);
+      if (siblings.length > MAX_OPERATIONS_PER_GRANT) return unverifiable;
+      for (const sibling of siblings) {
+        if (sibling.kind !== "research.collect") continue;
+        if (sibling.organizationId !== organizationId || sibling.projectId !== projectId) continue;
+        const decoded = decodeCollectionRequestId(sibling.requestId);
+        if (decoded.clientRequestId !== clientRequestId) continue;
+        return {
+          ok: true as const,
+          sibling: {
+            operationId: sibling._id,
+            jobId: sibling.jobId,
+            normalizedPayload: sibling.normalizedPayload,
+            binding: decoded.binding,
+          },
+        };
+      }
+    }
+  }
+  return { ok: true as const, sibling: null };
+}
+
+/**
  * Validate the collection target before any dispatch or accounting side
  * effect. Private/local source URLs are rejected here, including the search
  * path when a source URL is supplied alongside it.
@@ -1208,24 +1284,28 @@ export const requestGrantedResearch = f1Mutation({
       }
       return { ok: true as const, jobId: existing.jobId, operationId: existing._id, state: existingJob.state, requestCount: 0, incompleteCount: 0, controlled: false };
     }
-    const grantOperations = await ctx.db
-      .query("operations")
-      .withIndex("by_grant", (q) => q.eq("grantId", args.grantId))
-      .take(MAX_OPERATIONS_PER_GRANT + 1);
-    for (const sibling of grantOperations) {
-      if (sibling.kind !== "research.collect") continue;
-      const decoded = decodeCollectionRequestId(sibling.requestId);
-      if (decoded.clientRequestId !== args.requestId) continue;
+    // Cross-grant idempotency fence: the same logical project/client
+    // request ID returns its original operation (identical payload and
+    // collection target, including legacy rows without a stored binding)
+    // or conflicts (changed payload or target) under every grant of this
+    // project, before any job, reservation, or dispatch side effect.
+    const crossGrant = await lookupProjectRequest(ctx, project.organizationId, project._id, args.requestId);
+    if (!crossGrant.ok) return crossGrant;
+    const sibling = crossGrant.sibling;
+    if (sibling !== null) {
       if (
-        decoded.binding === undefined &&
-        sibling.projectId === project._id &&
-        sibling.normalizedPayload === operationPayload
+        sibling.normalizedPayload === operationPayload &&
+        (sibling.binding === undefined || collectionTargetsEqual(sibling.binding, requestedTarget))
       ) {
-        const legacyJob = await ctx.db.get(sibling.jobId);
-        if (legacyJob === null || legacyJob.projectId !== project._id) {
+        const siblingJob = await ctx.db.get(sibling.jobId);
+        if (
+          siblingJob === null ||
+          siblingJob.organizationId !== project.organizationId ||
+          siblingJob.projectId !== project._id
+        ) {
           return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
         }
-        return { ok: true as const, jobId: sibling.jobId, operationId: sibling._id, state: legacyJob.state, requestCount: 0, incompleteCount: 0, controlled: false };
+        return { ok: true as const, jobId: sibling.jobId, operationId: sibling.operationId, state: siblingJob.state, requestCount: 0, incompleteCount: 0, controlled: false };
       }
       return { ok: false as const, code: "duplicate-conflict", message: "requestId reused with a different research payload" };
     }
