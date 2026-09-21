@@ -2502,7 +2502,7 @@ function twoOfferProjectionWithVerdicts(
   };
 }
 
-test("a verdict for the same candidate but an unrelated quote is never displayed", () => {
+test("a verdict for the same candidate but an unrelated quote fails closed", () => {
   // Control: the backend-named opposing quote ids bind and the exact delta renders.
   const control = parseWorkbenchSnapshot(twoOfferProjection(), projection.project.id);
   if (control === null) throw new Error("Two-offer projection should parse");
@@ -2515,28 +2515,17 @@ test("a verdict for the same candidate but an unrelated quote is never displayed
     twoOfferProjectionWithVerdicts((verdict) => ({ ...verdict, againstQuoteId: "quote-stale-unrelated" })),
     projection.project.id,
   );
-  if (stale === null) throw new Error("Stale-quote projection should still parse");
-  const staleHtml = renderToStaticMarkup(createElement(WorkbenchView, { loadState: { state: "ready", snapshot: stale } }));
-  expect(staleHtml).not.toContain("wb-comparison-tape");
-  expect(staleHtml).not.toContain("549.51");
-  expect(staleHtml).not.toContain("lower than");
-  // Both offers stay visible with their own honest terms; nothing is ranked.
-  expect(staleHtml).toContain("Harbor Equipment");
-  expect(staleHtml).toContain("Elm Supply");
-  expect(staleHtml).toContain("Total (EUR)");
+  expect(stale).toBeNull();
 
   // A verdict with no quote binding fails closed as well.
   const unbound = parseWorkbenchSnapshot(
     twoOfferProjectionWithVerdicts((verdict) => ({ ...verdict, againstQuoteId: null })),
     projection.project.id,
   );
-  if (unbound === null) throw new Error("Unbound-quote projection should still parse");
-  const unboundHtml = renderToStaticMarkup(createElement(WorkbenchView, { loadState: { state: "ready", snapshot: unbound } }));
-  expect(unboundHtml).not.toContain("wb-comparison-tape");
-  expect(unboundHtml).not.toContain("lower than");
+  expect(unbound).toBeNull();
 });
 
-test("a verdict is never displayed when the opposing quote is absent", () => {
+test("a verdict fails closed when the opposing quote is absent", () => {
   const value = twoOfferProjection();
   const candidates = value.candidates as readonly Record<string, unknown>[];
   const withoutOpposingQuote = parseWorkbenchSnapshot({
@@ -2545,12 +2534,7 @@ test("a verdict is never displayed when the opposing quote is absent", () => {
       ? { ...candidate, latestValidQuote: null }
       : candidate),
   }, projection.project.id);
-  if (withoutOpposingQuote === null) throw new Error("Missing-quote projection should still parse");
-  const html = renderToStaticMarkup(createElement(WorkbenchView, { loadState: { state: "ready", snapshot: withoutOpposingQuote } }));
-  expect(html).not.toContain("wb-comparison-tape");
-  expect(html).not.toContain("lower than");
-  expect(html).toContain("Harbor Equipment");
-  expect(html).toContain("No quote yet");
+  expect(withoutOpposingQuote).toBeNull();
 });
 
 // -- E16 repair (F7): exact decimal-string intake budget parsing --------------
