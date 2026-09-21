@@ -722,3 +722,126 @@ describe("F1 negotiation authority binding", () => {
     expect(await attemptCount(fixture)).toBe(0);
   });
 });
+
+describe("Astra review2: atomic saved-draft binding at creation", () => {
+  async function operationCount(t: Fixture["t"]): Promise<number> {
+    return await t.run(async (ctx) => (await ctx.db.query("operations").collect()).length);
+  }
+
+  function draftPins(fixture: Fixture): {
+    quoteVersion: string;
+    quoteContentHash: string;
+    roundsUsed: number;
+    conversationVersion: number;
+    conversationState: string;
+    payloadHash: string;
+  } {
+    return {
+      quoteVersion: "v1",
+      quoteContentHash: fixture.quoteContentHash,
+      roundsUsed: 0,
+      conversationVersion: 1,
+      conversationState: "awaitingReply",
+      payloadHash: payloadHash(DRAFT),
+    };
+  }
+
+  async function createWithDraft(
+    fixture: FixtureWithReservation,
+    requestId: string,
+  ): Promise<MutationReturn<typeof operations.create>> {
+    return await fixture.t.withIdentity(OWNER).mutation(createOperationRef, {
+      jobId: fixture.jobId,
+      organizationId: fixture.organizationId,
+      projectId: fixture.projectId,
+      kind: "communication.send",
+      requestId,
+      payloadJson: CANONICAL_DRAFT,
+      grantId: fixture.grantId,
+      reservationId: fixture.reservationId,
+      negotiationId: fixture.negotiationId,
+      negotiationDraft: draftPins(fixture),
+    });
+  }
+
+  test("a current draft pins atomically and claims once", async () => {
+    const fixture = await reserveFor(await createMandateFixture(3));
+    const created = await createWithDraft(fixture, "req-draft-current");
+    expect(created).toMatchObject({ ok: true, deduped: false });
+    if (!created.ok) throw new Error("draft-bound creation failed");
+    const claimed = await claim(fixture, created.operationId);
+    expect(claimed).toMatchObject({ ok: true });
+    const negotiation = await fixture.t.run(async (ctx) => await ctx.db.get(fixture.negotiationId));
+    expect(negotiation?.roundsUsed).toBe(1);
+  });
+
+  test("a draft whose round advanced denies at creation with no row", async () => {
+    const fixture = await reserveFor(await createMandateFixture(3));
+    await fixture.t.run(async (ctx) => {
+      await ctx.db.patch(fixture.negotiationId, { roundsUsed: 1 });
+    });
+    const before = await operationCount(fixture.t);
+    const created = await createWithDraft(fixture, "req-draft-stale-round");
+    expect(created).toMatchObject({ ok: false, code: "draft-round-stale" });
+    expect(await operationCount(fixture.t)).toBe(before);
+  });
+
+  test("a second creation after the round advances denies stale with no row", async () => {
+    const base = await createMandateFixture(3);
+    const first = await reserveFor(base);
+    const created = await createWithDraft(first, "req-draft-first");
+    expect(created.ok).toBe(true);
+    if (!created.ok) throw new Error("first draft-bound creation failed");
+    expect(await claim(first, created.operationId)).toMatchObject({ ok: true });
+    const second = await reserveFor(base);
+    const before = await operationCount(second.t);
+    const stale = await createWithDraft(second, "req-draft-second");
+    expect(stale).toMatchObject({ ok: false, code: "draft-round-stale" });
+    expect(await operationCount(second.t)).toBe(before);
+    const negotiation = await second.t.run(async (ctx) => await ctx.db.get(second.negotiationId));
+    expect(negotiation?.roundsUsed).toBe(1);
+  });
+
+  test("two different request ids from one draft create, but claims serialize to one send", async () => {
+    const base = await createMandateFixture(3);
+    const first = await reserveFor(base);
+    const second = await reserveFor(base);
+    // Interleaved arrival: both creations verify the same draft pins against
+    // the same live round before either claim runs.
+    const opA = await createWithDraft(first, "req-draft-race-a");
+    expect(opA).toMatchObject({ ok: true, deduped: false });
+    const opB = await createWithDraft(second, "req-draft-race-b");
+    expect(opB).toMatchObject({ ok: true, deduped: false });
+    if (!opA.ok || !opB.ok) throw new Error("race setup failed");
+    const claimA = await claim(first, opA.operationId);
+    expect(claimA).toMatchObject({ ok: true });
+    // The stale loser denies with no effect: no attempt, no round.
+    const claimB = await claim(second, opB.operationId);
+    expect(claimB).toMatchObject({ ok: false, code: "mandate-round-changed" });
+    expect((await attemptCount({ t: base.t, operationId: opA.operationId })) +
+      (await attemptCount({ t: base.t, operationId: opB.operationId }))).toBe(1);
+    const loser = await operationState({ t: base.t, operationId: opB.operationId });
+    expect(loser?.state).toBe("prepared");
+    const negotiation = await base.t.run(async (ctx) => await ctx.db.get(base.negotiationId));
+    expect(negotiation?.roundsUsed).toBe(1);
+  });
+
+  test("a mismatched draft payload hash denies at creation with no row", async () => {
+    const fixture = await reserveFor(await createMandateFixture(3));
+    const before = await operationCount(fixture.t);
+    const created = await fixture.t.withIdentity(OWNER).mutation(createOperationRef, {
+      jobId: fixture.jobId,
+      organizationId: fixture.organizationId,
+      projectId: fixture.projectId,
+      kind: "communication.send",
+      requestId: "req-draft-tampered",
+      payloadJson: CANONICAL_DRAFT,
+      grantId: fixture.grantId,
+      reservationId: fixture.reservationId,
+      negotiationId: fixture.negotiationId,
+      negotiationDraft: { ...draftPins(fixture), payloadHash: "tampered-payload-hash" },
+    });
+    expect(created).toMatchObject({ ok: false, code: "draft-payload-mismatch" });
+    expect(await operationCount(fixture.t)).toBe(before);
+  });
+});
