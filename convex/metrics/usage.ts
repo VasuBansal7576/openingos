@@ -23,7 +23,13 @@
  * - Confirmed spend groups stored cost entries by currency with finite
  *   integer arithmetic and no conversion; an unplaced selection is never
  *   procurement spend because spend derives only from order-linked cost
- *   entries.
+ *   entries. Paid cash (payments less cash refunds) and settled
+ *   acquisition cost (settled costs less price-reducing credits) are
+ *   reported as separate financial states: a deposit payment and its
+ *   settled cost are never added into one combined spend total. Refunds
+ *   reduce only net paid cash, credits reduce only net settled cost, and
+ *   a linked credit/refund pair is counted once in each state — never
+ *   subtracted twice from a single total.
  * - Cached versus fresh collection and controlled versus live provenance
  *   are separated from stored freshness and execution-mode fields.
  * - Every scan is an indexed, bounded read with a one-row truncation
@@ -236,9 +242,13 @@ const metricsValidator = v.object({
         currency: v.string(),
         entries: v.number(),
         byKind: countsValidator,
-        paymentsAndSettledMinorUnits: measuredTotalValidator,
-        refundsAndCreditsMinorUnits: measuredTotalValidator,
-        netMinorUnits: measuredTotalValidator,
+        paymentsMinorUnits: measuredTotalValidator,
+        refundsMinorUnits: measuredTotalValidator,
+        netPaidMinorUnits: measuredTotalValidator,
+        settledCostsMinorUnits: measuredTotalValidator,
+        creditsMinorUnits: measuredTotalValidator,
+        netSettledMinorUnits: measuredTotalValidator,
+        linkedPairs: v.number(),
       }),
     ),
   }),
@@ -461,8 +471,11 @@ export const projectUsageMetrics = f1Query({
     interface CurrencyBucket {
       entries: number;
       byKind: Record<string, number>;
-      paymentsAndSettledMinorUnits: number | Overflow;
-      refundsAndCreditsMinorUnits: number | Overflow;
+      paymentsMinorUnits: number | Overflow;
+      refundsMinorUnits: number | Overflow;
+      settledCostsMinorUnits: number | Overflow;
+      creditsMinorUnits: number | Overflow;
+      linkedPairs: number;
     }
     const spendByCurrency = new Map<string, CurrencyBucket>();
     for (const entry of spendPage.rows) {
@@ -471,49 +484,80 @@ export const projectUsageMetrics = f1Query({
         bucket = {
           entries: 0,
           byKind: zeroCounts(COST_ENTRY_KINDS),
-          paymentsAndSettledMinorUnits: 0,
-          refundsAndCreditsMinorUnits: 0,
+          paymentsMinorUnits: 0,
+          refundsMinorUnits: 0,
+          settledCostsMinorUnits: 0,
+          creditsMinorUnits: 0,
+          linkedPairs: 0,
         };
         spendByCurrency.set(entry.amount.currency, bucket);
       }
       bucket.entries += 1;
       bump(bucket.byKind, entry.kind);
-      if (entry.kind === "payment" || entry.kind === "settledCost") {
-        bucket.paymentsAndSettledMinorUnits = addSafe(
-          bucket.paymentsAndSettledMinorUnits,
+      // Each financial state accumulates only its own kinds: cash refunds
+      // reduce paid cash, price-reducing credits reduce settled cost. A
+      // linked credit/refund pair therefore appears once in each state's
+      // gross total and once in each net — never twice in one total.
+      if (entry.kind === "payment") {
+        bucket.paymentsMinorUnits = addSafe(
+          bucket.paymentsMinorUnits,
+          entry.amount.minorUnits,
+        );
+      } else if (entry.kind === "refund") {
+        bucket.refundsMinorUnits = addSafe(
+          bucket.refundsMinorUnits,
+          entry.amount.minorUnits,
+        );
+      } else if (entry.kind === "settledCost") {
+        bucket.settledCostsMinorUnits = addSafe(
+          bucket.settledCostsMinorUnits,
           entry.amount.minorUnits,
         );
       } else {
-        bucket.refundsAndCreditsMinorUnits = addSafe(
-          bucket.refundsAndCreditsMinorUnits,
+        bucket.creditsMinorUnits = addSafe(
+          bucket.creditsMinorUnits,
           entry.amount.minorUnits,
         );
+      }
+      if (entry.linkedEntryId !== undefined) {
+        bucket.linkedPairs += 1;
       }
     }
     const currencies = [...spendByCurrency.entries()]
       .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
       .map(([currency, bucket]) => {
         if (
-          bucket.paymentsAndSettledMinorUnits === OVERFLOW ||
-          bucket.refundsAndCreditsMinorUnits === OVERFLOW
+          bucket.paymentsMinorUnits === OVERFLOW ||
+          bucket.refundsMinorUnits === OVERFLOW ||
+          bucket.settledCostsMinorUnits === OVERFLOW ||
+          bucket.creditsMinorUnits === OVERFLOW
         ) {
           overflowedSections.push(`spend.currencies.${currency}`);
         }
+        // With both components of a state exact, that state's net stays
+        // exact (a plain subtraction of safe integers within the scanned
+        // bound cannot round); with either component unavailable, only
+        // that state's net is unavailable — the other state's net is
+        // unaffected.
+        const netPaid =
+          bucket.paymentsMinorUnits === OVERFLOW || bucket.refundsMinorUnits === OVERFLOW
+            ? OVERFLOW
+            : bucket.paymentsMinorUnits - bucket.refundsMinorUnits;
+        const netSettled =
+          bucket.settledCostsMinorUnits === OVERFLOW || bucket.creditsMinorUnits === OVERFLOW
+            ? OVERFLOW
+            : bucket.settledCostsMinorUnits - bucket.creditsMinorUnits;
         return {
           currency,
           entries: bucket.entries,
           byKind: bucket.byKind,
-          paymentsAndSettledMinorUnits: measuredTotal(bucket.paymentsAndSettledMinorUnits),
-          refundsAndCreditsMinorUnits: measuredTotal(bucket.refundsAndCreditsMinorUnits),
-          // With both components exact, the difference stays exact; with
-          // either component unavailable, the net is unavailable too.
-          netMinorUnits:
-            bucket.paymentsAndSettledMinorUnits === OVERFLOW ||
-            bucket.refundsAndCreditsMinorUnits === OVERFLOW
-              ? measuredTotal(OVERFLOW)
-              : measuredTotal(
-                  bucket.paymentsAndSettledMinorUnits - bucket.refundsAndCreditsMinorUnits,
-                ),
+          paymentsMinorUnits: measuredTotal(bucket.paymentsMinorUnits),
+          refundsMinorUnits: measuredTotal(bucket.refundsMinorUnits),
+          netPaidMinorUnits: measuredTotal(netPaid),
+          settledCostsMinorUnits: measuredTotal(bucket.settledCostsMinorUnits),
+          creditsMinorUnits: measuredTotal(bucket.creditsMinorUnits),
+          netSettledMinorUnits: measuredTotal(netSettled),
+          linkedPairs: bucket.linkedPairs,
         };
       });
 

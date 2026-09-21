@@ -25,7 +25,12 @@ import * as decisions from "./decisions.js";
 import * as fulfillment from "./fulfillment.js";
 import * as workspace from "./workspace.js";
 import * as impact from "./impact.js";
-import { ALTERNATIVE_EVALUATION_BOUND, PROPOSAL_REASON_MAX_LENGTH } from "./impact.js";
+import {
+  ALTERNATIVE_EVALUATION_BOUND,
+  PLACED_ORDER_PROBE_BOUND,
+  PROPOSAL_REASON_MAX_LENGTH,
+  SELECTION_SCAN_BOUND,
+} from "./impact.js";
 
 const rawModules = import.meta.glob([
   "../access/**/*.ts",
@@ -738,9 +743,12 @@ describe("E5 impact assessments", () => {
       assessmentId: unrelated.assessmentId,
     });
     if (!view.ok) throw new Error("assessment view failed");
-    expect(view.assessment.orderImpact).toBe("none");
-    expect(view.assessment.affectedSelectionId).toBeUndefined();
-    expect(view.assessment.reason).toContain("pins another revision");
+    // Bounded revision ancestry reaches across two generations: the
+    // selection pinned to q-a1 is affected by q-a3 even though q-a3's
+    // immediate predecessor is q-a2.
+    expect(view.assessment.orderImpact).toBe("selectionOnly");
+    expect(view.assessment.affectedSelectionId).toBe(seed.selectionId);
+    expect(view.assessment.reason).toContain("unplaced selection basis changed");
     const noSelection = await setupProject(t, OWNER, "noselection");
     const reqId = await createRequirement(t, noSelection, "noselection-req");
     const vendor = await createVendor(t, noSelection, "No-selection vendor");
@@ -1343,5 +1351,236 @@ describe("E5 substitute proposals", () => {
       return rows.length;
     });
     expect(noSelectionApprovalCount).toBe(0);
+  });
+});
+
+describe("E5 lineage-independent order impact (P-12, D-15)", () => {
+  test("an order on selection A stays impacted after newer selection B", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t);
+    const seed = await seedSelectedRequirement(t, project, "ab-keep", true);
+    const ordersBefore = await t.run(async (ctx) =>
+      ctx.db
+        .query("orders")
+        .withIndex("by_project", (q) => q.eq("projectId", project.projectId))
+        .collect(),
+    );
+    expect(ordersBefore).toHaveLength(1);
+    // A newer selection for another candidate becomes the latest
+    // selection, while the placed order stays on selection A.
+    const selectionB = await selectQuote(
+      t,
+      project,
+      seed.requirementId,
+      seed.candidateB,
+      seed.quoteB1.quoteId,
+      "q-b1-ab-keep",
+      "ab-keep-selection-b",
+    );
+    expect(selectionB).not.toBe(seed.selectionId);
+    const latest = await t.run(async (ctx) =>
+      ctx.db
+        .query("selections")
+        .withIndex("by_requirement", (q) => q.eq("requirementId", seed.requirementId))
+        .order("desc")
+        .take(1),
+    );
+    expect(latest[0]?._id).toBe(selectionB);
+    const quoteA2 = await createQuote(t, project, seed.requirementId, seed.vendorA, "q-a2", seed.quoteA1Hash);
+    const result = await t.withIdentity(OWNER).mutation(assessQuoteRevisionImpactRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      idempotencyKey: "impact-ab-keep",
+      quoteId: quoteA2.quoteId,
+    });
+    if (!result.ok) throw new Error(`assessment failed: ${JSON.stringify(result)}`);
+    const view = await t.withIdentity(OWNER).query(getImpactAssessmentRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      assessmentId: result.assessmentId,
+    });
+    if (!view.ok) throw new Error("assessment view failed");
+    expect(view.assessment.orderImpact).toBe("reviewRequired");
+    expect(view.assessment.state).toBe("recorded");
+    expect(view.assessment.affectedSelectionId).toBe(seed.selectionId);
+    expect(view.assessment.placedOrderCount).toBe(1);
+    expect(view.assessment.reason).toContain("keep their history");
+    const ordersAfter = await t.run(async (ctx) =>
+      ctx.db
+        .query("orders")
+        .withIndex("by_project", (q) => q.eq("projectId", project.projectId))
+        .collect(),
+    );
+    expect(ordersAfter).toEqual(ordersBefore);
+  });
+
+  test("a two-generation revision still impacts the originally selected quote", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t);
+    const seed = await seedSelectedRequirement(t, project, "multi-gen", true);
+    const quoteA2 = await createQuote(t, project, seed.requirementId, seed.vendorA, "q-a2-multi", seed.quoteA1Hash);
+    const quoteA3 = await createQuote(t, project, seed.requirementId, seed.vendorA, "q-a3-multi", quoteA2.contentHash);
+    const direct = await t.withIdentity(OWNER).mutation(assessQuoteRevisionImpactRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      idempotencyKey: "impact-multi-direct",
+      quoteId: quoteA2.quoteId,
+    });
+    if (!direct.ok) throw new Error("direct assessment failed");
+    const directView = await t.withIdentity(OWNER).query(getImpactAssessmentRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      assessmentId: direct.assessmentId,
+    });
+    if (!directView.ok) throw new Error("direct view failed");
+    expect(directView.assessment.orderImpact).toBe("reviewRequired");
+    expect(directView.assessment.affectedSelectionId).toBe(seed.selectionId);
+    const secondGeneration = await t.withIdentity(OWNER).mutation(assessQuoteRevisionImpactRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      idempotencyKey: "impact-multi-second",
+      quoteId: quoteA3.quoteId,
+    });
+    if (!secondGeneration.ok) throw new Error("second-generation assessment failed");
+    const secondView = await t.withIdentity(OWNER).query(getImpactAssessmentRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      assessmentId: secondGeneration.assessmentId,
+    });
+    if (!secondView.ok) throw new Error("second-generation view failed");
+    expect(secondView.assessment.orderImpact).toBe("reviewRequired");
+    expect(secondView.assessment.state).toBe("recorded");
+    expect(secondView.assessment.affectedSelectionId).toBe(seed.selectionId);
+    expect(secondView.assessment.placedOrderCount).toBe(1);
+    expect(secondView.assessment.reason).toContain("was superseded by q-a3-multi");
+    expect(secondView.assessment.reason).toContain("keep their history");
+  });
+
+  test("a watch on a previously selected candidate still impacts old orders after reselection", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t);
+    const seed = await seedSelectedRequirement(t, project, "watch-reselect", true);
+    await selectQuote(
+      t,
+      project,
+      seed.requirementId,
+      seed.candidateB,
+      seed.quoteB1.quoteId,
+      "q-b1-watch-reselect",
+      "watch-reselect-selection-b",
+    );
+    const watchId = await createWatch(t, project, seed.candidateA, "watch-reselect-key");
+    const result = await t.withIdentity(OWNER).mutation(assessWatchObservationRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      idempotencyKey: "watch-reselect-impact",
+      watchId,
+      result: "ok",
+    });
+    if (!result.ok) throw new Error(`watch assessment failed: ${JSON.stringify(result)}`);
+    const view = await t.withIdentity(OWNER).query(getImpactAssessmentRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      assessmentId: result.assessmentId,
+    });
+    if (!view.ok) throw new Error("assessment view failed");
+    expect(view.assessment.orderImpact).toBe("reviewRequired");
+    expect(view.assessment.state).toBe("recorded");
+    expect(view.assessment.affectedSelectionId).toBe(seed.selectionId);
+    expect(view.assessment.placedOrderCount).toBe(1);
+    expect(view.assessment.reason).toContain("keep their history");
+  });
+
+  test("an over-bound placed-order probe is explicitly incomplete with history preserved", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t);
+    const seed = await seedSelectedRequirement(t, project, "overbound-orders");
+    const orderCount = PLACED_ORDER_PROBE_BOUND + 1;
+    await t.run(async (ctx) => {
+      const now = Date.now();
+      for (let index = 0; index < orderCount; index += 1) {
+        await ctx.db.insert("orders", {
+          organizationId: project.organizationId,
+          projectId: project.projectId,
+          selectionId: seed.selectionId,
+          requirementId: seed.requirementId,
+          quoteId: seed.quoteA1,
+          quoteVersion: "q-a1-overbound-orders",
+          requirementVersion: 1,
+          idempotencyKey: `ord-overbound-${index}`,
+          state: "recorded",
+          amendmentCount: 0,
+          createdAt: now,
+          updatedAt: now,
+        });
+      }
+    });
+    const quoteA2 = await createQuote(t, project, seed.requirementId, seed.vendorA, "q-a2", seed.quoteA1Hash);
+    const result = await t.withIdentity(OWNER).mutation(assessQuoteRevisionImpactRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      idempotencyKey: "impact-overbound-orders",
+      quoteId: quoteA2.quoteId,
+    });
+    if (!result.ok) throw new Error("assessment failed");
+    const view = await t.withIdentity(OWNER).query(getImpactAssessmentRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      assessmentId: result.assessmentId,
+    });
+    if (!view.ok) throw new Error("assessment view failed");
+    expect(view.assessment.orderImpact).toBe("reviewRequired");
+    expect(view.assessment.state).toBe("incomplete");
+    expect(view.assessment.affectedSelectionId).toBe(seed.selectionId);
+    expect(view.assessment.placedOrderCount).toBe(orderCount);
+    expect(view.assessment.reason).toContain(`exceeded ${PLACED_ORDER_PROBE_BOUND} rows`);
+    const preserved = await t.run(async (ctx) =>
+      ctx.db
+        .query("orders")
+        .withIndex("by_project", (q) => q.eq("projectId", project.projectId))
+        .collect(),
+    );
+    expect(preserved).toHaveLength(orderCount);
+  });
+
+  test("an over-bound selection scan is explicitly incomplete", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t);
+    const seed = await seedSelectedRequirement(t, project, "overbound-sel");
+    await t.run(async (ctx) => {
+      const now = Date.now();
+      for (let index = 0; index < SELECTION_SCAN_BOUND; index += 1) {
+        await ctx.db.insert("selections", {
+          organizationId: project.organizationId,
+          projectId: project.projectId,
+          idempotencyKey: `sel-overbound-${index}`,
+          requirementId: seed.requirementId,
+          candidateId: seed.candidateA,
+          quoteId: seed.quoteA1,
+          quoteVersion: "q-a1-overbound-sel",
+          requirementVersion: 1,
+          actor: OWNER.tokenIdentifier,
+          createdAt: now,
+        });
+      }
+    });
+    const quoteA2 = await createQuote(t, project, seed.requirementId, seed.vendorA, "q-a2", seed.quoteA1Hash);
+    const result = await t.withIdentity(OWNER).mutation(assessQuoteRevisionImpactRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      idempotencyKey: "impact-overbound-sel",
+      quoteId: quoteA2.quoteId,
+    });
+    if (!result.ok) throw new Error("assessment failed");
+    const view = await t.withIdentity(OWNER).query(getImpactAssessmentRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      assessmentId: result.assessmentId,
+    });
+    if (!view.ok) throw new Error("assessment view failed");
+    expect(view.assessment.state).toBe("incomplete");
+    expect(view.assessment.orderImpact).toBe("selectionOnly");
+    expect(view.assessment.affectedSelectionId).toBe(seed.selectionId);
+    expect(view.assessment.reason).toContain(`exceeded ${SELECTION_SCAN_BOUND} rows`);
   });
 });
