@@ -401,8 +401,36 @@ describe("F1 negotiation authority binding", () => {
 
     const claim1 = await claim(fixture, fixture.operationId);
     expect(claim1).toMatchObject({ ok: true });
+    const claimedState = await fixture.t.run(async (ctx) => ({
+      negotiation: await ctx.db.get(fixture.negotiationId),
+      operation: await ctx.db.get(fixture.operationId),
+    }));
+    expect(claimedState.negotiation?.roundsUsed).toBe(1);
+    expect(claimedState.operation).toMatchObject({
+      negotiationRoundConsumed: true,
+      negotiationRoundRefunded: false,
+    });
     const claim2 = await claim(fixture, fixture.operationId);
     expect(claim2).toMatchObject({ ok: false, code: "already-claimed" });
+  });
+
+  test("concurrent bound claims consume one unique round and mint one attempt", async () => {
+    const base = await createMandateFixture(3);
+    const first = await prepareOperation(await reserveFor(base), "req-concurrent-1");
+    const second = await prepareOperation(await reserveFor(base), "req-concurrent-2");
+    const results = await Promise.all([
+      claim(first, first.operationId),
+      claim(second, second.operationId),
+    ]);
+    expect(results.filter((result) => result.ok)).toHaveLength(1);
+    expect(results.filter((result) => !result.ok)).toHaveLength(1);
+    expect(results.find((result) => !result.ok)).toMatchObject({
+      ok: false,
+      code: "mandate-round-changed",
+    });
+    expect((await attemptCount(first)) + (await attemptCount(second))).toBe(1);
+    const negotiation = await base.t.run(async (ctx) => await ctx.db.get(base.negotiationId));
+    expect(negotiation?.roundsUsed).toBe(1);
   });
 
   test("a created-bound operation deduplicates on identical retry without consuming the mandate round", async () => {

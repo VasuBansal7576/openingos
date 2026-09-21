@@ -21,10 +21,11 @@
  *   capability, mandate, quote, conversation, and job authority. E6 fences
  *   run before the first provider call AND again after drafting, immediately
  *   before the send operation is created.
- * - Exactly one bounded step per call. Rounds advance only for an observed,
- *   recorded provider acceptance with a message id. Ambiguous outcomes stay
- *   unknown under the existing reconciliation contract; there is never a
- *   blind resend or a second send path.
+ * - Exactly one bounded step per call. The operation's atomic claim consumes
+ *   one round immediately before provider effect. Definitive non-sends refund
+ *   only their own operation's round; ambiguous outcomes keep the round under
+ *   the reconciliation contract. There is never a blind resend or a second
+ *   send path.
  * - Nothing here accepts an offer, creates a quote revision, order,
  *   commitment, saving, or live-success claim. Owner-authored terms stay
  *   labeled controlled demo evidence (`ownerStandIn`, never realized
@@ -150,6 +151,7 @@ const pinnedContextValidator = v.object({
   mandateQuoteVersion: v.string(),
   mandateQuoteContentHash: v.string(),
   mandateConversationVersion: v.optional(v.number()),
+  mandateConversationState: v.optional(v.string()),
   mandateHasConversation: v.boolean(),
   roundsUsed: v.number(),
   roundLimit: v.number(),
@@ -178,6 +180,7 @@ interface PinnedContext {
   mandateQuoteContentHash: string;
   mandateConversationId: Id<"conversations"> | undefined;
   mandateConversationVersion: number | undefined;
+  mandateConversationState: string | undefined;
   roundsUsed: number;
   roundLimit: number;
   expiresAt: number;
@@ -209,10 +212,9 @@ function genericDenial(): { ok: false; code: string; message: string } {
  * reply must first be ingested into a new quote version and mandate basis
  * before another outbound step may proceed.
  *
- * Residual shared need: the mandate-approved conversation version is not a
- * persisted negotiations field, so an already-processed reply (state moved
- * past `replyReceived` without a new quote version) still passes on current
- * pins. Persisting that basis is a foundation-owned schema change.
+ * The foundation persists the mandate-approved conversation version and
+ * state. The live conversation must still equal both pins before any model
+ * or transport call; old bound mandates without those pins fail closed.
  */
 function conversationGate(conversationState: string | undefined): {
   readonly stopped: boolean;
@@ -225,6 +227,22 @@ function conversationGate(conversationState: string | undefined): {
     return { stopped: true };
   }
   return { stopped: false };
+}
+
+function approvedConversationGate(pinned: PinnedContext): {
+  readonly stopped: boolean;
+} {
+  if (pinned.mandateConversationId === undefined) {
+    return conversationGate(pinned.conversationState);
+  }
+  return {
+    stopped:
+      pinned.mandateConversationVersion === undefined ||
+      pinned.mandateConversationState === undefined ||
+      pinned.conversationVersion !== pinned.mandateConversationVersion ||
+      pinned.conversationState !== pinned.mandateConversationState ||
+      conversationGate(pinned.conversationState).stopped,
+  };
 }
 
 /**
@@ -305,6 +323,16 @@ export const loadNegotiationContext = f1InternalQuery({
     let conversationVersion: number | undefined;
     let conversationState: string | undefined;
     if (negotiation.conversationId !== undefined) {
+      if (
+        negotiation.conversationVersion === undefined ||
+        negotiation.conversationState === undefined
+      ) {
+        return {
+          ok: false as const,
+          code: "mandate-approval-unpinned",
+          message: "bound negotiation lacks its approved conversation version and state",
+        };
+      }
       const conversation = await ctx.db.get(negotiation.conversationId);
       if (
         conversation === null ||
@@ -345,7 +373,12 @@ export const loadNegotiationContext = f1InternalQuery({
       // The row stores no content hash; pin the live hash as the mandate
       // basis so in-step drift still fails closed at the post-draft recheck.
       mandateQuoteContentHash: quote.contentHash,
-      ...(conversationVersion === undefined ? {} : { mandateConversationVersion: conversationVersion }),
+      ...(negotiation.conversationVersion === undefined
+        ? {}
+        : { mandateConversationVersion: negotiation.conversationVersion }),
+      ...(negotiation.conversationState === undefined
+        ? {}
+        : { mandateConversationState: negotiation.conversationState }),
       mandateHasConversation: negotiation.conversationId !== undefined,
       roundsUsed: negotiation.roundsUsed,
       roundLimit: negotiation.roundLimit,
@@ -548,6 +581,7 @@ async function resolvePins(
           ? (loaded.currentConversationId as Id<"conversations">)
           : undefined,
       mandateConversationVersion: loaded.mandateConversationVersion,
+      mandateConversationState: loaded.mandateConversationState,
       roundsUsed: loaded.roundsUsed,
       roundLimit: loaded.roundLimit,
       expiresAt: loaded.expiresAt,
@@ -903,161 +937,17 @@ const outcomeValidator = v.union(
 );
 
 /**
- * Atomically consume one negotiation round before the external effect
- * (Devin 4060797039 repair).
- *
- * Post-send incrementing loses rounds under concurrency: two accepted sends
- * can observe the same pre-send count and only one increment survives, and a
- * post-send membership loss drops the increment entirely. Consuming first,
- * in the same transaction that re-verifies mandate state, expiry, round
- * limit, quote/conversation pins, and recipient version, makes every send
- * own exactly one recorded round. Definitive non-sends refund through
- * `refundNegotiationRound`; ambiguous outcomes never refund, so a possibly
- * sent message always keeps its round. Over-counting on crash before refund
- * is the documented conservative direction; under-counting is impossible.
- */
-export const consumeNegotiationRound = f1InternalMutation({
-  args: {
-    negotiationId: v.id("negotiations"),
-    identity: v.string(),
-    expectedRoundsUsed: v.number(),
-    expectedQuoteVersion: v.string(),
-    expectedQuoteContentHash: v.string(),
-    expectedConversationVersion: v.optional(v.number()),
-    expectedRecipientVersion: v.number(),
-  },
-  returns: v.union(
-    v.object({ ok: v.literal(true), roundsUsedAfter: v.number() }),
-    denialValidator,
-  ),
-  handler: async (ctx, args) => {
-    if (args.identity.trim().length === 0) {
-      return { ok: false as const, code: "forged-identity", message: "missing identity proof" };
-    }
-    const negotiation = await ctx.db.get(args.negotiationId);
-    if (negotiation === null) return genericDenial();
-    const access = await checkProjectAccess(
-      ctx,
-      args.identity,
-      negotiation.organizationId,
-      negotiation.projectId,
-      "approver",
-      Date.now(),
-    );
-    if (!access.ok) {
-      if (access.code === "denied-membership") return genericDenial();
-      return { ok: false as const, code: access.code, message: access.message };
-    }
-    const now = Date.now();
-    if (negotiation.state === "paused") {
-      return { ok: false as const, code: "mandate-paused", message: "negotiation mandate is paused" };
-    }
-    if (negotiation.state === "revoked") {
-      return { ok: false as const, code: "mandate-revoked", message: "negotiation mandate was revoked" };
-    }
-    if (negotiation.state === "concluded") {
-      return { ok: false as const, code: "mandate-concluded", message: "negotiation mandate concluded" };
-    }
-    if (negotiation.state === "expired" || now >= negotiation.expiresAt) {
-      return { ok: false as const, code: "mandate-expired", message: "negotiation mandate expired" };
-    }
-    if (negotiation.state !== "active") {
-      return { ok: false as const, code: "mandate-not-active", message: "negotiation mandate is not active" };
-    }
-    if (negotiation.roundsUsed !== args.expectedRoundsUsed) {
-      return {
-        ok: false as const,
-        code: "stale-input-version",
-        message: "negotiation rounds changed before the send; re-approval required",
-      };
-    }
-    if (negotiation.roundsUsed >= negotiation.roundLimit) {
-      return { ok: false as const, code: "round-limit-reached", message: "negotiation round limit reached" };
-    }
-    const quote = await ctx.db.get(negotiation.quoteId);
-    if (
-      quote === null ||
-      quote.organizationId !== negotiation.organizationId ||
-      quote.projectId !== negotiation.projectId ||
-      quote.version !== args.expectedQuoteVersion ||
-      quote.contentHash !== args.expectedQuoteContentHash
-    ) {
-      return { ok: false as const, code: "quote-changed", message: "bound quote changed before the send" };
-    }
-    const successors = await ctx.db
-      .query("quotes")
-      .withIndex("by_project_and_supersedes", (q) =>
-        q.eq("projectId", negotiation.projectId).eq("supersedes", quote.contentHash),
-      )
-      .take(1);
-    if (successors.length > 0) {
-      return { ok: false as const, code: "quote-superseded", message: "bound quote was superseded before the send" };
-    }
-    if (negotiation.conversationId !== undefined) {
-      const conversation = await ctx.db.get(negotiation.conversationId);
-      if (
-        conversation === null ||
-        conversation.organizationId !== negotiation.organizationId ||
-        conversation.projectId !== negotiation.projectId ||
-        conversation.version !== args.expectedConversationVersion ||
-        conversation.state === "replyReceived" ||
-        conversation.state === "closed" ||
-        conversation.state === "cancelled"
-      ) {
-        return {
-          ok: false as const,
-          code: "conversation-changed",
-          message: "bound conversation changed before the send",
-        };
-      }
-    } else if (args.expectedConversationVersion !== undefined) {
-      return {
-        ok: false as const,
-        code: "conversation-changed",
-        message: "bound conversation changed before the send",
-      };
-    }
-    const recipients = await ctx.db
-      .query("recipientConfigs")
-      .withIndex("by_active", (q) => q.eq("active", true))
-      .take(2);
-    if (recipients.length !== 1 || recipients[0] === undefined) {
-      return { ok: false as const, code: "recipient-missing", message: "owner recipient is not configured" };
-    }
-    if (recipients[0].version !== args.expectedRecipientVersion) {
-      return {
-        ok: false as const,
-        code: "recipient-changed",
-        message: "recipient configuration changed; re-approval required",
-      };
-    }
-    await ctx.db.patch(args.negotiationId, {
-      roundsUsed: negotiation.roundsUsed + 1,
-      updatedAt: now,
-    });
-    return { ok: true as const, roundsUsedAfter: negotiation.roundsUsed + 1 };
-  },
-});
-
-const consumeRoundRef = makeFunctionReference<
-  "mutation",
-  MutationArgs<typeof consumeNegotiationRound>,
-  MutationReturn<typeof consumeNegotiationRound>
->("negotiation/orchestrator:consumeNegotiationRound");
-
-/**
- * Refund a consumed round when provably no send occurred (definitive
- * dispatch denial, definitive provider rejection, or a denied operation
- * that never dispatched). Best-effort and conditional: it decrements only
- * when the count is exactly one above the pre-consume expectation, so a
- * refund can never erase another attempt's round. Ambiguous outcomes never
- * reach this mutation.
+ * Refund a claim-consumed round when provably no send occurred. Production
+ * callers identify the exact operation whose atomic claim owns the round;
+ * the ownership markers prevent a concurrent failed attempt from refunding
+ * another attempt's round. Ambiguous outcomes never reach this mutation.
  */
 export const refundNegotiationRound = f1InternalMutation({
   args: {
     negotiationId: v.id("negotiations"),
     identity: v.string(),
     expectedRoundsUsed: v.number(),
+    operationId: v.id("operations"),
   },
   returns: v.union(
     v.object({ ok: v.literal(true), refunded: v.boolean(), roundsUsed: v.number() }),
@@ -1081,9 +971,25 @@ export const refundNegotiationRound = f1InternalMutation({
       if (access.code === "denied-membership") return genericDenial();
       return { ok: false as const, code: access.code, message: access.message };
     }
+    const operation = await ctx.db.get(args.operationId);
+    if (
+      operation === null ||
+      operation.organizationId !== negotiation.organizationId ||
+      operation.projectId !== negotiation.projectId ||
+      operation.negotiationAuthority?.negotiationId !== args.negotiationId ||
+      operation.negotiationAuthority.roundsUsed !== args.expectedRoundsUsed ||
+      operation.negotiationRoundConsumed !== true ||
+      operation.negotiationRoundRefunded === true
+    ) {
+      return { ok: true as const, refunded: false, roundsUsed: negotiation.roundsUsed };
+    }
     if (negotiation.roundsUsed === args.expectedRoundsUsed + 1) {
       await ctx.db.patch(args.negotiationId, {
         roundsUsed: args.expectedRoundsUsed,
+        updatedAt: Date.now(),
+      });
+      await ctx.db.patch(args.operationId, {
+        negotiationRoundRefunded: true,
         updatedAt: Date.now(),
       });
       return { ok: true as const, refunded: true, roundsUsed: args.expectedRoundsUsed };
@@ -1099,11 +1005,11 @@ const refundRoundRef = makeFunctionReference<
 >("negotiation/orchestrator:refundNegotiationRound");
 
 /**
- * Persist honest job states against existing records. Round accounting now
- * lives in `consumeNegotiationRound`/`refundNegotiationRound`; this mutation
- * only moves jobs into the existing supplier/user wait states on sent and
- * waiting outcomes. Terminal, denied, and deduplicated outcomes write
- * nothing. Never touches quotes, orders, selections, or commitments.
+ * Persist honest job states against existing records. Round consumption
+ * lives in the operation's atomic claim and definitive non-sends use
+ * `refundNegotiationRound`; this mutation only moves jobs into the existing
+ * supplier/user wait states. Terminal, denied, and deduplicated outcomes
+ * write nothing. Never touches quotes, orders, selections, or commitments.
  */
 export const applyStepOutcome = f1InternalMutation({
   args: {
@@ -1648,7 +1554,7 @@ export const prepareNegotiationDraft = f1Action({
       }
       return deniedResult(earlyFence.code, earlyFence.message);
     }
-    if (conversationGate(pinned.conversationState).stopped) {
+    if (approvedConversationGate(pinned).stopped) {
       return {
         ok: true as const,
         outcome: "stopped" as const,
@@ -1901,7 +1807,7 @@ export const dispatchApprovedDraft = f1Action({
       }
       return deniedResult(earlyFence.code, earlyFence.message);
     }
-    if (conversationGate(pinned.conversationState).stopped) {
+    if (approvedConversationGate(pinned).stopped) {
       return {
         ok: true as const,
         outcome: "stopped" as const,
@@ -1988,68 +1894,6 @@ export const dispatchApprovedDraft = f1Action({
     const envelopeValue = JSON.parse(args.envelopeCanonical) as Record<string, unknown>;
     const hash = payloadHash(envelopeValue);
     const key = requestKey(String(pinned.organizationId), NEGOTIATION_OPERATION_KIND, args.requestId);
-    const consumed = await ctx.runMutation(consumeRoundRef, {
-      negotiationId: pinned.negotiationId,
-      identity,
-      expectedRoundsUsed: pinned.roundsUsed,
-      expectedQuoteVersion: pinned.quoteVersion,
-      expectedQuoteContentHash: pinned.quoteContentHash,
-      ...(pinned.conversationVersion === undefined
-        ? {}
-        : { expectedConversationVersion: pinned.conversationVersion }),
-      expectedRecipientVersion: pinned.recipientConfigVersion ?? -1,
-    });
-    if (!consumed.ok) {
-      if (
-        consumed.code === "mandate-revoked" ||
-        consumed.code === "mandate-concluded" ||
-        consumed.code === "mandate-expired" ||
-        consumed.code === "round-limit-reached"
-      ) {
-        return {
-          ok: true as const,
-          outcome: "stopped" as const,
-          move: "none",
-          reason: consumed.code,
-          roundsUsedAfter: pinned.roundsUsed,
-          redactedPreview: approved.redactedPreview,
-        };
-      }
-      if (
-        consumed.code === "quote-changed" ||
-        consumed.code === "quote-superseded" ||
-        consumed.code === "conversation-changed"
-      ) {
-        return {
-          ok: true as const,
-          outcome: "stopped" as const,
-          move: "none",
-          reason: consumed.code,
-          roundsUsedAfter: pinned.roundsUsed,
-          redactedPreview: approved.redactedPreview,
-        };
-      }
-      if (consumed.code === "mandate-paused") {
-        return {
-          ok: true as const,
-          outcome: "waiting" as const,
-          move: "none",
-          reason: "mandate-paused",
-          roundsUsedAfter: pinned.roundsUsed,
-          redactedPreview: approved.redactedPreview,
-        };
-      }
-      return deniedResult(consumed.code, consumed.message);
-    }
-    const refundConsumed = async (): Promise<number> => {
-      const refunded = await ctx.runMutation(refundRoundRef, {
-        negotiationId: pinned.negotiationId,
-        identity,
-        expectedRoundsUsed: pinned.roundsUsed,
-      });
-      return refunded.ok ? refunded.roundsUsed : consumed.roundsUsedAfter;
-    };
-
     const created = await ctx.runMutation(createOperationRef, {
       jobId: capacity.jobId,
       organizationId: pinned.organizationId,
@@ -2059,26 +1903,35 @@ export const dispatchApprovedDraft = f1Action({
       payloadJson: args.envelopeCanonical,
       grantId: capacity.grantId,
       reservationId: capacity.reservationId,
+      negotiationId: pinned.negotiationId,
     });
     if (!created.ok) {
-      await refundConsumed();
       if (created.code === "duplicate-conflict") {
         return deniedResult("retry-conflict", "request key reused with a changed payload");
       }
       return deniedResult(created.code, created.message);
     }
     if (created.deduped) {
-      const roundsUsedAfter = await refundConsumed();
       return {
         ok: true as const,
         outcome: "deduplicated" as const,
         move: "none",
         requestKey: key,
         payloadHash: hash,
-        roundsUsedAfter,
+        roundsUsedAfter: pinned.roundsUsed,
         redactedPreview: approved.redactedPreview,
       };
     }
+    const expectedRoundsUsedAfter = pinned.roundsUsed + 1;
+    const refundConsumed = async (): Promise<number> => {
+      const refunded = await ctx.runMutation(refundRoundRef, {
+        negotiationId: pinned.negotiationId,
+        identity,
+        expectedRoundsUsed: pinned.roundsUsed,
+        operationId: created.operationId,
+      });
+      return refunded.ok ? refunded.roundsUsed : expectedRoundsUsedAfter;
+    };
 
     const dispatched = await ctx.runAction(dispatchRef, {
       operationId: created.operationId,
@@ -2135,14 +1988,14 @@ export const dispatchApprovedDraft = f1Action({
         outcome: "waiting",
         jobId: capacity.jobId,
         jobState: "waitingForSupplier",
-        expectedRoundsUsed: consumed.roundsUsedAfter,
+        expectedRoundsUsed: expectedRoundsUsedAfter,
       });
       return {
         ok: true as const,
         outcome: "waiting" as const,
         move: "none",
         reason: "outcome-unknown",
-        roundsUsedAfter: consumed.roundsUsedAfter,
+        roundsUsedAfter: expectedRoundsUsedAfter,
         redactedPreview: approved.redactedPreview,
       };
     }
@@ -2152,7 +2005,7 @@ export const dispatchApprovedDraft = f1Action({
       outcome: "sent",
       jobId: capacity.jobId,
       jobState: "waitingForSupplier",
-      expectedRoundsUsed: consumed.roundsUsedAfter,
+      expectedRoundsUsed: expectedRoundsUsedAfter,
     });
     if (!applied.ok) return deniedResult(applied.code, applied.message);
     return {
@@ -2161,7 +2014,7 @@ export const dispatchApprovedDraft = f1Action({
       move: "none",
       requestKey: key,
       payloadHash: hash,
-      roundsUsedAfter: consumed.roundsUsedAfter,
+      roundsUsedAfter: expectedRoundsUsedAfter,
       providerMessageId: success.providerMessageId,
       redactedPreview: approved.redactedPreview,
     };

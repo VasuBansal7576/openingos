@@ -891,6 +891,12 @@ export default defineSchema({
     // claimable exactly as before; a bound mandate must stay exact, active,
     // unexpired, round-current, and quote/conversation-current.
     negotiationAuthority: v.optional(negotiationAuthorityValidator),
+    // The atomic claim consumes the bound negotiation round before provider
+    // effect. Definitive non-sends may refund only the operation that owns
+    // this marker; this prevents one concurrent attempt from refunding
+    // another attempt's round.
+    negotiationRoundConsumed: v.optional(v.boolean()),
+    negotiationRoundRefunded: v.optional(v.boolean()),
     createdAt: v.number(),
     updatedAt: v.number(),
   })

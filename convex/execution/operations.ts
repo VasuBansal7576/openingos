@@ -1328,10 +1328,12 @@ export const claim = f1InternalMutation({
     }
 
     // Negotiation authority recheck (Devin findings 4060796830/4060796928):
-    // runs inside the same atomic mutation that mints the attempt token,
-    // immediately before provider effect. A revoked, expired, superseded,
-    // reply-changed, or round-moved mandate denies the claim with zero
-    // provider transport, and the prepared operation stays intact.
+    // runs inside the same atomic mutation that consumes the unique mandate
+    // round and mints the attempt token, immediately before provider effect.
+    // A revoked, expired, superseded, reply-changed, or round-moved mandate
+    // denies the claim with zero provider transport, and the prepared
+    // operation stays intact.
+    let negotiationRoundConsumed = false;
     if (operation.negotiationAuthority !== undefined) {
       const authority = operation.negotiationAuthority;
       const negotiation = await ctx.db.get(authority.negotiationId);
@@ -1414,12 +1416,20 @@ export const claim = f1InternalMutation({
           return { ok: false as const, code: "mandate-conversation-changed", message: "bound conversation changed after mandate approval" };
         }
       }
+      await ctx.db.patch(authority.negotiationId, {
+        roundsUsed: negotiation.roundsUsed + 1,
+        updatedAt: now,
+      });
+      negotiationRoundConsumed = true;
     }
 
     const token = crypto.randomUUID();
     await ctx.db.patch(args.operationId, {
       state: "dispatching",
       attemptToken: token,
+      ...(negotiationRoundConsumed
+        ? { negotiationRoundConsumed: true, negotiationRoundRefunded: false }
+        : {}),
       updatedAt: now,
     });
     await ctx.db.insert("attempts", {

@@ -538,7 +538,12 @@ async function createFixture(
     });
     conversationId = inserted;
     await t.run(async (ctx) => {
-      await ctx.db.patch(negotiationId, { conversationId, updatedAt: Date.now() });
+      await ctx.db.patch(negotiationId, {
+        conversationId,
+        conversationVersion: spec.version,
+        conversationState: spec.state,
+        updatedAt: Date.now(),
+      });
     });
   }
   const sendJob = await asOwner.mutation(startJobRef, {
@@ -669,6 +674,13 @@ describe("E12 permitted clarify and counter paths", () => {
     expect(state.negotiation?.roundsUsed).toBe(1);
     expect(state.job?.state).toBe("waitingForSupplier");
     expect(state.operation?.state).toBe("observedSuccess");
+    expect(state.operation?.negotiationAuthority).toMatchObject({
+      negotiationId: fixture.negotiationId,
+      quoteId: fixture.quoteId,
+      quoteVersion: "qv-1",
+      quoteContentHash: "hash-qv-1",
+      roundsUsed: 0,
+    });
   });
 
   test("counter move sends with honest lineage and no commitment writes", async () => {
@@ -1147,14 +1159,51 @@ describe("E12 D-17 scope, tenant isolation, and guest denial", () => {
 });
 
 describe("E12 Devin 4060796928: bound replies stop obsolete follow-ups", () => {
+  test("old bound mandates without approved conversation pins fail closed before providers", async () => {
+    const t = init();
+    const fixture = await createFixture(t, "clarify", {
+      conversation: { version: 1, state: "awaitingReply" },
+    });
+    await t.run(async (ctx) => {
+      await ctx.db.patch(fixture.negotiationId, {
+        conversationVersion: undefined,
+        conversationState: undefined,
+      });
+    });
+    const { result, log } = await runStep(fixture, "req-e12-unpinned", {});
+    expect(result).toMatchObject({ ok: false, code: "mandate-approval-unpinned" });
+    expect(log.jev).toHaveLength(0);
+    expect(log.openai).toHaveLength(0);
+    expect(log.agentmail).toHaveLength(0);
+  });
+
+  test("same-version reply state drift stops with zero provider calls", async () => {
+    const t = init();
+    const fixture = await createFixture(t, "clarify", {
+      conversation: { version: 1, state: "awaitingReply" },
+    });
+    await t.run(async (ctx) => {
+      if (fixture.conversationId === undefined) throw new Error("missing conversation");
+      await ctx.db.patch(fixture.conversationId, {
+        state: "replyReceived",
+        lastReplyAt: Date.now(),
+        updatedAt: Date.now(),
+      });
+    });
+    const { result, log } = await runStep(fixture, "req-e12-same-version-reply", {});
+    expect(result).toMatchObject({ ok: true, outcome: "stopped", reason: "conversation-changed" });
+    expect(log.jev).toHaveLength(0);
+    expect(log.openai).toHaveLength(0);
+    expect(log.agentmail).toHaveLength(0);
+  });
+
   test("replyReceived conversation stops with zero provider calls", async () => {
     const t = init();
     const fixture = await createFixture(t, "clarify", {
       conversation: { version: 1, state: "awaitingReply" },
     });
-    // The owner reply arrives: version advances and the state flips before
-    // ingestion extracts a new quote version. The loader pins v2 on both
-    // sides (the reported bug); the conversation gate must still stop.
+    // The owner reply advances the live row while the mandate remains pinned
+    // to its approved v1/awaitingReply basis.
     await t.run(async (ctx) => {
       const rows = await ctx.db.query("conversations").take(5);
       for (const row of rows) {
@@ -1390,7 +1439,11 @@ describe("E12 Devin 4060797039: atomic round accounting", () => {
         .unique(),
     }));
     expect(state.rounds).toBe(0);
-    expect(state.operation?.state).toBe("observedFailure");
+    expect(state.operation).toMatchObject({
+      state: "observedFailure",
+      negotiationRoundConsumed: true,
+      negotiationRoundRefunded: true,
+    });
   });
 
   test("ambiguous outcome keeps the round without resending", async () => {
@@ -1398,8 +1451,20 @@ describe("E12 Devin 4060797039: atomic round accounting", () => {
     const fixture = await createFixture(t);
     const first = await dispatchEnvelope(fixture, "req-e12-keep", { agentmailHttp: 500 });
     expect(first.result).toMatchObject({ ok: true, outcome: "waiting", reason: "outcome-unknown" });
-    const rounds = await t.run(async (ctx) => (await ctx.db.get(fixture.negotiationId))?.roundsUsed);
-    expect(rounds).toBe(1);
+    const state = await t.run(async (ctx) => ({
+      rounds: (await ctx.db.get(fixture.negotiationId))?.roundsUsed,
+      operation: await ctx.db
+        .query("operations")
+        .withIndex("by_requestKey", (q) =>
+          q.eq("requestKey", `${fixture.organizationId}|communication.send|req-e12-keep`),
+        )
+        .unique(),
+    }));
+    expect(state.rounds).toBe(1);
+    expect(state.operation).toMatchObject({
+      negotiationRoundConsumed: true,
+      negotiationRoundRefunded: false,
+    });
     const second = await dispatchEnvelope(fixture, "req-e12-keep", {});
     expect(second.result).toMatchObject({ ok: true, outcome: "waiting", reason: "outcome-unknown" });
     expect(second.log.agentmail).toHaveLength(0);
@@ -1416,43 +1481,20 @@ describe("E12 Devin 4060797039: atomic round accounting", () => {
     expect(log.agentmail).toHaveLength(0);
   });
 
-  test("consume denies when rounds moved concurrently", async () => {
+  test("the final available round sends and atomically reaches the limit", async () => {
     const t = init();
     const fixture = await createFixture(t);
-    const consumeRef = makeFunctionReference<
-      "mutation",
-      MutationArgs<typeof orchestrator.consumeNegotiationRound>,
-      MutationReturn<typeof orchestrator.consumeNegotiationRound>
-    >("negotiation/orchestrator:consumeNegotiationRound");
-    const refundRef = makeFunctionReference<
-      "mutation",
-      MutationArgs<typeof orchestrator.refundNegotiationRound>,
-      MutationReturn<typeof orchestrator.refundNegotiationRound>
-    >("negotiation/orchestrator:refundNegotiationRound");
-    const first = await t.withIdentity(OWNER).mutation(consumeRef, {
-      negotiationId: fixture.negotiationId,
-      identity: OWNER.tokenIdentifier,
-      expectedRoundsUsed: 0,
-      expectedQuoteVersion: "qv-1",
-      expectedQuoteContentHash: "hash-qv-1",
-      expectedRecipientVersion: 1,
+    await t.run(async (ctx) => {
+      await ctx.db.patch(fixture.negotiationId, {
+        roundsUsed: 2,
+        updatedAt: Date.now(),
+      });
     });
-    expect(first).toMatchObject({ ok: true, roundsUsedAfter: 1 });
-    const second = await t.withIdentity(OWNER).mutation(consumeRef, {
-      negotiationId: fixture.negotiationId,
-      identity: OWNER.tokenIdentifier,
-      expectedRoundsUsed: 0,
-      expectedQuoteVersion: "qv-1",
-      expectedQuoteContentHash: "hash-qv-1",
-      expectedRecipientVersion: 1,
-    });
-    expect(second).toMatchObject({ ok: false, code: "stale-input-version" });
-    const refunded = await t.withIdentity(OWNER).mutation(refundRef, {
-      negotiationId: fixture.negotiationId,
-      identity: OWNER.tokenIdentifier,
-      expectedRoundsUsed: 0,
-    });
-    expect(refunded).toMatchObject({ ok: true, refunded: true, roundsUsed: 0 });
+    const { result, log } = await dispatchEnvelope(fixture, "req-e12-final-round", {});
+    expect(result).toMatchObject({ ok: true, outcome: "sent", roundsUsedAfter: 3 });
+    expect(log.agentmail).toHaveLength(1);
+    const rounds = await t.run(async (ctx) => (await ctx.db.get(fixture.negotiationId))?.roundsUsed);
+    expect(rounds).toBe(3);
   });
 });
 
