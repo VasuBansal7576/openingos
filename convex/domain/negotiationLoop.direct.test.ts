@@ -1,17 +1,19 @@
 /**
- * E6 controlled negotiation-loop direct tests (P-05 / P-23, controlled D-12,
- * controlled J-06 extension; supports P-13 / P-17).
+ * E6 controlled negotiation policy/adapter contract tests (P-05 / P-23,
+ * controlled D-12, controlled J-06 extension; supports P-13 / P-17).
  *
  * Pure vitest boundary tests only: every provider/model outcome is an
- * injected controlled value, the sender is an in-memory controlled stub, and
- * no live transport, model call, or email send is ever invoked. `fetch` is
- * left unstubbed so any attempted live call would throw instead of succeeding.
+ * injected controlled value, the sender is an in-memory controlled stub
+ * mirroring the `communication/send:dispatch` result shape, and no live
+ * transport, model call, or email send is ever invoked. `fetch` is left
+ * unstubbed so any attempted live call would throw instead of succeeding.
  */
 
 import { describe, expect, test } from "vitest";
 import { JEV_PINNED_MODEL } from "../../proofs/jev/jev-boundary.js";
 import {
-  applyNegotiationSendOutcome,
+  applyControlledDispatchOutcome,
+  checkNegotiationBounds,
   checkNegotiationFences,
   deduplicateNegotiationRetry,
   E6_NEGOTIATION_CORPUS,
@@ -20,12 +22,14 @@ import {
   NEGOTIATION_MOVES,
   NEGOTIATION_OPENAI_MODEL,
   NEGOTIATION_OPERATION_KIND,
+  NEGOTIATION_SUBJECT,
   redactForProjection,
   runNegotiationStep,
   scoreE6NegotiationCorpus,
   selectNegotiationMove,
-  validateInjectedSendResult,
+  validateControlledDispatchResult,
   validateNegotiationDraft,
+  type ControlledDispatchResult,
   type ControlledNegotiationSender,
   type InjectedDraftResult,
   type InjectedJevResult,
@@ -59,14 +63,18 @@ function mandate(overrides: Partial<MandateSnapshot> = {}): MandateSnapshot {
 function current(overrides: Partial<NegotiationCurrentSnapshot> = {}): NegotiationCurrentSnapshot {
   return {
     now: 1_000_000,
+    currentQuoteId: "quote-e6",
     quoteVersion: "qv-3",
     quoteContentHash: "hash-qv-3",
     quoteSuperseded: false,
+    currentConversationId: "conv-e6",
     conversationVersion: 4,
     jobState: "running",
     jobCancelled: false,
     grantStatus: "active",
     grantExpiresAt: 2_000_000,
+    currentGrantId: "grant-e6",
+    operationGrantId: "grant-e6",
     grantRevocationVersion: 1,
     operationGrantVersion: 1,
     recipientConfigured: true,
@@ -95,7 +103,7 @@ function draft(overrides: Partial<InjectedDraftResult> = {}): InjectedDraftResul
   return {
     outcome: "completed",
     draftKind: "clarify",
-    content: "Could you confirm whether freight and installation are included in EUR 7,950?",
+    content: "Could you confirm whether freight and installation are included in the quoted total?",
     sourceQuoteVersion: "qv-3",
     sourceConversationVersion: 4,
     model: NEGOTIATION_OPENAI_MODEL,
@@ -105,27 +113,40 @@ function draft(overrides: Partial<InjectedDraftResult> = {}): InjectedDraftResul
   };
 }
 
-function stubSender(outcome: "success" | "failure" | "unknown" = "success"): {
-  sender: ControlledNegotiationSender;
-  calls: number;
-} {
-  const record = { calls: 0 };
+function controlledSuccess(overrides: Partial<Extract<ControlledDispatchResult, { ok: true }>> = {}): ControlledDispatchResult {
   return {
-    calls: record.calls,
+    ok: true,
+    outcome: "success",
+    providerMessageId: "msg-controlled-1",
+    providerThreadId: "thread-controlled-1",
+    recorded: true,
+    ...overrides,
+  };
+}
+
+function stubSender(result: ControlledDispatchResult = controlledSuccess()): {
+  sender: ControlledNegotiationSender;
+  calls: () => number;
+  lastCanonical: () => string | null;
+} {
+  let calls = 0;
+  let lastCanonical: string | null = null;
+  return {
+    calls: () => calls,
+    lastCanonical: () => lastCanonical,
     sender: {
       executionMode: "controlled",
-      send: () => {
-        record.calls += 1;
-        return outcome === "success"
-          ? { outcome, providerMessageId: "msg-controlled-1" }
-          : { outcome, reason: `controlled ${outcome}` };
+      send: (payload) => {
+        calls += 1;
+        lastCanonical = payload.canonical;
+        return result;
       },
     },
   };
 }
 
 function stepInput(overrides: Partial<NegotiationStepInput> = {}): NegotiationStepInput {
-  const stub = stubSender("success");
+  const stub = stubSender();
   return {
     mandate: mandate(),
     current: current(),
@@ -148,10 +169,12 @@ describe("E6 permitted move selection", () => {
   });
 
   test("clarify move with a valid draft sends once through the controlled sender and increments rounds", () => {
-    const stub = stubSender("success");
+    const stub = stubSender();
     const result = runNegotiationStep(stepInput({ sender: stub.sender }));
     expect(result.kind).toBe("sent");
     expect(result.sends).toBe(1);
+    expect(result.dispatchAttempts).toBe(1);
+    expect(stub.calls()).toBe(1);
     expect(stub.sender.executionMode).toBe("controlled");
     if (result.kind === "sent") {
       expect(result.move).toBe("clarify");
@@ -164,12 +187,15 @@ describe("E6 permitted move selection", () => {
       expect(result.lineage.conversationVersion).toBe(4);
       expect(result.lineage.operationKind).toBe(NEGOTIATION_OPERATION_KIND);
       expect(result.lineage.sendState).toBe("observedSuccess");
+      expect(result.lineage.providerMessageId).toBe("msg-controlled-1");
+      expect(result.lineage.providerThreadId).toBe("thread-controlled-1");
+      expect(result.lineage.dispatchAttempts).toBe(1);
       expect(result.lineage.evidenceLabel).toContain("never realized savings");
     }
   });
 
   test("counter move sends with the same honest lineage", () => {
-    const stub = stubSender("success");
+    const stub = stubSender();
     const result = runNegotiationStep(
       stepInput({ sender: stub.sender, jev: jev({ choice: "counter" }), draft: draft({ draftKind: "counter" }) }),
     );
@@ -179,11 +205,21 @@ describe("E6 permitted move selection", () => {
       expect(result.roundsUsedAfter).toBe(2);
     }
   });
+
+  test("dispatched payload uses the fixed server-derived subject", () => {
+    const stub = stubSender();
+    const result = runNegotiationStep(stepInput({ sender: stub.sender }));
+    expect(result.kind).toBe("sent");
+    const canonical = stub.lastCanonical();
+    expect(canonical).not.toBe(null);
+    const parsed: unknown = JSON.parse(canonical ?? "");
+    expect((parsed as Record<string, unknown>)["subject"]).toBe(NEGOTIATION_SUBJECT);
+  });
 });
 
 describe("E6 malformed and disallowed Jev answers", () => {
   test("missing choice denies with zero sends", () => {
-    const stub = stubSender("success");
+    const stub = stubSender();
     const noChoice: InjectedJevResult = {
       outcome: "decided",
       model: JEV_PINNED_MODEL,
@@ -194,47 +230,212 @@ describe("E6 malformed and disallowed Jev answers", () => {
     expect(result.kind).toBe("denied");
     if (result.kind === "denied") expect(result.code).toBe("jev-malformed");
     expect(result.sends).toBe(0);
+    expect(result.dispatchAttempts).toBe(0);
+    expect(stub.calls()).toBe(0);
   });
 
   test("disallowed choice denies with zero sends", () => {
-    const stub = stubSender("success");
+    const stub = stubSender();
     const result = runNegotiationStep(stepInput({ sender: stub.sender, jev: jev({ choice: "accept" }) }));
     expect(result.kind).toBe("denied");
     if (result.kind === "denied") expect(result.code).toBe("jev-malformed");
     expect(result.sends).toBe(0);
+    expect(stub.calls()).toBe(0);
   });
 
   test("wrong model version denies with zero sends", () => {
-    const stub = stubSender("success");
+    const stub = stubSender();
     const result = runNegotiationStep(stepInput({ sender: stub.sender, jev: jev({ model: "jev-latest" }) }));
     expect(result.kind).toBe("denied");
     if (result.kind === "denied") expect(result.code).toBe("jev-malformed");
     expect(result.sends).toBe(0);
+    expect(stub.calls()).toBe(0);
   });
 
   test("stale Jev input version waits with zero sends", () => {
-    const stub = stubSender("success");
+    const stub = stubSender();
     const result = runNegotiationStep(
       stepInput({ sender: stub.sender, jev: jev({ inputVersion: "e6-input-v0" }) }),
     );
     expect(result.kind).toBe("waiting");
     if (result.kind === "waiting") expect(result.reason).toBe("jev-stale");
     expect(result.sends).toBe(0);
+    expect(stub.calls()).toBe(0);
   });
 
   test("needsReview and unavailable Jev outcomes wait with zero sends", () => {
     for (const outcome of ["needsReview", "unavailable"] as const) {
-      const stub = stubSender("success");
+      const stub = stubSender();
       const result = runNegotiationStep(stepInput({ sender: stub.sender, jev: jev({ outcome }) }));
       expect(result.kind).toBe("waiting");
       expect(result.sends).toBe(0);
+      expect(stub.calls()).toBe(0);
     }
+  });
+});
+
+describe("E6 exact current basis", () => {
+  test("changed current quote id stops with zero sends", () => {
+    const stub = stubSender();
+    const result = runNegotiationStep(
+      stepInput({ sender: stub.sender, current: current({ currentQuoteId: "quote-other" }) }),
+    );
+    expect(result.kind).toBe("stopped");
+    if (result.kind === "stopped") expect(result.reason).toBe("quote-changed");
+    expect(result.sends).toBe(0);
+    expect(stub.calls()).toBe(0);
+  });
+
+  test("missing current quote id stops with zero sends", () => {
+    const { currentQuoteId: _droppedQuoteId, ...missing } = current();
+    void _droppedQuoteId;
+    const result = runNegotiationStep(stepInput({ current: missing }));
+    expect(result.kind).toBe("stopped");
+    if (result.kind === "stopped") expect(result.reason).toBe("quote-changed");
+    expect(result.sends).toBe(0);
+  });
+
+  test("mandate-bound conversation with missing current id stops", () => {
+    const { currentConversationId: _droppedConversationId, ...missing } = current();
+    void _droppedConversationId;
+    const result = runNegotiationStep(stepInput({ current: missing }));
+    expect(result.kind).toBe("stopped");
+    if (result.kind === "stopped") expect(result.reason).toBe("conversation-changed");
+    expect(result.sends).toBe(0);
+  });
+
+  test("mandate-bound conversation with missing current version stops", () => {
+    const { conversationVersion: _droppedVersion, ...missing } = current();
+    void _droppedVersion;
+    const result = runNegotiationStep(stepInput({ current: missing }));
+    expect(result.kind).toBe("stopped");
+    if (result.kind === "stopped") expect(result.reason).toBe("conversation-changed");
+    expect(result.sends).toBe(0);
+  });
+
+  test("mandate-bound conversation with a different current id stops", () => {
+    const result = runNegotiationStep(stepInput({ current: current({ currentConversationId: "conv-other" }) }));
+    expect(result.kind).toBe("stopped");
+    if (result.kind === "stopped") expect(result.reason).toBe("conversation-changed");
+    expect(result.sends).toBe(0);
+  });
+
+  test("unbound mandate does not silently accept a newly bound current conversation", () => {
+    const { conversationId: _droppedId, conversationVersion: _droppedVersion, ...freeRest } = mandate();
+    void _droppedId;
+    void _droppedVersion;
+    const free: MandateSnapshot = freeRest;
+    const boundId = runNegotiationStep(stepInput({ mandate: free, current: current({ currentConversationId: "conv-new" }) }));
+    expect(boundId.kind).toBe("stopped");
+    if (boundId.kind === "stopped") expect(boundId.reason).toBe("conversation-changed");
+    expect(boundId.sends).toBe(0);
+
+    const { currentConversationId: _droppedCurrentId, conversationVersion: _droppedCurrentVersion, ...clearRest } = current();
+    void _droppedCurrentId;
+    void _droppedCurrentVersion;
+    const versionOnly: NegotiationCurrentSnapshot = { ...clearRest, conversationVersion: 9 };
+    const withVersion = runNegotiationStep(stepInput({ mandate: free, current: versionOnly }));
+    expect(withVersion.kind).toBe("stopped");
+    expect(withVersion.sends).toBe(0);
+  });
+
+  test("unbound mandate with unbound current proceeds", () => {
+    const stub = stubSender();
+    const { conversationId: _freeId, conversationVersion: _freeVersion, ...freeRest } = mandate();
+    void _freeId;
+    void _freeVersion;
+    const free: MandateSnapshot = freeRest;
+    const { currentConversationId: _clearId, conversationVersion: _clearVersion, ...clearRest } = current();
+    void _clearId;
+    void _clearVersion;
+    const clear: NegotiationCurrentSnapshot = clearRest;
+    const { sourceConversationVersion: _droppedPin, ...draftRest } = draft();
+    void _droppedPin;
+    const unpinned: InjectedDraftResult = draftRest;
+    const result = runNegotiationStep(
+      stepInput({ sender: stub.sender, mandate: free, current: clear, draft: unpinned }),
+    );
+    expect(result.kind).toBe("sent");
+    expect(result.sends).toBe(1);
+  });
+});
+
+describe("E6 exact draft basis", () => {
+  test("missing source quote pin denies with zero dispatch", () => {
+    const stub = stubSender();
+    const { sourceQuoteVersion: _droppedPin, ...missingRest } = draft();
+    void _droppedPin;
+    const missing: InjectedDraftResult = missingRest;
+    const result = runNegotiationStep(stepInput({ sender: stub.sender, draft: missing }));
+    expect(result.kind).toBe("denied");
+    if (result.kind === "denied") expect(result.code).toBe("draft-malformed");
+    expect(result.sends).toBe(0);
+    expect(result.dispatchAttempts).toBe(0);
+    expect(stub.calls()).toBe(0);
+  });
+
+  test("mismatched source quote pin waits with zero dispatch", () => {
+    const stub = stubSender();
+    const result = runNegotiationStep(
+      stepInput({ sender: stub.sender, draft: draft({ sourceQuoteVersion: "qv-2" }) }),
+    );
+    expect(result.kind).toBe("waiting");
+    if (result.kind === "waiting") expect(result.reason).toBe("draft-stale");
+    expect(result.sends).toBe(0);
+    expect(result.dispatchAttempts).toBe(0);
+    expect(stub.calls()).toBe(0);
+  });
+
+  test("mandate conversation requires an exact conversation pin", () => {
+    const { sourceConversationVersion: _droppedConvPin, ...missingRest } = draft();
+    void _droppedConvPin;
+    const missing: InjectedDraftResult = missingRest;
+    const deniedResult = runNegotiationStep(stepInput({ draft: missing }));
+    expect(deniedResult.kind).toBe("denied");
+    if (deniedResult.kind === "denied") expect(deniedResult.code).toBe("draft-malformed");
+    expect(deniedResult.dispatchAttempts).toBe(0);
+
+    const stale = runNegotiationStep(stepInput({ draft: draft({ sourceConversationVersion: 3 }) }));
+    expect(stale.kind).toBe("waiting");
+    if (stale.kind === "waiting") expect(stale.reason).toBe("draft-stale");
+    expect(stale.dispatchAttempts).toBe(0);
+  });
+
+  test("conversation-bound draft against a conversation-free mandate waits", () => {
+    const { conversationId: _mandateId, conversationVersion: _mandateVersion, ...freeRest } = mandate();
+    void _mandateId;
+    void _mandateVersion;
+    const free: MandateSnapshot = freeRest;
+    const { currentConversationId: _currentId, conversationVersion: _currentVersion, ...clearRest } = current();
+    void _currentId;
+    void _currentVersion;
+    const clear: NegotiationCurrentSnapshot = clearRest;
+    const result = runNegotiationStep(stepInput({ mandate: free, current: clear, draft: draft() }));
+    expect(result.kind).toBe("waiting");
+    if (result.kind === "waiting") expect(result.reason).toBe("draft-stale");
+    expect(result.sends).toBe(0);
+    expect(result.dispatchAttempts).toBe(0);
+  });
+
+  test("draft kind must exactly equal the selected move", () => {
+    const { draftKind: _droppedKind, ...missingRest } = draft();
+    void _droppedKind;
+    const missing: InjectedDraftResult = missingRest;
+    const noKind = runNegotiationStep(stepInput({ draft: missing }));
+    expect(noKind.kind).toBe("denied");
+    if (noKind.kind === "denied") expect(noKind.code).toBe("draft-malformed");
+    expect(noKind.dispatchAttempts).toBe(0);
+
+    const other = runNegotiationStep(stepInput({ draft: draft({ draftKind: "counter" }) }));
+    expect(other.kind).toBe("denied");
+    if (other.kind === "denied") expect(other.code).toBe("draft-malformed");
+    expect(other.dispatchAttempts).toBe(0);
   });
 });
 
 describe("E6 disclosure redaction", () => {
   test("draft leaking the confidential target figure is denied with zero sends", () => {
-    const stub = stubSender("success");
+    const stub = stubSender();
     const result = runNegotiationStep(
       stepInput({
         sender: stub.sender,
@@ -244,6 +445,7 @@ describe("E6 disclosure redaction", () => {
     expect(result.kind).toBe("denied");
     if (result.kind === "denied") expect(result.code).toBe("draft-disclosure-leak");
     expect(result.sends).toBe(0);
+    expect(stub.calls()).toBe(0);
   });
 
   test("draft leaking the ceiling as a major-units amount is denied", () => {
@@ -251,6 +453,12 @@ describe("E6 disclosure redaction", () => {
       ceilingMinorUnits: 795000,
     });
     expect(checked.ok).toBe(false);
+  });
+
+  test("grouped and European figure renderings fail closed", () => {
+    expect(validateNegotiationDraft("We can do 7,500 flat.", { targetMinorUnits: 750000 }).ok).toBe(false);
+    expect(validateNegotiationDraft("We can do 7.500,00 flat.", { targetMinorUnits: 750000 }).ok).toBe(false);
+    expect(validateNegotiationDraft("Ceiling 7950 confirmed.", { ceilingMinorUnits: 795000 }).ok).toBe(false);
   });
 
   test("draft leaking the private owner mailbox is denied", () => {
@@ -265,7 +473,7 @@ describe("E6 disclosure redaction", () => {
     const preview = redactForProjection(`Contact ${OWNER_MAILBOX} about freight.`);
     expect(preview).not.toContain(OWNER_MAILBOX);
     expect(preview).toContain("[redacted-mailbox]");
-    const stub = stubSender("success");
+    const stub = stubSender();
     const result = runNegotiationStep(stepInput({ sender: stub.sender }));
     if (result.kind === "sent") {
       expect(result.lineage.redactedPreview).not.toContain(OWNER_MAILBOX);
@@ -280,55 +488,49 @@ describe("E6 disclosure redaction", () => {
 
 describe("E6 quote and conversation change stops", () => {
   test("changed quote version stops with zero sends", () => {
-    const stub = stubSender("success");
+    const stub = stubSender();
     const result = runNegotiationStep(
       stepInput({ sender: stub.sender, current: current({ quoteVersion: "qv-4", quoteContentHash: "hash-qv-4" }) }),
     );
     expect(result.kind).toBe("stopped");
     if (result.kind === "stopped") expect(result.reason).toBe("quote-changed");
     expect(result.sends).toBe(0);
+    expect(stub.calls()).toBe(0);
   });
 
   test("superseded quote stops with zero sends", () => {
-    const stub = stubSender("success");
+    const stub = stubSender();
     const result = runNegotiationStep(
       stepInput({ sender: stub.sender, current: current({ quoteSuperseded: true }) }),
     );
     expect(result.kind).toBe("stopped");
     if (result.kind === "stopped") expect(result.reason).toBe("quote-superseded");
     expect(result.sends).toBe(0);
+    expect(stub.calls()).toBe(0);
   });
 
   test("changed conversation version stops with zero sends", () => {
-    const stub = stubSender("success");
+    const stub = stubSender();
     const result = runNegotiationStep(
       stepInput({ sender: stub.sender, current: current({ conversationVersion: 5 }) }),
     );
     expect(result.kind).toBe("stopped");
     if (result.kind === "stopped") expect(result.reason).toBe("conversation-changed");
     expect(result.sends).toBe(0);
-  });
-
-  test("stale draft basis waits instead of sending against new terms", () => {
-    const stub = stubSender("success");
-    const result = runNegotiationStep(
-      stepInput({ sender: stub.sender, draft: draft({ sourceQuoteVersion: "qv-2" }) }),
-    );
-    expect(result.kind).toBe("waiting");
-    if (result.kind === "waiting") expect(result.reason).toBe("draft-stale");
-    expect(result.sends).toBe(0);
+    expect(stub.calls()).toBe(0);
   });
 });
 
 describe("E6 mandate expiry, revocation, and terminal stops", () => {
   test("expired mandate stops with zero sends", () => {
-    const stub = stubSender("success");
+    const stub = stubSender();
     const result = runNegotiationStep(
       stepInput({ sender: stub.sender, current: current({ now: 3_000_000 }) }),
     );
     expect(result.kind).toBe("stopped");
     if (result.kind === "stopped") expect(result.reason).toBe("mandate-expired");
     expect(result.sends).toBe(0);
+    expect(stub.calls()).toBe(0);
   });
 
   test("revoked and concluded mandates stop with zero sends", () => {
@@ -336,20 +538,22 @@ describe("E6 mandate expiry, revocation, and terminal stops", () => {
       ["revoked", "mandate-revoked"],
       ["concluded", "mandate-concluded"],
     ] as const) {
-      const stub = stubSender("success");
+      const stub = stubSender();
       const result = runNegotiationStep(stepInput({ sender: stub.sender, mandate: mandate({ state }) }));
       expect(result.kind).toBe("stopped");
       if (result.kind === "stopped") expect(result.reason).toBe(reason);
       expect(result.sends).toBe(0);
+      expect(stub.calls()).toBe(0);
     }
   });
 
   test("paused mandate waits honestly with zero sends", () => {
-    const stub = stubSender("success");
+    const stub = stubSender();
     const result = runNegotiationStep(stepInput({ sender: stub.sender, mandate: mandate({ state: "paused" }) }));
     expect(result.kind).toBe("waiting");
     if (result.kind === "waiting") expect(result.reason).toBe("mandate-paused");
     expect(result.sends).toBe(0);
+    expect(stub.calls()).toBe(0);
   });
 
   test("round limit, final offer, and user takeover stop with zero sends", () => {
@@ -359,10 +563,11 @@ describe("E6 mandate expiry, revocation, and terminal stops", () => {
       { name: "user-takeover", input: { current: current({ userTakeover: true }) } },
     ];
     for (const probe of stoppedCases) {
-      const stub = stubSender("success");
+      const stub = stubSender();
       const result = runNegotiationStep(stepInput({ sender: stub.sender, ...probe.input }));
       expect(result.kind).toBe("stopped");
       expect(result.sends).toBe(0);
+      expect(stub.calls()).toBe(0);
     }
     const limit = runNegotiationStep(stepInput({ mandate: mandate({ roundsUsed: 3 }) }));
     if (limit.kind === "stopped") expect(limit.reason).toBe("round-limit-reached");
@@ -370,19 +575,21 @@ describe("E6 mandate expiry, revocation, and terminal stops", () => {
   });
 
   test("Jev stop move stops with zero sends", () => {
-    const stub = stubSender("success");
+    const stub = stubSender();
     const result = runNegotiationStep(stepInput({ sender: stub.sender, jev: jev({ choice: "stop" }) }));
     expect(result.kind).toBe("stopped");
     if (result.kind === "stopped") expect(result.reason).toBe("stop-move");
     expect(result.sends).toBe(0);
+    expect(stub.calls()).toBe(0);
   });
 
   test("hold move waits for the owner with zero sends", () => {
-    const stub = stubSender("success");
+    const stub = stubSender();
     const result = runNegotiationStep(stepInput({ sender: stub.sender, jev: jev({ choice: "hold" }) }));
     expect(result.kind).toBe("waiting");
     if (result.kind === "waiting") expect(result.reason).toBe("waiting-for-owner");
     expect(result.sends).toBe(0);
+    expect(stub.calls()).toBe(0);
   });
 });
 
@@ -392,12 +599,29 @@ describe("E6 grant and recipient revocation before send", () => {
       [current({ grantStatus: "revoked" }), "grant-revoked"],
       [current({ grantStatus: "expired" }), "grant-expired"],
     ] as const) {
-      const stub = stubSender("success");
+      const stub = stubSender();
       const result = runNegotiationStep(stepInput({ sender: stub.sender, current: grant }));
       expect(result.kind).toBe("stopped");
       if (result.kind === "stopped") expect(result.reason).toBe(reason);
       expect(result.sends).toBe(0);
+      expect(stub.calls()).toBe(0);
     }
+  });
+
+  test("changed or missing grant binding denies with zero sends", () => {
+    const changed = runNegotiationStep(stepInput({ current: current({ currentGrantId: "grant-other" }) }));
+    expect(changed.kind).toBe("denied");
+    if (changed.kind === "denied") expect(changed.code).toBe("grant-binding-changed");
+    expect(changed.sends).toBe(0);
+    expect(changed.dispatchAttempts).toBe(0);
+
+    const { operationGrantId: _droppedGrant, ...missingRest } = current();
+    void _droppedGrant;
+    const missing: NegotiationCurrentSnapshot = missingRest;
+    const absent = runNegotiationStep(stepInput({ current: missing }));
+    expect(absent.kind).toBe("denied");
+    if (absent.kind === "denied") expect(absent.code).toBe("grant-binding-changed");
+    expect(absent.sends).toBe(0);
   });
 
   test("grant re-issue and recipient change deny with zero sends", () => {
@@ -440,7 +664,57 @@ describe("E6 grant and recipient revocation before send", () => {
   });
 });
 
-describe("E6 retry idempotency and send outcomes", () => {
+describe("E6 runtime bounds fail closed", () => {
+  test("bounds helper passes usable snapshots and rejects malformed counts", () => {
+    expect(checkNegotiationBounds(mandate(), current())).toBe(null);
+    for (const bad of [
+      mandate({ roundsUsed: NaN }),
+      mandate({ roundsUsed: -1 }),
+      mandate({ roundsUsed: 1.5 }),
+      mandate({ roundLimit: 0 }),
+      mandate({ roundLimit: Number.POSITIVE_INFINITY }),
+      mandate({ expiresAt: NaN }),
+      mandate({ targetMinorUnits: Number.NaN }),
+      mandate({ ceilingMinorUnits: Number.POSITIVE_INFINITY }),
+    ]) {
+      expect(checkNegotiationBounds(bad, current())?.kind).toBe("denied");
+    }
+    for (const bad of [
+      current({ now: NaN }),
+      current({ grantExpiresAt: Number.NEGATIVE_INFINITY }),
+      current({ conversationVersion: 1.5 }),
+      current({ recipientConfigVersion: NaN }),
+    ]) {
+      expect(checkNegotiationBounds(mandate(), bad)?.kind).toBe("denied");
+    }
+  });
+
+  test("untyped malformed numerics deny before any dispatch", () => {
+    const bypass = {
+      ...mandate(),
+      roundsUsed: "1",
+      targetMinorUnits: "750000",
+    } as unknown as MandateSnapshot;
+    const stub = stubSender();
+    const result = runNegotiationStep(stepInput({ sender: stub.sender, mandate: bypass }));
+    expect(result.kind).toBe("denied");
+    if (result.kind === "denied") expect(result.code).toBe("invalid-bounds");
+    expect(result.sends).toBe(0);
+    expect(result.dispatchAttempts).toBe(0);
+    expect(stub.calls()).toBe(0);
+  });
+
+  test("roundsUsed above the limit never reaches dispatch handling", () => {
+    const stub = stubSender();
+    const result = runNegotiationStep(stepInput({ sender: stub.sender, mandate: mandate({ roundsUsed: 9 }) }));
+    expect(result.kind).toBe("stopped");
+    if (result.kind === "stopped") expect(result.reason).toBe("round-limit-reached");
+    expect(result.sends).toBe(0);
+    expect(stub.calls()).toBe(0);
+  });
+});
+
+describe("E6 retry idempotency and dispatch outcomes", () => {
   test("identical retry deduplicates without a second send or round", () => {
     const first = runNegotiationStep(stepInput({ requestId: "req-dedup" }));
     expect(first.kind).toBe("sent");
@@ -454,20 +728,21 @@ describe("E6 retry idempotency and send outcomes", () => {
           executionMode: "controlled",
           send: () => {
             secondCalls += 1;
-            return { outcome: "success", providerMessageId: "msg-should-not-send" };
+            return controlledSuccess({ providerMessageId: "msg-should-not-send" });
           },
         },
       }),
     );
     expect(second.kind).toBe("deduplicated");
     expect(second.sends).toBe(0);
+    expect(second.dispatchAttempts).toBe(0);
     expect(secondCalls).toBe(0);
     expect(second.roundsUsedAfter).toBe(1);
     if (second.kind === "deduplicated") expect(second.lineage.sendState).toBe("deduplicated");
   });
 
   test("changed payload on a reused key conflicts with zero sends", () => {
-    const stub = stubSender("success");
+    const stub = stubSender();
     const result = runNegotiationStep(
       stepInput({
         sender: stub.sender,
@@ -478,6 +753,7 @@ describe("E6 retry idempotency and send outcomes", () => {
     expect(result.kind).toBe("denied");
     if (result.kind === "denied") expect(result.code).toBe("retry-conflict");
     expect(result.sends).toBe(0);
+    expect(stub.calls()).toBe(0);
   });
 
   test("deduplication gate semantics", () => {
@@ -486,23 +762,28 @@ describe("E6 retry idempotency and send outcomes", () => {
     expect(deduplicateNegotiationRetry("k", "h2", { requestKey: "k", payloadHash: "h" }).outcome).toBe("conflict");
   });
 
-  test("unknown transport outcome stays waiting without incrementing rounds", () => {
-    const stub = stubSender("unknown");
+  test("unknown dispatch outcome waits and records one attempt without a send", () => {
+    const stub = stubSender(controlledSuccess({ outcome: "unknown", providerMessageId: null, providerThreadId: null, recorded: false }));
     const result = runNegotiationStep(stepInput({ sender: stub.sender }));
     expect(result.kind).toBe("waiting");
     expect(result.sends).toBe(0);
+    expect(result.dispatchAttempts).toBe(1);
+    expect(stub.calls()).toBe(1);
     expect(result.roundsUsedAfter).toBe(1);
     if (result.kind === "waiting") {
       expect(result.reason).toBe("outcome-unknown");
       expect(result.lineage.sendState).toBe("outcomeUnknown");
+      expect(result.lineage.dispatchAttempts).toBe(1);
     }
   });
 
-  test("failed transport stays honest without incrementing rounds", () => {
-    const stub = stubSender("failure");
+  test("failed dispatch waits and records one attempt without a send", () => {
+    const stub = stubSender(controlledSuccess({ outcome: "failure", recorded: false }));
     const result = runNegotiationStep(stepInput({ sender: stub.sender }));
     expect(result.kind).toBe("waiting");
     expect(result.sends).toBe(0);
+    expect(result.dispatchAttempts).toBe(1);
+    expect(stub.calls()).toBe(1);
     expect(result.roundsUsedAfter).toBe(1);
     if (result.kind === "waiting") {
       expect(result.reason).toBe("send-failure");
@@ -510,23 +791,67 @@ describe("E6 retry idempotency and send outcomes", () => {
     }
   });
 
-  test("round accounting increments only on observed success", () => {
-    expect(applyNegotiationSendOutcome(2, "success")).toMatchObject({
-      sendState: "observedSuccess",
-      roundsUsedAfter: 3,
-      waiting: false,
-    });
-    expect(applyNegotiationSendOutcome(2, "unknown").roundsUsedAfter).toBe(2);
-    expect(applyNegotiationSendOutcome(2, "failure").roundsUsedAfter).toBe(2);
+  test("unrecorded success denies and never increments the round", () => {
+    const stub = stubSender(controlledSuccess({ recorded: false }));
+    const result = runNegotiationStep(stepInput({ sender: stub.sender }));
+    expect(result.kind).toBe("denied");
+    expect(result.sends).toBe(0);
+    expect(result.dispatchAttempts).toBe(1);
+    expect(stub.calls()).toBe(1);
+    expect(result.roundsUsedAfter).toBe(1);
+    if (result.kind === "denied") {
+      expect(result.code).toBe("provider-result-malformed");
+      expect(result.lineage.dispatchAttempts).toBe(1);
+    }
   });
 
-  test("malformed injected provider result denies with zero sends", () => {
-    expect(validateInjectedSendResult(null).ok).toBe(false);
-    expect(validateInjectedSendResult({ outcome: "delivered" }).ok).toBe(false);
-    const stub = stubSender("success");
-    void stub;
-    const parsed = validateInjectedSendResult({ outcome: "success", providerMessageId: "  " });
-    expect(parsed.ok).toBe(false);
+  test("success without a provider message id denies and never increments", () => {
+    const stub = stubSender(controlledSuccess({ providerMessageId: null }));
+    const result = runNegotiationStep(stepInput({ sender: stub.sender }));
+    expect(result.kind).toBe("denied");
+    if (result.kind === "denied") expect(result.code).toBe("provider-result-malformed");
+    expect(result.roundsUsedAfter).toBe(1);
+  });
+
+  test("adapter denial denies after recording the attempt", () => {
+    const stub = stubSender({ ok: false, code: "transport-down", message: "controlled adapter refusal" });
+    const result = runNegotiationStep(stepInput({ sender: stub.sender }));
+    expect(result.kind).toBe("denied");
+    expect(result.sends).toBe(0);
+    expect(result.dispatchAttempts).toBe(1);
+    expect(stub.calls()).toBe(1);
+    if (result.kind === "denied") expect(result.code).toBe("dispatch-denied");
+  });
+
+  test("round accounting advances only recorded success with a message id", () => {
+    const recorded = controlledSuccess();
+    expect(applyControlledDispatchOutcome(2, recorded)).toMatchObject({
+      outcome: "sent",
+      sendState: "observedSuccess",
+      roundsUsedAfter: 3,
+    });
+    if (recorded.ok) {
+      expect(applyControlledDispatchOutcome(2, { ...recorded, recorded: false }).outcome).toBe("denied");
+      expect(applyControlledDispatchOutcome(2, { ...recorded, providerMessageId: null }).outcome).toBe("denied");
+      expect(applyControlledDispatchOutcome(2, { ...recorded, outcome: "unknown" }).outcome).toBe("waiting");
+      expect(applyControlledDispatchOutcome(2, { ...recorded, outcome: "failure" }).outcome).toBe("waiting");
+    } else {
+      throw new Error("expected controlled success fixture");
+    }
+    expect(applyControlledDispatchOutcome(2, { ok: false, code: "x", message: "y" }).outcome).toBe("denied");
+  });
+
+  test("malformed adapter results deny with the attempt recorded", () => {
+    expect(validateControlledDispatchResult(null).ok).toBe(false);
+    expect(validateControlledDispatchResult({ ok: true, outcome: "delivered" }).ok).toBe(false);
+    expect(
+      validateControlledDispatchResult({ ok: true, outcome: "success", providerMessageId: "  ", providerThreadId: null, recorded: true }).ok,
+    ).toBe(false);
+    expect(
+      validateControlledDispatchResult({ ok: true, outcome: "success", providerMessageId: "m", providerThreadId: null }).ok,
+    ).toBe(false);
+    const valid = validateControlledDispatchResult(controlledSuccess());
+    expect(valid.ok).toBe(true);
   });
 
   test("non-controlled sender is refused before any invocation", () => {
@@ -535,7 +860,7 @@ describe("E6 retry idempotency and send outcomes", () => {
       executionMode: "live",
       send: () => {
         calls += 1;
-        return { outcome: "success" as const, providerMessageId: "msg-live" };
+        return controlledSuccess({ providerMessageId: "msg-live" });
       },
     };
     const result = runNegotiationStep(
@@ -545,6 +870,7 @@ describe("E6 retry idempotency and send outcomes", () => {
     if (result.kind === "denied") expect(result.code).toBe("live-transport-refused");
     expect(calls).toBe(0);
     expect(result.sends).toBe(0);
+    expect(result.dispatchAttempts).toBe(0);
   });
 });
 
@@ -599,6 +925,7 @@ describe("E6 loop metadata and zero-live-transport proof", () => {
       expect(result.sends).toBe(0);
       expect(result.lineage.executionMode).toBe("controlled");
       expect(result.lineage.loopVersion).toBe("e6-negotiation-loop-v1");
+      expect(result.lineage.evidenceLabel).toContain("controlled");
     }
   });
 });

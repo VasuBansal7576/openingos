@@ -1,41 +1,59 @@
 /**
- * E6 controlled negotiation execution loop (P-05 / P-23, controlled D-12,
- * controlled J-06 extension; supports P-13 / P-17).
+ * E6 controlled negotiation policy and adapter contract (P-05 / P-23,
+ * controlled D-12, controlled J-06 extension; supports P-13 / P-17).
  *
- * This module is deliberately pure: it performs no Convex reads or writes,
- * no model calls, no email sends, and no live transport of any kind. Every
- * external effect in production must flow through the existing boundaries:
+ * Honest scope: this module is a CONTROLLED, PURE policy contract. It
+ * performs no Convex reads or writes, persists no lineage rows, and makes no
+ * Jev, OpenAI, or AgentMail call of any kind. Every model/provider outcome
+ * here is an injected controlled value, and the only effect is one call to
+ * an injected controlled sender whose result must mirror the existing
+ * `communication/send:dispatch` result shape. Returned lineage objects are
+ * unpersisted in-memory values: they describe the existing-record references
+ * (negotiation, quote, conversation, F1 operation kind, request key, payload
+ * hash, attempt outcome) that a future production orchestrator must store,
+ * but this module stores nothing.
  *
- * - Move selection consumes the Jev typed decision boundary shape
- *   (ADR-0005, `proofs/jev/jev-boundary.ts`): only a validated, current
- *   `decided` choice over the permitted move catalog may supply a move.
- *   The pinned model constant is imported from that boundary so drift is a
+ * Production wiring still open (NOT implemented here, and not claimed):
+ * a production orchestrator package must (1) load mandate/current snapshots
+ * from live Convex rows, (2) call the real `models/jev:classify` decision
+ * and `models/openai:draft` actions, (3) claim an F1 operation and
+ * reservation, (4) invoke the real `communication/send:dispatch` action, and
+ * (5) persist the returned lineage against existing records. Until that
+ * package lands, this module only proves the policy that orchestrator must
+ * consume. It must never be presented as a live negotiation, a persisted
+ * history, or a completed external send.
+ *
+ * Consumed boundaries (shapes only, never invoked against live transport):
+ *
+ * - Move selection mirrors the Jev typed decision boundary (ADR-0005,
+ *   `proofs/jev/jev-boundary.ts`): only a validated, current `decided`
+ *   choice over the permitted move catalog may supply a move. The pinned
+ *   model constant is imported from that boundary so drift is a
  *   compile-time fact, not a string copy.
- * - Clarify/counter text follows the OpenAI supplier-draft boundary shape
+ * - Clarify/counter drafts mirror the OpenAI supplier-draft boundary shape
  *   (ADR-0005, `convex/models/openai.ts`): the dated
- *   `gpt-5.4-mini-2026-03-17` snapshot, source-bound drafts, and the output
- *   byte bound. The constant below mirrors that boundary; the type import
- *   keeps the draft shape identical without pulling server-only transport
- *   into this pure module.
+ *   `gpt-5.4-mini-2026-03-17` snapshot, mandatory source pins, and the
+ *   output byte bound. The constant below mirrors that boundary; the type
+ *   import keeps the draft shape identical without pulling server-only
+ *   transport into this pure module.
  * - Outbound validation reuses the existing C1 communication boundary
  *   (`convex/communication/contracts.ts` `validateOutboundPayload`), which
  *   binds the payload to the single server-configured owner mailbox and
  *   rejects CC/BCC, Reply-To redirection, alternate profiles, and unsafe
- *   content before anything may reach `communication/send:dispatch`.
+ *   content.
+ * - The controlled sender result mirrors the existing
+ *   `communication/send:dispatch` result shape (`ok`, `outcome`,
+ *   `providerMessageId`, `providerThreadId`, `recorded`, or a denial).
  * - Idempotency reuses the F1 request-key contract
  *   (`convex/shared/hashing.ts` `requestKey`/`payloadHash`): identical
  *   retries deduplicate, changed payloads conflict, and no second send path
  *   exists here.
  *
- * Durable lineage is expressed only with existing-record references
- * (negotiation, quote version/content hash, conversation version, F1
- * operation kind, request key, payload hash, attempt outcome). No schema
- * change is introduced by this module. Owner-authored terms flowing through
- * here are controlled demo evidence (`counterpartyRole: ownerStandIn`,
- * `executionMode: controlled`) and never realized savings; confidential
- * target/ceiling figures and the private owner mailbox never enter public
- * projections, logs, or evidence — lineage carries only redacted previews
- * and hashes.
+ * Owner-authored terms flowing through here are controlled demo evidence
+ * (`counterpartyRole: ownerStandIn`, `executionMode: controlled`) and never
+ * realized savings; confidential target/ceiling figures and the private
+ * owner mailbox never enter public projections, logs, or evidence — lineage
+ * carries only redacted previews and hashes.
  */
 
 import { JEV_PINNED_MODEL } from "../../proofs/jev/jev-boundary.js";
@@ -67,6 +85,13 @@ export const E6_NEGOTIATION_CORPUS_VERSION = "e6-negotiation-corpus-v1" as const
 export const NEGOTIATION_OPERATION_KIND = "communication.send" as const;
 /** Maximum draft bytes admitted, mirroring the OpenAI output bound. */
 export const NEGOTIATION_MAX_DRAFT_BYTES = 32 * 1024;
+/**
+ * The single fixed server-derived subject. Caller-controlled subject text
+ * was removed: confidential values cannot leak through a channel the caller
+ * cannot write to. The constant carries no figures or addresses, and every
+ * step re-validates it against the mandate disclosure before dispatch.
+ */
+export const NEGOTIATION_SUBJECT = "Negotiation follow-up — controlled demo" as const;
 
 export const NEGOTIATION_MOVES = [
   "clarify",
@@ -97,6 +122,7 @@ export type NegotiationJobState =
   | "cancelled";
 
 export type NegotiationDenialCode =
+  | "invalid-bounds"
   | "mandate-not-active"
   | "mandate-paused"
   | "mandate-expired"
@@ -109,6 +135,7 @@ export type NegotiationDenialCode =
   | "grant-revoked"
   | "grant-expired"
   | "grant-version-changed"
+  | "grant-binding-changed"
   | "recipient-missing"
   | "recipient-changed"
   | "job-cancelled"
@@ -120,6 +147,7 @@ export type NegotiationDenialCode =
   | "outbound-denied"
   | "retry-conflict"
   | "provider-result-malformed"
+  | "dispatch-denied"
   | "live-transport-refused";
 
 export type NegotiationStopReason =
@@ -168,14 +196,22 @@ export interface MandateSnapshot {
 
 export interface NegotiationCurrentSnapshot {
   readonly now: number;
+  /** Current quote identity. Must exactly equal the mandate quote id. */
+  readonly currentQuoteId?: string;
   readonly quoteVersion: string;
   readonly quoteContentHash: string;
   readonly quoteSuperseded: boolean;
+  /** Current conversation identity. Exact-equality with the mandate is required. */
+  readonly currentConversationId?: string;
   readonly conversationVersion?: number;
   readonly jobState: NegotiationJobState;
   readonly jobCancelled: boolean;
   readonly grantStatus: NegotiationGrantStatus;
   readonly grantExpiresAt: number;
+  /** Current grant binding. Must exactly equal the operation grant binding. */
+  readonly currentGrantId?: string;
+  /** Grant binding the operation was approved under. */
+  readonly operationGrantId?: string;
   readonly grantRevocationVersion: number;
   readonly operationGrantVersion: number;
   readonly recipientConfigured: boolean;
@@ -212,13 +248,28 @@ export interface InjectedDraftResult {
   readonly currentInputVersion: string;
 }
 
-export type InjectedSendOutcome = "success" | "failure" | "unknown";
-
-export interface InjectedSendResult {
-  readonly outcome: InjectedSendOutcome;
-  readonly providerMessageId?: string;
-  readonly reason?: string;
+/**
+ * Controlled adapter result mirroring the existing
+ * `communication/send:dispatch` result shape: a success/failure/unknown
+ * outcome with provider ids and a recorded flag, or a denial. A `success`
+ * may advance the round only when `recorded` is true and
+ * `providerMessageId` is a nonempty string; anything else stays honest.
+ */
+export interface ControlledDispatchSuccess {
+  readonly ok: true;
+  readonly outcome: "success" | "failure" | "unknown";
+  readonly providerMessageId: string | null;
+  readonly providerThreadId: string | null;
+  readonly recorded: boolean;
 }
+
+export interface ControlledDispatchDenial {
+  readonly ok: false;
+  readonly code: string;
+  readonly message: string;
+}
+
+export type ControlledDispatchResult = ControlledDispatchSuccess | ControlledDispatchDenial;
 
 export interface PriorNegotiationAttempt {
   readonly requestKey: string;
@@ -229,8 +280,8 @@ export interface PriorNegotiationAttempt {
  * Controlled stand-in for the `communication/send:dispatch` path. The only
  * accepted execution mode is `controlled`; any other mode is refused before
  * invocation, and this task never invokes dispatch against configured
- * transport. In production the same validated payload flows through the real
- * dispatch claim; here the injected result records the honest outcome.
+ * transport. The injected result must mirror the real dispatch shape above;
+ * malformed or unrecorded success never advances a round.
  */
 export interface ControlledNegotiationSender {
   readonly executionMode: "controlled";
@@ -238,7 +289,7 @@ export interface ControlledNegotiationSender {
     readonly canonical: string;
     readonly payloadHash: string;
     readonly requestKey: string;
-  }) => InjectedSendResult;
+  }) => ControlledDispatchResult;
 }
 
 export interface NegotiationLineage {
@@ -268,6 +319,9 @@ export interface NegotiationLineage {
     | "outcomeUnknown"
     | "deduplicated";
   readonly providerMessageId?: string;
+  readonly providerThreadId?: string;
+  /** Controlled dispatch invocations this step performed (0 or 1). */
+  readonly dispatchAttempts: number;
   readonly stopReason?: NegotiationStopReason;
   readonly waitReason?: NegotiationWaitReason;
   readonly denialCode?: NegotiationDenialCode;
@@ -283,6 +337,7 @@ export type NegotiationStepResult =
       readonly payloadHash: string;
       readonly roundsUsedAfter: number;
       readonly sends: 1;
+      readonly dispatchAttempts: 1;
       readonly lineage: NegotiationLineage;
     }
   | {
@@ -292,6 +347,7 @@ export type NegotiationStepResult =
       readonly payloadHash: string;
       readonly roundsUsedAfter: number;
       readonly sends: 0;
+      readonly dispatchAttempts: 0;
       readonly lineage: NegotiationLineage;
     }
   | {
@@ -300,6 +356,7 @@ export type NegotiationStepResult =
       readonly reason: NegotiationWaitReason;
       readonly roundsUsedAfter: number;
       readonly sends: 0;
+      readonly dispatchAttempts: 0 | 1;
       readonly lineage: NegotiationLineage;
     }
   | {
@@ -308,6 +365,7 @@ export type NegotiationStepResult =
       readonly reason: NegotiationStopReason;
       readonly roundsUsedAfter: number;
       readonly sends: 0;
+      readonly dispatchAttempts: 0;
       readonly lineage: NegotiationLineage;
     }
   | {
@@ -317,6 +375,7 @@ export type NegotiationStepResult =
       readonly message: string;
       readonly roundsUsedAfter: number;
       readonly sends: 0;
+      readonly dispatchAttempts: 0 | 1;
       readonly lineage: NegotiationLineage;
     };
 
@@ -326,12 +385,23 @@ function isMove(value: unknown): value is NegotiationMove {
   );
 }
 
+function isNonNegativeSafeInt(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+/** Fail-closed numeric projection: malformed counts never reach handling. */
+function safeCount(value: unknown): number {
+  return isNonNegativeSafeInt(value) ? value : 0;
+}
+
 function baseLineage(
   mandate: MandateSnapshot,
   current: NegotiationCurrentSnapshot,
   requestId: string,
   redactedPreview: string,
+  dispatchAttempts: number,
 ): Omit<NegotiationLineage, "move" | "payloadHash" | "sendState"> {
+  const roundsUsed = safeCount(mandate.roundsUsed);
   return {
     loopVersion: NEGOTIATION_LOOP_VERSION,
     executionMode: "controlled",
@@ -347,10 +417,11 @@ function baseLineage(
     ...(mandate.conversationVersion === undefined
       ? {}
       : { conversationVersion: mandate.conversationVersion }),
-    round: mandate.roundsUsed + 1,
-    roundsUsedAfter: mandate.roundsUsed,
+    round: roundsUsed + 1,
+    roundsUsedAfter: roundsUsed,
     operationKind: NEGOTIATION_OPERATION_KIND,
     requestKey: requestKey(mandate.organizationId, NEGOTIATION_OPERATION_KIND, requestId),
+    dispatchAttempts,
     redactedPreview,
   };
 }
@@ -415,15 +486,51 @@ function confidentialRenderings(minorUnits: number): string[] {
   renderings.add(
     major.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
   );
+  renderings.add(
+    major.toLocaleString("de-DE", { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
+  );
   return [...renderings];
 }
 
 /**
- * Deterministically validate supplier-visible draft text. Rejects empty or
- * oversized drafts, active HTML, instruction-shaped text, and any leak of
- * confidential target/ceiling figures or the private owner mailbox. Never
- * accepts, orders, or commits anything: drafts are clarification/counter
- * text only.
+ * Fail-closed confidential-figure detector. Besides fixed renderings (minor
+ * units, major units with decimals, US/EU grouped forms), every digit run in
+ * the text is normalized by stripping spaces, thousand/decimal separators
+ * and apostrophes, then compared against the minor-units digits and the
+ * major-units digits. Any match is a leak. Deliberately fail-closed: a
+ * supplier-visible draft that quotes a figure indistinguishable from a
+ * confidential target/ceiling is denied rather than risking disclosure.
+ */
+function confidentialFigureLeaked(text: string, minorUnits: number): boolean {
+  const lowered = text.toLowerCase();
+  for (const rendering of confidentialRenderings(minorUnits)) {
+    if (rendering.length > 0 && lowered.includes(rendering.toLowerCase())) return true;
+  }
+  const minorDigits = String(minorUnits).replace(/^0+(?=\d)/, "");
+  const majorDigits = String(Math.trunc(minorUnits / 100)).replace(/^0+(?=\d)/, "");
+  for (const match of text.matchAll(/[\d][\d\s.,']*/g)) {
+    const digits = match[0].replace(/[\s.,']/g, "").replace(/^0+(?=\d)/, "");
+    if (digits.length === 0) continue;
+    if (digits === minorDigits || digits === majorDigits) return true;
+  }
+  return false;
+}
+
+function mailboxLeaked(text: string, ownerMailboxNormalized: string | undefined): boolean {
+  const mailbox = ownerMailboxNormalized?.trim().toLowerCase();
+  if (mailbox === undefined || mailbox.length === 0) return false;
+  const lowered = text.toLowerCase();
+  if (lowered.includes(mailbox)) return true;
+  const localPart = mailbox.split("@")[0] ?? "";
+  return localPart.length >= 3 && lowered.includes(localPart);
+}
+
+/**
+ * Deterministically validate supplier-visible text against the mandate
+ * disclosure. Rejects empty or oversized text, active HTML,
+ * instruction-shaped text, and any leak of confidential target/ceiling
+ * figures or the private owner mailbox. Never accepts, orders, or commits
+ * anything: drafts are clarification/counter text only.
  */
 export function validateNegotiationDraft(
   content: unknown,
@@ -470,38 +577,25 @@ export function validateNegotiationDraft(
       message: "negotiation draft carries instruction-like content",
     };
   }
-  const lowered = content.toLowerCase();
   const secrets: number[] = [];
   if (disclosure.targetMinorUnits !== undefined) secrets.push(disclosure.targetMinorUnits);
   if (disclosure.ceilingMinorUnits !== undefined) secrets.push(disclosure.ceilingMinorUnits);
   for (const secret of secrets) {
-    for (const rendering of confidentialRenderings(secret)) {
-      if (rendering.length > 0 && lowered.includes(rendering.toLowerCase())) {
-        return {
-          ok: false as const,
-          code: "draft-disclosure-leak" as const,
-          message: "negotiation draft discloses a confidential negotiating figure",
-        };
-      }
+    if (!isNonNegativeSafeInt(secret)) continue;
+    if (confidentialFigureLeaked(content, secret)) {
+      return {
+        ok: false as const,
+        code: "draft-disclosure-leak" as const,
+        message: "negotiation draft discloses a confidential negotiating figure",
+      };
     }
   }
-  const mailbox = disclosure.ownerMailboxNormalized?.trim().toLowerCase();
-  if (mailbox !== undefined && mailbox.length > 0) {
-    const localPart = mailbox.split("@")[0] ?? "";
-    if (lowered.includes(mailbox)) {
-      return {
-        ok: false as const,
-        code: "draft-disclosure-leak" as const,
-        message: "negotiation draft discloses the private owner mailbox",
-      };
-    }
-    if (localPart.length >= 3 && lowered.includes(localPart)) {
-      return {
-        ok: false as const,
-        code: "draft-disclosure-leak" as const,
-        message: "negotiation draft discloses the private owner mailbox",
-      };
-    }
+  if (mailboxLeaked(content, disclosure.ownerMailboxNormalized)) {
+    return {
+      ok: false as const,
+      code: "draft-disclosure-leak" as const,
+      message: "negotiation draft discloses the private owner mailbox",
+    };
   }
   return { ok: true as const, redactedPreview: redactForProjection(content) };
 }
@@ -514,9 +608,62 @@ export function redactForProjection(content: string): string {
 }
 
 /**
+ * Runtime numeric bounds, checked before every fence and transition so that
+ * malformed counts from untyped callers fail closed. No NaN, infinity,
+ * non-integer, or negative round/expiry/version figure may reach
+ * model/draft/dispatch handling.
+ */
+export function checkNegotiationBounds(
+  mandate: MandateSnapshot,
+  current: NegotiationCurrentSnapshot,
+):
+  | { readonly kind: "denied"; readonly code: NegotiationDenialCode; readonly message: string }
+  | null {
+  const required: ReadonlyArray<readonly [string, unknown, boolean]> = [
+    ["roundsUsed", mandate.roundsUsed, false],
+    ["roundLimit", mandate.roundLimit, true],
+    ["expiresAt", mandate.expiresAt, false],
+    ["now", current.now, false],
+    ["grantExpiresAt", current.grantExpiresAt, false],
+    ["grantRevocationVersion", current.grantRevocationVersion, false],
+    ["operationGrantVersion", current.operationGrantVersion, false],
+  ];
+  for (const [field, value, positive] of required) {
+    if (!isNonNegativeSafeInt(value) || (positive && value <= 0)) {
+      return {
+        kind: "denied" as const,
+        code: "invalid-bounds" as const,
+        message: `negotiation ${field} is not a usable bound`,
+      };
+    }
+  }
+  const optional: ReadonlyArray<readonly [string, unknown]> = [
+    ["targetMinorUnits", mandate.targetMinorUnits],
+    ["ceilingMinorUnits", mandate.ceilingMinorUnits],
+    ["conversationVersion(mandate)", mandate.conversationVersion],
+    ["conversationVersion(current)", current.conversationVersion],
+    ["recipientConfigVersion", current.recipientConfigVersion],
+    ["currentRecipientConfigVersion", current.currentRecipientConfigVersion],
+  ];
+  for (const [field, value] of optional) {
+    if (value !== undefined && !isNonNegativeSafeInt(value)) {
+      return {
+        kind: "denied" as const,
+        code: "invalid-bounds" as const,
+        message: `negotiation ${field} is not a usable bound`,
+      };
+    }
+  }
+  return null;
+}
+
+/**
  * Re-check current authority immediately before every consequential
- * transition. Returns the first applicable fence: terminal stops, honest
- * waits, or denials — each with zero sends. Returns `null` when the loop may
+ * transition. Requires exact current quote identity and exact current
+ * conversation identity (both directions of present-versus-missing count as
+ * a change), exact grant id binding, and all mandate/grant/recipient/round
+ * fences. Returns the first applicable fence: terminal stops, honest waits,
+ * or denials — each with zero sends. Returns `null` when the loop may
  * proceed to move selection.
  */
 export function checkNegotiationFences(
@@ -559,6 +706,17 @@ export function checkNegotiationFences(
   if (current.grantStatus === "expired" || current.now >= current.grantExpiresAt) {
     return { kind: "stopped" as const, reason: "grant-expired" as const };
   }
+  if (
+    current.currentGrantId === undefined ||
+    current.operationGrantId === undefined ||
+    current.currentGrantId !== current.operationGrantId
+  ) {
+    return {
+      kind: "denied" as const,
+      code: "grant-binding-changed" as const,
+      message: "grant binding changed or is missing; re-approval required before send",
+    };
+  }
   if (current.grantRevocationVersion !== current.operationGrantVersion) {
     return {
       kind: "denied" as const,
@@ -591,21 +749,27 @@ export function checkNegotiationFences(
     return { kind: "stopped" as const, reason: "round-limit-reached" as const };
   }
   if (
+    current.currentQuoteId !== mandate.quoteId ||
     current.quoteSuperseded ||
     current.quoteVersion !== mandate.quoteVersion ||
     current.quoteContentHash !== mandate.quoteContentHash
   ) {
     return {
-      kind: current.quoteSuperseded ? ("stopped" as const) : ("stopped" as const),
+      kind: "stopped" as const,
       reason: (current.quoteSuperseded ? "quote-superseded" : "quote-changed") as NegotiationStopReason,
     };
   }
-  if (
-    mandate.conversationVersion !== undefined &&
-    current.conversationVersion !== undefined &&
-    current.conversationVersion !== mandate.conversationVersion
-  ) {
-    return { kind: "stopped" as const, reason: "conversation-changed" as const };
+  if (mandate.conversationId === undefined) {
+    if (current.currentConversationId !== undefined || current.conversationVersion !== undefined) {
+      return { kind: "stopped" as const, reason: "conversation-changed" as const };
+    }
+  } else {
+    if (current.currentConversationId !== mandate.conversationId) {
+      return { kind: "stopped" as const, reason: "conversation-changed" as const };
+    }
+    if (current.conversationVersion !== mandate.conversationVersion) {
+      return { kind: "stopped" as const, reason: "conversation-changed" as const };
+    }
   }
   if (current.userTakeover) {
     return { kind: "stopped" as const, reason: "user-takeover" as const };
@@ -634,67 +798,131 @@ export function deduplicateNegotiationRetry(
   return { outcome: "conflict" as const };
 }
 
-/**
- * Honest round accounting: only an observed successful owner-only send
- * increments `roundsUsed`. Ambiguous or failed transport stays honest and
- * never becomes a successful round.
- */
-export function applyNegotiationSendOutcome(
-  roundsUsed: number,
-  outcome: InjectedSendOutcome,
-):
-  | { readonly sendState: "observedSuccess"; readonly roundsUsedAfter: number; readonly waiting: false }
-  | { readonly sendState: "observedFailure" | "outcomeUnknown"; readonly roundsUsedAfter: number; readonly waiting: true } {
-  if (outcome === "success") {
-    return { sendState: "observedSuccess", roundsUsedAfter: roundsUsed + 1, waiting: false as const };
-  }
-  return {
-    sendState: outcome === "failure" ? "observedFailure" : "outcomeUnknown",
-    roundsUsedAfter: roundsUsed,
-    waiting: true as const,
-  };
-}
-
-/** Validate an injected provider result shape before it may affect lineage. */
-export function validateInjectedSendResult(
+/** Validate a controlled adapter result before it may affect lineage. */
+export function validateControlledDispatchResult(
   value: unknown,
 ):
-  | { readonly ok: true; readonly result: InjectedSendResult }
+  | { readonly ok: true; readonly result: ControlledDispatchSuccess | ControlledDispatchDenial }
   | { readonly ok: false; readonly code: NegotiationDenialCode; readonly message: string } {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return {
       ok: false as const,
       code: "provider-result-malformed" as const,
-      message: "provider result is not an object",
+      message: "dispatch result is not an object",
     };
   }
-  const outcome = (value as Record<string, unknown>)["outcome"];
+  const record = value as Record<string, unknown>;
+  if (record["ok"] === false) {
+    if (typeof record["code"] !== "string" || record["code"].trim().length === 0) {
+      return {
+        ok: false as const,
+        code: "provider-result-malformed" as const,
+        message: "dispatch denial carries no code",
+      };
+    }
+    if (typeof record["message"] !== "string" || record["message"].trim().length === 0) {
+      return {
+        ok: false as const,
+        code: "provider-result-malformed" as const,
+        message: "dispatch denial carries no message",
+      };
+    }
+    return {
+      ok: true as const,
+      result: { ok: false as const, code: record["code"], message: record["message"] },
+    };
+  }
+  if (record["ok"] !== true) {
+    return {
+      ok: false as const,
+      code: "provider-result-malformed" as const,
+      message: "dispatch result carries no ok flag",
+    };
+  }
+  const outcome = record["outcome"];
   if (outcome !== "success" && outcome !== "failure" && outcome !== "unknown") {
     return {
       ok: false as const,
       code: "provider-result-malformed" as const,
-      message: "provider result outcome is malformed",
+      message: "dispatch result outcome is malformed",
     };
   }
-  const messageId = (value as Record<string, unknown>)["providerMessageId"];
-  if (messageId !== undefined && (typeof messageId !== "string" || messageId.trim().length === 0)) {
+  for (const field of ["providerMessageId", "providerThreadId"] as const) {
+    const entry = record[field];
+    if (entry !== null && (typeof entry !== "string" || entry.trim().length === 0)) {
+      return {
+        ok: false as const,
+        code: "provider-result-malformed" as const,
+        message: `dispatch result ${field} is malformed`,
+      };
+    }
+  }
+  if (typeof record["recorded"] !== "boolean") {
     return {
       ok: false as const,
       code: "provider-result-malformed" as const,
-      message: "provider result message id is malformed",
+      message: "dispatch result recorded flag is malformed",
     };
   }
   return {
     ok: true as const,
     result: {
+      ok: true as const,
       outcome,
-      ...(typeof messageId === "string" ? { providerMessageId: messageId } : {}),
-      ...(((value as Record<string, unknown>)["reason"] as string | undefined) !== undefined &&
-      typeof (value as Record<string, unknown>)["reason"] === "string"
-        ? { reason: (value as Record<string, unknown>)["reason"] as string }
-        : {}),
+      providerMessageId: record["providerMessageId"] as string | null,
+      providerThreadId: record["providerThreadId"] as string | null,
+      recorded: record["recorded"] as boolean,
     },
   };
+}
+
+/**
+ * Honest round accounting over the dispatch-shaped adapter result. A round
+ * advances only for an observed, recorded success carrying a nonempty
+ * provider message id. Unrecorded or id-less "success" denies and never
+ * increments; failure/unknown stays waiting without claiming a send.
+ */
+export function applyControlledDispatchOutcome(
+  roundsUsed: number,
+  result: ControlledDispatchSuccess | ControlledDispatchDenial,
+):
+  | { readonly outcome: "sent"; readonly sendState: "observedSuccess"; readonly roundsUsedAfter: number }
+  | { readonly outcome: "waiting"; readonly sendState: "observedFailure" | "outcomeUnknown"; readonly reason: NegotiationWaitReason; readonly roundsUsedAfter: number }
+  | { readonly outcome: "denied"; readonly code: NegotiationDenialCode; readonly message: string; readonly roundsUsedAfter: number } {
+  const base = safeCount(roundsUsed);
+  if (!result.ok) {
+    return {
+      outcome: "denied" as const,
+      code: "dispatch-denied" as const,
+      message: result.message,
+      roundsUsedAfter: base,
+    };
+  }
+  if (result.outcome === "failure") {
+    return {
+      outcome: "waiting" as const,
+      sendState: "observedFailure" as const,
+      reason: "send-failure" as const,
+      roundsUsedAfter: base,
+    };
+  }
+  if (result.outcome === "unknown") {
+    return {
+      outcome: "waiting" as const,
+      sendState: "outcomeUnknown" as const,
+      reason: "outcome-unknown" as const,
+      roundsUsedAfter: base,
+    };
+  }
+  if (!result.recorded || result.providerMessageId === null) {
+    return {
+      outcome: "denied" as const,
+      code: "provider-result-malformed" as const,
+      message: "unrecorded dispatch success cannot advance a negotiation round",
+      roundsUsedAfter: base,
+    };
+  }
+  return { outcome: "sent" as const, sendState: "observedSuccess" as const, roundsUsedAfter: base + 1 };
 }
 
 export interface NegotiationStepInput {
@@ -705,7 +933,6 @@ export interface NegotiationStepInput {
   readonly requestId: string;
   readonly prior?: PriorNegotiationAttempt | null;
   readonly sender: ControlledNegotiationSender;
-  readonly subject?: string;
 }
 
 function denied(
@@ -715,15 +942,17 @@ function denied(
   move: NegotiationMove | "none",
   code: NegotiationDenialCode,
   message: string,
+  dispatchAttempts: 0 | 1 = 0,
 ): NegotiationStepResult {
-  const base = baseLineage(mandate, current, requestId, "denied — no supplier-visible text prepared");
+  const base = baseLineage(mandate, current, requestId, "denied — no supplier-visible text prepared", dispatchAttempts);
   return {
     kind: "denied" as const,
     move,
     code,
     message,
-    roundsUsedAfter: mandate.roundsUsed,
+    roundsUsedAfter: base.roundsUsedAfter,
     sends: 0 as const,
+    dispatchAttempts,
     lineage: {
       ...base,
       move,
@@ -742,21 +971,28 @@ function waiting(
   move: NegotiationMove | "none",
   reason: NegotiationWaitReason,
   preview = "waiting — no supplier-visible text prepared",
+  dispatchAttempts: 0 | 1 = 0,
+  payloadHashValue: string | null = null,
+  sendState: NegotiationLineage["sendState"] = "not-sent",
+  providerIds: { readonly messageId: string | null; readonly threadId: string | null } | null = null,
 ): NegotiationStepResult {
-  const base = baseLineage(mandate, current, requestId, preview);
+  const base = baseLineage(mandate, current, requestId, preview, dispatchAttempts);
   return {
     kind: "waiting" as const,
     move,
     reason,
-    roundsUsedAfter: mandate.roundsUsed,
+    roundsUsedAfter: base.roundsUsedAfter,
     sends: 0 as const,
+    dispatchAttempts,
     lineage: {
       ...base,
       move,
-      payloadHash: null,
-      sendState: "not-sent" as const,
+      payloadHash: payloadHashValue,
+      sendState,
       waitReason: reason,
       redactedPreview: base.redactedPreview,
+      ...(providerIds?.messageId == null ? {} : { providerMessageId: providerIds.messageId }),
+      ...(providerIds?.threadId == null ? {} : { providerThreadId: providerIds.threadId }),
     },
   };
 }
@@ -768,13 +1004,14 @@ function stopped(
   move: NegotiationMove | "none",
   reason: NegotiationStopReason,
 ): NegotiationStepResult {
-  const base = baseLineage(mandate, current, requestId, "stopped — no supplier-visible text prepared");
+  const base = baseLineage(mandate, current, requestId, "stopped — no supplier-visible text prepared", 0);
   return {
     kind: "stopped" as const,
     move,
     reason,
-    roundsUsedAfter: mandate.roundsUsed,
+    roundsUsedAfter: base.roundsUsedAfter,
     sends: 0 as const,
+    dispatchAttempts: 0 as const,
     lineage: {
       ...base,
       move,
@@ -786,18 +1023,41 @@ function stopped(
   };
 }
 
+function disclosureOf(
+  mandate: MandateSnapshot,
+  current: NegotiationCurrentSnapshot,
+): {
+  readonly targetMinorUnits?: number;
+  readonly ceilingMinorUnits?: number;
+  readonly ownerMailboxNormalized?: string;
+} {
+  return {
+    ...(mandate.targetMinorUnits === undefined ? {} : { targetMinorUnits: mandate.targetMinorUnits }),
+    ...(mandate.ceilingMinorUnits === undefined ? {} : { ceilingMinorUnits: mandate.ceilingMinorUnits }),
+    ...(current.recipientMailboxNormalized === undefined
+      ? {}
+      : { ownerMailboxNormalized: current.recipientMailboxNormalized }),
+  };
+}
+
 /**
- * Execute one controlled negotiation step: fence, permitted move selection,
- * deterministic draft validation, owner-only outbound validation, idempotent
- * controlled dispatch, and honest round accounting. Zero live provider or
- * model calls; the injected sender is the only effect, and it is invoked at
- * most once, only after every check passes. Never accepts terms, places an
- * order, or commits money.
+ * Execute one controlled negotiation step: runtime bounds, exact-basis
+ * fences, permitted move selection, exact draft-basis validation, disclosure
+ * screening of the fixed subject and draft body, owner-only outbound
+ * validation, idempotent controlled dispatch, and honest round accounting.
+ * Zero live provider or model calls; the injected controlled sender is the
+ * only effect, invoked at most once and only after every check passes.
+ * Never accepts terms, places an order, or commits money.
  */
 export function runNegotiationStep(input: NegotiationStepInput): NegotiationStepResult {
   const { mandate, current, requestId, sender } = input;
-  if (requestId.trim().length === 0) {
-    return denied(mandate, current, requestId, "none", "provider-result-malformed", "request id is required");
+  if (typeof requestId !== "string" || requestId.trim().length === 0) {
+    return denied(mandate, current, String(requestId), "none", "invalid-bounds", "request id is required");
+  }
+
+  const bounds = checkNegotiationBounds(mandate, current);
+  if (bounds !== null) {
+    return denied(mandate, current, requestId, "none", bounds.code, bounds.message);
   }
 
   const fence = checkNegotiationFences(mandate, current);
@@ -831,32 +1091,45 @@ export function runNegotiationStep(input: NegotiationStepInput): NegotiationStep
   if (draft.model !== NEGOTIATION_OPENAI_MODEL) {
     return denied(mandate, current, requestId, move, "draft-malformed", "draft is not from the pinned drafting model");
   }
-  if (
-    draft.sourceQuoteVersion !== undefined &&
-    (draft.sourceQuoteVersion !== mandate.quoteVersion ||
-      (draft.sourceConversationVersion !== undefined &&
-        mandate.conversationVersion !== undefined &&
-        draft.sourceConversationVersion !== mandate.conversationVersion))
-  ) {
+  if (draft.sourceQuoteVersion === undefined) {
+    return denied(mandate, current, requestId, move, "draft-malformed", "draft is not pinned to a quote version");
+  }
+  if (draft.sourceQuoteVersion !== mandate.quoteVersion) {
     return waiting(mandate, current, requestId, move, "draft-stale");
   }
+  if (mandate.conversationVersion !== undefined) {
+    if (draft.sourceConversationVersion === undefined) {
+      return denied(mandate, current, requestId, move, "draft-malformed", "draft is not pinned to the mandate conversation");
+    }
+    if (draft.sourceConversationVersion !== mandate.conversationVersion) {
+      return waiting(mandate, current, requestId, move, "draft-stale");
+    }
+  } else if (draft.sourceConversationVersion !== undefined) {
+    return waiting(mandate, current, requestId, move, "draft-stale");
+  }
+  if (draft.draftKind === undefined || draft.draftKind !== move) {
+    return denied(mandate, current, requestId, move, "draft-malformed", "draft kind does not match the selected move");
+  }
 
-  const checked = validateNegotiationDraft(draft.content, {
-    ...(mandate.targetMinorUnits === undefined ? {} : { targetMinorUnits: mandate.targetMinorUnits }),
-    ...(mandate.ceilingMinorUnits === undefined ? {} : { ceilingMinorUnits: mandate.ceilingMinorUnits }),
-    ...(current.recipientMailboxNormalized === undefined
-      ? {}
-      : { ownerMailboxNormalized: current.recipientMailboxNormalized }),
-  });
+  const disclosure = disclosureOf(mandate, current);
+  if (
+    confidentialFigureLeakedSafe(NEGOTIATION_SUBJECT, disclosure) ||
+    mailboxLeaked(NEGOTIATION_SUBJECT, disclosure.ownerMailboxNormalized)
+  ) {
+    return denied(mandate, current, requestId, move, "draft-disclosure-leak", "fixed subject fails disclosure screening");
+  }
+  const checked = validateNegotiationDraft(draft.content, disclosure);
   if (!checked.ok) {
     return denied(mandate, current, requestId, move, checked.code, checked.message);
   }
 
   // Keep the draft shape identical to the OpenAI supplier-draft output
   // contract without importing server transport: content plus source refs.
+  // This value is never sent anywhere; it exists so reviewers can verify
+  // the controlled shape matches the boundary type.
   const supplierDraft: SupplierDraftOutput = {
     kind: "supplierDraft",
-    draftKind: draft.draftKind ?? move,
+    draftKind: draft.draftKind,
     content: draft.content ?? "",
     sources: [],
   };
@@ -867,7 +1140,7 @@ export function runNegotiationStep(input: NegotiationStepInput): NegotiationStep
     cc: [],
     bcc: [],
     profile: COMMUNICATION_PROFILE_OWNER_ROLEPLAY,
-    subject: input.subject ?? `Negotiation ${move} — controlled demo`,
+    subject: NEGOTIATION_SUBJECT,
     body: draft.content ?? "",
   };
   const validated = validateOutboundPayload(outboundValue, current.recipientMailboxNormalized);
@@ -886,14 +1159,15 @@ export function runNegotiationStep(input: NegotiationStepInput): NegotiationStep
     return denied(mandate, current, requestId, move, "retry-conflict", "request key reused with a changed payload");
   }
   if (gate.outcome === "deduplicated") {
-    const base = baseLineage(mandate, current, requestId, checked.redactedPreview);
+    const base = baseLineage(mandate, current, requestId, checked.redactedPreview, 0);
     return {
       kind: "deduplicated" as const,
       move,
       requestKey: key,
       payloadHash: hash,
-      roundsUsedAfter: mandate.roundsUsed,
+      roundsUsedAfter: base.roundsUsedAfter,
       sends: 0 as const,
+      dispatchAttempts: 0 as const,
       lineage: {
         ...base,
         move,
@@ -908,13 +1182,18 @@ export function runNegotiationStep(input: NegotiationStepInput): NegotiationStep
     return denied(mandate, current, requestId, move, "live-transport-refused", "only controlled dispatch is permitted");
   }
   const raw = sender.send({ canonical, payloadHash: hash, requestKey: key });
-  const parsed = validateInjectedSendResult(raw);
+  const parsed = validateControlledDispatchResult(raw);
   if (!parsed.ok) {
-    return denied(mandate, current, requestId, move, parsed.code, parsed.message);
+    return denied(mandate, current, requestId, move, parsed.code, parsed.message, 1);
   }
-  const accounting = applyNegotiationSendOutcome(mandate.roundsUsed, parsed.result.outcome);
-  const base = baseLineage(mandate, current, requestId, checked.redactedPreview);
-  if (!accounting.waiting) {
+  if (!parsed.result.ok) {
+    return denied(mandate, current, requestId, move, "dispatch-denied", parsed.result.message, 1);
+  }
+  const accounting = applyControlledDispatchOutcome(safeCount(mandate.roundsUsed), parsed.result);
+  const base = baseLineage(mandate, current, requestId, checked.redactedPreview, 1);
+  const thread = parsed.result.providerThreadId;
+  const message = parsed.result.providerMessageId;
+  if (accounting.outcome === "sent") {
     return {
       kind: "sent" as const,
       move,
@@ -922,6 +1201,7 @@ export function runNegotiationStep(input: NegotiationStepInput): NegotiationStep
       payloadHash: hash,
       roundsUsedAfter: accounting.roundsUsedAfter,
       sends: 1 as const,
+      dispatchAttempts: 1 as const,
       lineage: {
         ...base,
         move,
@@ -929,31 +1209,39 @@ export function runNegotiationStep(input: NegotiationStepInput): NegotiationStep
         sendState: accounting.sendState,
         roundsUsedAfter: accounting.roundsUsedAfter,
         redactedPreview: checked.redactedPreview,
-        ...(parsed.result.providerMessageId === undefined
-          ? {}
-          : { providerMessageId: parsed.result.providerMessageId }),
+        ...(message === null ? {} : { providerMessageId: message }),
+        ...(thread === null ? {} : { providerThreadId: thread }),
       },
     };
   }
-  return {
-    kind: "waiting" as const,
-    move,
-    reason: (parsed.result.outcome === "failure" ? "send-failure" : "outcome-unknown") as NegotiationWaitReason,
-    roundsUsedAfter: accounting.roundsUsedAfter,
-    sends: 0 as const,
-    lineage: {
-      ...base,
+  if (accounting.outcome === "waiting") {
+    return waiting(
+      mandate,
+      current,
+      requestId,
       move,
-      payloadHash: hash,
-      sendState: accounting.sendState,
-      roundsUsedAfter: accounting.roundsUsedAfter,
-      waitReason: (parsed.result.outcome === "failure" ? "send-failure" : "outcome-unknown") as NegotiationWaitReason,
-      redactedPreview: checked.redactedPreview,
-      ...(parsed.result.providerMessageId === undefined
-        ? {}
-        : { providerMessageId: parsed.result.providerMessageId }),
-    },
-  };
+      accounting.reason,
+      checked.redactedPreview,
+      1,
+      hash,
+      accounting.sendState,
+      { messageId: parsed.result.providerMessageId, threadId: parsed.result.providerThreadId },
+    );
+  }
+  return denied(mandate, current, requestId, move, accounting.code, accounting.message, 1);
+}
+
+function confidentialFigureLeakedSafe(
+  text: string,
+  disclosure: { readonly targetMinorUnits?: number; readonly ceilingMinorUnits?: number },
+): boolean {
+  if (disclosure.targetMinorUnits !== undefined && isNonNegativeSafeInt(disclosure.targetMinorUnits)) {
+    if (confidentialFigureLeaked(text, disclosure.targetMinorUnits)) return true;
+  }
+  if (disclosure.ceilingMinorUnits !== undefined && isNonNegativeSafeInt(disclosure.ceilingMinorUnits)) {
+    if (confidentialFigureLeaked(text, disclosure.ceilingMinorUnits)) return true;
+  }
+  return false;
 }
 
 /** Versioned controlled E6 corpus extending J-06 (no new thresholds). */
