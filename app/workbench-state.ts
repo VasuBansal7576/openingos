@@ -400,9 +400,9 @@ export interface WorkbenchServerAdapter {
 export function formatMoney(minorUnits: number | null, currency: string | null, unknownLabel = "Unknown"): string {
   if (minorUnits === null || !Number.isFinite(minorUnits) || currency === null || currency.trim().length === 0) return unknownLabel;
   try {
-    return new Intl.NumberFormat("en-GB", { style: "currency", currency, maximumFractionDigits: 0 }).format(minorUnits / 100);
+    return new Intl.NumberFormat("en-GB", { style: "currency", currency, minimumFractionDigits: 0, maximumFractionDigits: 2 }).format(minorUnits / 100);
   } catch {
-    return `${currency} ${(minorUnits / 100).toFixed(0)}`;
+    return `${currency} ${(minorUnits / 100).toFixed(2).replace(/\.00$/, "")}`;
   }
 }
 

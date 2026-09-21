@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { parseWorkbenchSnapshot, type WorkbenchSnapshot } from "../workbench-state";
+import { formatMoney, parseWorkbenchSnapshot, type WorkbenchSnapshot } from "../workbench-state";
 
 /**
  * F2 parser contract regressions: the browser consumes the backend's
@@ -157,6 +157,11 @@ test("comparable pair keeps native money, tax identity, scope and the exact 5495
     },
   ]);
   expect(beta?.comparisons[0]?.cheaper).toBe("other");
+});
+
+test("money formatting preserves authoritative minor units without forced trailing zeros", () => {
+  expect(formatMoney(54951, "EUR")).toContain("549.51");
+  expect(formatMoney(850000, "EUR")).toContain("8,500");
 });
 
 test("mixed-currency, tax and scope verdicts parse with their machine statuses and reasons", () => {
