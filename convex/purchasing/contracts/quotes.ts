@@ -101,6 +101,8 @@ type QuoteFields = {
   vendorId?: Id<"vendors">;
   rfqId?: Id<"rfqs">;
   supersedes?: string;
+  /** Server-derived from the requirement row at quote creation time. */
+  requirementVersion?: number;
 };
 
 function validateQuoteFields(fields: QuoteFields): AuthorityResult<Quote> {
@@ -145,7 +147,9 @@ async function checkQuoteReferences(
     | "supersedes"
     | "counterpartyRole"
   >,
-): Promise<AuthorityResult<true>> {
+): Promise<AuthorityResult<{ readonly requirementVersion?: number }>> {
+  let requirementVersion: number | undefined;
+  let rfqRequirementId: Id<"requirements"> | undefined;
   if (fields.version.trim().length === 0) {
     return denial("invalid-payload", "version required");
   }
@@ -179,6 +183,7 @@ async function checkQuoteReferences(
     ) {
       return denial("denied-project", "requirement is not in this project");
     }
+    requirementVersion = requirement.version;
   }
   if (fields.vendorId !== undefined) {
     // Vendors are organization-scoped supplier identity: the binding
@@ -198,6 +203,18 @@ async function checkQuoteReferences(
     ) {
       return denial("denied-project", "rfq is not in this project");
     }
+    rfqRequirementId = rfq.requirementId;
+    if (fields.requirementId === undefined) {
+      const requirement = await ctx.db.get(rfq.requirementId);
+      if (
+        requirement === null ||
+        requirement.organizationId !== organizationId ||
+        requirement.projectId !== projectId
+      ) {
+        return denial("denied-project", "rfq requirement is not in this project");
+      }
+      requirementVersion = requirement.version;
+    }
   }
   // F1R-03: related references must agree with each other, not merely
   // resolve in-project. A quote cannot bind an RFQ scoped to another
@@ -205,11 +222,12 @@ async function checkQuoteReferences(
   // comparison scope naming another requirement. Any permitted
   // multi-requirement mapping must be represented explicitly, never
   // inferred from independent fields.
-  if (fields.rfqId !== undefined && fields.requirementId !== undefined) {
-    const rfq = await ctx.db.get(fields.rfqId);
-    if (rfq !== null && rfq.requirementId !== fields.requirementId) {
-      return denial("denied-project", "quote RFQ is bound to another requirement");
-    }
+  if (
+    rfqRequirementId !== undefined &&
+    fields.requirementId !== undefined &&
+    rfqRequirementId !== fields.requirementId
+  ) {
+    return denial("denied-project", "quote RFQ is bound to another requirement");
   }
   if (fields.rfqId !== undefined && fields.vendorId !== undefined) {
     const rfq = await ctx.db.get(fields.rfqId);
@@ -257,7 +275,9 @@ async function checkQuoteReferences(
       return denial("invalid-payload", "supersedes must retain the offer RFQ");
     }
   }
-  return approved(true);
+  return approved(
+    requirementVersion === undefined ? {} : { requirementVersion },
+  );
 }
 
 async function insertQuoteVersion(
@@ -267,7 +287,7 @@ async function insertQuoteVersion(
   now: number,
 ): Promise<{ quoteId: Id<"quotes">; contentHash: string }> {
   const parts = storedQuoteParts(quote);
-  const decision = quoteDecisionFields({
+  const decisionFields = quoteDecisionFields({
     organizationId: fields.organizationId,
     projectId: fields.projectId,
     version: quote.version,
@@ -285,6 +305,9 @@ async function insertQuoteVersion(
     ...(fields.rfqId === undefined ? {} : { rfqId: fields.rfqId }),
     ...(fields.supersedes === undefined ? {} : { supersedes: fields.supersedes }),
   });
+  const decision = fields.requirementVersion === undefined
+    ? decisionFields
+    : { ...decisionFields, requirementVersion: fields.requirementVersion };
   // Quote lineage is SHA-256 over the canonical decision fields: the
   // stored contentHash and payloadSha256 carry the same digest.
   const canonical = canonicalJson(decision);
@@ -314,6 +337,7 @@ async function insertQuoteVersion(
     ...(fields.requirementId === undefined ? {} : { requirementId: fields.requirementId }),
     ...(fields.vendorId === undefined ? {} : { vendorId: fields.vendorId }),
     ...(fields.rfqId === undefined ? {} : { rfqId: fields.rfqId }),
+    ...(fields.requirementVersion === undefined ? {} : { requirementVersion: fields.requirementVersion }),
     version: quote.version,
     contentHash,
     payloadSha256,
@@ -390,7 +414,10 @@ export const record = f1Mutation({
     if (!references.ok) {
       return { ok: false as const, code: references.code, message: references.message };
     }
-    const { quoteId, contentHash } = await insertQuoteVersion(ctx, fields, valid.value, now);
+    const fieldsWithLineage: QuoteFields = references.value.requirementVersion === undefined
+      ? fields
+      : { ...fields, requirementVersion: references.value.requirementVersion };
+    const { quoteId, contentHash } = await insertQuoteVersion(ctx, fieldsWithLineage, valid.value, now);
     return { ok: true as const, quoteId, contentHash };
   },
 });
@@ -431,7 +458,10 @@ export const ingestProviderQuote = f1InternalMutation({
     if (!references.ok) {
       return { ok: false as const, code: references.code, message: references.message };
     }
-    const { quoteId, contentHash } = await insertQuoteVersion(ctx, fields, valid.value, Date.now());
+    const fieldsWithLineage: QuoteFields = references.value.requirementVersion === undefined
+      ? fields
+      : { ...fields, requirementVersion: references.value.requirementVersion };
+    const { quoteId, contentHash } = await insertQuoteVersion(ctx, fieldsWithLineage, valid.value, Date.now());
     return { ok: true as const, quoteId, contentHash };
   },
 });

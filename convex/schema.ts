@@ -47,6 +47,7 @@ import {
   storedFinancialEvidenceRefValidator,
   storedOrderLineValidator,
   storedSelectionLineValidator,
+  requirementMilestoneValidator,
 } from "./shared/domainContracts.js";
 import { workflowAuthoritiesValidator, workflowAuthorityValidator } from "./shared/scope.js";
 
@@ -128,6 +129,9 @@ export default defineSchema({
     budgetMinorUnits: v.optional(v.number()),
     currency: v.optional(v.string()),
     needByAt: v.optional(v.number()),
+    hardConstraints: v.optional(v.string()),
+    responsible: v.optional(v.string()),
+    requiredMilestone: v.optional(requirementMilestoneValidator),
     templateId: v.optional(v.id("templates")),
     templateVersion: v.optional(v.string()),
     createdAt: v.number(),
@@ -138,6 +142,24 @@ export default defineSchema({
     .index("by_project_and_state", ["projectId", "state"])
     .index("by_organization_and_project", ["organizationId", "projectId"])
     .index("by_organization_and_project_and_title", ["organizationId", "projectId", "title"]),
+
+  /** Immutable before/after history for optimistic requirement edits. */
+  requirementRevisions: defineTable({
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    requirementId: v.id("requirements"),
+    idempotencyKey: v.string(),
+    expectedVersion: v.number(),
+    previousVersion: v.number(),
+    nextVersion: v.number(),
+    patchCanonical: v.string(),
+    before: v.string(),
+    after: v.string(),
+    actor: v.string(),
+    createdAt: v.number(),
+  })
+    .index("by_project_and_key", ["projectId", "idempotencyKey"])
+    .index("by_requirement", ["requirementId"]),
 
   dependencies: defineTable({
     organizationId: v.id("organizations"),
@@ -158,6 +180,21 @@ export default defineSchema({
     .index("by_project", ["projectId"])
     .index("by_from_requirement", ["fromRequirementId"])
     .index("by_to_requirement", ["toRequirementId"]),
+
+  /** Immutable transition history for dependency verification decisions. */
+  dependencyRevisions: defineTable({
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    dependencyId: v.id("dependencies"),
+    beforeVerification: v.string(),
+    afterVerification: v.string(),
+    beforeEvidenceRefs: v.optional(v.array(domainEvidenceRefValidator)),
+    afterEvidenceRefs: v.optional(v.array(domainEvidenceRefValidator)),
+    reason: v.optional(v.string()),
+    actor: v.string(),
+    createdAt: v.number(),
+  })
+    .index("by_dependency", ["dependencyId"]),
 
   vendors: defineTable({
     organizationId: v.id("organizations"),
@@ -377,6 +414,10 @@ export default defineSchema({
     snapshotHash: v.string(),
     selectionId: v.optional(v.id("selections")),
     quoteId: v.optional(v.id("quotes")),
+    // Derived server-side from the linked selection/quote. These fields let
+    // approval decisions re-check the exact requirement basis after edits.
+    requirementId: v.optional(v.id("requirements")),
+    requirementVersion: v.optional(v.number()),
     state: v.union(
       v.literal("pending"),
       v.literal("approved"),
@@ -1070,6 +1111,10 @@ export default defineSchema({
     requirementId: v.optional(v.id("requirements")),
     vendorId: v.optional(v.id("vendors")),
     rfqId: v.optional(v.id("rfqs")),
+    // New requirement-bound quotes pin the requirement version that produced
+    // them. Historical rows may omit this field and must fail closed when a
+    // new quote-only approval would otherwise need to infer the basis.
+    requirementVersion: v.optional(v.number()),
     version: v.string(),
     contentHash: v.string(),
     payloadSha256: v.optional(v.string()),

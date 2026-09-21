@@ -45,6 +45,11 @@ import {
   providerProductEvidenceInputValidator,
   quoteUpdateValidator,
   requirementInputValidator,
+  requirementEditInputValidator,
+  requirementMilestoneValidator,
+  normalizeBoundedText,
+  normalizeRequirementDate,
+  normalizeRequirementIdempotencyKey,
   researchCollectionValidator,
   rfqInputValidator,
   riskInputValidator,
@@ -131,6 +136,21 @@ describe("exact variant and evidence identity", () => {
 describe("immutable version and idempotency keys", () => {
   test("requirements key on the creation shape", () => {
     expect(requirementInputValidator.fields.key).toBeDefined();
+    expect(requirementInputValidator.fields.hardConstraints).toBeDefined();
+    expect(requirementInputValidator.fields.responsible).toBeDefined();
+    expect(requirementInputValidator.fields.requiredMilestone).toBeDefined();
+    expect(requirementEditInputValidator.fields.expectedVersion).toBeDefined();
+    expect(requirementEditInputValidator.fields.idempotencyKey).toBeDefined();
+    expect(requirementMilestoneValidator).toBeDefined();
+  });
+
+  test("requirement edit boundary normalizes and bounds text/date/replay inputs", () => {
+    expect(normalizeBoundedText("  espresso  ", "title", 32)).toBe("espresso");
+    expect(normalizeRequirementIdempotencyKey(" edit-1 ")).toBe("edit-1");
+    expect(normalizeRequirementDate(1_760_000_000_000)).toBe(1_760_000_000_000);
+    expect(() => normalizeBoundedText("x".repeat(33), "title", 32)).toThrow();
+    expect(() => normalizeRequirementIdempotencyKey(" ")).toThrow();
+    expect(() => normalizeRequirementDate(1.5)).toThrow();
   });
 
   test("rfqs, orders, and cost entries carry idempotency keys", () => {
