@@ -480,6 +480,18 @@ describe("F1 negotiation authority binding", () => {
     expect(await attemptCount(fixture)).toBe(0);
   });
 
+  test("a revoked-after-preparation mandate denies claim with zero provider transport", async () => {
+    const fixture = await prepareOperation(await reserveFor(await createMandateFixture(3)), "req-revocation-race");
+    await fixture.t.run(async (ctx) => {
+      await ctx.db.patch(fixture.negotiationId, { state: "revoked" });
+    });
+    const denied = await claim(fixture, fixture.operationId);
+    expect(denied).toMatchObject({ ok: false, code: "mandate-revoked" });
+    const state = await operationState(fixture);
+    expect(state?.state).toBe("prepared");
+    expect(await attemptCount(fixture)).toBe(0);
+  });
+
   test("a round-moved mandate denies claim with zero provider transport", async () => {
     const fixture = await prepareOperation(await reserveFor(await createMandateFixture(3)), "req-round-race");
     await fixture.t.run(async (ctx) => {
