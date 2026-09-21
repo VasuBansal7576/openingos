@@ -804,6 +804,10 @@ export default defineSchema({
     updatedAt: v.number(),
   })
     .index("by_requestKey", ["requestKey"])
+    // Coordinated R1 historical bridge: the R1 owner scopes exact
+    // project-local prefix ranges over previous F03 target-bound requestKey
+    // values without grant enumeration or cross-project coupling.
+    .index("by_project_and_requestKey", ["projectId", "requestKey"])
     .index("by_job", ["jobId"])
     .index("by_job_and_state", ["jobId", "state"])
     .index("by_reservation", ["reservationId"])
