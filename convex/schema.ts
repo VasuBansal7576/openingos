@@ -867,6 +867,10 @@ export default defineSchema({
     applicationOutcome: v.optional(v.union(v.literal("success"), v.literal("failure"), v.literal("unknown"))),
     applicationState: v.optional(v.string()),
     appliedAt: v.optional(v.number()),
+    // Fair replay rotation: the last time this row was evaluated by a
+    // waiting-set repair pass. Absent until the first evaluation; rows
+    // never evaluated sort ahead of retried rows.
+    replayLastAttemptAt: v.optional(v.number()),
     createdAt: v.number(),
   })
     .index("by_provider_environment_and_event", ["provider", "environment", "eventId"])
@@ -882,6 +886,22 @@ export default defineSchema({
     .index(
       "by_provider_environment_and_provider_thread_and_inbox",
       ["provider", "environment", "providerThreadId", "providerInboxId"],
+    )
+    // Retained pre-binding replies query their exact waiting set through
+    // this key (Greptile r4058523015 repair). Patching a replayed row to
+    // observedSuccess removes it from the waiting set, so the next bounded
+    // read advances past completed rows without sampling a fixed prefix and
+    // without deleting the raw event record or its application outcome.
+    .index(
+      "by_provider_environment_and_thread_inbox_and_state",
+      ["provider", "environment", "providerThreadId", "providerInboxId", "applicationState"],
+    )
+    // Fair replay rotation: equality on the waiting set plus ascending
+    // order over the last evaluation time, so each bounded take returns
+    // the least-recently-attempted waiting rows first.
+    .index(
+      "by_provider_environment_and_thread_inbox_state_and_attempt",
+      ["provider", "environment", "providerThreadId", "providerInboxId", "applicationState", "replayLastAttemptAt"],
     ),
 
   evidence: defineTable({
@@ -936,6 +956,77 @@ export default defineSchema({
     counterpartyRole: v.string(),
     createdAt: v.number(),
   }).index("by_operation", ["operationId"]),
+
+  /**
+   * C1 durable provider-thread identity (Greptile r4058523017 repair).
+   *
+   * One row binds a provider thread in an inbox to the single purchasing
+   * conversation it belongs to. `recordProviderBinding` establishes the row
+   * when the first outbound send binds, and denies a later send whose grant
+   * resolves to a different conversation, so conflicting identities fail
+   * closed at bind time. Inbound routing and quote-source proof read this
+   * row through one exact indexed lookup instead of scanning every binding
+   * row under the thread, so legitimate long threads keep routing no matter
+   * how many binding rows they accumulate. Threads that predate this table
+   * fall back to the bounded legacy row scan.
+   */
+  threadBindings: defineTable({
+    provider: v.string(),
+    environment: v.string(),
+    providerThreadId: v.string(),
+    providerInboxId: v.string(),
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    conversationId: v.id("conversations"),
+    operationId: v.id("operations"),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_provider_environment_and_thread_and_inbox", [
+      "provider",
+      "environment",
+      "providerThreadId",
+      "providerInboxId",
+    ])
+    .index("by_conversation", ["conversationId"]),
+
+  /**
+   * C1 resumable thread-identity migration (Greptile r4058523017 follow-up).
+   *
+   * Threads that accumulated more than 64 binding rows before the durable
+   * thread binding existed cannot be proven unanimous inside one bounded
+   * read. This row carries the migration progress so successive bounded
+   * transactions eventually prove exactly one identity: `candidate...`
+   * fields name the identity under proof, `cursor` is the opaque Convex
+   * pagination continuation for the exact thread/inbox index (absent at
+   * the start), and `verifiedReads` counts exactly verified rows.
+   * Positional cursors never stall on equal timestamps. `conflicted` is
+   * terminal and never produces a binding; only `complete` writes it.
+   */
+  threadMigrationStates: defineTable({
+    provider: v.string(),
+    environment: v.string(),
+    providerThreadId: v.string(),
+    providerInboxId: v.string(),
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    candidateConversationId: v.optional(v.id("conversations")),
+    candidateOperationId: v.optional(v.id("operations")),
+    verifiedReads: v.number(),
+    cursor: v.optional(v.string()),
+    state: v.union(
+      v.literal("verifying"),
+      v.literal("complete"),
+      v.literal("conflicted"),
+    ),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  }).index("by_provider_environment_and_thread_and_inbox", [
+    "provider",
+    "environment",
+    "providerThreadId",
+    "providerInboxId",
+  ]),
 
   conversations: defineTable({
     organizationId: v.id("organizations"),
