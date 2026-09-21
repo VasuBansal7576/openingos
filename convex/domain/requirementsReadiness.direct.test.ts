@@ -22,6 +22,12 @@ import * as requirements from "./requirements.js";
 import * as sourcing from "./sourcing.js";
 import * as decisions from "./decisions.js";
 import * as fulfillment from "./fulfillment.js";
+import {
+  DEPENDENCY_EVIDENCE_LOCATOR_MAX_LENGTH,
+  DEPENDENCY_EVIDENCE_MAX_REFS,
+  DEPENDENCY_EVIDENCE_SOURCE_ID_MAX_LENGTH,
+  DEPENDENCY_EVIDENCE_VERSION_MAX_LENGTH,
+} from "../shared/domainContracts.js";
 
 const rawModules = import.meta.glob([
   "../access/**/*.ts",
@@ -108,6 +114,11 @@ const recordQuoteRef = makeFunctionReference<
   MutationArgs<typeof quotes.record>,
   MutationReturn<typeof quotes.record>
 >("purchasing/contracts/quotes:record");
+const createRfqRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof sourcing.createRfq>,
+  MutationReturn<typeof sourcing.createRfq>
+>("domain/sourcing:createRfq");
 const recordSelectionRef = makeFunctionReference<
   "mutation",
   MutationArgs<typeof decisions.recordSelection>,
@@ -521,6 +532,157 @@ describe("E2 requirement revisions", () => {
     const storedSelection = await t.run((ctx) => ctx.db.get(selection.selectionId));
     expect(storedSelection?.requirementVersion).toBe(1);
   });
+
+  test("quote-only approvals use the quote's requirement version and fail closed for historical quotes", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, OWNER, "quote-requirement-lineage");
+    const requirementId = await createRequirement(t, project, "quote-lineage");
+    const asOwner = t.withIdentity(OWNER);
+    const quote = await asOwner.mutation(recordQuoteRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      version: "quote-lineage-1",
+      currency: "EUR",
+      lines: [{
+        lineId: "machine",
+        description: "Machine",
+        quantity: "1",
+        unitPrice: { currency: "EUR", minorUnits: 1_000 },
+        evidenceRefs: [],
+      }],
+      charges: [],
+      taxBasis: { kind: "inclusive", basisId: "controlled", evidenceRefs: [] },
+      evidenceRefs: [],
+      requirementId,
+    });
+    if (!quote.ok) throw new Error("quote setup failed");
+    const storedQuote = await t.run((ctx) => ctx.db.get(quote.quoteId));
+    expect(storedQuote?.requirementVersion).toBe(1);
+
+    const edited = await asOwner.mutation(updateRequirementRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      requirementId,
+      expectedVersion: 1,
+      idempotencyKey: "quote-lineage-edit",
+      title: "Changed after quote",
+    });
+    expect(edited.ok).toBe(true);
+
+    const snapshotCanonical = "{\"decision\":\"quote-lineage\"}";
+    const approval = await asOwner.mutation(recordApprovalRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      scope: "quote-only",
+      quoteId: quote.quoteId,
+      snapshotCanonical,
+      snapshotHash: await sha256Hex(snapshotCanonical),
+    });
+    if (!approval.ok) throw new Error("quote-only approval setup failed");
+    const storedApproval = await t.run((ctx) => ctx.db.get(approval.approvalId));
+    expect(storedApproval?.requirementId).toBe(requirementId);
+    expect(storedApproval?.requirementVersion).toBe(1);
+    const staleDecision = await asOwner.mutation(decideApprovalRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      approvalId: approval.approvalId,
+      decision: "approved",
+    });
+    expect(staleDecision).toMatchObject({ ok: false, code: "stale-approval-basis" });
+
+    const vendor = await asOwner.mutation(recordVendorRef, {
+      organizationId: project.organizationId,
+      name: "Controlled RFQ supplier",
+      regions: ["NL"],
+    });
+    if (!vendor.ok) throw new Error("vendor setup failed");
+    const rfq = await asOwner.mutation(createRfqRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      requirementId,
+      idempotencyKey: "quote-lineage-rfq",
+      scenarioVendorIds: [vendor.vendorId],
+      lineItems: [{ itemId: "machine", description: "Machine", quantity: "1", unit: "piece" }],
+      briefHash: "quote-lineage-rfq-brief",
+      conversationState: "draft",
+    });
+    if (!rfq.ok) throw new Error("RFQ setup failed");
+    const rfqQuote = await asOwner.mutation(recordQuoteRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      version: "quote-lineage-rfq-1",
+      currency: "EUR",
+      lines: [{
+        lineId: "machine",
+        description: "Machine",
+        quantity: "1",
+        unitPrice: { currency: "EUR", minorUnits: 1_000 },
+        evidenceRefs: [],
+      }],
+      charges: [],
+      taxBasis: { kind: "inclusive", basisId: "controlled-rfq", evidenceRefs: [] },
+      evidenceRefs: [],
+      rfqId: rfq.rfqId,
+    });
+    if (!rfqQuote.ok) throw new Error("RFQ-bound quote setup failed");
+    const storedRfqQuote = await t.run((ctx) => ctx.db.get(rfqQuote.quoteId));
+    expect(storedRfqQuote?.requirementId).toBeUndefined();
+    expect(storedRfqQuote?.requirementVersion).toBe(2);
+    const rfqApprovalSnapshot = "{\"decision\":\"quote-lineage-rfq\"}";
+    const rfqApproval = await asOwner.mutation(recordApprovalRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      scope: "quote-only",
+      quoteId: rfqQuote.quoteId,
+      snapshotCanonical: rfqApprovalSnapshot,
+      snapshotHash: await sha256Hex(rfqApprovalSnapshot),
+    });
+    if (!rfqApproval.ok) throw new Error("RFQ-bound approval setup failed");
+    const storedRfqApproval = await t.run((ctx) => ctx.db.get(rfqApproval.approvalId));
+    expect(storedRfqApproval?.requirementId).toBe(requirementId);
+    expect(storedRfqApproval?.requirementVersion).toBe(2);
+    const decidedRfqApproval = await asOwner.mutation(decideApprovalRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      approvalId: rfqApproval.approvalId,
+      decision: "approved",
+    });
+    expect(decidedRfqApproval).toMatchObject({ ok: true });
+
+    const historicalQuote = await asOwner.mutation(recordQuoteRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      version: "quote-lineage-historical",
+      currency: "EUR",
+      lines: [{
+        lineId: "machine",
+        description: "Machine",
+        quantity: "1",
+        unitPrice: { currency: "EUR", minorUnits: 1_000 },
+        evidenceRefs: [],
+      }],
+      charges: [],
+      taxBasis: { kind: "inclusive", basisId: "controlled-history", evidenceRefs: [] },
+      evidenceRefs: [],
+      requirementId,
+    });
+    if (!historicalQuote.ok) throw new Error("historical quote setup failed");
+    await t.run(async (ctx) => {
+      await ctx.db.patch(historicalQuote.quoteId, { requirementVersion: undefined });
+    });
+    const historicalSnapshot = "{\"decision\":\"historical-quote\"}";
+    const historicalApproval = await asOwner.mutation(recordApprovalRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      scope: "quote-only",
+      quoteId: historicalQuote.quoteId,
+      snapshotCanonical: historicalSnapshot,
+      snapshotHash: await sha256Hex(historicalSnapshot),
+    });
+    expect(historicalApproval).toMatchObject({ ok: false, code: "invalid-payload" });
+    const approvals = await t.run((ctx) => ctx.db.query("approvals").collect());
+    expect(approvals).toHaveLength(2);
+  });
 });
 
 describe("E2 procurement readiness", () => {
@@ -655,6 +817,123 @@ describe("E2 procurement readiness", () => {
     expect(complete.requirements[0]?.fulfilledQuantity).toBe("2");
   });
 
+  test("milestone-qualified accepted quantities do not cross order boundaries", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, OWNER, "order-boundary");
+    const requirementId = await createRequirement(t, project, "order-boundary-req", {
+      quantity: "2",
+      priority: "P0",
+      requiredMilestone: "commissioned",
+    });
+    const asOwner = t.withIdentity(OWNER);
+    const vendor = await asOwner.mutation(recordVendorRef, {
+      organizationId: project.organizationId,
+      name: "Controlled supplier",
+      regions: ["NL"],
+    });
+    if (!vendor.ok) throw new Error("vendor setup failed");
+    const candidate = await asOwner.mutation(recordCandidateRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      requirementId,
+      vendorId: vendor.vendorId,
+      productModel: "Machine",
+      variant: "220V",
+      conversationState: "draft",
+    });
+    if (!candidate.ok) throw new Error("candidate setup failed");
+    const quote = await asOwner.mutation(recordQuoteRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      version: "quote-order-boundary",
+      currency: "EUR",
+      lines: [{ lineId: "machine", description: "Machine", quantity: "2", unitPrice: { currency: "EUR", minorUnits: 1_000 }, evidenceRefs: [] }],
+      charges: [],
+      taxBasis: { kind: "inclusive", basisId: "controlled-order-boundary", evidenceRefs: [] },
+      comparisonScope: { requirementId: "order-boundary-req", scopeId: "scope", items: [{ itemId: "machine", lineId: "machine", unit: "piece", requiredQuantity: "2" }] },
+      evidenceRefs: [],
+      requirementId,
+      vendorId: vendor.vendorId,
+    });
+    if (!quote.ok) throw new Error("quote setup failed");
+    const selection = await asOwner.mutation(recordSelectionRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      requirementId,
+      candidateId: candidate.candidateId,
+      quoteId: quote.quoteId,
+      quoteVersion: "quote-order-boundary",
+      selectionLines: [{ quoteLineId: "machine", quantity: "2", unit: "piece" }],
+      idempotencyKey: "selection-order-boundary",
+      requirementVersion: 1,
+    });
+    if (!selection.ok) throw new Error("selection setup failed");
+    const commissionedOrder = await asOwner.mutation(recordOrderRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      selectionId: selection.selectionId,
+      idempotencyKey: "order-boundary-commissioned",
+      orderLines: [{ quoteLineId: "machine", quantity: "1", unit: "piece" }],
+    });
+    const deliveredOrder = await asOwner.mutation(recordOrderRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      selectionId: selection.selectionId,
+      idempotencyKey: "order-boundary-delivered",
+      orderLines: [{ quoteLineId: "machine", quantity: "1", unit: "piece" }],
+    });
+    if (!commissionedOrder.ok || !deliveredOrder.ok) throw new Error("order setup failed");
+    const commissionedAcceptance = await asOwner.mutation(appendOrderEventRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      orderId: commissionedOrder.orderId,
+      kind: "acceptance",
+      acceptanceLines: [{ quoteLineId: "machine", acceptedQuantity: "1", unit: "piece" }],
+      idempotencyKey: "order-boundary-commissioned-acceptance",
+    });
+    const commissioned = await asOwner.mutation(appendOrderEventRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      orderId: commissionedOrder.orderId,
+      kind: "commissioning",
+      idempotencyKey: "order-boundary-commissioned-event",
+    });
+    const delivered = await asOwner.mutation(appendOrderEventRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      orderId: deliveredOrder.orderId,
+      kind: "acceptance",
+      acceptanceLines: [{ quoteLineId: "machine", acceptedQuantity: "1", unit: "piece" }],
+      idempotencyKey: "order-boundary-delivered-acceptance",
+    });
+    expect(commissionedAcceptance.ok).toBe(true);
+    expect(commissioned.ok).toBe(true);
+    expect(delivered.ok).toBe(true);
+
+    const partial = await asOwner.query(getReadinessRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+    });
+    if (!partial.ok) throw new Error("readiness query denied");
+    expect(partial.status).toBe("notReady");
+    expect(partial.requirements[0]?.ready).toBe(false);
+    expect(partial.requirements[0]?.fulfilledQuantity).toBe("2");
+
+    const deliveredCommissioned = await asOwner.mutation(appendOrderEventRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      orderId: deliveredOrder.orderId,
+      kind: "commissioning",
+      idempotencyKey: "order-boundary-delivered-commissioning",
+    });
+    expect(deliveredCommissioned.ok).toBe(true);
+    const complete = await asOwner.query(getReadinessRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+    });
+    expect(complete).toMatchObject({ ok: true, status: "ready" });
+  });
+
   test("pending dependencies block readiness and verified dependencies clear the blocker with immutable history", async () => {
     const t = convexTest(schema, modules);
     const project = await setupProject(t, OWNER, "dependency");
@@ -695,6 +974,82 @@ describe("E2 procurement readiness", () => {
     expect(history).toHaveLength(1);
     expect(history[0]?.beforeVerification).toBe("pending");
     expect(history[0]?.afterVerification).toBe("verified");
+  });
+
+  test("dependency evidence bounds reject oversized inputs before writes and normalize one shared basis", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, OWNER, "dependency-evidence-bounds");
+    const fromRequirementId = await createRequirement(t, project, "evidence-from");
+    const toRequirementId = await createRequirement(t, project, "evidence-to");
+    const asOwner = t.withIdentity(OWNER);
+    const oversizedCount = await asOwner.mutation(addDependencyRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      fromRequirementId,
+      toRequirementId,
+      kind: "technical",
+      evidenceRefs: Array.from({ length: DEPENDENCY_EVIDENCE_MAX_REFS + 1 }, (_, index) => ({
+        sourceId: `source-${index}`,
+        version: "1",
+      })),
+    });
+    expect(oversizedCount).toMatchObject({ ok: false, code: "invalid-payload" });
+    expect(await t.run((ctx) => ctx.db.query("dependencies").collect())).toHaveLength(0);
+
+    const dependency = await asOwner.mutation(addDependencyRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      fromRequirementId,
+      toRequirementId,
+      kind: "technical",
+      evidenceRefs: [{ sourceId: " initial-source ", version: " initial-version " }],
+    });
+    if (!dependency.ok) throw new Error("dependency setup failed");
+
+    const oversizedVerificationCount = await asOwner.mutation(verifyDependencyRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      dependencyId: dependency.dependencyId,
+      verification: "verified",
+      evidenceRefs: Array.from({ length: DEPENDENCY_EVIDENCE_MAX_REFS + 1 }, (_, index) => ({
+        sourceId: `source-${index}`,
+        version: "1",
+      })),
+    });
+    expect(oversizedVerificationCount).toMatchObject({ ok: false, code: "invalid-payload" });
+
+    const oversizedFields = [
+      { sourceId: "x".repeat(DEPENDENCY_EVIDENCE_SOURCE_ID_MAX_LENGTH + 1), version: "1" },
+      { sourceId: "source", version: "x".repeat(DEPENDENCY_EVIDENCE_VERSION_MAX_LENGTH + 1) },
+      { sourceId: "source", version: "1", locator: "x".repeat(DEPENDENCY_EVIDENCE_LOCATOR_MAX_LENGTH + 1) },
+    ];
+    for (const evidenceRefs of oversizedFields) {
+      const rejected = await asOwner.mutation(verifyDependencyRef, {
+        organizationId: project.organizationId,
+        projectId: project.projectId,
+        dependencyId: dependency.dependencyId,
+        verification: "verified",
+        evidenceRefs: [evidenceRefs],
+      });
+      expect(rejected).toMatchObject({ ok: false, code: "invalid-payload" });
+    }
+    expect(await t.run((ctx) => ctx.db.query("dependencyRevisions").collect())).toHaveLength(0);
+    const stillPending = await t.run((ctx) => ctx.db.get(dependency.dependencyId));
+    expect(stillPending?.verification).toBe("pending");
+
+    const normalized = await asOwner.mutation(verifyDependencyRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      dependencyId: dependency.dependencyId,
+      verification: "verified",
+      evidenceRefs: [{ sourceId: " source ", version: " v1 ", locator: " locator " }],
+    });
+    expect(normalized.ok).toBe(true);
+    const storedDependency = await t.run((ctx) => ctx.db.get(dependency.dependencyId));
+    const revisions = await t.run((ctx) => ctx.db.query("dependencyRevisions").collect());
+    const expectedEvidence = [{ sourceId: "source", version: "v1", locator: "locator" }];
+    expect(storedDependency?.evidenceRefs).toEqual(expectedEvidence);
+    expect(revisions[0]?.afterEvidenceRefs).toEqual(expectedEvidence);
   });
 
   test("readiness reports explicit incompleteness when scope exceeds its bound", async () => {

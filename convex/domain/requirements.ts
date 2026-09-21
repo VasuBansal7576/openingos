@@ -26,6 +26,7 @@ import {
   dependencyVerificationInputValidator,
   dependencyCreatesCycle,
   dependencyInputValidator,
+  normalizeDependencyEvidenceRefs,
   normalizeBoundedText,
   normalizeRequirementDate,
   normalizeRequirementIdempotencyKey,
@@ -808,6 +809,16 @@ export const addDependency = f1Mutation({
     if (!access.ok) {
       return { ok: false as const, code: access.code, message: access.message };
     }
+    let normalizedEvidenceRefs: ReturnType<typeof normalizeDependencyEvidenceRefs>;
+    try {
+      normalizedEvidenceRefs = normalizeDependencyEvidenceRefs(args.evidenceRefs);
+    } catch (error) {
+      return {
+        ok: false as const,
+        code: "invalid-payload",
+        message: error instanceof Error ? error.message : "dependency evidence is invalid",
+      };
+    }
     const from = await requireOwnedRef(
       await ctx.db.get(args.fromRequirementId),
       args.organizationId,
@@ -850,7 +861,7 @@ export const addDependency = f1Mutation({
       kind: args.kind,
       verification: "pending",
       ...(args.responsible === undefined ? {} : { responsible: args.responsible }),
-      ...(args.evidenceRefs === undefined ? {} : { evidenceRefs: [...args.evidenceRefs] }),
+      ...(normalizedEvidenceRefs === undefined ? {} : { evidenceRefs: normalizedEvidenceRefs }),
       createdAt: Date.now(),
     });
     return { ok: true as const, dependencyId };
@@ -875,6 +886,16 @@ export const verifyDependency = f1Mutation({
     );
     if (!access.ok) {
       return { ok: false as const, code: access.code, message: access.message };
+    }
+    let normalizedEvidenceRefs: ReturnType<typeof normalizeDependencyEvidenceRefs>;
+    try {
+      normalizedEvidenceRefs = normalizeDependencyEvidenceRefs(args.evidenceRefs);
+    } catch (error) {
+      return {
+        ok: false as const,
+        code: "invalid-payload",
+        message: error instanceof Error ? error.message : "dependency evidence is invalid",
+      };
     }
     if (args.verification === "waived") {
       const approver = await requireDomainAccess(
@@ -902,13 +923,10 @@ export const verifyDependency = f1Mutation({
         message: "dependency verification is already resolved",
       };
     }
-    const evidenceRefs = args.evidenceRefs === undefined ? [] : [...args.evidenceRefs];
+    const evidenceRefs = normalizedEvidenceRefs === undefined ? [] : normalizedEvidenceRefs;
     if (args.verification === "verified") {
       if (evidenceRefs.length === 0) {
         return { ok: false as const, code: "invalid-payload", message: "verified dependency requires evidence" };
-      }
-      if (evidenceRefs.some((ref) => ref.sourceId.trim().length === 0 || ref.version.trim().length === 0)) {
-        return { ok: false as const, code: "invalid-payload", message: "dependency evidence is incomplete" };
       }
     }
     let reason: string | undefined;
@@ -1010,13 +1028,6 @@ const MILESTONE_RANK: Readonly<Record<"delivered" | "installed" | "commissioned"
   installed: 2,
   commissioned: 3,
 };
-
-function fulfillmentRank(value: string): number {
-  if (value === "commissioned") return 3;
-  if (value === "installed") return 2;
-  if (value === "delivered") return 1;
-  return 0;
-}
 
 function readinessIncomplete(
   reason: string,
@@ -1194,7 +1205,8 @@ export const getReadiness = f1Query({
       }
     }
     const acceptedByRequirement = new Map<Id<"requirements">, Decimal>();
-    const eventMilestoneByRequirement = new Map<Id<"requirements">, number>();
+    const acceptedByOrder = new Map<Id<"orders">, Decimal>();
+    const eventMilestoneByOrder = new Map<Id<"orders">, number>();
     for (const event of eventRows) {
       if (event.organizationId !== args.organizationId) {
         return readinessIncomplete("fulfillment event graph is foreign", activeRequirements);
@@ -1206,12 +1218,18 @@ export const getReadiness = f1Query({
       if (order.state === "cancelled") continue;
       const requirement = requirementById.get(order.requirementId);
       if (requirement === undefined) continue;
-      if (event.kind === "installation") {
-        eventMilestoneByRequirement.set(requirement._id, Math.max(eventMilestoneByRequirement.get(requirement._id) ?? 0, 2));
-      } else if (event.kind === "commissioning") {
-        eventMilestoneByRequirement.set(requirement._id, 3);
-      } else if (event.kind === "partialDelivery" || event.kind === "acceptance") {
-        eventMilestoneByRequirement.set(requirement._id, Math.max(eventMilestoneByRequirement.get(requirement._id) ?? 0, 1));
+      const eventMilestone = event.kind === "installation"
+        ? 2
+        : event.kind === "commissioning"
+          ? 3
+          : event.kind === "partialDelivery" || event.kind === "acceptance"
+            ? 1
+            : 0;
+      if (eventMilestone > 0) {
+        eventMilestoneByOrder.set(
+          event.orderId,
+          Math.max(eventMilestoneByOrder.get(event.orderId) ?? 0, eventMilestone),
+        );
       }
       const acceptedLines = event.acceptanceLines !== undefined
         ? event.acceptanceLines.map((line) => ({ quantity: line.acceptedQuantity, unit: line.unit }))
@@ -1234,9 +1252,40 @@ export const getReadiness = f1Query({
             requirement._id,
             previous === undefined ? accepted : decimalAdd(previous, accepted),
           );
+          const acceptedForOrder = acceptedByOrder.get(event.orderId);
+          acceptedByOrder.set(
+            event.orderId,
+            acceptedForOrder === undefined ? accepted : decimalAdd(acceptedForOrder, accepted),
+          );
         } catch {
           return readinessIncomplete("fulfilled quantity exceeds the supported precision", activeRequirements);
         }
+      }
+    }
+
+    // A requirement can aggregate several orders, but an accepted unit only
+    // qualifies for its required milestone when its own order lineage has
+    // reached that milestone. This prevents a commissioned order from
+    // lending its milestone to accepted units on a merely delivered order.
+    const milestoneQualifiedAcceptedByRequirement = new Map<Id<"requirements">, Decimal>();
+    for (const [orderId, accepted] of acceptedByOrder) {
+      const order = orderById.get(orderId);
+      if (order === undefined) {
+        return readinessIncomplete("fulfillment event has no resolvable order", activeRequirements);
+      }
+      const requirement = requirementById.get(order.requirementId);
+      if (requirement === undefined) continue;
+      const requiredMilestone = requirement.requiredMilestone ?? "delivered";
+      const reachedMilestone = eventMilestoneByOrder.get(orderId) ?? 0;
+      if (reachedMilestone < MILESTONE_RANK[requiredMilestone]) continue;
+      const previous = milestoneQualifiedAcceptedByRequirement.get(requirement._id);
+      try {
+        milestoneQualifiedAcceptedByRequirement.set(
+          requirement._id,
+          previous === undefined ? accepted : decimalAdd(previous, accepted),
+        );
+      } catch {
+        return readinessIncomplete("fulfilled quantity exceeds the supported precision", activeRequirements);
       }
     }
 
@@ -1254,16 +1303,11 @@ export const getReadiness = f1Query({
       const required = requiredById.get(row._id);
       if (required === undefined) throw new Error("readiness quantity invariant violated");
       const fulfilled = acceptedByRequirement.get(row._id) ?? decimalZero();
+      const milestoneQualifiedFulfilled = milestoneQualifiedAcceptedByRequirement.get(row._id) ?? decimalZero();
       const milestone = row.requiredMilestone ?? "delivered";
-      const milestoneRank = MILESTONE_RANK[milestone];
-      const observedMilestone = Math.max(
-        fulfillmentRank(row.fulfillment),
-        eventMilestoneByRequirement.get(row._id) ?? 0,
-      );
-      const quantityReady = decimalCompare(fulfilled, required) >= 0;
-      const milestoneReady = observedMilestone >= milestoneRank;
+      const quantityReady = decimalCompare(milestoneQualifiedFulfilled, required) >= 0;
       const blocked = dependencyBlocked.has(row._id);
-      const ready = quantityReady && milestoneReady && !blocked;
+      const ready = quantityReady && !blocked;
       if (!ready && row.priority === "P0") unresolvedP0Count += 1;
       if (ready) numerator += PRIORITY_WEIGHT[row.priority] / counts[row.priority];
       return {

@@ -1099,6 +1099,10 @@ export default defineSchema({
     requirementId: v.optional(v.id("requirements")),
     vendorId: v.optional(v.id("vendors")),
     rfqId: v.optional(v.id("rfqs")),
+    // New requirement-bound quotes pin the requirement version that produced
+    // them. Historical rows may omit this field and must fail closed when a
+    // new quote-only approval would otherwise need to infer the basis.
+    requirementVersion: v.optional(v.number()),
     version: v.string(),
     contentHash: v.string(),
     payloadSha256: v.optional(v.string()),

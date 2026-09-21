@@ -183,6 +183,16 @@ export const REQUIREMENT_IDEMPOTENCY_KEY_MAX_LENGTH = 128;
 export const REQUIREMENT_REVISION_MAX_PAYLOAD_LENGTH = 16_384;
 export const REQUIREMENT_DATE_MAX_TIMESTAMP = 8_640_000_000_000_000;
 
+/**
+ * Dependency evidence is small, bounded provenance rather than an arbitrary
+ * document payload. These limits keep both the input and the append-only
+ * dependency revision inside a predictable transaction size.
+ */
+export const DEPENDENCY_EVIDENCE_MAX_REFS = 32;
+export const DEPENDENCY_EVIDENCE_SOURCE_ID_MAX_LENGTH = 256;
+export const DEPENDENCY_EVIDENCE_VERSION_MAX_LENGTH = 128;
+export const DEPENDENCY_EVIDENCE_LOCATOR_MAX_LENGTH = 2_048;
+
 /** Normalize required/optional text at a trusted command boundary. */
 export function normalizeBoundedText(
   raw: string,
@@ -193,6 +203,40 @@ export function normalizeBoundedText(
   if (normalized.length === 0) throw new Error(`${label} required`);
   if (normalized.length > maxLength) throw new Error(`${label} exceeds the supported length`);
   return normalized;
+}
+
+/** Normalize and bound dependency evidence before any dependency write. */
+export function normalizeDependencyEvidenceRefs(
+  refs: readonly DomainEvidenceRef[] | undefined,
+): DomainEvidenceRef[] | undefined {
+  if (refs === undefined) return undefined;
+  if (refs.length > DEPENDENCY_EVIDENCE_MAX_REFS) {
+    throw new Error(
+      `dependency evidence references exceed the supported bound of ${DEPENDENCY_EVIDENCE_MAX_REFS}`,
+    );
+  }
+  return refs.map((ref, index) => {
+    const sourceId = normalizeBoundedText(
+      ref.sourceId,
+      `dependency evidence ${index + 1} source id`,
+      DEPENDENCY_EVIDENCE_SOURCE_ID_MAX_LENGTH,
+    );
+    const version = normalizeBoundedText(
+      ref.version,
+      `dependency evidence ${index + 1} version`,
+      DEPENDENCY_EVIDENCE_VERSION_MAX_LENGTH,
+    );
+    const locator = ref.locator === undefined
+      ? undefined
+      : normalizeBoundedText(
+        ref.locator,
+        `dependency evidence ${index + 1} locator`,
+        DEPENDENCY_EVIDENCE_LOCATOR_MAX_LENGTH,
+      );
+    return locator === undefined
+      ? { sourceId, version }
+      : { sourceId, version, locator };
+  });
 }
 
 /** Normalize a stable replay key without allowing whitespace-only keys. */

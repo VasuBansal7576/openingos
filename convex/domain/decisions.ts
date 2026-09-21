@@ -618,17 +618,38 @@ export const recordApproval = f1Mutation({
           message: "selection and quote must refer to the same quote",
         };
       }
-      if (approvalRequirementId === undefined && quote.requirementId !== undefined) {
-        const requirement = await requireOwnedRef(
-          await ctx.db.get(quote.requirementId),
-          args.organizationId,
-          args.projectId,
-        );
-        if (!requirement.ok) {
-          return { ok: false as const, code: requirement.code, message: requirement.message };
+      if (approvalRequirementId === undefined) {
+        let quoteRequirementId = quote.requirementId;
+        if (quoteRequirementId === undefined && quote.rfqId !== undefined) {
+          const rfq = await ctx.db.get(quote.rfqId);
+          if (
+            rfq === null ||
+            rfq.organizationId !== args.organizationId ||
+            rfq.projectId !== args.projectId
+          ) {
+            return { ok: false as const, code: "denied-project", message: "quote RFQ is not in this project" };
+          }
+          quoteRequirementId = rfq.requirementId;
         }
-        approvalRequirementId = requirement.value._id;
-        approvalRequirementVersion = requirement.value.version;
+        if (quoteRequirementId !== undefined) {
+          if (quote.requirementVersion === undefined) {
+            return {
+              ok: false as const,
+              code: "invalid-payload",
+              message: "quote requirement version lineage is unavailable; record a new quote",
+            };
+          }
+          const requirement = await requireOwnedRef(
+            await ctx.db.get(quoteRequirementId),
+            args.organizationId,
+            args.projectId,
+          );
+          if (!requirement.ok) {
+            return { ok: false as const, code: requirement.code, message: requirement.message };
+          }
+          approvalRequirementId = requirement.value._id;
+          approvalRequirementVersion = quote.requirementVersion;
+        }
       }
     }
     const approvalId = await ctx.db.insert("approvals", {
@@ -689,6 +710,7 @@ export const decideApproval = f1Mutation({
     // mutation, so a revision racing the decision still fences it.
     // Historical approvals and orders stay intact.
     const basisQuoteIds: Id<"quotes">[] = [];
+    const quoteOnlyApproval = approval.value.selectionId === undefined && approval.value.quoteId !== undefined;
     if (approval.value.quoteId !== undefined) {
       basisQuoteIds.push(approval.value.quoteId);
     }
@@ -749,6 +771,37 @@ export const decideApproval = f1Mutation({
     for (const basisQuoteId of basisQuoteIds) {
       const basisQuote = await ctx.db.get(basisQuoteId);
       if (basisQuote === null) continue;
+      let basisRequirementId = basisQuote.requirementId;
+      if (quoteOnlyApproval && basisRequirementId === undefined && basisQuote.rfqId !== undefined) {
+        const basisRfq = await ctx.db.get(basisQuote.rfqId);
+        if (
+          basisRfq === null ||
+          basisRfq.organizationId !== args.organizationId ||
+          basisRfq.projectId !== args.projectId
+        ) {
+          return { ok: false as const, code: "denied-project", message: "quote RFQ is not in this project" };
+        }
+        basisRequirementId = basisRfq.requirementId;
+      }
+      if (quoteOnlyApproval && basisRequirementId !== undefined) {
+        if (basisQuote.requirementVersion === undefined) {
+          return {
+            ok: false as const,
+            code: "stale-approval-basis",
+            message: "quote requirement version lineage is unavailable; renewed quote authority required",
+          };
+        }
+        if (
+          approval.value.requirementId !== basisRequirementId ||
+          approval.value.requirementVersion !== basisQuote.requirementVersion
+        ) {
+          return {
+            ok: false as const,
+            code: "stale-approval-basis",
+            message: "approval requirement basis does not match the quote lineage; renewed authority required",
+          };
+        }
+      }
       // Bounded indexed existence probe (PRD 30): one row at most per
       // basis quote, never a full project collect per loop iteration.
       const basisSuccessor = await ctx.db
