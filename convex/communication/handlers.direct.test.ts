@@ -6,6 +6,7 @@ import type { Id } from "../_generated/dataModel.js";
 import * as callbacks from "./callbacks.js";
 import * as cleanup from "./cleanup.js";
 import * as send from "./send.js";
+import * as attempts from "../execution/attempts.js";
 import { canonicalJson, payloadHash } from "../shared/hashing.js";
 import { OUTBOUND_RETENTION_MS } from "./contracts.js";
 
@@ -87,6 +88,11 @@ const cleanupRef = makeFunctionReference<
   MutationArgs<typeof cleanup.cleanupFinalizedProviderRows>,
   MutationReturn<typeof cleanup.cleanupFinalizedProviderRows>
 >("communication/cleanup:cleanupFinalizedProviderRows");
+const reconcileAfterCrashRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof attempts.reconcileAfterCrash>,
+  MutationReturn<typeof attempts.reconcileAfterCrash>
+>("execution/attempts:reconcileAfterCrash");
 
 const DRAFT = {
   profile: "ownerRoleplay",
@@ -218,6 +224,92 @@ describe("C1 Convex callback handlers", () => {
     expect(OUTBOUND_RETENTION_MS).toBe(7 * 24 * 60 * 60 * 1_000);
     const invalid = await f.t.mutation(cleanupRef, { retentionMs: OUTBOUND_RETENTION_MS - 1 });
     expect(invalid).toMatchObject({ ok: false, code: "invalid-payload" });
+  });
+
+  test("admits reconciliation under the original reservation after revocation and cancellation, then rejects exhaustion", async () => {
+    const f = await fixture("prepared");
+    const prepared = await f.t.mutation(prepareRef, { operationId: f.operationId, inboxId: "owner-inbox" });
+    expect(prepared).toMatchObject({ ok: true });
+    const reservation = await f.t.run(async (ctx) => {
+      const now = Date.now();
+      const operation = await ctx.db.get(f.operationId);
+      if (operation === null) throw new Error("operation missing");
+      const budgetId = await ctx.db.insert("providerBudgets", {
+        organizationId: f.organizationId,
+        ceilingMicroUsd: 2,
+        reservedMicroUsd: 2,
+        spentMicroUsd: 0,
+        unresolvedMicroUsd: 0,
+        pricingBasis: "controlled-reconciliation-read",
+        updatedAt: now,
+      });
+      const reservationId = await ctx.db.insert("reservations", {
+        organizationId: f.organizationId,
+        jobId: operation.jobId,
+        budgetId,
+        ceilingMicroUsd: 2,
+        reservedMicroUsd: 2,
+        spentMicroUsd: 0,
+        unresolvedMicroUsd: 0,
+        pricingBasis: "controlled-reconciliation-read",
+        state: "open",
+        updatedAt: now,
+      });
+      await ctx.db.patch(operation.grantId, { status: "revoked" });
+      await ctx.db.patch(operation.jobId, { state: "cancelled" });
+      await ctx.db.patch(f.operationId, { state: "outcomeUnknown", reservationId, attemptToken: "reconciliation-attempt" });
+      await ctx.db.insert("attempts", {
+        operationId: f.operationId,
+        token: "reconciliation-attempt",
+        state: "outcomeUnknown",
+        createdAt: now,
+      });
+      return { reservationId, budgetId };
+    });
+    const admitted = await f.t.mutation(reconcileAfterCrashRef, {
+      operationId: f.operationId,
+      mode: "admitRead",
+      attemptToken: "reconciliation-attempt",
+      readNumber: 1,
+    });
+    expect(admitted).toMatchObject({ ok: true, allowed: true });
+    const retried = await f.t.mutation(reconcileAfterCrashRef, {
+      operationId: f.operationId,
+      mode: "admitRead",
+      attemptToken: "reconciliation-attempt",
+      readNumber: 1,
+    });
+    expect(retried).toMatchObject({ ok: true, allowed: true });
+    const accounted = await f.t.run(async (ctx) => {
+      const row = await ctx.db.get(reservation.reservationId);
+      const budget = await ctx.db.get(reservation.budgetId);
+      if (row === null || budget === null) throw new Error("accounting rows missing");
+      return {
+        reservation: { reservedMicroUsd: row.reservedMicroUsd, spentMicroUsd: row.spentMicroUsd },
+        budget: { reservedMicroUsd: budget.reservedMicroUsd, spentMicroUsd: budget.spentMicroUsd },
+      };
+    });
+    expect(accounted).toEqual({
+      reservation: { reservedMicroUsd: 1, spentMicroUsd: 1 },
+      budget: { reservedMicroUsd: 1, spentMicroUsd: 1 },
+    });
+    const exhausted = await f.t.run(async (ctx) => {
+      const row = await ctx.db.get(reservation.reservationId);
+      if (row === null) throw new Error("reservation missing");
+      await ctx.db.patch(row._id, { reservedMicroUsd: 0, unresolvedMicroUsd: 0 });
+      const budget = await ctx.db.get(reservation.budgetId);
+      if (budget === null) throw new Error("budget missing");
+      await ctx.db.patch(budget._id, { reservedMicroUsd: 0, unresolvedMicroUsd: 0 });
+      return true;
+    });
+    expect(exhausted).toBe(true);
+    const denied = await f.t.mutation(reconcileAfterCrashRef, {
+      operationId: f.operationId,
+      mode: "admitRead",
+      attemptToken: "reconciliation-attempt",
+      readNumber: 2,
+    });
+    expect(denied).toMatchObject({ ok: false, code: "allowance-exhausted" });
   });
 
   test("creates one exact outbound snapshot under concurrent replay and rejects stale authority", async () => {

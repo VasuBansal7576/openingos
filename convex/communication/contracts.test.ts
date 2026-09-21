@@ -7,6 +7,7 @@ import {
   providerPayloadFromOutbound,
   parseProviderReconciliationMessages,
   isCommunicationDenial,
+  type ReconciliationSnapshot,
 } from "./contracts.js";
 import { reconcileAgentMailOnce } from "./reconciliation.js";
 import { sendAgentMailOneShot } from "./transport.js";
@@ -20,6 +21,15 @@ const VALID_DRAFT = {
   bcc: [],
   subject: "Controlled RFQ",
   body: "Please confirm the controlled terms.",
+};
+
+const SNAPSHOT: ReconciliationSnapshot = {
+  to: [OWNER],
+  cc: [],
+  bcc: [],
+  subject: "Controlled RFQ",
+  body: "Terms",
+  attachments: [],
 };
 
 function response(status: number, body: unknown): Response {
@@ -139,33 +149,145 @@ describe("C1 inbound safety and reconciliation", () => {
 
   test("retains exact binding and treats ambiguous matches as unknown", () => {
     const messages = [
-      { messageId: "msg-1", threadId: "thread-1", to: [OWNER], subject: "Controlled RFQ", text: "Terms", headers: { "x-openingos-operation": "openingos-op-1" } },
-      { messageId: "msg-2", threadId: "thread-2", to: [OWNER], subject: "Controlled RFQ", text: "Terms", headers: { "x-openingos-operation": "openingos-other" } },
+      { messageId: "msg-1", threadId: "thread-1", to: [OWNER], cc: [], bcc: [], subject: "Controlled RFQ", text: "Terms", attachments: [], headers: { "x-openingos-operation": "openingos-op-1" } },
+      { messageId: "msg-2", threadId: "thread-2", to: [OWNER], cc: [], bcc: [], subject: "Controlled RFQ", text: "Other terms", attachments: [], headers: { "x-openingos-operation": "openingos-other" } },
     ] as const;
-    expect(reconcileProviderMessages(messages, { recipient: OWNER, subject: "Controlled RFQ", operationLabel: "openingos-op-1" })).toMatchObject({ kind: "confirmed" });
-    expect(reconcileProviderMessages([...messages, messages[0]], { recipient: OWNER, subject: "Controlled RFQ", operationLabel: "openingos-op-1" })).toEqual({ kind: "unknown", reason: "ambiguous" });
+    expect(reconcileProviderMessages(messages, { snapshot: SNAPSHOT, operationLabel: "openingos-op-1" })).toMatchObject({ kind: "confirmed" });
+    expect(reconcileProviderMessages([...messages, messages[0]], { snapshot: SNAPSHOT, operationLabel: "openingos-op-1" })).toEqual({ kind: "unknown", reason: "ambiguous" });
+  });
+
+  test("requires the bound thread when the immutable snapshot has one", () => {
+    const message = {
+      messageId: "msg-threaded",
+      threadId: "thread-actual",
+      to: [OWNER],
+      cc: [],
+      bcc: [],
+      subject: SNAPSHOT.subject,
+      text: SNAPSHOT.body,
+      attachments: [],
+      headers: {},
+    } as const;
+    expect(reconcileProviderMessages([message], { snapshot: { ...SNAPSHOT, threadId: "thread-actual" } })).toMatchObject({ kind: "confirmed" });
+    expect(reconcileProviderMessages([message], { snapshot: { ...SNAPSHOT, threadId: "thread-other" } })).toEqual({ kind: "unknown", reason: "empty" });
   });
 
   test("bounds reconciliation reads and never turns an empty listing into a send", async () => {
     let reads = 0;
     const result = await reconcileAgentMailOnce({
       inboxId: "inbox-1",
-      recipient: OWNER,
-      subject: "Controlled RFQ",
       operationLabel: "openingos-op-1",
+      snapshot: { ...SNAPSHOT, body: "Please confirm the controlled terms." },
       baseUrl: EU_AGENTMAIL_BASE_URL,
       fetchImpl: async () => {
         reads += 1;
-        return response(200, { messages: [] });
+        return response(200, { messages: [], next_page_token: null });
       },
       maxReads: 99,
     });
-    expect(result).toEqual({ outcome: { kind: "unknown", reason: "empty" }, reads: 3 });
-    expect(reads).toBe(3);
+    expect(result).toEqual({ outcome: { kind: "unknown", reason: "empty" }, reads: 1 });
+    expect(reads).toBe(1);
   });
 
   test("rejects malformed reconciliation pages", () => {
     expect(parseProviderReconciliationMessages({ messages: [{ message_id: "missing-fields" }] })).toBeNull();
+  });
+
+  test.each([
+    ["changed body", { to: [OWNER], cc: [], bcc: [], subject: SNAPSHOT.subject, text: "changed", attachments: [] }],
+    ["expanded recipients", { to: [OWNER, "other@example.test"], cc: [], bcc: [], subject: SNAPSHOT.subject, text: SNAPSHOT.body, attachments: [] }],
+    ["missing attachment proof", { to: [OWNER], cc: [], bcc: [], subject: SNAPSHOT.subject, text: SNAPSHOT.body }],
+  ] as const)("keeps %s unknown even with a matching operation label", (_name, candidate) => {
+    expect(
+      reconcileProviderMessages(
+        [{ messageId: "msg-boundary", threadId: "thread-boundary", headers: { "x-openingos-operation": "openingos-op-1" }, ...candidate }],
+        { snapshot: SNAPSHOT, operationLabel: "openingos-op-1" },
+      ),
+    ).toEqual({ kind: "unknown", reason: "empty" });
+  });
+
+  test("follows page-two cursor and confirms only after the complete bounded listing", async () => {
+    const urls: string[] = [];
+    const result = await reconcileAgentMailOnce({
+      inboxId: "inbox-1",
+      operationLabel: "openingos-op-page-two",
+      snapshot: SNAPSHOT,
+      fetchImpl: async (input) => {
+        urls.push(input);
+        if (input.includes("page_token=next-page")) {
+          return response(200, {
+            messages: [{ message_id: "msg-page-two", thread_id: "thread-page-two", to: [OWNER], cc: [], bcc: [], subject: SNAPSHOT.subject, text: SNAPSHOT.body, attachments: [], headers: {} }],
+            next_page_token: null,
+          });
+        }
+        return response(200, { messages: [], next_page_token: "next-page" });
+      },
+    });
+    expect(result).toMatchObject({ outcome: { kind: "confirmed", message: { messageId: "msg-page-two" } }, reads: 2 });
+    expect(urls).toHaveLength(2);
+    expect(urls[0]).not.toContain("page_token=");
+    expect(urls[1]).toContain("page_token=next-page");
+  });
+
+  test("rejects a continuation cursor loop instead of rereading page one", async () => {
+    const urls: string[] = [];
+    const result = await reconcileAgentMailOnce({
+      inboxId: "inbox-1",
+      operationLabel: "openingos-op-loop",
+      snapshot: SNAPSHOT,
+      fetchImpl: async (input) => {
+        urls.push(input);
+        return response(200, { messages: [], next_page_token: "same-page" });
+      },
+    });
+    expect(result).toEqual({ outcome: { kind: "unknown", reason: "malformed" }, reads: 2 });
+    expect(urls).toHaveLength(2);
+    expect(urls[0]).not.toContain("page_token=");
+    expect(urls[1]).toContain("page_token=same-page");
+  });
+
+  test("enforces transport, body and overall deadlines", async () => {
+    const transport = await reconcileAgentMailOnce({
+      inboxId: "inbox-1",
+      operationLabel: "openingos-op-hung-fetch",
+      snapshot: SNAPSHOT,
+      perReadTimeoutMs: 5,
+      overallTimeoutMs: 20,
+      fetchImpl: async () => await new Promise<Response>(() => undefined),
+    });
+    expect(transport).toMatchObject({ outcome: { kind: "unknown", reason: "malformed" }, reads: 1 });
+
+    const body = await reconcileAgentMailOnce({
+      inboxId: "inbox-1",
+      operationLabel: "openingos-op-hung-body",
+      snapshot: SNAPSHOT,
+      perReadTimeoutMs: 5,
+      overallTimeoutMs: 20,
+      fetchImpl: async () => ({ ok: true, text: async () => await new Promise<string>(() => undefined) }) as Response,
+    });
+    expect(body).toMatchObject({ outcome: { kind: "unknown", reason: "malformed" }, reads: 1 });
+  });
+
+  test("does not confirm a candidate when bounded page exhaustion leaves continuation unread", async () => {
+    const urls: string[] = [];
+    const result = await reconcileAgentMailOnce({
+      inboxId: "inbox-1",
+      operationLabel: "openingos-op-exhausted",
+      snapshot: SNAPSHOT,
+      maxReads: 3,
+      fetchImpl: async (input) => {
+        urls.push(input);
+        const page = urls.length;
+        return response(200, {
+          messages: page === 1
+            ? [{ message_id: "msg-candidate", thread_id: "thread-candidate", to: [OWNER], cc: [], bcc: [], subject: SNAPSHOT.subject, text: SNAPSHOT.body, attachments: [], headers: { "x-openingos-operation": "openingos-op-exhausted" } }]
+            : [],
+          next_page_token: `cursor-${page}`,
+        });
+      },
+    });
+    expect(result).toEqual({ outcome: { kind: "unknown", reason: "exhausted" }, reads: 3 });
+    expect(new Set(urls).size).toBe(3);
   });
 });
 

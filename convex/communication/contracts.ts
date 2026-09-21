@@ -18,6 +18,15 @@ export const MAX_MESSAGE_BODY_BYTES = 64_000;
 export const MAX_PROVIDER_RESPONSE_BYTES = 64_000;
 export const MAX_RECONCILIATION_RESULTS = 25;
 export const MAX_RECONCILIATION_READS = 3;
+/**
+ * Provider reads are paid/retry-owned execution work even when the original
+ * send was cancelled or its grant was later revoked.
+ */
+export const RECONCILIATION_RETRY_OWNER = "openingos.execution.reconciliation" as const;
+export const RECONCILIATION_READ_COST_MICRO_USD = 1;
+export const DEFAULT_RECONCILIATION_READ_TIMEOUT_MS = 10_000;
+export const DEFAULT_RECONCILIATION_OVERALL_TIMEOUT_MS = 30_000;
+export const MAX_RECONCILIATION_TIMEOUT_MS = 30_000;
 export const OUTBOUND_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
 
 export type CommunicationDenialCode =
@@ -132,14 +141,46 @@ export interface ReconciliationMessage {
   readonly messageId: string;
   readonly threadId: string;
   readonly to: readonly string[];
+  /** `null` means the provider omitted the field, so exact proof is absent. */
+  readonly cc?: readonly string[] | null;
+  /** `null` means the provider omitted the field, so exact proof is absent. */
+  readonly bcc?: readonly string[] | null;
   readonly subject: string;
   readonly text: string;
+  /** `null` means attachment facts were not present in the provider page. */
+  readonly attachments?: readonly ReconciliationAttachment[] | null;
   readonly headers: Readonly<Record<string, string>>;
 }
 
+export interface ReconciliationAttachment {
+  readonly filename: string;
+  readonly contentBase64?: string;
+  readonly contentType?: string;
+}
+
+/**
+ * The immutable outbound facts required to confirm a provider message.
+ * `to` accepts the persisted scalar form as well as the normalized list form
+ * used by provider pages. Attachments are intentionally optional at this
+ * boundary, but an omitted list cannot prove that no attachment was sent.
+ */
+export interface ReconciliationSnapshot {
+  readonly to: string | readonly string[];
+  readonly cc: readonly string[];
+  readonly bcc: readonly string[];
+  readonly subject: string;
+  readonly body: string;
+  readonly attachments?: readonly ReconciliationAttachment[];
+  readonly threadId?: string;
+}
+
+export type ReconciliationReadAdmission =
+  | { readonly allowed: true; readonly snapshot: ReconciliationSnapshot }
+  | { readonly allowed: false; readonly reason?: string };
+
 export type ReconciliationResult =
   | { readonly kind: "confirmed"; readonly message: ReconciliationMessage }
-  | { readonly kind: "unknown"; readonly reason: "empty" | "ambiguous" | "malformed" };
+  | { readonly kind: "unknown"; readonly reason: "empty" | "ambiguous" | "malformed" | "exhausted" };
 
 function denial(code: CommunicationDenialCode, message: string): CommunicationDenial {
   return { ok: false, code, message };
@@ -397,20 +438,63 @@ export function sanitizeInboundContent(message: Pick<InboundMessage, "text" | "h
   };
 }
 
-export function parseProviderReconciliationMessages(value: unknown): readonly ReconciliationMessage[] | null {
+export interface ProviderReconciliationPage {
+  readonly messages: readonly ReconciliationMessage[];
+  /** The provider's opaque continuation token, or `null` at the end. */
+  readonly nextPageToken: string | null;
+}
+
+function optionalAddressList(value: unknown): readonly string[] | null {
+  if (value === undefined) return null;
+  return parseAddressList(value);
+}
+
+function parseReconciliationAttachments(value: unknown): readonly ReconciliationAttachment[] | null {
+  if (value === undefined) return null;
+  if (!Array.isArray(value)) return null;
+  const parsed: ReconciliationAttachment[] = [];
+  for (const candidate of value) {
+    if (!isRecord(candidate) || !nonEmptyString(candidate["filename"])) return null;
+    const content = candidate["contentBase64"] ?? candidate["content"];
+    const contentType = candidate["contentType"] ?? candidate["content_type"];
+    if (content !== undefined && !nonEmptyString(content)) return null;
+    if (contentType !== undefined && !nonEmptyString(contentType)) return null;
+    parsed.push({
+      filename: candidate["filename"],
+      ...(typeof content === "string" ? { contentBase64: content } : {}),
+      ...(typeof contentType === "string" ? { contentType } : {}),
+    });
+  }
+  return parsed;
+}
+
+function parseProviderReconciliationPageValue(value: unknown): ProviderReconciliationPage | null {
   if (!isRecord(value)) return null;
   const candidates = value["messages"] ?? value["data"] ?? value["items"];
   if (!Array.isArray(candidates)) return null;
+  if (candidates.length > MAX_RECONCILIATION_RESULTS) return null;
   const parsed: ReconciliationMessage[] = [];
-  for (const candidate of candidates.slice(0, MAX_RECONCILIATION_RESULTS)) {
+  for (const candidate of candidates) {
     if (!isRecord(candidate)) return null;
     const messageId = candidate["message_id"];
     const threadId = candidate["thread_id"];
     const to = parseAddressList(candidate["to"]);
+    const cc = optionalAddressList(candidate["cc"]);
+    const bcc = optionalAddressList(candidate["bcc"]);
     const subject = candidate["subject"];
-    const text = candidate["text"];
+    const text = candidate["text"] ?? candidate["body"];
+    const attachments = parseReconciliationAttachments(candidate["attachments"]);
     const headers = candidate["headers"];
-    if (!nonEmptyString(messageId) || !nonEmptyString(threadId) || to === null || typeof subject !== "string" || typeof text !== "string") {
+    if (
+      !nonEmptyString(messageId) ||
+      !nonEmptyString(threadId) ||
+      to === null ||
+      (candidate["cc"] !== undefined && cc === null) ||
+      (candidate["bcc"] !== undefined && bcc === null) ||
+      typeof subject !== "string" ||
+      typeof text !== "string" ||
+      (candidate["attachments"] !== undefined && attachments === null)
+    ) {
       return null;
     }
     const normalizedHeaders: Record<string, string> = {};
@@ -421,30 +505,97 @@ export function parseProviderReconciliationMessages(value: unknown): readonly Re
         normalizedHeaders[key.toLowerCase()] = headerValue;
       }
     }
-    parsed.push({ messageId, threadId, to, subject, text, headers: normalizedHeaders });
+    parsed.push({ messageId, threadId, to, cc, bcc, subject, text, attachments, headers: normalizedHeaders });
   }
-  return parsed;
+  const rawNextPageToken =
+    value["next_page_token"] ??
+    value["nextPageToken"] ??
+    value["next_cursor"] ??
+    value["nextCursor"] ??
+    null;
+  if (rawNextPageToken !== null && (!nonEmptyString(rawNextPageToken) || rawNextPageToken.length > 512)) return null;
+  return { messages: parsed, nextPageToken: rawNextPageToken === null ? null : rawNextPageToken };
+}
+
+export function parseProviderReconciliationPage(value: unknown): ProviderReconciliationPage | null {
+  return parseProviderReconciliationPageValue(value);
+}
+
+export function parseProviderReconciliationMessages(value: unknown): readonly ReconciliationMessage[] | null {
+  const page = parseProviderReconciliationPageValue(value);
+  return page?.messages ?? null;
+}
+
+function normalizedRecipients(value: readonly string[] | string): readonly string[] {
+  const values = typeof value === "string" ? [value] : value;
+  return values.map(normalizeMailbox).sort();
+}
+
+function sameRecipients(actual: readonly string[] | null | undefined, expected: readonly string[] | string): boolean {
+  if (actual === null || actual === undefined) return false;
+  const left = normalizedRecipients(actual);
+  const right = normalizedRecipients(expected);
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function sameAttachments(
+  actual: readonly ReconciliationAttachment[] | null | undefined,
+  expected: readonly ReconciliationAttachment[] | undefined,
+): boolean {
+  if (actual === null || actual === undefined || expected === undefined || actual.length !== expected.length) return false;
+  return actual.every((attachment, index) => {
+    const wanted = expected[index];
+    if (wanted === undefined || attachment.filename !== wanted.filename) return false;
+    if ((attachment.contentBase64 ?? undefined) !== (wanted.contentBase64 ?? undefined)) return false;
+    return (attachment.contentType ?? undefined) === (wanted.contentType ?? undefined);
+  });
+}
+
+function exactSnapshotMatch(message: ReconciliationMessage, snapshot: ReconciliationSnapshot): boolean {
+  return (
+    sameRecipients(message.to, snapshot.to) &&
+    sameRecipients(message.cc, snapshot.cc) &&
+    sameRecipients(message.bcc, snapshot.bcc) &&
+    message.subject === snapshot.subject &&
+    message.text === snapshot.body &&
+    sameAttachments(message.attachments, snapshot.attachments) &&
+    (snapshot.threadId === undefined || message.threadId === snapshot.threadId)
+  );
 }
 
 export function reconcileProviderMessages(
   messages: readonly ReconciliationMessage[],
-  expected: { readonly recipient: string; readonly subject: string; readonly operationLabel: string },
+  expected:
+    | { readonly snapshot: ReconciliationSnapshot; readonly operationLabel?: string }
+    | { readonly recipient: string; readonly subject: string; readonly operationLabel: string },
 ): ReconciliationResult {
-  const recipient = normalizeMailbox(expected.recipient);
-  const matches = messages.filter((message) => {
-    const recipients = message.to.map(normalizeMailbox);
-    const label = message.headers["x-openingos-operation"] ?? message.headers["x-openingos-operation-label"];
-    return (
-      recipients.includes(recipient) &&
-      message.subject === expected.subject &&
-      label === expected.operationLabel
-    );
-  });
+  if (!("snapshot" in expected)) return { kind: "unknown", reason: "malformed" };
+  const matches = messages.filter((message) => exactSnapshotMatch(message, expected.snapshot));
+  if (matches.length === 0) return { kind: "unknown", reason: "empty" };
+  const operationLabel = expected.operationLabel?.trim();
+  if (operationLabel !== undefined && operationLabel.length > 0) {
+    const correlated = matches.filter((message) => {
+      const label = message.headers["x-openingos-operation"] ?? message.headers["x-openingos-operation-label"];
+      return label === operationLabel;
+    });
+    if (correlated.length === 1) {
+      const message = correlated[0];
+      if (message !== undefined) return { kind: "confirmed", message };
+    }
+    // A missing label can still be confirmed when the immutable content is
+    // unique. A present, conflicting label is evidence for another request.
+    if (matches.length === 1) {
+      const only = matches[0];
+      const label = only?.headers["x-openingos-operation"] ?? only?.headers["x-openingos-operation-label"];
+      if (only !== undefined && label === undefined) return { kind: "confirmed", message: only };
+    }
+    return { kind: "unknown", reason: "ambiguous" };
+  }
   if (matches.length === 1) {
     const message = matches[0];
     if (message !== undefined) return { kind: "confirmed", message };
   }
-  return { kind: "unknown", reason: matches.length === 0 ? "empty" : "ambiguous" };
+  return { kind: "unknown", reason: "ambiguous" };
 }
 
 export function serializeProviderEventForBinding(event: ParsedProviderEvent): string {
