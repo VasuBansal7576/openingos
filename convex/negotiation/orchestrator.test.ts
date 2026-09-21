@@ -279,6 +279,7 @@ interface Fixture {
   sendJobId: Id<"jobs">;
   sendGrantId: Id<"grants">;
   conversationId?: Id<"conversations">;
+  senderSeedConversationId: Id<"conversations">;
   draftBody: string;
   expectedDraftSources: Array<{ sourceId: string; version: string; locator: string }>;
 }
@@ -564,6 +565,55 @@ async function createFixture(
   });
   if (!sendReservation.ok) throw new Error(`send reservation setup failed: ${sendReservation.message}`);
 
+  // Astra F1 sender-binding seed: the server-owned project inbox lives in
+  // the protected provider-binding contract (threadBindings), established
+  // here the way a coordinator binds a known controlled inbox. The seed
+  // conversation is standalone so mandate/quote/conversation fences keep
+  // their exact behavior; resolution finds the project's single established
+  // inbox through it. Negotiations with their own bound conversation also
+  // get that conversation bound to the same inbox.
+  const senderSeedConversationId = await t.run(async (ctx) => {
+    const seedConversationId = await ctx.db.insert("conversations", {
+      organizationId,
+      projectId,
+      grantId: sendGrant.grantId,
+      version: 1,
+      state: "awaitingReply",
+      recipientConfigVersion: 1,
+      updatedAt: Date.now(),
+    });
+    await ctx.db.insert("threadBindings", {
+      provider: "agentmail-binding",
+      environment: "live",
+      providerThreadId: "seed-thread-e12",
+      providerInboxId: INBOX_ID,
+      organizationId,
+      projectId,
+      conversationId: seedConversationId,
+      operationId: draftOperation.operationId,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+    return seedConversationId;
+  });
+  if (overrides.conversation !== undefined && conversationId !== undefined) {
+    const boundConversationId: Id<"conversations"> = conversationId;
+    await t.run(async (ctx) => {
+      await ctx.db.insert("threadBindings", {
+        provider: "agentmail-binding",
+        environment: "live",
+        providerThreadId: "seed-thread-e12-conversation",
+        providerInboxId: INBOX_ID,
+        organizationId,
+        projectId,
+        conversationId: boundConversationId,
+        operationId: draftOperation.operationId,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      });
+    });
+  }
+
   return {
     t,
     organizationId,
@@ -575,6 +625,7 @@ async function createFixture(
     sendJobId: sendJob.jobId,
     sendGrantId: sendGrant.grantId,
     ...(conversationId === undefined ? {} : { conversationId }),
+    senderSeedConversationId,
     draftBody,
     expectedDraftSources: draftWorkload.sources.map(({ sourceId, version, locator }) => ({
       sourceId,
@@ -1242,47 +1293,47 @@ describe("E12 Devin 4060796928: bound replies stop obsolete follow-ups", () => {
   });
 });
 
+async function runPrepare(
+  fixture: Fixture,
+  plan: StubPlan,
+  move: "clarify" | "counter" = "clarify",
+) {
+  const log = installFetchStub(plan, {
+    draftKind: move,
+    sources: fixture.expectedDraftSources,
+    content: fixture.draftBody,
+  });
+  const result = await fixture.t.withIdentity(OWNER).action(prepareRef, {
+    negotiationId: fixture.negotiationId,
+    jevOperationId: fixture.jevOperationId,
+    draftOperationId: fixture.draftOperationId,
+  });
+  return { result, log };
+}
+
+async function runDispatch(
+  fixture: Fixture,
+  requestId: string,
+  envelopeCanonical: string,
+  plan: StubPlan,
+  extra: { requestText?: string; identity?: { tokenIdentifier: string }; inboxId?: string } = {},
+) {
+  const log = installFetchStub(plan, {
+    draftKind: "clarify",
+    sources: fixture.expectedDraftSources,
+    content: fixture.draftBody,
+  });
+  const result = await fixture.t.withIdentity(extra.identity ?? OWNER).action(dispatchRef, {
+    negotiationId: fixture.negotiationId,
+    requestId,
+    envelopeCanonical,
+    inboxId: extra.inboxId ?? INBOX_ID,
+    ...(extra.requestText === undefined ? {} : { requestText: extra.requestText }),
+  });
+  return { result, log };
+}
+
 describe("E12 Devin 4060796714: two-phase prepare and dispatch", () => {
-  async function runPrepare(
-    fixture: Fixture,
-    plan: StubPlan,
-    move: "clarify" | "counter" = "clarify",
-  ) {
-    const log = installFetchStub(plan, {
-      draftKind: move,
-      sources: fixture.expectedDraftSources,
-      content: fixture.draftBody,
-    });
-    const result = await fixture.t.withIdentity(OWNER).action(prepareRef, {
-      negotiationId: fixture.negotiationId,
-      jevOperationId: fixture.jevOperationId,
-      draftOperationId: fixture.draftOperationId,
-    });
-    return { result, log };
-  }
-
-  async function runDispatch(
-    fixture: Fixture,
-    requestId: string,
-    envelopeCanonical: string,
-    plan: StubPlan,
-    extra: { requestText?: string; identity?: { tokenIdentifier: string } } = {},
-  ) {
-    const log = installFetchStub(plan, {
-      draftKind: "clarify",
-      sources: fixture.expectedDraftSources,
-      content: fixture.draftBody,
-    });
-    const result = await fixture.t.withIdentity(extra.identity ?? OWNER).action(dispatchRef, {
-      negotiationId: fixture.negotiationId,
-      requestId,
-      envelopeCanonical,
-      inboxId: INBOX_ID,
-      ...(extra.requestText === undefined ? {} : { requestText: extra.requestText }),
-    });
-    return { result, log };
-  }
-
   test("prepare with hold move waits without drafting, operating, or consuming", async () => {
     const t = init();
     const fixture = await createFixture(t);
@@ -1564,5 +1615,317 @@ describe("E12 Devin 4060797122: bounded capacity search", () => {
     });
     expect(result).toMatchObject({ ok: true, outcome: "sent" });
     expect(log.agentmail).toHaveLength(1);
+  });
+});
+
+describe("E12 Astra F1: server-owned sender inbox binding", () => {
+  test("unbound project sender fails closed with zero provider calls", async () => {
+    const t = init();
+    const fixture = await createFixture(t);
+    await t.run(async (ctx) => {
+      const rows = await ctx.db.query("threadBindings").take(100);
+      for (const row of rows) await ctx.db.delete(row._id);
+    });
+    const envelope = canonicalJson(sendEnvelope(OWNER_MAILBOX, fixture.draftBody));
+    const before = await tableCounts(t);
+    const { result, log } = await runDispatch(fixture, "req-e12-f1-unbound", envelope, {});
+    expect(result).toMatchObject({ ok: false, code: "sender-inbox-unbound" });
+    expect(log.jev).toHaveLength(0);
+    expect(log.openai).toHaveLength(0);
+    expect(log.agentmail).toHaveLength(0);
+    const after = await tableCounts(t);
+    expect(after.operations).toBe(before.operations);
+    expect(after.outboundSnapshots).toBe(before.outboundSnapshots);
+    expect(after.negotiations).toEqual([{ roundsUsed: 0, state: "active" }]);
+  });
+
+  test("foreign sender inbox fails closed with zero provider calls", async () => {
+    const t = init();
+    const fixture = await createFixture(t);
+    const envelope = canonicalJson(sendEnvelope(OWNER_MAILBOX, fixture.draftBody));
+    const before = await tableCounts(t);
+    const { result, log } = await runDispatch(fixture, "req-e12-f1-foreign", envelope, {}, {
+      inboxId: "inbox-foreign-1",
+    });
+    expect(result).toMatchObject({ ok: false, code: "sender-inbox-foreign" });
+    expect(log.jev).toHaveLength(0);
+    expect(log.openai).toHaveLength(0);
+    expect(log.agentmail).toHaveLength(0);
+    const after = await tableCounts(t);
+    expect(after.operations).toBe(before.operations);
+    expect(after.outboundSnapshots).toBe(before.outboundSnapshots);
+    expect(after.negotiations).toEqual([{ roundsUsed: 0, state: "active" }]);
+  });
+
+  test("cross-project sender inbox fails closed with zero provider calls", async () => {
+    const t = init();
+    const fixture = await createFixture(t);
+    const asOwner = t.withIdentity(OWNER);
+    const projectB = await asOwner.mutation(createProjectRef, {
+      organizationId: fixture.organizationId,
+      name: "E12 second controlled project",
+      visibility: "open",
+    });
+    if (!projectB.ok) throw new Error(`second project setup failed: ${projectB.message}`);
+    const otherInbox = "inbox-e12-other";
+    await t.run(async (ctx) => {
+      const conversationId = await ctx.db.insert("conversations", {
+        organizationId: fixture.organizationId,
+        projectId: projectB.projectId,
+        grantId: fixture.sendGrantId,
+        version: 1,
+        state: "awaitingReply",
+        recipientConfigVersion: 1,
+        updatedAt: Date.now(),
+      });
+      await ctx.db.insert("threadBindings", {
+        provider: "agentmail-binding",
+        environment: "live",
+        providerThreadId: "seed-thread-e12-other",
+        providerInboxId: otherInbox,
+        organizationId: fixture.organizationId,
+        projectId: projectB.projectId,
+        conversationId,
+        operationId: fixture.draftOperationId,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      });
+    });
+    const envelope = canonicalJson(sendEnvelope(OWNER_MAILBOX, fixture.draftBody));
+    const { result, log } = await runDispatch(fixture, "req-e12-f1-cross", envelope, {}, {
+      inboxId: otherInbox,
+    });
+    // The other project's bound inbox does not authorize this project.
+    expect(result).toMatchObject({ ok: false, code: "sender-inbox-foreign" });
+    expect(log.jev).toHaveLength(0);
+    expect(log.openai).toHaveLength(0);
+    expect(log.agentmail).toHaveLength(0);
+    const rounds = await t.run(async (ctx) => (await ctx.db.get(fixture.negotiationId))?.roundsUsed);
+    expect(rounds).toBe(0);
+  });
+
+  test("stale sender binding on closed conversations fails closed", async () => {
+    const t = init();
+    const fixture = await createFixture(t);
+    await t.run(async (ctx) => {
+      const rows = await ctx.db.query("conversations").take(10);
+      for (const row of rows) {
+        await ctx.db.patch(row._id, { state: "closed", updatedAt: Date.now() });
+      }
+    });
+    const envelope = canonicalJson(sendEnvelope(OWNER_MAILBOX, fixture.draftBody));
+    const { result, log } = await runDispatch(fixture, "req-e12-f1-stale", envelope, {});
+    expect(result).toMatchObject({ ok: false, code: "sender-inbox-stale" });
+    expect(log.jev).toHaveLength(0);
+    expect(log.openai).toHaveLength(0);
+    expect(log.agentmail).toHaveLength(0);
+    const rounds = await t.run(async (ctx) => (await ctx.db.get(fixture.negotiationId))?.roundsUsed);
+    expect(rounds).toBe(0);
+  });
+
+  test("single-step flow with foreign inbox denies before any model call", async () => {
+    const t = init();
+    const fixture = await createFixture(t);
+    const log = installFetchStub({}, {
+      draftKind: "clarify",
+      sources: fixture.expectedDraftSources,
+      content: fixture.draftBody,
+    });
+    const result = await t.withIdentity(OWNER).action(runStepRef, {
+      negotiationId: fixture.negotiationId,
+      requestId: "req-e12-f1-step-foreign",
+      jevOperationId: fixture.jevOperationId,
+      draftOperationId: fixture.draftOperationId,
+      inboxId: "inbox-foreign-1",
+    });
+    expect(result).toMatchObject({ ok: false, code: "sender-inbox-foreign" });
+    expect(log.jev).toHaveLength(0);
+    expect(log.openai).toHaveLength(0);
+    expect(log.agentmail).toHaveLength(0);
+    const rounds = await t.run(async (ctx) => (await ctx.db.get(fixture.negotiationId))?.roundsUsed);
+    expect(rounds).toBe(0);
+  });
+});
+
+describe("E12 Astra F3: exact-replay idempotency", () => {
+  test("same requestId with changed body conflicts with one provider call", async () => {
+    const t = init();
+    const fixture = await createFixture(t);
+    const envelope = canonicalJson(sendEnvelope(OWNER_MAILBOX, fixture.draftBody));
+    const first = await runDispatch(fixture, "req-e12-f3-body", envelope, {});
+    expect(first.result).toMatchObject({ ok: true, outcome: "sent" });
+    expect(first.log.agentmail).toHaveLength(1);
+    const changed = canonicalJson(sendEnvelope(OWNER_MAILBOX, COUNTER_BODY));
+    const second = await runDispatch(fixture, "req-e12-f3-body", changed, {});
+    expect(second.result).toMatchObject({ ok: false, code: "duplicate-conflict" });
+    expect(second.log.jev).toHaveLength(0);
+    expect(second.log.openai).toHaveLength(0);
+    expect(second.log.agentmail).toHaveLength(0);
+    const state = await t.run(async (ctx) => ({
+      rounds: (await ctx.db.get(fixture.negotiationId))?.roundsUsed,
+      jobState: (await ctx.db.get(fixture.sendJobId))?.state,
+      operations: (await ctx.db.query("operations").take(100)).length,
+    }));
+    expect(state.rounds).toBe(1);
+    expect(state.jobState).toBe("waitingForSupplier");
+    // Jev + draft + exactly one send operation; the conflict creates nothing.
+    expect(state.operations).toBe(3);
+  });
+
+  test("same requestId with changed inbox conflicts instead of sending", async () => {
+    const t = init();
+    const fixture = await createFixture(t);
+    const envelope = canonicalJson(sendEnvelope(OWNER_MAILBOX, fixture.draftBody));
+    const first = await runDispatch(fixture, "req-e12-f3-inbox", envelope, {});
+    expect(first.result).toMatchObject({ ok: true, outcome: "sent" });
+    const second = await runDispatch(fixture, "req-e12-f3-inbox", envelope, {}, {
+      inboxId: "inbox-foreign-1",
+    });
+    // The replay binds the sender before dedup, so the changed inbox is a
+    // changed-payload conflict, not a fresh foreign-inbox denial.
+    expect(second.result).toMatchObject({ ok: false, code: "duplicate-conflict" });
+    expect(second.log.agentmail).toHaveLength(0);
+    const rounds = await t.run(async (ctx) => (await ctx.db.get(fixture.negotiationId))?.roundsUsed);
+    expect(rounds).toBe(1);
+  });
+
+  test("same requestId on another negotiation conflicts", async () => {
+    const t = init();
+    const fixture = await createFixture(t);
+    const envelope = canonicalJson(sendEnvelope(OWNER_MAILBOX, fixture.draftBody));
+    const first = await runDispatch(fixture, "req-e12-f3-neg", envelope, {});
+    expect(first.result).toMatchObject({ ok: true, outcome: "sent" });
+    const negotiationId2 = await t.run(async (ctx) => {
+      const negotiation = await ctx.db.get(fixture.negotiationId);
+      if (negotiation === null) throw new Error("missing negotiation");
+      return await ctx.db.insert("negotiations", {
+        organizationId: negotiation.organizationId,
+        projectId: negotiation.projectId,
+        quoteId: negotiation.quoteId,
+        quoteVersion: negotiation.quoteVersion,
+        currency: negotiation.currency,
+        mandateHash: negotiation.mandateHash,
+        ...(negotiation.targetMinorUnits === undefined ? {} : { targetMinorUnits: negotiation.targetMinorUnits }),
+        roundLimit: negotiation.roundLimit,
+        roundsUsed: 0,
+        state: "active",
+        expiresAt: Date.now() + 60 * 60 * 1000,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      });
+    });
+    const log = installFetchStub({}, {
+      draftKind: "clarify",
+      sources: fixture.expectedDraftSources,
+      content: fixture.draftBody,
+    });
+    const second = await t.withIdentity(OWNER).action(dispatchRef, {
+      negotiationId: negotiationId2,
+      requestId: "req-e12-f3-neg",
+      envelopeCanonical: envelope,
+      inboxId: INBOX_ID,
+    });
+    expect(second).toMatchObject({ ok: false, code: "duplicate-conflict" });
+    expect(log.agentmail).toHaveLength(0);
+  });
+
+  test("same requestId in another project conflicts", async () => {
+    const t = init();
+    const fixture = await createFixture(t);
+    const envelope = canonicalJson(sendEnvelope(OWNER_MAILBOX, fixture.draftBody));
+    const first = await runDispatch(fixture, "req-e12-f3-proj", envelope, {});
+    expect(first.result).toMatchObject({ ok: true, outcome: "sent" });
+    const asOwner = t.withIdentity(OWNER);
+    const projectB = await asOwner.mutation(createProjectRef, {
+      organizationId: fixture.organizationId,
+      name: "E12 replay project",
+      visibility: "open",
+    });
+    if (!projectB.ok) throw new Error(`replay project setup failed: ${projectB.message}`);
+    const quoteB = await t.run(async (ctx) => {
+      const quote = await ctx.db.get(fixture.quoteId);
+      if (quote === null) throw new Error("missing quote");
+      return await ctx.db.insert("quotes", {
+        organizationId: fixture.organizationId,
+        projectId: projectB.projectId,
+        version: quote.version,
+        contentHash: quote.contentHash,
+        currency: quote.currency,
+        lines: quote.lines,
+        charges: [],
+        taxBasis: quote.taxBasis,
+        evidenceRefs: [],
+        counterpartyRole: "ownerStandIn",
+        executionMode: "fixture",
+        createdAt: Date.now(),
+      });
+    });
+    const negotiationB = await t.run(async (ctx) => {
+      return await ctx.db.insert("negotiations", {
+        organizationId: fixture.organizationId,
+        projectId: projectB.projectId,
+        quoteId: quoteB,
+        quoteVersion: "qv-1",
+        currency: "EUR",
+        mandateHash: "hash-qv-1",
+        roundLimit: 3,
+        roundsUsed: 0,
+        state: "active",
+        expiresAt: Date.now() + 60 * 60 * 1000,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      });
+    });
+    const log = installFetchStub({}, {
+      draftKind: "clarify",
+      sources: fixture.expectedDraftSources,
+      content: fixture.draftBody,
+    });
+    // The request key is organization-scoped, so this reaches the stored
+    // operation from the first project and must conflict on project scope.
+    const second = await t.withIdentity(OWNER).action(dispatchRef, {
+      negotiationId: negotiationB,
+      requestId: "req-e12-f3-proj",
+      envelopeCanonical: envelope,
+      inboxId: INBOX_ID,
+    });
+    expect(second).toMatchObject({ ok: false, code: "duplicate-conflict" });
+    expect(log.agentmail).toHaveLength(0);
+  });
+
+  test("concurrent same-key dispatches send exactly once", async () => {
+    const t = init();
+    const fixture = await createFixture(t);
+    const envelope = canonicalJson(sendEnvelope(OWNER_MAILBOX, fixture.draftBody));
+    const log = installFetchStub({}, {
+      draftKind: "clarify",
+      sources: fixture.expectedDraftSources,
+      content: fixture.draftBody,
+    });
+    const asOwner = t.withIdentity(OWNER);
+    const [first, second] = await Promise.all([
+      asOwner.action(dispatchRef, {
+        negotiationId: fixture.negotiationId,
+        requestId: "req-e12-f3-race",
+        envelopeCanonical: envelope,
+        inboxId: INBOX_ID,
+      }),
+      asOwner.action(dispatchRef, {
+        negotiationId: fixture.negotiationId,
+        requestId: "req-e12-f3-race",
+        envelopeCanonical: envelope,
+        inboxId: INBOX_ID,
+      }),
+    ]);
+    const outcomes = [first, second].map((result) =>
+      result.ok ? result.outcome : `denied:${result.code}`,
+    ).sort();
+    expect(log.agentmail).toHaveLength(1);
+    const rounds = await t.run(async (ctx) => (await ctx.db.get(fixture.negotiationId))?.roundsUsed);
+    expect(rounds).toBe(1);
+    // One attempt sends; the loser deduplicates (or honestly waits on the
+    // in-flight attempt) without a second provider call.
+    expect(outcomes[1]).toBe("sent");
+    expect(["deduplicated", "waiting"]).toContain(outcomes[0]);
   });
 });

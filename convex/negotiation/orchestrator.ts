@@ -17,6 +17,13 @@
  * - The recipient is always the single server-configured owner mailbox read
  *   from `recipientConfigs`. Callers, models, and reply headers cannot set
  *   it. Missing or changed configuration fails closed before any send.
+ * - The sender is always the server-owned provider inbox resolved from the
+ *   existing protected provider-binding contract (`threadBindings`) for the
+ *   bound conversation, else the project. A caller-supplied inbox must equal
+ *   that binding exactly; missing, foreign, stale, ambiguous, or
+ *   cross-project bindings fail closed with zero provider calls and no
+ *   round/job advancement. The sender binding is also compared before any
+ *   observed-success deduplication, so a changed same-key replay conflicts.
  * - Every consequential transition re-reads and pins project, grant,
  *   capability, mandate, quote, conversation, and job authority. E6 fences
  *   run before the first provider call AND again after drafting, immediately
@@ -53,7 +60,7 @@ import type {
 import { v } from "convex/values";
 import type { Id } from "../_generated/dataModel.js";
 import { f1Action, f1InternalMutation, f1InternalQuery, f1Query } from "../server.js";
-import type { F1DataModel } from "../server.js";
+import type { F1DataModel, F1QueryCtx } from "../server.js";
 import type { GenericActionCtx } from "convex/server";
 import {
   checkNegotiationBounds,
@@ -878,20 +885,235 @@ const discoverCapacityRef = makeFunctionReference<
 >("negotiation/orchestrator:discoverSendCapacity");
 
 /**
- * Pre-flight send-operation check: an identical in-flight or terminal send
- * operation for this request key short-circuits the step with zero provider
- * calls. A prepared operation left by a crashed attempt stays unknown under
- * reconciliation; it is never blindly resumed here.
+ * Server-owned sender-inbox resolution (Astra F1 repair).
+ *
+ * The caller-supplied `inboxId` is never trusted as authority. The
+ * application-side sender is the provider inbox recorded in the existing
+ * protected provider-binding contract (`threadBindings`: provider,
+ * environment, organization, project, provider inbox/thread, application
+ * conversation/operation), assigned server-side per sponsor-contracts. A
+ * negotiation bound to a conversation must use that conversation's single
+ * bound inbox; a negotiation without one must use the project's single
+ * established inbox. Missing, foreign, stale (closed/cancelled), ambiguous,
+ * or cross-project bindings fail closed with zero provider calls.
+ */
+const SENDER_BINDING_SCAN_WINDOW = 65;
+
+type SenderScope = {
+  readonly organizationId: Id<"organizations">;
+  readonly projectId: Id<"projects">;
+  readonly conversationId: Id<"conversations"> | undefined;
+};
+
+async function collectConversationInbox(
+  ctx: F1QueryCtx,
+  scope: SenderScope,
+  conversation: {
+    readonly _id: Id<"conversations">;
+    readonly organizationId: Id<"organizations">;
+    readonly projectId: Id<"projects">;
+    readonly state: string;
+  },
+  inboxes: Set<string>,
+): Promise<{ readonly ok: true; readonly sawBinding: boolean } | { readonly ok: false; readonly code: string; readonly message: string }> {
+  const rows = await ctx.db
+    .query("threadBindings")
+    .withIndex("by_conversation", (q) => q.eq("conversationId", conversation._id))
+    .take(SENDER_BINDING_SCAN_WINDOW + 1);
+  if (rows.length > SENDER_BINDING_SCAN_WINDOW) {
+    return {
+      ok: false as const,
+      code: "sender-inbox-conflict",
+      message: "sender binding search exceeded its bounded window without proving unanimity",
+    };
+  }
+  let sawBinding = false;
+  for (const row of rows) {
+    if (row.provider !== "agentmail-binding" || row.environment !== "live") continue;
+    if (row.organizationId !== scope.organizationId || row.projectId !== scope.projectId) {
+      return {
+        ok: false as const,
+        code: "sender-inbox-cross-project",
+        message: "sender binding belongs to another organization or project",
+      };
+    }
+    sawBinding = true;
+    inboxes.add(row.providerInboxId);
+  }
+  return { ok: true as const, sawBinding };
+}
+
+async function resolveServerSenderInbox(
+  ctx: F1QueryCtx,
+  scope: SenderScope,
+): Promise<{ readonly ok: true; readonly inboxId: string } | { readonly ok: false; readonly code: string; readonly message: string }> {
+  if (scope.conversationId !== undefined) {
+    const conversation = await ctx.db.get(scope.conversationId);
+    if (
+      conversation === null ||
+      conversation.organizationId !== scope.organizationId ||
+      conversation.projectId !== scope.projectId
+    ) {
+      return {
+        ok: false as const,
+        code: "sender-inbox-cross-project",
+        message: "sender binding conversation is not in this organization and project",
+      };
+    }
+    if (conversation.state === "closed" || conversation.state === "cancelled") {
+      return {
+        ok: false as const,
+        code: "sender-inbox-stale",
+        message: "sender binding conversation is closed; re-approval must establish a live binding",
+      };
+    }
+    const inboxes = new Set<string>();
+    const collected = await collectConversationInbox(ctx, scope, conversation, inboxes);
+    if (!collected.ok) return collected;
+    if (inboxes.size === 0) {
+      return {
+        ok: false as const,
+        code: "sender-inbox-unbound",
+        message: "no bound provider sender inbox authorizes this project conversation",
+      };
+    }
+    if (inboxes.size > 1) {
+      return {
+        ok: false as const,
+        code: "sender-inbox-conflict",
+        message: "sender binding is ambiguous for this project conversation",
+      };
+    }
+    return { ok: true as const, inboxId: [...inboxes][0] as string };
+  }
+  const conversations = await ctx.db
+    .query("conversations")
+    .withIndex("by_project", (q) => q.eq("projectId", scope.projectId))
+    .take(SENDER_BINDING_SCAN_WINDOW + 1);
+  if (conversations.length > SENDER_BINDING_SCAN_WINDOW) {
+    return {
+      ok: false as const,
+      code: "sender-inbox-conflict",
+      message: "sender binding search exceeded its bounded window without proving unanimity",
+    };
+  }
+  const inboxes = new Set<string>();
+  let sawBinding = false;
+  for (const conversation of conversations) {
+    if (conversation.organizationId !== scope.organizationId) {
+      return {
+        ok: false as const,
+        code: "sender-inbox-cross-project",
+        message: "sender binding belongs to another organization",
+      };
+    }
+    // Closed and cancelled conversations keep their historical binding but
+    // no longer authorize new sends; they count toward stale, not toward
+    // the live project inbox.
+    if (conversation.state === "closed" || conversation.state === "cancelled") {
+      const probe = new Set<string>();
+      const collected = await collectConversationInbox(ctx, scope, conversation, probe);
+      if (!collected.ok) return collected;
+      if (collected.sawBinding) sawBinding = true;
+      continue;
+    }
+    const collected = await collectConversationInbox(ctx, scope, conversation, inboxes);
+    if (!collected.ok) return collected;
+    if (collected.sawBinding) sawBinding = true;
+  }
+  if (inboxes.size === 1) {
+    return { ok: true as const, inboxId: [...inboxes][0] as string };
+  }
+  if (inboxes.size > 1) {
+    return {
+      ok: false as const,
+      code: "sender-inbox-conflict",
+      message: "sender binding is ambiguous for this project",
+    };
+  }
+  if (sawBinding) {
+    return {
+      ok: false as const,
+      code: "sender-inbox-stale",
+      message: "project sender bindings exist only on closed conversations",
+    };
+  }
+  return {
+    ok: false as const,
+    code: "sender-inbox-unbound",
+    message: "no bound provider sender inbox authorizes this project",
+  };
+}
+
+/**
+ * Server-owned sender-inbox gate for the negotiation send paths. Reads only;
+ * fails closed before any operation, claim, or provider call.
+ */
+export const resolveNegotiationSenderInbox = f1InternalQuery({
+  args: {
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    conversationId: v.optional(v.id("conversations")),
+    identity: v.string(),
+  },
+  returns: v.union(v.object({ ok: v.literal(true), inboxId: v.string() }), denialValidator),
+  handler: async (ctx, args) => {
+    if (args.identity.trim().length === 0) {
+      return { ok: false as const, code: "forged-identity", message: "missing identity proof" };
+    }
+    const access = await checkProjectAccess(
+      ctx,
+      args.identity,
+      args.organizationId,
+      args.projectId,
+      "approver",
+      Date.now(),
+    );
+    if (!access.ok) {
+      if (access.code === "denied-membership") return genericDenial();
+      return { ok: false as const, code: access.code, message: access.message };
+    }
+    return resolveServerSenderInbox(ctx, {
+      organizationId: args.organizationId,
+      projectId: args.projectId,
+      conversationId: args.conversationId,
+    });
+  },
+});
+
+const resolveSenderInboxRef = makeFunctionReference<
+  "query",
+  QueryArgs<typeof resolveNegotiationSenderInbox>,
+  QueryReturn<typeof resolveNegotiationSenderInbox>
+>("negotiation/orchestrator:resolveNegotiationSenderInbox");
+
+/**
+ * Pre-flight send-operation check (Astra F3 repair): the authorized
+ * organization/project/job/negotiation, canonical payload hash/envelope, and
+ * sender binding are compared BEFORE observed-success deduplication. Only an
+ * exact replay deduplicates. The same requestId with a changed body,
+ * subject, negotiation/project, or inbox returns conflict with no further
+ * state change. A prepared operation left by a crashed attempt stays unknown
+ * under reconciliation; it is never blindly resumed here.
  */
 export const inspectSendOperation = f1InternalQuery({
   args: {
     organizationId: v.string(),
+    projectId: v.id("projects"),
+    negotiationId: v.id("negotiations"),
     requestId: v.string(),
+    inboxId: v.string(),
+    envelopeCanonical: v.optional(v.string()),
     identity: v.string(),
   },
   returns: v.union(
     v.object({
-      status: v.union(v.literal("absent"), v.literal("deduplicated"), v.literal("unknown")),
+      status: v.union(
+        v.literal("absent"),
+        v.literal("deduplicated"),
+        v.literal("unknown"),
+        v.literal("conflict"),
+      ),
       requestKey: v.string(),
       payloadHash: v.optional(v.string()),
     }),
@@ -911,6 +1133,47 @@ export const inspectSendOperation = f1InternalQuery({
       .unique();
     if (existing === null) {
       return { status: "absent" as const, requestKey: key };
+    }
+    const conflict = { status: "conflict" as const, requestKey: key, payloadHash: existing.normalizedPayloadHash };
+    // The request key is organization-scoped, not project-scoped: a reused
+    // key must still prove the same project, job, negotiation, payload, and
+    // sender before any success may be reported.
+    if (String(existing.organizationId) !== args.organizationId || existing.projectId !== args.projectId) {
+      return conflict;
+    }
+    if (existing.negotiationAuthority?.negotiationId !== args.negotiationId) {
+      return conflict;
+    }
+    const job = await ctx.db.get(existing.jobId);
+    if (job === null || job.organizationId !== existing.organizationId || job.projectId !== existing.projectId) {
+      return conflict;
+    }
+    if (args.envelopeCanonical !== undefined) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(args.envelopeCanonical) as unknown;
+      } catch {
+        return conflict;
+      }
+      if (
+        typeof parsed !== "object" ||
+        parsed === null ||
+        canonicalJson(parsed) !== existing.normalizedPayload ||
+        payloadHash(parsed) !== existing.normalizedPayloadHash
+      ) {
+        return conflict;
+      }
+    }
+    // The stored operation's sender is the server-owned binding at first
+    // send (threadBindings for its bound conversation, else its project).
+    // A replay naming any other inbox conflicts instead of deduplicating.
+    const storedSender = await resolveServerSenderInbox(ctx, {
+      organizationId: existing.organizationId,
+      projectId: existing.projectId,
+      conversationId: existing.negotiationAuthority?.conversationId,
+    });
+    if (!storedSender.ok || storedSender.inboxId !== args.inboxId) {
+      return conflict;
     }
     if (existing.state === "observedSuccess") {
       return { status: "deduplicated" as const, requestKey: key, payloadHash: existing.normalizedPayloadHash };
@@ -1824,12 +2087,25 @@ export const dispatchApprovedDraft = f1Action({
     );
     if (!approved.ok) return deniedResult(approved.code, approved.message);
 
+    // F3: replay inspection binds project/negotiation/payload/sender before
+    // any deduplication, so a changed same-key replay conflicts here rather
+    // than reporting a false success or falling through to grant lookup.
     const prior = await ctx.runQuery(inspectOperationRef, {
       organizationId: String(pinned.organizationId),
+      projectId: pinned.projectId,
+      negotiationId: pinned.negotiationId,
       requestId: args.requestId,
+      inboxId: args.inboxId,
+      envelopeCanonical: args.envelopeCanonical,
       identity,
     });
     if (!("status" in prior)) return deniedResult(prior.code, prior.message);
+    if (prior.status === "conflict") {
+      return deniedResult(
+        "duplicate-conflict",
+        "request key reused with a changed payload, project, negotiation, or sender inbox",
+      );
+    }
     if (prior.status === "deduplicated") {
       return {
         ok: true as const,
@@ -1850,6 +2126,24 @@ export const dispatchApprovedDraft = f1Action({
         roundsUsedAfter: pinned.roundsUsed,
         redactedPreview: "waiting — prior attempt outcome is unknown under reconciliation",
       };
+    }
+
+    // F1: the caller-selected inbox must exactly equal the server-owned
+    // organization/project/conversation binding before any grant, operation,
+    // claim, or provider call. Missing, foreign, stale, ambiguous, or
+    // cross-project bindings fail closed here.
+    const senderBinding = await ctx.runQuery(resolveSenderInboxRef, {
+      organizationId: pinned.organizationId,
+      projectId: pinned.projectId,
+      ...(pinned.mandateConversationId === undefined ? {} : { conversationId: pinned.mandateConversationId }),
+      identity,
+    });
+    if (!senderBinding.ok) return deniedResult(senderBinding.code, senderBinding.message);
+    if (senderBinding.inboxId !== args.inboxId) {
+      return deniedResult(
+        "sender-inbox-foreign",
+        "provider sender inbox is not the bound project inbox",
+      );
     }
 
     const capacity = await ctx.runQuery(discoverCapacityRef, {
@@ -2063,12 +2357,38 @@ export const runNegotiationStep = f1Action({
     }
     const resolved = await resolvePins(ctx, args.negotiationId, identity, args.requestText);
     if (!resolved.ok) return deniedResult(resolved.code, resolved.message);
+    // A bound reply that arrived before this call stops the step before any
+    // replay, sender, readiness, or model effect, preserving the obsolete
+    // follow-up fence for the single-step flow.
+    if (approvedConversationGate(resolved.pinned).stopped) {
+      return {
+        ok: true as const,
+        outcome: "stopped" as const,
+        move: "none",
+        reason: "conversation-changed",
+        roundsUsedAfter: resolved.pinned.roundsUsed,
+        redactedPreview: "stopped — bound reply arrived; ingestion must update the mandate basis first",
+      };
+    }
+    // F3: bind the replay to project/negotiation/sender before dedup. No
+    // envelope exists yet (the draft is built below), so payload comparison
+    // happens in the dispatch phase; sender/project/negotiation conflicts
+    // still fail closed here with zero model calls.
     const prior = await ctx.runQuery(inspectOperationRef, {
       organizationId: String(resolved.pinned.organizationId),
+      projectId: resolved.pinned.projectId,
+      negotiationId: resolved.pinned.negotiationId,
       requestId: args.requestId,
+      inboxId: args.inboxId,
       identity,
     });
     if (!("status" in prior)) return deniedResult(prior.code, prior.message);
+    if (prior.status === "conflict") {
+      return deniedResult(
+        "duplicate-conflict",
+        "request key reused with a changed project, negotiation, or sender inbox",
+      );
+    }
     if (prior.status === "deduplicated") {
       return {
         ok: true as const,
@@ -2089,6 +2409,23 @@ export const runNegotiationStep = f1Action({
         roundsUsedAfter: resolved.pinned.roundsUsed,
         redactedPreview: "waiting — prior attempt outcome is unknown under reconciliation",
       };
+    }
+    // F1: exact sender-binding equality before the first model call, so a
+    // foreign or unbound inbox costs zero provider calls.
+    const senderBinding = await ctx.runQuery(resolveSenderInboxRef, {
+      organizationId: resolved.pinned.organizationId,
+      projectId: resolved.pinned.projectId,
+      ...(resolved.pinned.mandateConversationId === undefined
+        ? {}
+        : { conversationId: resolved.pinned.mandateConversationId }),
+      identity,
+    });
+    if (!senderBinding.ok) return deniedResult(senderBinding.code, senderBinding.message);
+    if (senderBinding.inboxId !== args.inboxId) {
+      return deniedResult(
+        "sender-inbox-foreign",
+        "provider sender inbox is not the bound project inbox",
+      );
     }
     const readiness = await ctx.runQuery(probeReadinessRef, {
       organizationId: resolved.pinned.organizationId,
