@@ -1540,3 +1540,57 @@ test("pending intake creation resolving after reconnect does not load the stale 
     await harness.cleanup();
   }
 });
+
+test("intake reconnect reuses the same key for an unchanged retry and loads the current success once", async () => {
+  const harness = await mountCreationEpochHarness();
+  try {
+    await harness.renderStatus("connected");
+    await waitForQueueLength(harness.discoverQueue, 1);
+    await act(async () => {
+      harness.discoverQueue[0]?.resolve(null);
+      await harness.discoverQueue[0]?.promise;
+    });
+    await waitForText(harness.container, "Open a workspace");
+
+    await harness.submitIntake("Harbor expansion", "Amsterdam, Netherlands");
+    await waitForQueueLength(harness.intakeQueue, 1);
+    const firstKey = harness.intakeCalls[0]?.idempotencyKey;
+    expect(firstKey?.trim().length).toBeGreaterThan(0);
+
+    await harness.renderStatus("reconnecting");
+    await waitForText(harness.container, "CONNECTION INTERRUPTED");
+    await harness.renderStatus("connected");
+    await waitForQueueLength(harness.discoverQueue, 2);
+
+    await act(async () => {
+      harness.intakeQueue[0]?.resolve({ ok: true, projectId: "project-intake-stale" });
+      await harness.intakeQueue[0]?.promise;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+    // Stale-epoch success loads nothing before the parent fence.
+    expect(harness.loadCalls).not.toContain("project-intake-stale");
+
+    await act(async () => {
+      harness.discoverQueue[1]?.resolve(null);
+      await harness.discoverQueue[1]?.promise;
+    });
+    await waitForText(harness.container, "Open a workspace");
+
+    // The remounted form mints a fresh UI key, but the parent reconciles the
+    // unchanged logical payload to the original server key.
+    await harness.submitIntake("Harbor expansion", "Amsterdam, Netherlands");
+    await waitForQueueLength(harness.intakeQueue, 2);
+    expect(harness.intakeCalls[1]?.idempotencyKey).toBe(firstKey);
+
+    await act(async () => {
+      harness.intakeQueue[1]?.resolve({ ok: true, projectId: "project-intake-fresh" });
+      await harness.intakeQueue[1]?.promise;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+    // Current-epoch success loads exactly its project, never the stale one.
+    expect(harness.loadCalls).not.toContain("project-intake-stale");
+    expect(harness.loadCalls.filter((id) => id === "project-intake-fresh")).toHaveLength(1);
+  } finally {
+    await harness.cleanup();
+  }
+});

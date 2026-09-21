@@ -109,6 +109,28 @@ export function applyLiveWorkbenchSnapshot(current: WorkbenchSnapshot, live: Wor
   };
 }
 
+/**
+ * Logical intake fingerprint for reconnect reconciliation: the stable payload
+ * identity without the transport idempotency key. An unchanged retry across a
+ * disconnect/remount must reuse the original server key; a changed payload
+ * must use its fresh key so the server never sees a duplicate-conflict.
+ */
+export function intakePayloadFingerprint(input: WorkbenchIntakeInput): string {
+  return JSON.stringify({
+    mode: input.mode,
+    projectName: input.projectName,
+    workspaceKind: input.workspaceKind,
+    region: input.region ?? null,
+    currency: input.currency ?? null,
+    needByAt: input.needByAt ?? null,
+    budgetMinorUnits: input.budgetMinorUnits ?? null,
+    detailTitle: input.detailTitle ?? null,
+    detailCategory: input.detailCategory ?? null,
+    detailSummary: input.detailSummary ?? null,
+    urgency: input.urgency ?? null,
+  });
+}
+
 const ANONYMOUS_SIGN_IN_FAILED =
   "Anonymous sign-in failed, so this browser has no authorized backend identity. No project state was read and nothing was sent. Retry to sign in again.";
 
@@ -230,6 +252,11 @@ export function AdapterAwareApp({
   };
   const onAuthDenialRef = useRef(onAuthDenial);
   onAuthDenialRef.current = onAuthDenial;
+  // Reconnect-safe intake key: the intake form remounts when the empty state
+  // leaves during disconnect, so a fresh mount would mint a fresh random key
+  // even for an unchanged logical retry. This remembers the last logical
+  // payload fingerprint and its original server key across epochs/remounts.
+  const lastIntakeAttemptRef = useRef<{ readonly fingerprint: string; readonly key: string } | null>(null);
   // A request context is tied to one project, adapter and connected client
   // generation. Reconnects, revocations and adapter replacement invalidate the
   // context before an old load can apply to a fresh snapshot for the same ID.
@@ -493,13 +520,25 @@ export function AdapterAwareApp({
     if (callingAdapter?.createIntake === undefined) {
       return { ok: false, message: "No server intake route is configured. Nothing was sent." };
     }
+    // Reconnect reconciliation: an unchanged logical payload reuses its
+    // original server key so the retry replays idempotently; a changed
+    // payload keeps its fresh key so the server never sees a
+    // duplicate-conflict. The mapping survives disconnect/remount epochs.
+    const fingerprint = intakePayloadFingerprint(input);
+    const remembered = lastIntakeAttemptRef.current;
+    const effectiveInput = remembered !== null && remembered.fingerprint === fingerprint
+      ? { ...input, idempotencyKey: remembered.key }
+      : input;
+    if (remembered === null || remembered.fingerprint !== fingerprint) {
+      lastIntakeAttemptRef.current = { fingerprint, key: input.idempotencyKey };
+    }
     // Bind this creation to the connection/auth epoch that dispatched it. A
     // completion from an older epoch (disconnect/reconnect, denial, or
     // adapter replacement racing a slow mutation) must not adopt the
     // returned project. See P-17, D-06, D-14.
     const dispatchEpoch = connectionEpochRef.current;
     try {
-      const result = await callingAdapter.createIntake(input);
+      const result = await callingAdapter.createIntake(effectiveInput);
       if (result.ok && result.projectId !== undefined) {
         if (dispatchEpoch !== connectionEpochRef.current || backendStatusRef.current !== "connected" || adapterRef.current !== callingAdapter) {
           const message = "The workspace may have been created but could not be loaded in this session. Reconnect or discovery can find authorized projects.";
