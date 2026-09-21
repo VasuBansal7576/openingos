@@ -92,6 +92,21 @@ function ActionButton({
   );
 }
 
+const FOCUSABLE_SELECTOR = [
+  "a[href]",
+  "button:not([disabled])",
+  "input:not([disabled])",
+  "select:not([disabled])",
+  "textarea:not([disabled])",
+  "[tabindex]:not([tabindex=\"-1\"])",
+].join(",");
+
+function focusableElements(container: HTMLElement): HTMLElement[] {
+  return Array.from(container.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter((element) => {
+    return !element.hasAttribute("hidden") && element.getAttribute("aria-hidden") !== "true";
+  });
+}
+
 function StatusDot({ state }: { readonly state: DeliveryState }) {
   return <span className={`wb-status-dot wb-status-${state}`} aria-hidden="true" />;
 }
@@ -274,7 +289,7 @@ function SelectionPanel({ offer, snapshot, onClose, onAction, onMessage }: { rea
     onMessage(result.ok ? "Selection request recorded by the server." : result.message ?? "Selection was not recorded.");
     if (result.ok) onClose();
   };
-  return <div className="wb-overlay"><section className="wb-selection-panel" role="dialog" aria-modal="true" aria-labelledby="selection-title"><div className="wb-panel-head"><div><span className="wb-eyebrow">DECISION REVIEW</span><h2 id="selection-title">{vendorName} · quote v{quote?.version ?? "unknown"}</h2></div><button className="wb-icon-button" type="button" onClick={onClose} aria-label="Close decision review"><Icon name="close" size={18} /></button></div><div className="wb-selection-content"><div className="wb-selection-brand"><span className="wb-vendor-monogram large">{vendorName.slice(0, 1).toUpperCase()}</span><div><h3>{offer.productModel}</h3><p>{offer.variant} · {vendorRegions}</p></div><ProvenancePill mode={offer.provenance} ownerAuthoredTerms={offer.ownerAuthoredTerms} /></div><QuoteSummary quote={quote} currency={snapshot.project.currency} /><div className="wb-decision-explanation"><Icon name="shield" size={19} /><div><strong>Selection is not an order.</strong><p>This exact quote would change the selected forecast only. It does not create a commitment, place an order or take payment.</p></div></div>{snapshot.access.capabilities.canApprove === null ? <div className="wb-inline-warning"><Icon name="lock" size={16} /> Approval authority is not represented in this projection.</div> : snapshot.access.capabilities.canApprove === false ? <div className="wb-inline-warning"><Icon name="lock" size={16} /> Your role cannot approve this decision. An authorized approver must review it.</div> : null}{quote?.superseded === true ? <div className="wb-inline-warning"><Icon name="warning" size={16} /> This quote version is superseded. Refresh the projection before approving.</div> : quote?.superseded === null ? <div className="wb-inline-warning"><Icon name="warning" size={16} /> Quote successor status is not represented in this projection.</div> : null}<ActionButton disabled={!onAction || !canSelect} onClick={() => { void choose(); }} title={!onAction ? "No server action is attached" : !canSelect ? "A complete, compatible, current quote and authorized capability are required" : undefined}>Select exact quote <Icon name="check" size={16} /></ActionButton><p className="wb-micro">No order will be placed. No payment will be taken.</p></div></section></div>;
+  return <div className="wb-overlay"><section className="wb-selection-panel" role="dialog" aria-modal="true" aria-labelledby="selection-title"><div className="wb-panel-head"><div><span className="wb-eyebrow">DECISION REVIEW</span><h2 id="selection-title">{vendorName} · quote v{quote?.version ?? "unknown"}</h2></div><button className="wb-icon-button" type="button" onClick={onClose} aria-label="Close decision review"><Icon name="close" size={18} /></button></div><div className="wb-selection-content"><div className="wb-selection-brand"><span className="wb-vendor-monogram large">{vendorName.slice(0, 1).toUpperCase()}</span><div><h3>{offer.productModel}</h3><p>{offer.variant} · {vendorRegions}</p></div><ProvenancePill mode={offer.provenance} ownerAuthoredTerms={offer.ownerAuthoredTerms} /></div><QuoteSummary quote={quote} currency={snapshot.project.currency} /><div className="wb-decision-explanation"><Icon name="shield" size={19} /><div><strong>Selection is not an order.</strong><p>This exact quote would change the selected forecast only. It does not create a commitment, place an order or take payment.</p></div></div>{snapshot.access.capabilities.canApprove === null ? <div className="wb-inline-warning"><Icon name="lock" size={16} /> Approval authority is not represented in this projection.</div> : snapshot.access.capabilities.canApprove === false ? <div className="wb-inline-warning"><Icon name="lock" size={16} /> Your role cannot approve this decision. An authorized approver must review it.</div> : null}{quote?.superseded === true ? <div className="wb-inline-warning"><Icon name="warning" size={16} /> This quote version is superseded. Refresh the projection before approving.</div> : quote?.superseded === null ? <div className="wb-inline-warning"><Icon name="warning" size={16} /> Quote successor status is not represented in this projection. The server must project authoritative successor state before selection can proceed.</div> : null}{quote?.comparableTotalMinorUnits === null ? <div className="wb-inline-warning"><Icon name="warning" size={16} /> Comparable total is not represented in this projection. Selection stays blocked until the server supplies an authoritative total.</div> : null}<ActionButton disabled={!onAction || !canSelect} onClick={() => { void choose(); }} title={!onAction ? "No server action is attached" : !canSelect ? "A complete, compatible, current quote and authorized capability are required" : undefined}>Select exact quote <Icon name="check" size={16} /></ActionButton><p className="wb-micro">No order will be placed. No payment will be taken.</p></div></section></div>;
 }
 
 function ProjectView({ snapshot, onReview, onAction, onLoadMore, onTabChange, onMessage }: { readonly snapshot: WorkbenchSnapshot; readonly onReview: (offer: WorkbenchOffer) => void; readonly onAction?: WorkbenchViewProps["onAction"]; readonly onLoadMore?: (() => void) | undefined; readonly onTabChange: (tab: Tab) => void; readonly onMessage: (message: string) => void }) {
@@ -282,13 +297,24 @@ function ProjectView({ snapshot, onReview, onAction, onLoadMore, onTabChange, on
   const offers = primaryRequirement ? snapshot.offers.filter((offer) => offer.requirementId === primaryRequirement.id) : [];
   const selected = snapshot.selectedOfferId;
   const [showAll, setShowAll] = useState(false);
+  const [researchPending, setResearchPending] = useState(false);
+  const researchPendingRef = useRef(false);
   const visibleOffers = showAll ? offers : offers.slice(0, 3);
+  const researchDisabled = !onAction || !snapshot.access.capabilities.canResearch || snapshot.truncation.requirements;
   const action = async () => {
+    if (researchPendingRef.current) return;
     if (!onAction) { onMessage("This connected view has no server action attached yet. No external effect occurred."); return; }
-    const result = await onAction({ type: "startResearch", projectId: snapshot.project.id });
-    onMessage(result.ok ? "Request accepted by the server." : result.message ?? "Request was not accepted.");
+    researchPendingRef.current = true;
+    setResearchPending(true);
+    try {
+      const result = await onAction({ type: "startResearch", projectId: snapshot.project.id });
+      onMessage(result.ok ? "Request accepted by the server." : result.message ?? "Request was not accepted.");
+    } finally {
+      researchPendingRef.current = false;
+      setResearchPending(false);
+    }
   };
-  return <div className="wb-page"><PageHeading eyebrow="PURCHASING WORKBENCH" title="Everything on the table." description="Evidence, comparable offers and the next authorized move, kept together." action={<ActionButton kind="secondary" onClick={() => { void action(); }} disabled={!onAction || !snapshot.access.capabilities.canResearch} title={!onAction ? "Actions wait for a connected projection" : !snapshot.access.capabilities.canResearch ? "Your role cannot start research" : undefined}><Icon name="spark" size={15} /> Start bounded research</ActionButton>} /><div className="wb-scope-row"><span><Icon name="lock" size={13} /> {snapshot.project.region ?? "Region unknown"} · {snapshot.project.currency ?? "Currency unknown"}</span><span>Need by {formatDate(snapshot.project.needByAt)}</span><ProvenancePill mode={snapshot.provenance.mode} ownerAuthoredTerms={snapshot.provenance.ownerAuthoredTerms} /></div>{primaryRequirement ? <RequirementCard snapshot={snapshot} requirement={primaryRequirement} /> : <EmptyState icon="compass" title="No requirements in scope" message="This project has no server-recorded requirement yet. OpeningOS will not invent one from the page brief." action={<ActionButton kind="secondary" disabled title="Requirement creation is a server-authorized workflow">Add a requirement</ActionButton>} />}<section className="wb-section-heading"><div><span className="wb-eyebrow">COMPARABLE OFFERS</span><h2>Quotes you can actually compare.</h2><p>Unknown charges stay visible. An incomplete offer is not ranked as a saving.</p></div><button className="wb-text-button" type="button" onClick={() => onTabChange("suppliers")}>See all suppliers <Icon name="arrow" size={14} /></button></section>{visibleOffers.length > 0 ? <div className="wb-offer-grid">{visibleOffers.map((offer) => <OfferCard key={offer.id} offer={offer} snapshot={snapshot} selected={offer.id === selected} onReview={() => onReview(offer)} />)}</div> : <EmptyState icon="search" title="No offers have arrived" message="Research can continue independently, but this project has no verified quote to compare yet." action={<ActionButton kind="secondary" onClick={() => onTabChange("suppliers")}>Open supplier view</ActionButton>} />}{offers.length > 3 ? <button className="wb-load-more" type="button" onClick={() => setShowAll((value) => !value)}>{showAll ? "Show fewer offers" : `Show ${offers.length - 3} more offers`} <Icon name="chevron" size={14} /></button> : null}<div className="wb-project-lower"><section className="wb-panel wb-financial-panel"><div className="wb-panel-heading"><div><span className="wb-eyebrow">FORECAST, NOT COMMITMENT</span><h2>One decision at a time.</h2></div><Icon name="trend" size={20} /></div><div className="wb-forecast-lines"><div><span>Selected forecast</span><strong>{formatMoney(snapshot.selectedForecastMinorUnits, snapshot.project.currency)}</strong></div><div><span>Committed expenditure</span><strong>{formatMoney(snapshot.committedMinorUnits, snapshot.project.currency)}</strong></div><div><span>Paid amount</span><strong>{formatMoney(snapshot.paidMinorUnits, snapshot.project.currency)}</strong></div></div><p className="wb-micro">Selecting an offer does not place an order. Only a recorded external order changes committed expenditure.</p></section><section className="wb-panel"><div className="wb-panel-heading"><div><span className="wb-eyebrow">RECENT CHANGES</span><h2>Activity with evidence.</h2></div><button className="wb-text-button" type="button" onClick={() => onTabChange("inbox")}>Open inbox <Icon name="arrow" size={14} /></button></div><ActivityList items={snapshot.activity.items.slice(0, 4)} compact />{!snapshot.activity.isDone && onLoadMore ? <ActionButton kind="secondary" onClick={onLoadMore}><Icon name="refresh" size={15} /> Load older activity</ActionButton> : null}</section></div></div>;
+  return <div className="wb-page"><PageHeading eyebrow="PURCHASING WORKBENCH" title="Everything on the table." description="Evidence, comparable offers and the next authorized move, kept together." action={<ActionButton kind="secondary" onClick={() => { void action(); }} disabled={researchDisabled || researchPending} title={!onAction ? "Actions wait for a connected projection" : !snapshot.access.capabilities.canResearch ? "Your role cannot start research" : snapshot.truncation.requirements ? "Research waits for a complete requirements projection" : undefined}><Icon name="spark" size={15} /> {researchPending ? "Starting…" : "Start bounded research"}</ActionButton>} /><div className="wb-scope-row"><span><Icon name="lock" size={13} /> {snapshot.project.region ?? "Region unknown"} · {snapshot.project.currency ?? "Currency unknown"}</span><span>Need by {formatDate(snapshot.project.needByAt)}</span><ProvenancePill mode={snapshot.provenance.mode} ownerAuthoredTerms={snapshot.provenance.ownerAuthoredTerms} /></div>{primaryRequirement ? <RequirementCard snapshot={snapshot} requirement={primaryRequirement} /> : <EmptyState icon="compass" title="No requirements in scope" message="This project has no server-recorded requirement yet. OpeningOS will not invent one from the page brief." action={<ActionButton kind="secondary" disabled title="Requirement creation is a server-authorized workflow">Add a requirement</ActionButton>} />}<section className="wb-section-heading"><div><span className="wb-eyebrow">COMPARABLE OFFERS</span><h2>Quotes you can actually compare.</h2><p>Unknown charges stay visible. An incomplete offer is not ranked as a saving.</p></div><button className="wb-text-button" type="button" onClick={() => onTabChange("suppliers")}>See all suppliers <Icon name="arrow" size={14} /></button></section>{visibleOffers.length > 0 ? <div className="wb-offer-grid">{visibleOffers.map((offer) => <OfferCard key={offer.id} offer={offer} snapshot={snapshot} selected={offer.id === selected} onReview={() => onReview(offer)} />)}</div> : <EmptyState icon="search" title="No offers have arrived" message="Research can continue independently, but this project has no verified quote to compare yet." action={<ActionButton kind="secondary" onClick={() => onTabChange("suppliers")}>Open supplier view</ActionButton>} />}{offers.length > 3 ? <button className="wb-load-more" type="button" onClick={() => setShowAll((value) => !value)}>{showAll ? "Show fewer offers" : `Show ${offers.length - 3} more offers`} <Icon name="chevron" size={14} /></button> : null}<div className="wb-project-lower"><section className="wb-panel wb-financial-panel"><div className="wb-panel-heading"><div><span className="wb-eyebrow">FORECAST, NOT COMMITMENT</span><h2>One decision at a time.</h2></div><Icon name="trend" size={20} /></div><div className="wb-forecast-lines"><div><span>Selected forecast</span><strong>{formatMoney(snapshot.selectedForecastMinorUnits, snapshot.project.currency)}</strong></div><div><span>Committed expenditure</span><strong>{formatMoney(snapshot.committedMinorUnits, snapshot.project.currency)}</strong></div><div><span>Paid amount</span><strong>{formatMoney(snapshot.paidMinorUnits, snapshot.project.currency)}</strong></div></div><p className="wb-micro">Selecting an offer does not place an order. Only a recorded external order changes committed expenditure.</p></section><section className="wb-panel"><div className="wb-panel-heading"><div><span className="wb-eyebrow">RECENT CHANGES</span><h2>Activity with evidence.</h2></div><button className="wb-text-button" type="button" onClick={() => onTabChange("inbox")}>Open inbox <Icon name="arrow" size={14} /></button></div><ActivityList items={snapshot.activity.items.slice(0, 4)} compact />{!snapshot.activity.isDone && onLoadMore ? <ActionButton kind="secondary" onClick={onLoadMore}><Icon name="refresh" size={15} /> Load older activity</ActionButton> : null}</section></div></div>;
 }
 
 function SuppliersView({ snapshot, onReview, onOpenEvidence }: { readonly snapshot: WorkbenchSnapshot; readonly onReview: (offer: WorkbenchOffer) => void; readonly onOpenEvidence: (evidence: WorkbenchEvidence) => void }) {
@@ -311,13 +337,13 @@ function InboxView({ snapshot, onAction, onMessage }: { readonly snapshot: Workb
 
 function JobRow({ job, snapshot, onAction, onMessage }: { readonly job: WorkbenchSnapshot["jobs"][number]; readonly snapshot: WorkbenchSnapshot; readonly onAction?: WorkbenchViewProps["onAction"]; readonly onMessage: (message: string) => void }) {
   const canRetry = job.delivery === "unknown" || job.delivery === "paused" || job.state === "failed";
-  const canCancel = job.state === "queued" || job.state === "running" || job.state === "waiting";
+  const canCancel = job.cancellable && (job.state === "queued" || job.state === "running" || job.state === "waitingForSupplier" || job.state === "waitingForUser");
   const run = async (type: "retryJob" | "cancelJob") => {
-    if (!onAction || (type === "retryJob" && !snapshot.access.capabilities.canResearch) || (type === "cancelJob" && snapshot.access.capabilities.canResolveRisk !== true)) { onMessage("This action is not authorized in the current project role or connection state."); return; }
+    if (!onAction || (type === "retryJob" && !snapshot.access.capabilities.canResearch) || (type === "cancelJob" && !job.cancellable)) { onMessage("This action is not authorized in the current project role or connection state."); return; }
     const result = await onAction({ type, projectId: snapshot.project.id, jobId: job.id });
     onMessage(result.ok ? `${formatStateLabel(type)} request recorded by the server.` : result.message ?? "The server did not accept this action.");
   };
-  return <article className="wb-job-row"><div className="wb-job-state"><StatusDot state={job.delivery} /><div><strong>{formatStateLabel(job.kind)} · {deliveryLabel(job.delivery)}</strong><p>{job.summary ?? "Job detail unavailable in this projection."}</p></div></div><div className="wb-job-progress"><span>{job.progress === null ? "Progress unknown" : `${Math.round(job.progress * 100)}%`}</span><div className="wb-progress-track"><span style={{ width: `${job.progress === null ? 0 : Math.max(0, Math.min(100, job.progress * 100))}%` }} /></div></div><div className="wb-job-meta"><span>Attempt {job.attempts}</span><span>Updated {formatDate(job.updatedAt)}</span></div><div className="wb-job-actions">{canRetry ? <ActionButton kind="secondary" disabled={!onAction || !snapshot.access.capabilities.canResearch} onClick={() => { void run("retryJob"); }}>Retry bounded branch</ActionButton> : null}{canCancel ? <ActionButton kind="text" disabled={!onAction || snapshot.access.capabilities.canResolveRisk !== true} onClick={() => { void run("cancelJob"); }}>Cancel</ActionButton> : null}</div>{job.failureCode ? <p className="wb-card-footnote"><Icon name="warning" size={13} /> {job.failureCode} · completed results remain retained.</p> : null}</article>;
+  return <article className="wb-job-row"><div className="wb-job-state"><StatusDot state={job.delivery} /><div><strong>{formatStateLabel(job.kind)} · {deliveryLabel(job.delivery)}</strong><p>{job.summary ?? "Job detail unavailable in this projection."}</p></div></div><div className="wb-job-progress"><span>{job.progress === null ? "Progress unknown" : `${Math.round(job.progress * 100)}%`}</span><div className="wb-progress-track"><span style={{ width: `${job.progress === null ? 0 : Math.max(0, Math.min(100, job.progress * 100))}%` }} /></div></div><div className="wb-job-meta"><span>Attempt {job.attempts}</span><span>Updated {formatDate(job.updatedAt)}</span></div><div className="wb-job-actions">{canRetry ? <ActionButton kind="secondary" disabled={!onAction || !snapshot.access.capabilities.canResearch} onClick={() => { void run("retryJob"); }}>Retry bounded branch</ActionButton> : null}{canCancel ? <ActionButton kind="text" disabled={!onAction || !job.cancellable} onClick={() => { void run("cancelJob"); }}>Cancel</ActionButton> : null}</div>{job.failureCode ? <p className="wb-card-footnote"><Icon name="warning" size={13} /> {job.failureCode} · completed results remain retained.</p> : null}</article>;
 }
 
 function RecoveryView({ snapshot, onAction, onMessage }: { readonly snapshot: WorkbenchSnapshot; readonly onAction?: WorkbenchViewProps["onAction"]; readonly onMessage: (message: string) => void }) {
@@ -375,6 +401,8 @@ function ServiceCaseDialog({
   const [submittedFingerprint, setSubmittedFingerprint] = useState<string | null>(null);
   const dialogRef = useRef<HTMLElement | null>(null);
   const submittingRef = useRef(false);
+  const pendingRef = useRef(false);
+  const onCloseRef = useRef(onClose);
   const previousActiveElement = useRef<HTMLElement | null>(null);
   const idPrefix = useId().replace(/:/g, "");
   const titleId = `${idPrefix}-service-case-title`;
@@ -384,10 +412,50 @@ function ServiceCaseDialog({
   const countId = `${idPrefix}-service-case-count`;
   const errorId = `${idPrefix}-service-case-error`;
 
+  pendingRef.current = pending;
+  onCloseRef.current = onClose;
+
   useEffect(() => {
-    previousActiveElement.current = typeof document === "undefined" ? null : document.activeElement as HTMLElement | null;
-    dialogRef.current?.focus();
+    const dialog = dialogRef.current;
+    if (dialog === null || typeof document === "undefined") return;
+    previousActiveElement.current = document.activeElement as HTMLElement | null;
+    const focusFirst = (): void => {
+      const first = focusableElements(dialog)[0];
+      (first ?? dialog).focus();
+    };
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") {
+        if (!pendingRef.current) {
+          event.preventDefault();
+          onCloseRef.current();
+        }
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const elements = focusableElements(dialog);
+      if (elements.length === 0) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+      const first = elements[0]!;
+      const last = elements[elements.length - 1]!;
+      const active = document.activeElement;
+      if (event.shiftKey ? active === first || !dialog.contains(active) : active === last || !dialog.contains(active)) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+      }
+    };
+    const onFocusIn = (event: FocusEvent): void => {
+      const target = event.target;
+      if (target === null || !dialog.contains(target as HTMLElement)) focusFirst();
+    };
+    dialog.addEventListener("keydown", onKeyDown);
+    document.addEventListener("focusin", onFocusIn);
+    focusFirst();
     return () => {
+      dialog.removeEventListener("keydown", onKeyDown);
+      document.removeEventListener("focusin", onFocusIn);
       previousActiveElement.current?.focus();
     };
   }, []);
@@ -455,12 +523,6 @@ function ServiceCaseDialog({
         aria-busy={pending}
         tabIndex={-1}
         ref={dialogRef}
-        onKeyDown={(event) => {
-          if (event.key === "Escape" && !pending) {
-            event.preventDefault();
-            onClose();
-          }
-        }}
       >
         <div className="wb-panel-head">
           <div>

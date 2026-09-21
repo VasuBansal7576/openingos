@@ -541,8 +541,8 @@ describe("U1 workbench projection", () => {
     expect(result.ok).toBe(true);
     if (!result.ok) throw new Error("projection denied");
     expect(result.candidates[0]?.latestValidQuote?.lines[0]?.unit).toBe("piece");
-    expect(result.jobs.some((job) => job.status === "queued" && job.cancellable)).toBe(true);
-    expect(result.jobs.some((job) => job.status === "sent" && !job.cancellable)).toBe(true);
+    expect(result.jobs.some((job) => job.state === "queued" && job.status === "queued" && job.cancellable)).toBe(true);
+    expect(result.jobs.some((job) => job.state === "completed" && job.status === "sent" && !job.cancellable)).toBe(true);
     expect(result.decisions.some((decision) => decision.kind === "approval" && decision.state === "requested")).toBe(true);
     expect(result.access.capabilities.canApprove).toBe(true);
     expect(result.access.capabilities.canOpenServiceCase).toBe(true);

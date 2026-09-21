@@ -93,12 +93,12 @@ const projection = {
     provenance: { mode: "recorded", label: "Recorded owner exchange", ownerAuthoredTerms: true },
   }],
   jobs: [
-    { id: "job-queued", kind: "research", status: "queued", cancellable: true, createdAt: Date.UTC(2026, 8, 20), updatedAt: Date.UTC(2026, 8, 20), grantVersion: 1, attempts: [] },
-    { id: "job-sent", kind: "communication", status: "sent", cancellable: false, createdAt: Date.UTC(2026, 8, 20), updatedAt: Date.UTC(2026, 8, 20), grantVersion: 1, attempts: [{ state: "observedSuccess", createdAt: Date.UTC(2026, 8, 20) }] },
-    { id: "job-delivered", kind: "communication", status: "delivered", cancellable: false, createdAt: Date.UTC(2026, 8, 20), updatedAt: Date.UTC(2026, 8, 20), grantVersion: 1, attempts: [{ state: "observedSuccess", createdAt: Date.UTC(2026, 8, 20), observedAt: Date.UTC(2026, 8, 20) }] },
-    { id: "job-unknown", kind: "communication", status: "unknown", cancellable: false, createdAt: Date.UTC(2026, 8, 20), updatedAt: Date.UTC(2026, 8, 20), grantVersion: 1, attempts: [{ state: "outcomeUnknown", createdAt: Date.UTC(2026, 8, 20) }] },
-    { id: "job-partial", kind: "recovery", status: "partial", cancellable: true, createdAt: Date.UTC(2026, 8, 20), updatedAt: Date.UTC(2026, 8, 20), grantVersion: 1, attempts: [{ state: "observedSuccess", createdAt: Date.UTC(2026, 8, 20) }] },
-    { id: "job-paused", kind: "recovery", status: "paused", cancellable: true, createdAt: Date.UTC(2026, 8, 20), updatedAt: Date.UTC(2026, 8, 20), grantVersion: 1, attempts: [] },
+    { id: "job-queued", kind: "research", state: "queued", status: "queued", cancellable: true, createdAt: Date.UTC(2026, 8, 20), updatedAt: Date.UTC(2026, 8, 20), grantVersion: 1, attempts: [] },
+    { id: "job-sent", kind: "communication", state: "completed", status: "sent", cancellable: false, createdAt: Date.UTC(2026, 8, 20), updatedAt: Date.UTC(2026, 8, 20), grantVersion: 1, attempts: [{ state: "observedSuccess", createdAt: Date.UTC(2026, 8, 20) }] },
+    { id: "job-delivered", kind: "communication", state: "completed", status: "delivered", cancellable: false, createdAt: Date.UTC(2026, 8, 20), updatedAt: Date.UTC(2026, 8, 20), grantVersion: 1, attempts: [{ state: "observedSuccess", createdAt: Date.UTC(2026, 8, 20), observedAt: Date.UTC(2026, 8, 20) }] },
+    { id: "job-unknown", kind: "communication", state: "failed", status: "unknown", cancellable: false, createdAt: Date.UTC(2026, 8, 20), updatedAt: Date.UTC(2026, 8, 20), grantVersion: 1, attempts: [{ state: "outcomeUnknown", createdAt: Date.UTC(2026, 8, 20) }] },
+    { id: "job-partial", kind: "recovery", state: "partial", status: "partial", cancellable: true, createdAt: Date.UTC(2026, 8, 20), updatedAt: Date.UTC(2026, 8, 20), grantVersion: 1, attempts: [{ state: "observedSuccess", createdAt: Date.UTC(2026, 8, 20) }] },
+    { id: "job-paused", kind: "recovery", state: "pausedBudget", status: "paused", cancellable: true, createdAt: Date.UTC(2026, 8, 20), updatedAt: Date.UTC(2026, 8, 20), grantVersion: 1, attempts: [] },
   ],
   decisions: [{ id: "approval-w1-1", kind: "approval", state: "requested", scope: "selection:quote-w1-1", snapshotHash: "snapshot-hash-w1-1", quoteId: "quote-w1-1", createdAt: Date.UTC(2026, 8, 20) }],
   activity: { page: [{ id: "event-w1-1", kind: "quoteRecorded", createdAt: Date.UTC(2026, 8, 20) }], continueCursor: null, isDone: true },
@@ -168,6 +168,7 @@ test("rejects malformed, cross-project, and private W1 projection payloads", () 
   expect(parseWorkbenchSnapshot(projection, "different-project")).toBeNull();
   expect(parseWorkbenchSnapshot({ ...projection, project: { ...projection.project, ownerEmail: "private@example.test" } }, projection.project.id)).toBeNull();
   expect(parseWorkbenchSnapshot({ ...projection, candidates: [{ ...projection.candidates[0], latestValidQuote: { ...projection.candidates[0]!.latestValidQuote!, charges: [{ ...projection.candidates[0]!.latestValidQuote!.charges[0], state: { kind: "known", amount: null } }] } }] }, projection.project.id)).toBeNull();
+  expect(parseWorkbenchSnapshot({ ...projection, jobs: [{ ...projection.jobs[0]!, state: "not-a-server-lifecycle" }] }, projection.project.id)).toBeNull();
   expect(parseWorkbenchSnapshot({ ...projection, activity: { ...projection.activity, page: [{ id: "event-w1-1", kind: "quoteRecorded", createdAt: "not-a-time" }] } }, projection.project.id)).toBeNull();
 });
 
@@ -847,6 +848,106 @@ test("renders real assets with documents, cases, truncation, and opens the servi
   }
 });
 
+test("clicks a projected cancellable queued job and dispatches one cancellation", async () => {
+  const snapshot = parseWorkbenchSnapshot(projection, projection.project.id);
+  if (snapshot === null) throw new Error("W1 projection should parse");
+  const actionCalls: WorkbenchAction[] = [];
+  const mounted = await mountEquipmentTab({ state: "ready", snapshot }, (action: WorkbenchAction) => {
+    actionCalls.push(action);
+    return { ok: true, message: "Cancellation queued by the server." };
+  });
+  try {
+    await mounted.clickTab("Inbox");
+    const cancel = mounted.findButton("Cancel");
+    expect(cancel.disabled).toBe(false);
+    await act(async () => { cancel.click(); });
+    expect(actionCalls).toEqual([{ type: "cancelJob", projectId: "project-w1-1", jobId: "job-queued" }]);
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("disables generic research and makes zero calls while requirements are truncated", async () => {
+  const snapshot = parseWorkbenchSnapshot({ ...projection, requirementsTruncated: true }, projection.project.id);
+  if (snapshot === null) throw new Error("Truncated W1 projection should parse");
+  const actionCalls: WorkbenchAction[] = [];
+  const mounted = await mountEquipmentTab({ state: "ready", snapshot }, (action: WorkbenchAction) => {
+    actionCalls.push(action);
+    return { ok: true };
+  });
+  try {
+    const start = mounted.findButton("Start bounded research");
+    expect(start.disabled).toBe(true);
+    await act(async () => { start.click(); });
+    expect(actionCalls).toEqual([]);
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("keeps concurrent mounted research clicks to one action request", async () => {
+  const snapshot = parseWorkbenchSnapshot(projection, projection.project.id);
+  if (snapshot === null) throw new Error("W1 projection should parse");
+  const actionCalls: WorkbenchAction[] = [];
+  let resolveAction: ((result: WorkbenchActionResult) => void) | undefined;
+  const actionResult = new Promise<WorkbenchActionResult>((resolve) => { resolveAction = resolve; });
+  const mounted = await mountEquipmentTab({ state: "ready", snapshot }, (action: WorkbenchAction) => {
+    actionCalls.push(action);
+    return actionResult;
+  });
+  try {
+    const start = mounted.findButton("Start bounded research");
+    await act(async () => {
+      start.click();
+      start.click();
+    });
+    expect(actionCalls).toEqual([{ type: "startResearch", projectId: "project-w1-1" }]);
+    resolveAction?.({ ok: true, message: "Research queued by the server." });
+    await act(async () => {});
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("contains service dialog focus, cycles first and last controls, handles Escape, and restores focus", async () => {
+  const snapshot = parseWorkbenchSnapshot(projectionWithEquipment({ assets: [assetFixture()], assetsTruncated: false }), projection.project.id);
+  if (snapshot === null) throw new Error("E1 equipment projection should parse");
+  const mounted = await mountEquipmentTab({ state: "ready", snapshot }, () => ({ ok: false, message: "controlled test refusal" }));
+  try {
+    await mounted.clickTab("Equipment");
+    const open = mounted.findButton("Open service case");
+    open.focus();
+    await act(async () => { open.click(); });
+    const dialog = mounted.container.querySelector('[role="dialog"]');
+    if (!(dialog instanceof Object)) throw new Error("Service dialog not found");
+    const controls = Array.from(dialog.querySelectorAll<HTMLElement>("button:not([disabled]), select:not([disabled]), textarea:not([disabled])"));
+    const first = controls[0];
+    const last = controls[controls.length - 1];
+    if (first === undefined || last === undefined) throw new Error("Service dialog controls not found");
+    expect(mounted.container.ownerDocument.activeElement).toBe(first);
+
+    last.focus();
+    last.dispatchEvent(new mounted.container.ownerDocument.defaultView!.KeyboardEvent("keydown", { bubbles: true, key: "Tab" }));
+    expect(mounted.container.ownerDocument.activeElement).toBe(first);
+    first.focus();
+    first.dispatchEvent(new mounted.container.ownerDocument.defaultView!.KeyboardEvent("keydown", { bubbles: true, key: "Tab", shiftKey: true }));
+    expect(mounted.container.ownerDocument.activeElement).toBe(last);
+
+    const background = mounted.findButton("Project");
+    background.focus();
+    background.dispatchEvent(new mounted.container.ownerDocument.defaultView!.Event("focusin", { bubbles: true }));
+    expect(mounted.container.ownerDocument.activeElement).toBe(first);
+
+    await act(async () => {
+      dialog.dispatchEvent(new mounted.container.ownerDocument.defaultView!.KeyboardEvent("keydown", { bubbles: true, key: "Escape" }));
+    });
+    expect(mounted.container.querySelector('[role="dialog"]')).toBeNull();
+    expect(mounted.container.ownerDocument.activeElement).toBe(open);
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
 test("keeps the equipment service action disabled with zero adapter calls while reconnecting", async () => {
   const snapshot = parseWorkbenchSnapshot(projectionWithEquipment({
     assets: [assetFixture()],
@@ -903,7 +1004,7 @@ test("disables every mutation control while reconnecting and resumes after a fre
       },
     },
     decisions: parsed.decisions.map((decision) => ({ ...decision, evidenceIds: ["product-evidence-w1-1"] })),
-    jobs: parsed.jobs.map((job, index) => index === 0 ? { ...job, state: "queued" } : job),
+    jobs: parsed.jobs.map((job, index) => index === 0 ? { ...job, state: "queued" as const } : job),
   };
   const dom = new HappyWindow({ url: "https://openingos.test/" });
   const previousWindow = globalThis.window;

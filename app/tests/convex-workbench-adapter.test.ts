@@ -98,7 +98,7 @@ function actionProjection(projectId = "project-1", requirementVersion = 4): Reco
       evidence: [],
       provenance: { mode: "recorded", label: "Recorded terms", ownerAuthoredTerms: false },
     }],
-    jobs: [{ id: "job-1", kind: "research", status: "queued", cancellable: true, createdAt: 1, updatedAt: 1, grantVersion: 1, attempts: [] }],
+    jobs: [{ id: "job-1", kind: "research", state: "queued", status: "queued", cancellable: true, createdAt: 1, updatedAt: 1, grantVersion: 1, attempts: [] }],
     decisions: [{ id: "approval-1", kind: "approval", state: "pending", createdAt: 1 }],
   };
 }
@@ -474,6 +474,48 @@ test("starts only one supported purchasing research brief and reports queued bac
   expect(result.message).not.toContain("provider succeeded");
 });
 
+test("rejects generic research when requirements are truncated without mutation", async () => {
+  const calls: MutationCall[] = [];
+  const truncated = { ...actionProjection(), requirementsTruncated: true };
+  const controls = controlledWatch(() => truncated);
+  const adapter = createConvexWorkbenchAdapter(actionClient(truncated, controls.watch, calls, { ok: true, state: "queued" }));
+  await adapter.load("project-1");
+  await expect(adapter.act({ type: "startResearch", projectId: "project-1" })).resolves.toEqual({
+    ok: false,
+    message: "Research is unavailable while the project requirements are truncated. Nothing was sent.",
+  });
+  expect(calls).toHaveLength(0);
+});
+
+test("fences concurrent research calls before the first mutation resolves", async () => {
+  const calls: MutationCall[] = [];
+  const controls = controlledWatch(() => actionProjection());
+  let resolveMutation: ((value: unknown) => void) | undefined;
+  const mutation = new Promise<unknown>((resolve) => { resolveMutation = resolve; });
+  const adapter = createConvexWorkbenchAdapter({
+    query: async () => actionProjection(),
+    watchQuery: () => controls.watch,
+    mutation: async (reference: unknown, args: unknown) => {
+      calls.push({ reference, args });
+      return mutation;
+    },
+  } as unknown as ConvexWorkbenchClient);
+  await adapter.load("project-1");
+
+  const action: WorkbenchAction = { type: "startResearch", projectId: "project-1" };
+  const first = adapter.act(action);
+  const second = adapter.act(action);
+  expect(calls).toHaveLength(1);
+  await expect(second).resolves.toEqual({
+    ok: false,
+    message: "This action is already in progress. Wait for the current server response.",
+  });
+  resolveMutation?.({ ok: true, jobId: "job-2", state: "queued", supportedSegment: "research suppliers", refusedSegments: [] });
+  await expect(first).resolves.toEqual({ ok: true, message: "Research queued by the server; provider outcome is still pending." });
+  await expect(adapter.act(action)).resolves.toMatchObject({ ok: false });
+  expect(calls).toHaveLength(1);
+});
+
 test("rejects missing, stale, cross-project, and malformed action inputs without mutation", async () => {
   const calls: MutationCall[] = [];
   const controls = controlledWatch(() => actionProjection());
@@ -533,7 +575,7 @@ test("action-specific stale and authority fences make zero mutations", async () 
 
   const nonCancellableProjection = {
     ...actionProjection(),
-    jobs: [{ id: "job-1", kind: "research", status: "queued", cancellable: false, createdAt: 1, updatedAt: 1, grantVersion: 1, attempts: [] }],
+    jobs: [{ id: "job-1", kind: "research", state: "queued", status: "queued", cancellable: false, createdAt: 1, updatedAt: 1, grantVersion: 1, attempts: [] }],
   };
   const cancelCalls: MutationCall[] = [];
   const cancelAdapter = await loadActionAdapter(nonCancellableProjection, cancelCalls);
@@ -551,6 +593,12 @@ test("action-specific stale and authority fences make zero mutations", async () 
   const researchAdapter = await loadActionAdapter(ambiguousProjection, researchCalls);
   await researchAdapter.act({ type: "startResearch", projectId: "project-1" });
   expect(researchCalls).toHaveLength(0);
+
+  const truncatedProjection = { ...baseProjection, requirementsTruncated: true };
+  const truncatedCalls: MutationCall[] = [];
+  const truncatedAdapter = await loadActionAdapter(truncatedProjection, truncatedCalls);
+  await truncatedAdapter.act({ type: "startResearch", projectId: "project-1" });
+  expect(truncatedCalls).toHaveLength(0);
 });
 
 test("invalidates action cache on watch errors and unsubscribe while preserving an empty initial watch", async () => {

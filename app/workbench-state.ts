@@ -10,6 +10,19 @@ export type ProvenanceMode = "controlled" | "recorded" | "live" | "fixture" | "m
 
 export type DeliveryState = "queued" | "sent" | "delivered" | "unknown" | "partial" | "paused";
 
+/** Exact safe execution lifecycle states projected by the Convex workbench. */
+export type WorkbenchJobState =
+  | "queued"
+  | "running"
+  | "waitingForSupplier"
+  | "waitingForUser"
+  | "pausedBudget"
+  | "completed"
+  | "partial"
+  | "failed"
+  | "cancelling"
+  | "cancelled";
+
 export type WorkbenchLoadState =
   | { readonly state: "loading"; readonly lastKnown?: WorkbenchSnapshot }
   | { readonly state: "ready"; readonly snapshot: WorkbenchSnapshot }
@@ -137,7 +150,7 @@ export interface WorkbenchJob {
   readonly id: string;
   readonly kind: string;
   readonly cancellable: boolean;
-  readonly state: string;
+  readonly state: WorkbenchJobState;
   readonly delivery: DeliveryState;
   readonly progress: number | null;
   readonly attempts: number;
@@ -515,9 +528,10 @@ function parseJob(value: unknown): WorkbenchJob | null {
   const id = requiredString(value.id);
   const kind = typeof value.kind === "string" ? value.kind : null;
   const cancellable = value.cancellable;
+  const state = isOneOf(value.state, ["queued", "running", "waitingForSupplier", "waitingForUser", "pausedBudget", "completed", "partial", "failed", "cancelling", "cancelled"] as const) ? value.state : null;
   const status = isOneOf(value.status, ["queued", "sent", "delivered", "unknown", "partial", "paused"] as const) ? value.status : null;
   const attempts = Array.isArray(value.attempts) ? value.attempts : null;
-  if (id === null || kind === null || typeof cancellable !== "boolean" || status === null || !isFiniteNumber(value.createdAt) || !isFiniteNumber(value.updatedAt) || !isFiniteNumber(value.grantVersion) || attempts === null) return null;
+  if (id === null || kind === null || typeof cancellable !== "boolean" || state === null || status === null || !isFiniteNumber(value.createdAt) || !isFiniteNumber(value.updatedAt) || !isFiniteNumber(value.grantVersion) || attempts === null) return null;
   let lastCheckedAt: number | null = null;
   for (const attempt of attempts) {
     if (!isRecord(attempt) || typeof attempt.state !== "string" || !isFiniteNumber(attempt.createdAt)) return null;
@@ -525,7 +539,7 @@ function parseJob(value: unknown): WorkbenchJob | null {
     if (observedAt === undefined) return null;
     if (observedAt !== null && (lastCheckedAt === null || observedAt > lastCheckedAt)) lastCheckedAt = observedAt;
   }
-  return { id, kind, cancellable, state: "unknown", delivery: status, progress: null, attempts: attempts.length, updatedAt: value.updatedAt, failureCode: null, lastCheckedAt, summary: null, evidenceIds: [] };
+  return { id, kind, cancellable, state, delivery: status, progress: null, attempts: attempts.length, updatedAt: value.updatedAt, failureCode: null, lastCheckedAt, summary: null, evidenceIds: [] };
 }
 
 function optionalId(value: unknown): string | null | undefined {

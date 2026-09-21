@@ -221,9 +221,38 @@ const jobStatusValidator = v.union(
   v.literal("paused"),
 );
 
+// Keep the durable execution state separate from the derived delivery label.
+// The UI may expose cancellation only when both this server state and the
+// server-owned cancellable capability prove that the job is still actionable.
+const jobLifecycleStateValidator = v.union(
+  v.literal("queued"),
+  v.literal("running"),
+  v.literal("waitingForSupplier"),
+  v.literal("waitingForUser"),
+  v.literal("pausedBudget"),
+  v.literal("completed"),
+  v.literal("partial"),
+  v.literal("failed"),
+  v.literal("cancelling"),
+  v.literal("cancelled"),
+);
+
+type JobLifecycleState =
+  | "queued"
+  | "running"
+  | "waitingForSupplier"
+  | "waitingForUser"
+  | "pausedBudget"
+  | "completed"
+  | "partial"
+  | "failed"
+  | "cancelling"
+  | "cancelled";
+
 const jobValidator = v.object({
   id: v.id("jobs"),
   kind: v.string(),
+  state: jobLifecycleStateValidator,
   status: jobStatusValidator,
   cancellable: v.boolean(),
   createdAt: v.number(),
@@ -1123,6 +1152,7 @@ export const getProjection = f1Query({
     const jobs = [] as Array<{
       readonly id: Id<"jobs">;
       readonly kind: string;
+      readonly state: JobLifecycleState;
       readonly status: "queued" | "sent" | "delivered" | "unknown" | "partial" | "paused";
       readonly cancellable: boolean;
       readonly createdAt: number;
@@ -1164,6 +1194,7 @@ export const getProjection = f1Query({
       jobs.push({
         id: job._id,
         kind: job.kind,
+        state: job.state,
         status: mapJobStatus(
           job.state,
           job.kind,
