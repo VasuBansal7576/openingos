@@ -2721,3 +2721,61 @@ test("pixel-QA CSS keeps the tape and decision bar above the fold", async () => 
   expect(css).toContain(".wb-bench-action { display: grid; grid-column: 1 / -1;");
   expect(css).toContain("margin: 1rem -2.625rem 0;");
 });
+
+// -- Mobile 390px fidelity: compact header, metadata, and product row --------
+
+test("narrow CSS compacts identity, heading, and product cards toward the first quote", async () => {
+  const css = await Bun.file(new URL("../styles.css", import.meta.url)).text();
+  const phone = css.slice(css.indexOf("@media (max-width: 480px)"));
+  // Project identity folds into the main header row instead of a tall block.
+  expect(phone).toContain(".wb-header { display: grid;");
+  expect(phone).toContain(".wb-project-picker { grid-row: 1; grid-column: 2;");
+  expect(phone).toContain(".wb-project-picker .wb-eyebrow { display: none;");
+  expect(phone).toContain(".wb-project-picker > span:last-child { display: none;");
+  expect(phone).toContain(".wb-nav { grid-row: 2;");
+  // Touch targets stay usable.
+  expect(phone).toContain(".wb-nav button { min-width: 0; flex: 1 1 20%;");
+  // Heading and metadata reflow without hiding copy.
+  expect(phone).toContain(".wb-bench-heading h1 { max-width: 100%; font-size: clamp(2rem, 10.5vw, 2.5rem);");
+  expect(phone).toContain(".wb-bench-heading p { font-size: .72rem; line-height: 1.55; }");
+  expect(phone).toContain(".wb-bench-heading-actions .wb-button { min-height: 2.4rem;");
+  // Asset and on-your-list cards share one compact row so the first quote
+  // starts near the prototype position.
+  expect(phone).toContain(".wb-desk-product { display: grid; grid-column: 1; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);");
+  expect(phone).toContain(".wb-polaroid { width: auto;");
+  expect(phone).toContain(".wb-scope-note h2 { font-size: 1.05rem; }");
+});
+
+test("narrow CSS hides no honest project, scope, or quote state from the markup", () => {
+  const snapshot = parseWorkbenchSnapshot(
+    {
+      ...projection,
+      project: { ...projection.project, sampleKind: "controlledSample", sampleLabel: "Controlled sample data" },
+    },
+    projection.project.id,
+  );
+  if (snapshot === null) throw new Error("Sample projection should parse");
+  const html = renderToStaticMarkup(createElement(WorkbenchView, { loadState: { state: "ready", snapshot } }));
+  // Narrow rules use display:none for duplicated decoration only; every
+  // honest fact below remains in the markup for all viewports.
+  for (const fact of [
+    "Northside caf",
+    "Controlled sample data",
+    "Netherlands",
+    "EUR",
+    "Need by",
+    "Recorded owner exchange",
+    "Two-group espresso machine",
+    "ON YOUR LIST",
+    "Allocation",
+    "Harbor Equipment",
+    "Missing terms",
+    "Validity not confirmed",
+    "Unknown charges block an unqualified saving claim.",
+    "Review selected offer",
+    "Ask about these quotes",
+    "No order is placed.",
+  ]) {
+    expect(html).toContain(fact);
+  }
+});
