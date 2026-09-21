@@ -24,7 +24,8 @@ This file supplies order, not duplicate contracts or a running automation.
    Use the Netherlands/EUR source set in PRD section 52; preserve all required categories and the full evaluator journey.
    - [x] R1 bounded Firecrawl collection and controlled S-11 through S-14 coverage include independently paginated evidence, claims and candidate streams at exact PR head `099d016`.
    - [x] C1 owner-only transport, callbacks, reconciliation and quote ingestion use indexed provider binding lookup at exact PR head `099d016`.
-   - [ ] U1 production-state adapter, live Convex wiring and desktop/narrow browser proof remain open.
+   - [x] U1 production-state adapter and live Convex wiring are implemented at pushed PR #3 head `284e528`; the complete local suite passes on that exact commit.
+   - [ ] U1 desktop/narrow browser proof, authoritative quote-selection projection and final exact-head review remain open.
 5. [ ] **E1, integrated behavior.** Build recovery, change impact and equipment/service flows against the integrated research and communication modules.
    - [x] Project-authorized, bounded equipment projection reads real asset, safe document and service-case records at local integration commit `436dc61`.
    - [x] The workbench consumes that exact equipment shape at local integration commit `8ac84de`, renders honest empty and truncation states, and keeps service creation disabled because no backend command route exists.
@@ -105,7 +106,11 @@ This file supplies order, not duplicate contracts or a running automation.
 - [x] Repair Greptile E1 P1 discussion `4058268105` through integrated commit `3a73e65`: backend-valid empty optional equipment strings become absent display metadata without dropping the authorized projection, while defined non-string values still fail closed.
 - [x] Repair Greptile W1 P2 discussion `4058268108` through integrated commit `3a73e65`: temporary membership creation schedules an idempotent membership-scoped expiry mutation whose database write invalidates reactive project and workbench queries.
 - [x] Repair Greptile C1 P1 discussion `4058329243` through integrated commit `c13f1b8`: a changed fully supported supplier draft is rejected before an operation row, request key or grant allowance is consumed, while corrected same-key retries and D-17 mixed-segment canonicalization remain valid.
-- [ ] Finish the U1 backend-shape adapter, connect the UI to Convex, inspect the selected flow at desktop and narrow widths, then obtain exact-head CI, Greptile and separate Astra review.
+- [x] Repair the three separate Astra C1 findings at pushed PR #2 head `0fb855f`: reconciliation slots are charged per provider read, retained replies continue through bounded autonomous batches, and complete inbound source bodies remain protected while public excerpts stay bounded. Focused communication suites, TypeScript and every expected GitHub check pass on that head.
+- [x] Repair the four separate Astra workbench findings at pushed PR #3 head `284e528`: mutation completion preserves newer reactive projections, decimals and coordinated objects remain intact during scope classification, readiness stays explicitly unassessed without authoritative data, and every overlay uses a shared modal keyboard/focus contract. The complete local `bun run test` suite passes with 293 direct handler tests; exact-head GitHub checks are still being observed.
+- [x] Repair PR #4 readiness lineage, quantity aggregation and evidence bounds at pushed head `947561c`; the complete local suite and every expected GitHub check pass on that exact commit.
+- [ ] Fresh Greptile reviews are unavailable because the connected trial reports its 50-credit limit exhausted; prior actionable threads are resolved with exact commit evidence, but a skipped review is not treated as acceptance.
+- [ ] Finish server-side cross-client research-start idempotency and authoritative quote total/currentness projection, integrate the latest PR #2 base into PRs #3 and #4, inspect the selected flow at desktop and narrow widths, then obtain exact-head CI and separate Astra review.
 
 The completed money and Jev proof wave contains controlled proofs only, reviewed at `595d30c` with no actionable findings remaining.
 Luna owned `proofs/money/**`; Muse Spark owned `proofs/jev/**`; Astra owned shared tooling, integration and progress files.
