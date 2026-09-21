@@ -426,6 +426,18 @@ Greptile again supplied quota notices rather than code review, so the review gat
 All cited evidence is controlled local or CI execution.
 No hosted Convex deployment, live provider call, owner-mailbox exchange, genuine supplier response, public origin, purchase, realized saving or commercial outcome was observed.
 
+### 2026-09-21 - selected workbench and negotiation-authority integration checkpoint
+
+Combined checkpoint `220165a` integrates the selected purchasing-desk rebuild, E7 import/review, E9 second-location reuse, E11 service outcomes, E12 production negotiation orchestration and the shared F1 negotiation-authority repair.
+The unrelated dark foundation page no longer replaces the product when Convex is unconfigured.
+Unconfigured, connecting, empty, error and reconnecting states now remain inside the same ivory-navigation, sage-desk and paper-surface design system as the accepted prototype without inserting sample suppliers, quotes or provider outcomes.
+The duplicate `O.OpeningOS.` brand and narrow header overflow were repaired.
+The exact merge candidate passes `bun run test`, strict TypeScript, the production build and `git diff --check`.
+Controlled Chrome DevTools inspection at 1440×1200 and exact 390×844 CSS viewports reports viewport width equal to document width, all five navigation controls present, provider-changing controls disabled, and zero console errors in the unconfigured state.
+This is controlled local evidence only.
+The populated authorized flow still requires Playwright or Orca Computer Use against a real backend projection, and no hosted Convex run, live provider call, owner-mailbox exchange, genuine supplier response, public origin, purchase, realized saving or commercial outcome was observed.
+Orca 1.4.205 reported ready after one restart and then exited before the first orchestration query, so no new worker was dispatched and no broad native permission was granted.
+
 ### 2026-09-21 - E8 correctness repair and visual rejection checkpoint
 
 Ready PR #14 is repaired at `b23f6a7` so stale substitute approval remains a zero-write denial while an authorized user may still reject the stale proposal and preserve its history.

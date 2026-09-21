@@ -1,8 +1,8 @@
 # OpeningOS evidence matrix
 
 This matrix keeps every stable requirement ID tied to its original meaning in [PRD.md](../../PRD.md) and every sponsor/Jev case tied to the [implementation plan](../implementation/sponsor-integration-plan.md).
-It records evidence through application integration baseline `1a1bf7d`, factual delivery-log head `48b2b41`, and the explicitly unintegrated ready heads listed below on September 21, 2026.
-Ready child PR evidence remains controlled and partial until its review gate passes and the fixed combined revision is independently accepted.
+It records controlled evidence through combined integration checkpoint `220165a` on September 21, 2026.
+The integrated child-package evidence remains partial until exact-head CI passes and the fixed combined revision receives independent Astra review.
 
 Status meanings:
 
@@ -38,7 +38,7 @@ Passing controlled evidence never counts as a live provider, deployed applicatio
 | P-18 | partial-controlled | The integrated workbench reads real bounded asset, safe document and service-case records, and ready PR #7 adds controlled commissioning and service outcomes; PR #7 remains unintegrated and live equipment outcomes are unverified. |
 | P-19 | partial-controlled | PR #12 initially proved draft/notOrdered specification reuse and explicit fresh-fact revalidation without historical financial copies, but coordinator-found source-project and malformed-limit defects are under repair. |
 | P-20 | partial-controlled | F1 enforces contributor, approver and owner authority across project scopes; the due-decision workbench flow remains for U1/E1. |
-| P-21 | partial-controlled | Foundation UI has reviewed desktop/narrow and keyboard retry evidence; U1 now preserves paginated activity and visibly fences server mutations during reconnect, while the complete selected workflow and final visual inspection remain. |
+| P-21 | partial-controlled | The selected purchasing-desk system now renders real projections plus honest unconfigured, loading, empty, error and reconnecting states at `220165a`; controlled 1440×1200 and exact 390×844 Chrome inspection reports no horizontal overflow or console errors. The populated authorized flow still needs Playwright or Orca Computer Use. |
 | P-22 | partial-controlled | Ready PR #9 head `bc8bcfe` derives truthful usage/outcome metrics from stored records and reports unsafe overflow as unavailable; it remains unintegrated and no business outcome is claimed. |
 | P-23 | partial-controlled | Ready PR #11 head `157d09d` proves a controlled pure negotiation policy with exact mandate/basis, disclosure, round and termination fences; production persistence and provider orchestration remain open. |
 | P-24 | partial-controlled | E7 commit `62dd541` parses bounded equipment CSV and review-gates draft promotion, but coordinator-found exact-source, idempotency, collision and attachment-truth defects are under repair. |
@@ -104,7 +104,7 @@ Passing controlled evidence never counts as a live provider, deployed applicatio
 | S-17 | partial-controlled | C1 controlled reconciliation keeps ambiguous outcomes unknown and never authorizes an automatic resend. |
 | S-18 | partial-controlled | C1 controlled cleanup tests retain durable project evidence while component transport state is bounded; hosted component cleanup remains unverified. |
 | S-19 | partial-controlled | C1 contracts and handlers reject unsafe HTML, header redirects and invalid/expired/remote attachments before transport; live malicious-provider input remains unverified. |
-| S-20 | partial-controlled | Foundation UI has truthful configured/unconfigured/retry states and reviewed responsive behavior; U1 renders last-known state during reconnect, blocks every server mutation until a fresh connected snapshot and preserves truthful activity cursors, while hosted reconnect behavior remains unverified. |
+| S-20 | partial-controlled | At `220165a`, every connection state remains inside the selected workbench shell, last-known reconnect state blocks mutations until a fresh projection, and exact 390×844 controlled browser inspection has `clientWidth = scrollWidth = 390`. Hosted reconnect behavior remains unverified. |
 | S-21 | live-unverified | Full published Firecrawl/Jev/OpenAI/AgentMail/Convex path has not run. |
 | S-22 | partial-controlled | F1 and browser tests enforce owner-only recipient versions and block alternate channels across API, model, retry and browser boundaries; C1 still owns the real transport integration. |
 | S-23 | live-unverified | Requires the owner mailbox, hosted route, provider credentials and an unscripted real reply. |
@@ -128,7 +128,6 @@ Passing controlled evidence never counts as a live provider, deployed applicatio
 - Foundation/browser checkpoint: `6432e98`, with application typecheck/build/tests, provider/user-path contracts and 155 browser tests green locally and in CI.
 - Shared-contract checkpoint: `92a49cd`, with 244 F1 tests, 180 direct-handler tests, exact-head Actions and Greptile green, and a separate Astra ACCEPT after 22 fresh actual-handler probes; merged as `96f0f1f` with an identical tree.
 - Application integration baseline: `1a1bf7d`, containing R1/C1/U1/E1, research-start idempotency, readiness and authoritative quote total/currentness controlled behavior; PR #2 remains open.
-- Ready unintegrated heads: PR #7 `e73277c`, PR #8 `f4c9177`, PR #9 `bc8bcfe`, PR #10 `c6e6f76` and PR #11 `157d09d`; all nine expected CI checks pass on each exact head, but Greptile supplied quota notices and the fixed combined Astra review remains open.
-- Repairing heads: E7 `62dd541` and PR #12 `513b28f`; neither is accepted while coordinator findings remain open.
+- Combined local checkpoint: `220165a`, integrating the repaired E7/E9/E11/E12 packages, shared negotiation authority and the selected purchasing-desk UI. The full local matrix, strict TypeScript, production build and controlled desktop/narrow browser checks pass; exact-head remote CI and independent Astra review remain open.
 - Fixed-commit browser re-review artifacts are private temporary evidence and contain no live-provider result.
 - The selected design reference remains `design/purchasing-workbench.html`; it is not counted as application behavior.
