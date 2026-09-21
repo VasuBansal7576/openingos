@@ -133,6 +133,11 @@ const approveRef = makeFunctionReference<
   QueryArgs<typeof orchestrator.approveNegotiationDraft>,
   QueryReturn<typeof orchestrator.approveNegotiationDraft>
 >("negotiation/orchestrator:approveNegotiationDraft");
+const approveSendRef = makeFunctionReference<
+  "action",
+  ActionArgs<typeof orchestrator.approveNegotiationSend>,
+  ActionReturn<typeof orchestrator.approveNegotiationSend>
+>("negotiation/orchestrator:approveNegotiationSend");
 
 const OWNER = { tokenIdentifier: "e12-owner" };
 const GUEST = { tokenIdentifier: "e12-guest" };
@@ -2663,5 +2668,193 @@ describe("Astra: versioned quote terms and reply workloads", () => {
     expect(log.agentmail).toHaveLength(0);
     const rounds = await t.run(async (ctx) => (await ctx.db.get(fixture.negotiationId))?.roundsUsed);
     expect(rounds).toBe(0);
+  });
+});
+
+describe("Astra finding 3: approval establishes exact send authority from draftId", () => {
+  async function grantCount(t: TestConvex<typeof schema>): Promise<number> {
+    return await t.run(async (ctx) => (await ctx.db.query("grants").take(100)).length);
+  }
+
+  async function approveSend(
+    fixture: Fixture,
+    draftId: Id<"evidence">,
+    extra: { costCeilingMicroUsd?: number; roundLimit?: number; expiresAt?: number } = {},
+  ) {
+    const log = installFetchStub({}, {
+      draftKind: "clarify",
+      sources: fixture.expectedDraftSources,
+      content: fixture.draftBody,
+    });
+    const result = await fixture.t.withIdentity(OWNER).action(approveSendRef, {
+      negotiationId: fixture.negotiationId,
+      draftId,
+      costCeilingMicroUsd: extra.costCeilingMicroUsd ?? 1_000_000,
+      roundLimit: extra.roundLimit ?? 8,
+      expiresAt: extra.expiresAt ?? Date.now() + 60 * 60 * 1000,
+    });
+    return { result, log };
+  }
+
+  test("prepare, approval, public job/reserve, and dispatch succeed with no pre-existing send grant", async () => {
+    const t = init();
+    const fixture = await createFixture(t);
+    // Remove the fixture's pre-issued send grant so the only path to
+    // dispatch runs through the new public approval from the draft id.
+    await t.run(async (ctx) => {
+      await ctx.db.delete(fixture.sendGrantId);
+    });
+    const draftId = await prepareValidDraftId(fixture);
+    const before = await grantCount(t);
+    const { result: approved, log: approveLog } = await approveSend(fixture, draftId);
+    expect(approved).toMatchObject({
+      ok: true,
+      outcome: "grant-issued",
+      move: "clarify",
+      quoteVersion: "qv-1",
+      quoteContentHash: "hash-qv-1",
+      roundsUsed: 0,
+    });
+    expect(approveLog.jev).toHaveLength(0);
+    expect(approveLog.openai).toHaveLength(0);
+    expect(approveLog.agentmail).toHaveLength(0);
+    if (!approved.ok || approved.outcome !== "grant-issued") {
+      throw new Error(`expected issued approval grant: ${JSON.stringify(approved)}`);
+    }
+    expect(await grantCount(t)).toBe(before + 1);
+    // The approval response carries no mailbox, no canonical envelope, and
+    // no envelope field of any kind.
+    const serialized = JSON.stringify(approved);
+    expect(serialized).not.toContain(OWNER_MAILBOX);
+    expect(serialized).not.toContain("envelopeCanonical");
+    expect(serialized).not.toContain("owner-negotiation");
+    // Normal public job/reservation setup against the approval grant, then
+    // the standard dispatch succeeds exactly once to the owner only.
+    const asOwner = t.withIdentity(OWNER);
+    const job = await asOwner.mutation(startJobRef, {
+      organizationId: fixture.organizationId,
+      projectId: fixture.projectId,
+      text: fixture.draftBody,
+      operationId: "communication.send",
+      kind: "communication",
+      grantId: approved.grantId,
+    });
+    if (!job.ok) throw new Error(`approval job setup failed: ${JSON.stringify(job)}`);
+    const reservation = await asOwner.mutation(reserveRef, {
+      jobId: job.jobId,
+      organizationId: fixture.organizationId,
+      projectId: fixture.projectId,
+      amountMicroUsd: 10_000,
+      pricingBasis: "controlled-send-basis-v1",
+    });
+    if (!reservation.ok) throw new Error(`approval reservation setup failed: ${reservation.message}`);
+    const { result, log } = await runDispatch(fixture, "req-astra-approve-flow", draftId, {});
+    expect(result).toMatchObject({ ok: true, outcome: "sent", move: "clarify" });
+    expect(log.agentmail).toHaveLength(1);
+    expect(log.agentmail[0]?.body).toContain(OWNER_MAILBOX);
+    if (result.ok && result.outcome === "sent") {
+      expect(result.roundsUsedAfter).toBe(1);
+    } else {
+      throw new Error("expected sent dispatch");
+    }
+    const rounds = await t.run(async (ctx) => (await ctx.db.get(fixture.negotiationId))?.roundsUsed);
+    expect(rounds).toBe(1);
+  });
+
+  test("approval rejects unbounded parameters without creating a grant", async () => {
+    const t = init();
+    const fixture = await createFixture(t);
+    const draftId = await prepareValidDraftId(fixture);
+    const before = await grantCount(t);
+    for (const params of [
+      { costCeilingMicroUsd: 0 },
+      { roundLimit: 0 },
+      { roundLimit: 64 },
+      { expiresAt: Date.now() - 1000 },
+    ]) {
+      const { result } = await approveSend(fixture, draftId, params);
+      expect(result).toMatchObject({ ok: false, code: "invalid-bounds" });
+    }
+    expect(await grantCount(t)).toBe(before);
+  });
+
+  test("cross-project, stale, and tampered drafts create no grant", async () => {
+    const t = init();
+    const fixture = await createFixture(t);
+    const draftId = await prepareValidDraftId(fixture);
+    const asOwner = t.withIdentity(OWNER);
+    const projectB = await asOwner.mutation(createProjectRef, {
+      organizationId: fixture.organizationId,
+      name: "Astra approval project",
+      visibility: "open",
+    });
+    if (!projectB.ok) throw new Error(`second project setup failed: ${projectB.message}`);
+    const negotiationB = await t.run(async (ctx) => {
+      const quote = await ctx.db.get(fixture.quoteId);
+      if (quote === null) throw new Error("missing quote");
+      const quoteB = await ctx.db.insert("quotes", {
+        organizationId: fixture.organizationId,
+        projectId: projectB.projectId,
+        version: quote.version,
+        contentHash: quote.contentHash,
+        currency: quote.currency,
+        lines: quote.lines,
+        charges: [],
+        taxBasis: quote.taxBasis,
+        evidenceRefs: [],
+        counterpartyRole: "ownerStandIn",
+        executionMode: "fixture",
+        createdAt: Date.now(),
+      });
+      return await ctx.db.insert("negotiations", {
+        organizationId: fixture.organizationId,
+        projectId: projectB.projectId,
+        quoteId: quoteB,
+        quoteVersion: "qv-1",
+        currency: "EUR",
+        mandateHash: "hash-qv-1",
+        roundLimit: 3,
+        roundsUsed: 0,
+        state: "active",
+        expiresAt: Date.now() + 60 * 60 * 1000,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      });
+    });
+    const before = await grantCount(t);
+    const crossLog = installFetchStub({}, {
+      draftKind: "clarify",
+      sources: fixture.expectedDraftSources,
+      content: fixture.draftBody,
+    });
+    const cross = await t.withIdentity(OWNER).action(approveSendRef, {
+      negotiationId: negotiationB,
+      draftId,
+      costCeilingMicroUsd: 1_000_000,
+      roundLimit: 8,
+      expiresAt: Date.now() + 60 * 60 * 1000,
+    });
+    expect(cross).toMatchObject({ ok: false });
+    expect(crossLog.agentmail).toHaveLength(0);
+    await t.run(async (ctx) => {
+      await ctx.db.patch(fixture.negotiationId, { roundsUsed: 1, updatedAt: Date.now() });
+    });
+    const { result: stale } = await approveSend(fixture, draftId);
+    expect(stale).toMatchObject({ ok: false, code: "draft-round-stale" });
+    await t.run(async (ctx) => {
+      await ctx.db.patch(fixture.negotiationId, { roundsUsed: 0, updatedAt: Date.now() });
+      const row = await ctx.db.get(draftId);
+      if (row === null || typeof row.protectedSourceText !== "string") {
+        throw new Error("missing prepared draft");
+      }
+      const bundle = JSON.parse(row.protectedSourceText) as Record<string, unknown>;
+      const swapped = canonicalJson(sendEnvelope(OWNER_MAILBOX, COUNTER_BODY));
+      await ctx.db.patch(draftId, {
+        protectedSourceText: canonicalJson({ ...bundle, envelopeCanonical: swapped }),
+      });
+    });
+    const { result: tampered } = await approveSend(fixture, draftId);
+    expect(tampered).toMatchObject({ ok: false, code: "draft-payload-mismatch" });
+    expect(await grantCount(t)).toBe(before);
   });
 });

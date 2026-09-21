@@ -95,6 +95,7 @@ import type * as jev from "../models/jev.js";
 import type * as openai from "../models/openai.js";
 import type * as send from "../communication/send.js";
 import type * as operations from "../execution/operations.js";
+import type * as grants from "../access/grants.js";
 import type {
   StoredQuoteCharge,
   StoredQuoteLine,
@@ -128,6 +129,11 @@ const createOperationRef = makeFunctionReference<
   MutationArgs<typeof operations.create>,
   MutationReturn<typeof operations.create>
 >("execution/operations:create");
+const issueGrantRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof grants.issue>,
+  MutationReturn<typeof grants.issue>
+>("access/grants:issue");
 
 /** Pinned input version for the server-built Jev move workload. */
 export const NEGOTIATION_JEV_INPUT_VERSION = "e6-negotiation-workload-v2" as const;
@@ -2875,6 +2881,184 @@ export const approveNegotiationDraft = f1Query({
     };
   },
 });
+
+const approvalGrantValidator = v.union(
+  v.object({
+    ok: v.literal(true),
+    outcome: v.literal("grant-issued"),
+    grantId: v.id("grants"),
+    revocationVersion: v.number(),
+    move: v.string(),
+    quoteVersion: v.string(),
+    quoteContentHash: v.string(),
+    roundsUsed: v.number(),
+    payloadHash: v.string(),
+    redactedPreview: v.string(),
+  }),
+  denialValidator,
+);
+
+/**
+ * Bounded approval parameters for issuing the exact send grant. All values
+ * are non-private numbers; the private envelope always comes from the
+ * server-side draft bundle, never from the caller.
+ */
+const APPROVAL_MAX_COST_CEILING_MICRO_USD = 1_000_000;
+const APPROVAL_MAX_ROUND_LIMIT = 8;
+const APPROVAL_MAX_EXPIRY_MS = 7 * 24 * 60 * 60 * 1000;
+/** Send input-version marker the readiness probe and discovery require. */
+const APPROVAL_SEND_INPUT_VERSION = "send-v1";
+
+/**
+ * Public approval that establishes send authority from a draft id (Astra
+ * finding 3 root-cause repair).
+ *
+ * The read-only `approveNegotiationDraft` preview alone could not close the
+ * loop: `discoverSendCapacity` demands a pre-existing grant whose canonical
+ * payload equals the private envelope, and `grants:issue` demands a
+ * browser-supplied `payloadJson` — so a fresh approver holding only a
+ * draft id could never reach authorized dispatch without knowing or
+ * leaking the protected envelope. This action closes that gap: it accepts
+ * the draft id plus only non-private bounded approval parameters,
+ * resolves and validates the protected envelope server-side (same pins,
+ * envelope validation, and exact draft bindings as dispatch), and issues
+ * the exact send grant through the existing `grants:issue` invariants —
+ * same recipient-version binding, same canonical-payload equality, same
+ * workflow authority — with `payloadJson` supplied server-side from the
+ * stored bundle. The response carries the new grant id, the approved move
+ * and pins, and a redacted preview; never the mailbox, the canonical
+ * envelope, or raw draft text. Makes no model calls and sends nothing;
+ * the normal public job/reservation setup followed by
+ * `dispatchApprovedDraft` completes the flow.
+ */
+export const approveNegotiationSend = f1Action({
+  args: {
+    negotiationId: v.id("negotiations"),
+    draftId: v.id("evidence"),
+    costCeilingMicroUsd: v.number(),
+    roundLimit: v.number(),
+    expiresAt: v.number(),
+  },
+  returns: approvalGrantValidator,
+  handler: async (ctx, args) => {
+    const authIdentity = await ctx.auth.getUserIdentity();
+    const identity = authIdentity?.tokenIdentifier ?? null;
+    if (identity === null || identity.trim().length === 0) {
+      return deniedResult("forged-identity", "unauthenticated");
+    }
+    if (
+      !Number.isSafeInteger(args.costCeilingMicroUsd) ||
+      args.costCeilingMicroUsd < 1 ||
+      args.costCeilingMicroUsd > APPROVAL_MAX_COST_CEILING_MICRO_USD
+    ) {
+      return deniedResult("invalid-bounds", "cost ceiling must be a positive safe integer within the approval bound");
+    }
+    if (
+      !Number.isSafeInteger(args.roundLimit) ||
+      args.roundLimit < 1 ||
+      args.roundLimit > APPROVAL_MAX_ROUND_LIMIT
+    ) {
+      return deniedResult("invalid-bounds", "round limit must be a positive safe integer within the approval bound");
+    }
+    const now = Date.now();
+    if (
+      !Number.isSafeInteger(args.expiresAt) ||
+      args.expiresAt <= now ||
+      args.expiresAt > now + APPROVAL_MAX_EXPIRY_MS
+    ) {
+      return deniedResult("invalid-bounds", "grant expiry must be in the future within the approval bound");
+    }
+    const resolved = await resolvePins(ctx, args.negotiationId, identity, undefined);
+    if (!resolved.ok) return deniedResult(resolved.code, resolved.message);
+    const pinned = resolved.pinned;
+    const mandate = mandateSnapshotOf(pinned);
+    const bounds = checkNegotiationBounds(mandate, currentSnapshotOf(pinned, null));
+    if (bounds !== null) return deniedResult(bounds.code, bounds.message);
+    const earlyFence = checkNegotiationFences(mandate, currentSnapshotOf(pinned, null));
+    if (earlyFence !== null) {
+      return deniedResult("mandate-not-current", "negotiation mandate is not currently sendable");
+    }
+    if (approvedConversationGate(pinned).stopped) {
+      return deniedResult("mandate-not-current", "bound reply arrived; ingestion must update the mandate basis first");
+    }
+    const approvedDraft = await ctx.runQuery(loadDraftRef, {
+      organizationId: pinned.organizationId,
+      projectId: pinned.projectId,
+      negotiationId: pinned.negotiationId,
+      draftId: args.draftId,
+      identity,
+    });
+    if (!approvedDraft.ok) return deniedResult(approvedDraft.code, approvedDraft.message);
+    const envelopeCanonical: string = approvedDraft.envelopeCanonical;
+    const approved = validateApprovedEnvelope(
+      envelopeCanonical,
+      pinned.recipientMailboxNormalized,
+      pinned.targetMinorUnits,
+    );
+    if (!approved.ok) return deniedResult(approved.code, approved.message);
+    const binding = checkDraftBindings(
+      {
+        projectId: approvedDraft.projectId,
+        negotiationId: approvedDraft.negotiationId,
+        quoteId: approvedDraft.quoteId,
+        quoteVersion: approvedDraft.quoteVersion,
+        quoteContentHash: approvedDraft.quoteContentHash,
+        conversationVersion: approvedDraft.conversationVersion,
+        replyVersion: approvedDraft.replyVersion,
+        roundsUsed: approvedDraft.roundsUsed,
+        move: approvedDraft.move,
+        payloadHash: approvedDraft.payloadHash,
+      },
+      {
+        projectId: String(pinned.projectId),
+        negotiationId: String(pinned.negotiationId),
+        quoteId: String(pinned.quoteId),
+        quoteVersion: pinned.quoteVersion,
+        quoteContentHash: pinned.quoteContentHash,
+        conversationVersion: pinned.conversationVersion,
+        replyVersion: pinned.replyVersion,
+        roundsUsed: pinned.roundsUsed,
+      },
+      envelopeCanonical,
+    );
+    if (!binding.ok) return deniedResult(binding.code, binding.message);
+    // Issue the exact send grant through the existing grant invariants.
+    // The canonical payload comes server-side from the validated stored
+    // bundle; the caller never supplies or receives it.
+    const issued = await ctx.runMutation(issueGrantRef, {
+      organizationId: pinned.organizationId,
+      projectId: pinned.projectId,
+      operations: [NEGOTIATION_OPERATION_KIND],
+      communicationProfile: COMMUNICATION_PROFILE_OWNER_ROLEPLAY,
+      recipientConfigVersion: pinned.recipientConfigVersion ?? 0,
+      inputVersions: { send: APPROVAL_SEND_INPUT_VERSION },
+      payloadJson: envelopeCanonical,
+      costCeilingMicroUsd: args.costCeilingMicroUsd,
+      roundLimit: args.roundLimit,
+      expiresAt: args.expiresAt,
+      workflowAuthorities: [{ operationId: NEGOTIATION_OPERATION_KIND, projectId: pinned.projectId }],
+    });
+    if (!issued.ok) return deniedResult(issued.code, issued.message);
+    return {
+      ok: true as const,
+      outcome: "grant-issued" as const,
+      grantId: issued.grantId,
+      revocationVersion: issued.revocationVersion,
+      move: approvedDraft.move,
+      quoteVersion: approvedDraft.quoteVersion,
+      quoteContentHash: approvedDraft.quoteContentHash,
+      roundsUsed: approvedDraft.roundsUsed,
+      payloadHash: approvedDraft.payloadHash,
+      redactedPreview: approved.redactedPreview,
+    };
+  },
+});
+
+const approveSendRef = makeFunctionReference<
+  "action",
+  ActionArgs<typeof approveNegotiationSend>,
+  ActionReturn<typeof approveNegotiationSend>
+>("negotiation/orchestrator:approveNegotiationSend");
 
 /**
  * Phase two of the two-phase flow: send a previously prepared and approved
