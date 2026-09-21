@@ -620,16 +620,25 @@ function parseComparisonScope(value: unknown): WorkbenchComparisonScope | null |
  * side, `estimated` requires the signed delta range, and the other
  * statuses carry neither. A present but malformed verdict rejects the
  * snapshot instead of being dropped.
+ *
+ * E18 finding 3 (parser half): a verdict may only bind to the displayed
+ * comparison contract when it names the compared quote, so `againstQuoteId`
+ * is required on every emitted verdict. Minor-unit delta ranges must be
+ * safe integers (no fractional minor units) and correctly ordered
+ * (minimum <= maximum; a reversed or negative-width range is rejected).
+ * An exact `equal` verdict must carry a zero difference, and a zero
+ * difference must be claimed as `equal` — anything else is ambiguous
+ * rank data and rejects the payload.
  */
 function parseOfferComparison(value: unknown): WorkbenchOfferComparison | null {
   if (!isRecord(value)) return null;
   const againstOfferId = requiredString(value.againstCandidateId);
-  const againstQuoteId = nullableString(value.againstQuoteId);
+  const againstQuoteId = requiredString(value.againstQuoteId);
   const reason = requiredString(value.reason);
   const status = isOneOf(value.status, ["comparable", "estimated", "incompatible", "incomplete"] as const)
     ? value.status
     : null;
-  if (againstOfferId === null || againstQuoteId === undefined || reason === null || status === null) return null;
+  if (againstOfferId === null || againstQuoteId === null || reason === null || status === null) return null;
   const differenceMinorUnits = parseExactTotal(value.differenceMinorUnits);
   if (differenceMinorUnits === undefined) return null;
   const cheaper = value.cheaper === null || value.cheaper === undefined
@@ -645,12 +654,14 @@ function parseOfferComparison(value: unknown): WorkbenchOfferComparison | null {
     const minimum = nullableNumber(value.estimatedDeltaMinorUnits.minimum);
     const maximum = nullableNumber(value.estimatedDeltaMinorUnits.maximum);
     if (minimum === null || minimum === undefined || maximum === null || maximum === undefined) return null;
+    if (!Number.isSafeInteger(minimum) || !Number.isSafeInteger(maximum) || minimum > maximum) return null;
     estimatedDeltaMinorUnits = { minimum, maximum };
   } else {
     return null;
   }
   if (status === "comparable") {
     if (differenceMinorUnits === null || cheaper === null || estimatedDeltaMinorUnits !== null) return null;
+    if (cheaper === "equal" ? differenceMinorUnits !== 0 : differenceMinorUnits === 0) return null;
   } else if (status === "estimated") {
     if (estimatedDeltaMinorUnits === null || differenceMinorUnits !== null || cheaper !== null) return null;
   } else if (differenceMinorUnits !== null || cheaper !== null || estimatedDeltaMinorUnits !== null) {
@@ -1168,6 +1179,19 @@ export function parseWorkbenchSnapshot(value: unknown, expectedProjectId?: strin
   for (const entry of value.activity.page) { const parsed = parseActivityItem(entry); if (parsed === null) return null; activity.push(parsed); }
   for (const entry of rawImpacts) { const parsed = parseImpact(entry); if (parsed === null) return null; impacts.push(parsed); }
   for (const entry of rawSubstitutes) { const parsed = parseSubstitute(entry); if (parsed === null) return null; substitutes.push(parsed); }
+  // E18 finding 3: each verdict must bind to the displayed comparison
+  // contract. The compared offer has to exist in this same snapshot and the
+  // verdict's againstQuoteId must equal that offer's current quote identity;
+  // an unresolvable or stale quote reference is not a displayable
+  // comparison and fails closed.
+  const offersById = new Map(offers.map((offer) => [offer.id, offer]));
+  for (const offer of offers) {
+    for (const verdict of offer.comparisons) {
+      const other = offersById.get(verdict.againstOfferId);
+      if (other === undefined || other.id === offer.id) return null;
+      if (other.quote === null || other.quote.id !== verdict.againstQuoteId) return null;
+    }
+  }
   return {
     project,
     access,
