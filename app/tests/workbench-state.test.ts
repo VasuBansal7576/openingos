@@ -1,4 +1,6 @@
 import { expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { formatMoney, parseWorkbenchSnapshot, type WorkbenchSnapshot } from "../workbench-state";
 
 /**
@@ -360,4 +362,165 @@ test("legacy payloads without the F2 blocks still parse without ranking data", (
   expect(offer?.quote?.taxBasisId).toBe("NL-EUR-INCLUSIVE");
   expect(offer?.quote?.comparisonScope).toBeNull();
   expect(offer?.comparisons).toEqual([]);
+});
+
+/**
+ * E18 finding 3 (parser half) regressions: verdict ranges, equal claims and
+ * compared-quote bindings must be strictly validated so the displayed
+ * comparison contract cannot rest on ambiguous verdict data.
+ */
+
+test("fractional delta-range endpoints reject the payload", () => {
+  const snapshot = parse([
+    offer({
+      id: "offer-a",
+      quote: quote({ id: "quote-a", currency: "EUR", totalMinorUnits: 795049 }),
+      comparisons: [{
+        againstCandidateId: "offer-b",
+        againstQuoteId: "quote-b",
+        status: "estimated",
+        reason: "equivalent-scope-with-estimates",
+        differenceMinorUnits: null,
+        cheaper: null,
+        estimatedDeltaMinorUnits: { minimum: -60000.5, maximum: -50000 },
+      }],
+    }),
+    offer({ id: "offer-b", quote: quote({ id: "quote-b", currency: "EUR", totalMinorUnits: 850000 }) }),
+  ]);
+  expect(snapshot).toBeNull();
+});
+
+test("reversed delta ranges reject the payload", () => {
+  const snapshot = parse([
+    offer({
+      id: "offer-a",
+      quote: quote({ id: "quote-a", currency: "EUR", totalMinorUnits: 795049 }),
+      comparisons: [{
+        againstCandidateId: "offer-b",
+        againstQuoteId: "quote-b",
+        status: "estimated",
+        reason: "equivalent-scope-with-estimates",
+        differenceMinorUnits: null,
+        cheaper: null,
+        estimatedDeltaMinorUnits: { minimum: -50000, maximum: -60000 },
+      }],
+    }),
+    offer({ id: "offer-b", quote: quote({ id: "quote-b", currency: "EUR", totalMinorUnits: 850000 }) }),
+  ]);
+  expect(snapshot).toBeNull();
+});
+
+test("an equal claim with a nonzero difference rejects the payload", () => {
+  const snapshot = parse([
+    offer({
+      id: "offer-a",
+      quote: quote({ id: "quote-a", currency: "EUR", totalMinorUnits: 795049 }),
+      comparisons: [comparableVerdict("offer-b", "quote-b", 54951, "equal")],
+    }),
+    offer({ id: "offer-b", quote: quote({ id: "quote-b", currency: "EUR", totalMinorUnits: 850000 }) }),
+  ]);
+  expect(snapshot).toBeNull();
+});
+
+test("a zero difference claimed against the other offer rejects the payload", () => {
+  const snapshot = parse([
+    offer({
+      id: "offer-a",
+      quote: quote({ id: "quote-a", currency: "EUR", totalMinorUnits: 795049 }),
+      comparisons: [comparableVerdict("offer-b", "quote-b", 0, "self")],
+    }),
+    offer({ id: "offer-b", quote: quote({ id: "quote-b", currency: "EUR", totalMinorUnits: 850000 }) }),
+  ]);
+  expect(snapshot).toBeNull();
+});
+
+test("an exact equal verdict with a zero difference parses", () => {
+  const snapshot = parse([
+    offer({
+      id: "offer-a",
+      quote: quote({ id: "quote-a", currency: "EUR", totalMinorUnits: 850000 }),
+      comparisons: [comparableVerdict("offer-b", "quote-b", 0, "equal")],
+    }),
+    offer({ id: "offer-b", quote: quote({ id: "quote-b", currency: "EUR", totalMinorUnits: 850000 }) }),
+  ]);
+  expect(snapshot).not.toBeNull();
+  expect(snapshot?.offers[0]?.comparisons[0]?.cheaper).toBe("equal");
+  expect(snapshot?.offers[0]?.comparisons[0]?.differenceMinorUnits).toBe(0);
+});
+
+test("a verdict without a compared quote identity rejects the payload", () => {
+  const missingQuoteId = parse([
+    offer({
+      id: "offer-a",
+      quote: quote({ id: "quote-a", currency: "EUR", totalMinorUnits: 795049 }),
+      comparisons: [{
+        againstCandidateId: "offer-b",
+        againstQuoteId: null,
+        status: "comparable",
+        reason: "equivalent-scope",
+        differenceMinorUnits: 54951,
+        cheaper: "self",
+        estimatedDeltaMinorUnits: null,
+      }],
+    }),
+    offer({ id: "offer-b", quote: quote({ id: "quote-b", currency: "EUR", totalMinorUnits: 850000 }) }),
+  ]);
+  expect(missingQuoteId).toBeNull();
+
+  const estimatedMissingQuoteId = parse([
+    offer({
+      id: "offer-a",
+      quote: quote({ id: "quote-a", currency: "EUR", totalMinorUnits: null }),
+      comparisons: [{
+        againstCandidateId: "offer-b",
+        againstQuoteId: null,
+        status: "estimated",
+        reason: "equivalent-scope-with-estimates",
+        differenceMinorUnits: null,
+        cheaper: null,
+        estimatedDeltaMinorUnits: { minimum: -60000, maximum: -50000 },
+      }],
+    }),
+    offer({ id: "offer-b", quote: quote({ id: "quote-b", currency: "EUR", totalMinorUnits: 850000 }) }),
+  ]);
+  expect(estimatedMissingQuoteId).toBeNull();
+});
+
+test("verdicts must bind to the compared offer's current quote identity", () => {
+  const staleQuoteReference = parse([
+    offer({
+      id: "offer-a",
+      quote: quote({ id: "quote-a", currency: "EUR", totalMinorUnits: 795049 }),
+      comparisons: [comparableVerdict("offer-b", "quote-stale", 54951, "self")],
+    }),
+    offer({ id: "offer-b", quote: quote({ id: "quote-b", currency: "EUR", totalMinorUnits: 850000 }) }),
+  ]);
+  expect(staleQuoteReference).toBeNull();
+
+  const unknownOfferReference = parse([
+    offer({
+      id: "offer-a",
+      quote: quote({ id: "quote-a", currency: "EUR", totalMinorUnits: 795049 }),
+      comparisons: [comparableVerdict("offer-missing", "quote-b", 54951, "self")],
+    }),
+    offer({ id: "offer-b", quote: quote({ id: "quote-b", currency: "EUR", totalMinorUnits: 850000 }) }),
+  ]);
+  expect(unknownOfferReference).toBeNull();
+
+  const selfReference = parse([
+    offer({
+      id: "offer-a",
+      quote: quote({ id: "quote-a", currency: "EUR", totalMinorUnits: 795049 }),
+      comparisons: [comparableVerdict("offer-a", "quote-a", 0, "equal")],
+    }),
+  ]);
+  expect(selfReference).toBeNull();
+});
+
+test("the normal application test command runs the parser regressions", () => {
+  const packageJson = JSON.parse(
+    readFileSync(fileURLToPath(new URL("../../package.json", import.meta.url)), "utf8"),
+  ) as { scripts?: Record<string, string> };
+  const command = packageJson.scripts?.["test:app"] ?? "";
+  expect(command).toContain("app/tests/workbench-state.test.ts");
 });

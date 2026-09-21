@@ -251,6 +251,7 @@ test("automatically wires the default adapter and discovers the first authorized
   const actEnvironment = globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean };
   const previousActEnvironment = actEnvironment.IS_REACT_ACT_ENVIRONMENT;
   const queryArgs: unknown[] = [];
+  const eventLog: string[] = [];
   let unmounted = false;
 
   const projectProjection: Record<string, unknown> = {
@@ -335,9 +336,20 @@ test("automatically wires the default adapter and discovers the first authorized
       clearAuth: () => {},
       connectionState: () => ({ isWebSocketConnected: true, hasEverConnected: true, connectionRetries: 0 }),
       subscribeToConnectionState: (_callback: unknown) => () => {},
+      action: async (_name: unknown, args: unknown) => {
+        const provider = typeof args === "object" && args !== null && "provider" in args
+          ? String((args as { provider: unknown }).provider)
+          : "unknown";
+        eventLog.push(`signIn:${provider}`);
+        return { tokens: { token: "controlled-anonymous-token", refreshToken: "controlled-anonymous-refresh" } };
+      },
       query: async (_reference: unknown, args: unknown) => {
         queryArgs.push(args);
-        if (typeof args === "object" && args !== null && "projectId" in args) return projectProjection;
+        if (typeof args === "object" && args !== null && "projectId" in args) {
+          eventLog.push("query:projection");
+          return projectProjection;
+        }
+        eventLog.push("query:listAccessibleProjects");
         return projectList;
       },
       watchQuery: (_reference: unknown, _args: unknown) => watch,
@@ -367,6 +379,97 @@ test("automatically wires the default adapter and discovers the first authorized
     expect(container.textContent).toContain("Northside café");
     expect(queryArgs[0]).toEqual({ limit: 1 });
     expect(queryArgs.some((args) => typeof args === "object" && args !== null && "projectId" in args)).toBe(true);
+    // E18 finding 2: a fresh visitor must establish the real anonymous
+    // Convex Auth session before any discovery query runs.
+    expect(eventLog).toContain("signIn:anonymous");
+    expect(eventLog.indexOf("signIn:anonymous")).toBeLessThan(eventLog.indexOf("query:listAccessibleProjects"));
+    await act(async () => {
+      root?.unmount();
+    });
+    unmounted = true;
+  } finally {
+    if (!unmounted) unmountRoot();
+    dom.close();
+    browserGlobals.window = previousWindow;
+    browserGlobals.document = previousDocument;
+    browserGlobals.navigator = previousNavigator;
+    if (previousActEnvironment === undefined) delete actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+    else actEnvironment.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment;
+  }
+});
+
+test("anonymous sign-in failure stays honest without forged-identity discovery", async () => {
+  const dom = new HappyWindow({ url: "https://openingos.test/" });
+  const previousWindow = globalThis.window;
+  const previousDocument = globalThis.document;
+  const previousNavigator = globalThis.navigator;
+  const actEnvironment = globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean };
+  const previousActEnvironment = actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+  const queryArgs: unknown[] = [];
+  const actionArgs: unknown[] = [];
+  let unmounted = false;
+
+  const failingClient = {
+    address: "https://controlled.convex.cloud",
+    logger: false,
+    setAuth: (_fetchToken: unknown, onChange: (authenticated: boolean) => void) => onChange(false),
+    clearAuth: () => {},
+    connectionState: () => ({ isWebSocketConnected: true, hasEverConnected: true, connectionRetries: 0 }),
+    subscribeToConnectionState: (_callback: unknown) => () => {},
+    action: async (_name: unknown, args: unknown) => {
+      actionArgs.push(args);
+      throw new Error("controlled anonymous denial");
+    },
+    query: async (_reference: unknown, args: unknown) => {
+      queryArgs.push(args);
+      return null;
+    },
+    watchQuery: () => ({
+      localQueryResult: () => undefined,
+      onUpdate: () => () => {},
+    }) as unknown as Watch<unknown>,
+    close: async () => {},
+  } as unknown as ConvexReactClient;
+
+  const browserGlobals = globalThis as unknown as { window: unknown; document: unknown; navigator: unknown };
+  browserGlobals.window = dom as unknown as globalThis.Window;
+  browserGlobals.document = dom.document as unknown as globalThis.Document;
+  browserGlobals.navigator = dom.navigator as unknown as globalThis.Navigator;
+  actEnvironment.IS_REACT_ACT_ENVIRONMENT = true;
+
+  const container = dom.document.createElement("div");
+  dom.document.body.append(container);
+  let root: ReturnType<typeof mountRootApplication> | null = null;
+  const unmountRoot = () => {
+    if (root !== null) root.unmount();
+  };
+  try {
+    await act(async () => {
+      root = mountRootApplication(container as unknown as globalThis.Element, {
+        clientFactory: () => failingClient,
+        configuredUrl: "https://controlled.convex.cloud",
+      });
+    });
+    const deadline = Date.now() + 1_500;
+    while (!container.textContent?.includes("PROJECT STATE UNAVAILABLE") && Date.now() < deadline) {
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      });
+    }
+    expect(container.textContent).toContain("PROJECT STATE UNAVAILABLE");
+    expect(container.textContent).toContain("Anonymous sign-in failed");
+    // Exactly one anonymous sign-in attempt was made through Convex Auth,
+    // and the denial is not retried into a loop or disguised as a query.
+    expect(actionArgs).toHaveLength(1);
+    expect((actionArgs[0] as { provider?: string }).provider).toBe("anonymous");
+    // No discovery or projection query ran with a forged identity.
+    expect(queryArgs).toHaveLength(0);
+    // The honest failure keeps a retry action available.
+    expect(
+      Array.from(container.querySelectorAll("button")).some((button) =>
+        button.textContent?.includes("Retry project state"),
+      ),
+    ).toBe(true);
     await act(async () => {
       root?.unmount();
     });

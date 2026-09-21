@@ -1,4 +1,4 @@
-import { ConvexAuthProvider, useConvexAuth } from "@convex-dev/auth/react";
+import { ConvexAuthProvider, useAuthActions, useAuthToken, useConvexAuth } from "@convex-dev/auth/react";
 import { ConvexReactClient, useConvexConnectionState } from "convex/react";
 import React, { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
@@ -109,9 +109,35 @@ export function applyLiveWorkbenchSnapshot(current: WorkbenchSnapshot, live: Wor
   };
 }
 
+const ANONYMOUS_SIGN_IN_FAILED =
+  "Anonymous sign-in failed, so this browser has no authorized backend identity. No project state was read and nothing was sent. Retry to sign in again.";
+
 function ConnectionAwareApp({ onRetry, projectId, workbenchAdapter }: { readonly onRetry: () => void; readonly projectId?: string | undefined; readonly workbenchAdapter?: RuntimeWorkbenchAdapter | undefined }) {
   const connection = useConvexConnectionState();
   const auth = useConvexAuth();
+  const authToken = useAuthToken();
+  const authActions = useAuthActions();
+  const [anonymousSignIn, setAnonymousSignIn] = useState<"idle" | "establishing" | "failed">("idle");
+  const attemptedAnonymousRef = useRef(false);
+
+  // A fresh visitor holds no session. Establish the real anonymous identity
+  // through the registered Convex Auth provider before any discovery, load,
+  // or creation mutation runs, so the backend sees an authenticated caller.
+  // Without this, the backend denies forged-identity requests and project
+  // discovery would disguise that denial as an empty project list.
+  useEffect(() => {
+    if (auth.isLoading || authToken !== null || attemptedAnonymousRef.current) return;
+    attemptedAnonymousRef.current = true;
+    setAnonymousSignIn("establishing");
+    authActions.signIn("anonymous").then((result) => {
+      // The anonymous provider signs in immediately; the stored token flips
+      // the auth context. A non-signing result created no session.
+      setAnonymousSignIn(result.signingIn ? "idle" : "failed");
+    }).catch(() => {
+      setAnonymousSignIn("failed");
+    });
+  }, [auth.isLoading, authToken, authActions]);
+
   const backendStatus = statusFromConnection({
     isWebSocketConnected: connection.isWebSocketConnected,
     hasEverConnected: connection.hasEverConnected,
@@ -119,7 +145,15 @@ function ConnectionAwareApp({ onRetry, projectId, workbenchAdapter }: { readonly
     authLoading: auth.isLoading,
   });
 
-  return <AdapterAwareApp backendStatus={backendStatus} onRetry={onRetry} projectId={projectId} workbenchAdapter={workbenchAdapter} />;
+  // Auth failure stays honest: an explicit error with a retry path, never a
+  // fake identity and never an "empty" project list that hides the denial.
+  if (backendStatus === "connected" && authToken === null && anonymousSignIn === "failed") {
+    return <App backendStatus="connected" onRetry={onRetry} workbench={{ state: "error", message: ANONYMOUS_SIGN_IN_FAILED }} />;
+  }
+  // Discovery and creation wait for the established session; the honest
+  // authenticating state replaces "connected" while the identity is pending.
+  const connectedWithoutIdentity = backendStatus === "connected" && authToken === null;
+  return <AdapterAwareApp backendStatus={connectedWithoutIdentity ? "authenticating" : backendStatus} onRetry={onRetry} projectId={projectId} workbenchAdapter={workbenchAdapter} />;
 }
 
 export function AdapterAwareApp({
