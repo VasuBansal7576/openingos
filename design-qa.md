@@ -3,13 +3,15 @@
 **Source visual truth**
 
 - `design/purchasing-workbench.html` (accepted September 19, 2026; self-contained fixture prototype)
-- Prior browser capture: `/tmp/openingos-design-qa/reference-workbench.png`
+- Accepted prototype captures: `/private/tmp/openingos-prototype-desktop-fresh.png`
+  at 1440 × 1200 and `/private/tmp/openingos-prototype-mobile-390.png` at
+  390 × 844.
 - Source pixels: 1440 × 1200 at device scale factor 1.
 
 **Implementation evidence (this repair)**
 
 - Production bundle built from this checkout: `dist/` via `bun run build`
-  (renders `dist/assets/index-CEWej7NF.js`, contains the landing copy; the
+  (renders `dist/assets/index-TWb1xBTK.js`, contains the landing copy; the
   espresso-machine visual ships as `dist/assets/espresso-machine-Ci7aWQZ4.png`).
 - Automated verification, all passing on this checkout:
   - `bun test app/tests/application.test.ts`: 11 pass, 103 assertions
@@ -32,6 +34,21 @@
 - Static audit: no fixed-pixel `width:` overflow offenders in landing rules;
   landing grids use fractional units with `minmax(0, …)`/`min-width: 0` and
   `overflow-wrap: break-word` on display headings.
+- Local browser verification against this checkout, with the backend
+  deliberately unconfigured:
+  - Production captures:
+    `/private/tmp/openingos-e13-desktop-v2.png` at 1440 × 1200 and
+    `/private/tmp/openingos-e13-mobile-v2.png` at 390 × 844.
+  - The production page document width exactly matched each viewport. The
+    intentionally rotated desk collage had the same small internal transformed
+    overflow as the accepted prototype and did not create page overflow.
+  - Visual comparison confirmed the accepted hierarchy, layout, paper/photo
+    overlap, typography, imagery, colors, CTA placement and responsive stack.
+  - CDP interaction verification opened both landing panels, confirmed heading
+    focus, closed each with Escape, restored focus to its invoking button and
+    observed zero runtime exceptions.
+  - This is controlled local browser evidence, not live backend or provider
+    integration evidence.
 
 **Target state**
 
@@ -109,7 +126,7 @@
 - P1 (fixed): `tsc --noEmit` flagged a narrowed `empty`-state comparison in
   `App.tsx` and a happy-dom `activeElement` type mismatch in the new
   keyboard test. Both repaired; both typechecks are clean.
-- P2 (fixed in code, browser verification pending): F2/F4/F7/F9 findings
+- P2 (fixed and locally browser-verified where renderable): F2/F4/F7/F9 findings
   from the coordinator's Astra UI review are repaired with regression tests.
   F2 now renders native quote currency and exact minor units, consumes only
   backend-authored pairwise verdicts, and does not rank incompatible,
@@ -134,21 +151,18 @@
 
 **Remaining blocker**
 
-- Rendered-pixel comparison at 1440×1200 and 390×844 could not be captured
-  in this worker environment (no browser available), so same-state
-  screenshot parity rests on DOM composition, shipped-token contrast math,
-  CSS overflow audit, and interaction tests rather than pixel diffs. A
-  browser pass (Playwright or Computer Use against this exact commit, static
-  landing states plus connected key routes: brief, compare, vendors, inbox,
-  review, recovery, equipment) should confirm visual polish before handoff.
+- Static landing parity and interactions were verified in a local headless
+  browser at desktop and mobile sizes. Connected key routes (brief, compare,
+  vendors, inbox, review, recovery and equipment) still need browser
+  verification against an authorized backend state.
+- The sample-project backend route is not implemented, so the Northside action
+  correctly remains unavailable rather than substituting fixture state.
   Controlled prototype states remain labeled controlled; nothing here is
   live-integration evidence.
 
 **Final result**
 
-final result: pending browser verification. The sample-project backend route
-also remains an open product dependency. The implementation must not be marked
-passed until same-state desktop and mobile browser captures have been compared
-with the accepted prototype, all resulting P0/P1/P2 issues are fixed, and the
-real isolated sample-project path has been verified. No fixture data was
-introduced in this checkpoint.
+final result: static landing fidelity passed local desktop/mobile browser
+comparison and interaction verification. Full design QA remains pending the
+real isolated sample-project path and connected key-route browser verification.
+No fixture data was introduced in this checkpoint.

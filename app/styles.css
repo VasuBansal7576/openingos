@@ -460,6 +460,7 @@ h1, h2, h3, p { margin-top: 0; }
 .wb-landing-hero { position: relative; display: grid; max-width: 100rem; min-height: 42.5rem; grid-template-columns: 47% 53%; align-items: center; margin: auto; padding: 1.875rem 4vw 3.4375rem; }
 .wb-hero-copy { position: relative; z-index: 2; }
 .wb-hero-eyebrow { display: flex; align-items: center; gap: .625rem; color: #1e3a2c; font-size: .5625rem; letter-spacing: .12em; }
+.wb-hero-eyebrow .wb-landing-status-dot { background: #f26050; }
 .wb-hero-copy h1 { margin: 1.75rem 0; color: var(--wb-ink); font-family: var(--wb-serif); font-size: clamp(3.125rem, 6.5vw, 6.0625rem); font-weight: 400; letter-spacing: -.045em; line-height: 1.02; overflow-wrap: break-word; }
 .wb-hero-description { max-width: 25rem; margin: 0; color: #1e3a2c; font-size: 1rem; line-height: 1.9; }
 .wb-hero-actions { display: flex; flex-direction: column; align-items: flex-start; gap: 1.25rem; margin: 1.75rem 0 1.5rem; }
@@ -479,6 +480,11 @@ h1, h2, h3, p { margin-top: 0; }
 .wb-landing-paper-cta { display: flex; align-items: center; gap: .5rem; width: 100%; margin-top: 1.125rem; padding: 1rem 0 0; border: 0; border-top: 1px solid var(--wb-border); color: var(--wb-ink); background: transparent; font-size: .75rem; font-weight: 800; text-align: left; }
 .wb-landing-paper-cta:hover { text-decoration: underline; }
 .wb-yellow-note { position: absolute; bottom: 0; left: 3%; padding: .9375rem 1.5625rem; background: var(--wb-accent); box-shadow: 0 4px 8px #1f37292b; transform: rotate(-3deg); color: var(--wb-accent-ink); font-family: var(--wb-serif); font-size: 1.0625rem; }
+
+@media (min-width: 951px) {
+  .wb-hero-workbench { padding-left: 42%; }
+  .wb-hero-workbench > .wb-polaroid { width: 43%; }
+}
 .wb-landing-entry { max-width: 100rem; margin: auto; padding: 0 4vw 1rem; }
 .wb-landing-brief { scroll-margin-top: 1rem; }
 .wb-landing-brief:focus { outline: none; }

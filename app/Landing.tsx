@@ -168,9 +168,9 @@ export default function LandingView({ backendStatus, onRetry, workbench, onIntak
         <button
           type="button"
           className="wb-button wb-button-secondary wb-landing-nav-cta"
-          onClick={(event) => openBrief(event.currentTarget)}
+          onClick={(event) => openDemo(event.currentTarget)}
         >
-          Start your own brief
+          Open demo <span aria-hidden="true">&rarr;</span>
         </button>
       </header>
       <main id="workbench-main" tabIndex={-1}>
@@ -187,7 +187,7 @@ export default function LandingView({ backendStatus, onRetry, workbench, onIntak
                 className="wb-button wb-button-primary wb-hero-primary"
                 onClick={(event) => openDemo(event.currentTarget)}
               >
-                Try the Northside caf&eacute; demo
+                Try the Northside caf&eacute; demo <span aria-hidden="true">&rarr;</span>
               </button>
               <button
                 type="button"
