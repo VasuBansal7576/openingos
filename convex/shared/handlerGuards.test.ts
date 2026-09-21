@@ -71,7 +71,7 @@ const ALLOWLIST: Record<string, Record<string, Visibility>> = {
   "access/recipients.ts": { describe: "query", configure: "internalMutation" },
   "execution/jobs.ts": { get: "query", listUnresolvedOperations: "query", start: "mutation", cancel: "mutation" },
   "execution/operations.ts": { get: "query", create: "mutation", claim: "internalMutation" },
-  "execution/reservations.ts": { ledger: "query", reserve: "mutation" },
+  "execution/reservations.ts": { ledger: "query", reserve: "mutation", reserveServerRead: "internalMutation", settleServerRead: "internalMutation" },
   "execution/attempts.ts": {
     attemptsForOperation: "query",
     recordOutcome: "internalMutation",
