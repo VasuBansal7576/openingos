@@ -1576,7 +1576,7 @@ test("renders due decisions with reason, basis, and truncation in the inbox", as
   }
 });
 
-test("stale substitute approval stays disabled and makes zero writes", async () => {
+test("stale substitute approval stays disabled with zero writes while rejection still routes", async () => {
   const snapshot = parseWorkbenchSnapshot(e8Projection({
     substitutes: [e8SubstituteFixture({ basisStale: true, basisReason: "Proposed quote terms changed; renewed authority required." })],
   }), projection.project.id);
@@ -1591,10 +1591,15 @@ test("stale substitute approval stays disabled and makes zero writes", async () 
     expect(mounted.container.textContent).toContain("Stale basis");
     expect(mounted.container.textContent).toContain("Proposed quote terms changed");
     expect(mounted.findButton("Approve substitute").disabled).toBe(true);
+    expect(mounted.findButton("Reject").disabled).toBe(false);
     await act(async () => {
       mounted.findButton("Approve substitute").click();
     });
     expect(actionCalls).toEqual([]);
+    await act(async () => {
+      mounted.findButton("Reject").click();
+    });
+    expect(actionCalls).toEqual(["decideSubstituteProposal"]);
   } finally {
     await mounted.cleanup();
   }
@@ -1663,5 +1668,30 @@ test("E8 cards reuse fluid panel layout with no fixed-width overflow", async () 
     expect(mounted.container.innerHTML).toContain("wb-substitute-card");
   } finally {
     await mounted.cleanup();
+  }
+});
+
+test("inbox never claims nothing needs review while E8 due items exist", async () => {
+  const snapshot = parseWorkbenchSnapshot(e8Projection({ decisions: [], jobs: [] }), projection.project.id);
+  if (snapshot === null) throw new Error("E8 projection should parse");
+  expect(snapshot.decisions).toEqual([]);
+  expect(snapshot.jobs).toEqual([]);
+  const mounted = await mountE8Tab({ state: "ready", snapshot }, () => ({ ok: false, message: "controlled test refusal" }));
+  try {
+    await mounted.clickTab("Inbox");
+    expect(mounted.container.textContent).not.toContain("Nothing needs your review");
+    expect(mounted.container.textContent).toContain("Due decisions with their reason and basis.");
+    expect(mounted.container.textContent).toContain("keeps current terms");
+  } finally {
+    await mounted.cleanup();
+  }
+  const empty = parseWorkbenchSnapshot(e8Projection({ decisions: [], jobs: [], impacts: [], substitutes: [] }), projection.project.id);
+  if (empty === null) throw new Error("Empty E8 projection should parse");
+  const mountedEmpty = await mountE8Tab({ state: "ready", snapshot: empty }, () => ({ ok: false, message: "controlled test refusal" }));
+  try {
+    await mountedEmpty.clickTab("Inbox");
+    expect(mountedEmpty.container.textContent).toContain("Nothing needs your review");
+  } finally {
+    await mountedEmpty.cleanup();
   }
 });

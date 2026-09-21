@@ -1080,10 +1080,17 @@ test("stale-basis, decided, viewer, and missing substitute inputs make zero writ
   const stale = await loadAdapter(substituteProjection(substituteFixture({ basisStale: true, basisReason: "Proposed quote terms changed; renewed authority required." }), impactFixture()), staleCalls);
   await expect(stale.act({ type: "decideSubstituteProposal", projectId: "project-1", proposalId: "proposal-1", decision: "approved" })).resolves.toMatchObject({ ok: false, message: expect.stringContaining("basis changed") });
   expect(staleCalls).toHaveLength(0);
+  // Rejection closes the proposal without relying on the changed terms, so a
+  // stale basis still routes the rejection to the authorized backend action.
+  const staleRejectCalls: MutationCall[] = [];
+  const staleReject = await loadAdapter(substituteProjection(substituteFixture({ basisStale: true, basisReason: "Proposed quote terms changed; renewed authority required." }), impactFixture()), staleRejectCalls);
+  await expect(staleReject.act({ type: "decideSubstituteProposal", projectId: "project-1", proposalId: "proposal-1", decision: "rejected" })).resolves.toMatchObject({ ok: true });
+  expect(staleRejectCalls).toHaveLength(1);
+  expect(staleRejectCalls[0]?.args).toMatchObject({ proposalId: "proposal-1", decision: "rejected" });
 
   const decidedCalls: MutationCall[] = [];
   const decided = await loadAdapter(substituteProjection(substituteFixture({ state: "approved" }), impactFixture()), decidedCalls);
-  await expect(decided.act({ type: "decideSubstituteProposal", projectId: "project-1", proposalId: "proposal-1", decision: "approved" })).resolves.toMatchObject({ ok: false });
+  await expect(decided.act({ type: "decideSubstituteProposal", projectId: "project-1", proposalId: "proposal-1", decision: "approved" })).resolves.toEqual({ ok: false, message: "This substitute proposal is already approved. Nothing was sent." });
   expect(decidedCalls).toHaveLength(0);
 
   const viewerCalls: MutationCall[] = [];

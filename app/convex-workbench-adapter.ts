@@ -611,17 +611,23 @@ export function createConvexWorkbenchAdapter(client: ConvexWorkbenchClient): Con
 
     if (action.type === "decideSubstituteProposal") {
       const proposal = current.substitutes.find((candidate) => candidate.id === action.proposalId);
-      if (proposal === undefined || proposal.state !== "pending") {
+      if (proposal === undefined) {
         return { ok: false, message: ACTION_REQUIRES_CURRENT_PROJECTION };
+      }
+      if (proposal.state !== "pending") {
+        return { ok: false, message: `This substitute proposal is already ${proposal.state}. Nothing was sent.` };
       }
       if (current.access.capabilities.canApprove !== true) {
         return { ok: false, message: "Substitute approval is not authorized for this project role. Nothing was sent." };
       }
-      if (proposal.basisStale) {
-        return { ok: false, message: `This substitute basis changed (${proposal.basisReason}); renewed authority required. Nothing was sent.` };
-      }
       if (!isOneOf(action.decision, ["approved", "rejected"] as const)) {
         return { ok: false, message: ACTION_REQUIRES_CURRENT_PROJECTION };
+      }
+      // Approval acts on the proposed terms, so a changed basis blocks it
+      // with zero writes. Rejection closes the proposal without relying on
+      // those terms, so it still routes while the proposal is pending.
+      if (action.decision === "approved" && proposal.basisStale) {
+        return { ok: false, message: `This substitute basis changed (${proposal.basisReason}); renewed authority required. Nothing was sent.` };
       }
       const args: W1DecideSubstituteProposalArgs = {
         organizationId,
@@ -651,7 +657,8 @@ export function createConvexWorkbenchAdapter(client: ConvexWorkbenchClient): Con
       }
     }
 
-    if (action.type === "openServiceCase") {      if (current.access.capabilities.canOpenServiceCase !== true) {
+    if (action.type === "openServiceCase") {
+      if (current.access.capabilities.canOpenServiceCase !== true) {
         return { ok: false, message: "Service-case creation is not authorized for this project. Nothing was sent." };
       }
       const asset = current.equipment.assets.find((candidate) => candidate.id === action.assetId);
