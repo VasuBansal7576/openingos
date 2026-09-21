@@ -382,13 +382,59 @@ function OverviewStrip({ snapshot }: { readonly snapshot: WorkbenchSnapshot }) {
   );
 }
 
+function chargeAmountLabel(charge: WorkbenchQuote["charges"][number], fallbackCurrency: string): string {
+  switch (charge.state) {
+    case "included":
+      return "Included";
+    case "unknown":
+      return "Unknown";
+    case "estimated":
+      return charge.minorUnits === null
+        ? "Estimated range"
+        : `Estimated ${formatMoney(charge.minorUnits, charge.currency ?? fallbackCurrency)}`;
+    case "notApplicable":
+      return "Not applicable";
+    default:
+      return formatMoney(charge.minorUnits, charge.currency ?? fallbackCurrency);
+  }
+}
+
+function taxBasisLabel(taxBasis: WorkbenchQuote["taxBasis"]): string {
+  switch (taxBasis) {
+    case "inclusive":
+      return "Tax inclusive";
+    case "exclusive":
+      return "Tax exclusive";
+    default:
+      return "Tax basis unknown";
+  }
+}
+
+/**
+ * Concise controlled-fixture card heading. A trailing parenthetical qualifier
+ * (for example " (controlled demo)") is omitted from the visible heading only
+ * while the same card keeps a visible provenance pill carrying the controlled
+ * evidence identity, so no honesty is lost and headings recover source
+ * density. The full original name always stays available through the heading
+ * title and the review control's accessible label.
+ */
+function displayVendorName(offer: WorkbenchOffer): string {
+  const full = offer.vendor?.name ?? "Vendor unavailable";
+  if (offer.vendor === null) return full;
+  if (offer.provenance !== "fixture" && offer.ownerAuthoredTerms !== true) return full;
+  const concise = full.replace(/\s*\([^()]*\)\s*$/, "");
+  return concise.length > 0 ? concise : full;
+}
+
 function QuoteSummary({ quote }: { readonly quote: WorkbenchQuote | null }) {
   if (!quote) return <div className="wb-quote-unknown"><Icon name="warning" size={16} /> Quote terms have not arrived.</div>;
   const unknownCharges = quote.charges.filter((charge) => charge.state === "unknown");
+  const totalCurrency = quote.total?.currency ?? quote.currency;
   return (
     <div className="wb-quote-summary">
-      <div className="wb-quote-total"><span>{quote.total === null ? "Exact total unavailable" : "Quoted total"}</span><strong>{formatMoney(quote.total?.minorUnits ?? null, quote.total?.currency ?? quote.currency)}</strong></div>
-      <div className="wb-charge-list">{quote.charges.slice(0, 4).map((charge) => <div key={`${charge.kind}-${charge.scope}`} className={charge.state === "unknown" ? "missing" : undefined}><span>{formatStateLabel(charge.kind)}</span><strong>{charge.state === "included" ? "Included" : charge.state === "unknown" ? "Unknown" : formatMoney(charge.minorUnits, quote.currency)}</strong></div>)}</div>
+      <div className="wb-charge-list">{quote.charges.map((charge) => <div key={`${charge.kind}-${charge.scope}`} className={charge.state === "unknown" ? "missing" : undefined}><span>{formatStateLabel(charge.kind)}</span><strong>{chargeAmountLabel(charge, quote.currency)}</strong></div>)}</div>
+      <div className="wb-quote-total"><span>{quote.total === null ? "Exact total unavailable" : `Total (${totalCurrency})`}</span><strong>{formatMoney(quote.total?.minorUnits ?? null, totalCurrency)}</strong></div>
+      <div className="wb-paper-meta"><span>{taxBasisLabel(quote.taxBasis)}</span></div>
       {unknownCharges.length > 0 ? <div className="wb-unknown-note"><Icon name="warning" size={14} /> {unknownCharges.length} charge{unknownCharges.length === 1 ? "" : "s"} still needs confirmation.</div> : null}
     </div>
   );
@@ -398,18 +444,20 @@ function OfferCard({ offer, index, selected, onReview, onOpenEvidence }: { reado
   const isIncompatible = offer.compatibility === "fail";
   const hasUnknown = offer.quote?.charges.some((charge) => charge.state === "unknown") ?? true;
   const vendorName = offer.vendor?.name ?? "Vendor unavailable";
+  const conciseVendorName = displayVendorName(offer);
   const vendorRegions = offer.vendor?.regions.join(", ") || "Service region unknown";
   const firstEvidence = offer.evidence[0];
   return (
     <article className={`wb-offer-card wb-paper-${index % 3} ${selected ? "selected" : ""} ${isIncompatible ? "incompatible" : ""}`}>
-      <div className="wb-offer-header"><div><button type="button" onClick={onReview} aria-label={`Review quote from ${vendorName}`} disabled={offer.vendor === null}><h3>{vendorName}</h3></button><p>{offer.productModel} · {offer.variant}</p><ProvenancePill mode={offer.provenance} ownerAuthoredTerms={offer.ownerAuthoredTerms} /></div><span className="wb-paper-version">{offer.quote ? `Quote v${offer.quote.version}` : "No quote yet"}</span></div>
+      <div className="wb-offer-header wb-paper-head"><div><button type="button" onClick={onReview} aria-label={`Review quote from ${vendorName}`} disabled={offer.vendor === null}><h3 title={vendorName}>{conciseVendorName}</h3></button><p>{offer.productModel} · {offer.variant}</p><ProvenancePill mode={offer.provenance} ownerAuthoredTerms={offer.ownerAuthoredTerms} /></div><span className="wb-paper-version">{offer.quote ? `Quote v${offer.quote.version}` : "No quote yet"}</span></div>
       <p className="wb-paper-kicker">{vendorRegions === "Service region unknown" ? "SERVICE REGION UNKNOWN" : `SERVICE REGION · ${vendorRegions.toUpperCase()}`}</p>
       <div className="wb-paper-rule">QUOTE <span>{offer.quote === null ? "NO QUOTE YET" : offer.quote.superseded ? "SUPERSEDED" : "CURRENT"}</span></div>
       <div className="wb-offer-tags"><Pill tone={offer.compatibility === "pass" ? "success" : offer.compatibility === "fail" ? "danger" : "warning"}>{offer.compatibility === "pass" ? "Fit evidence passed" : offer.compatibility === "fail" ? "Incompatible" : "Fit unknown"}</Pill><Pill>{formatStateLabel(offer.conversationState)}</Pill></div>
       <QuoteSummary quote={offer.quote} />
+      <div className="wb-paper-ready"><Icon name="truck" size={14} /><span>{offer.quote?.validUntil ? `Valid through ${formatDate(offer.quote.validUntil)}` : "Validity not confirmed"}</span></div>
       {hasUnknown && !isIncompatible ? <button className="wb-missing-terms" type="button" onClick={firstEvidence && onOpenEvidence ? () => onOpenEvidence(firstEvidence) : onReview}><span>Missing terms</span><Icon name="arrow" size={13} /></button> : null}
       {firstEvidence && onOpenEvidence ? <button className="wb-paper-source" type="button" onClick={() => onOpenEvidence(firstEvidence)}><span>Original quote document · View original</span><Icon name="link" size={12} /></button> : null}
-      <div className="wb-offer-foot"><span>{offer.quote?.validUntil ? `Valid through ${formatDate(offer.quote.validUntil)}` : "Validity not confirmed"}</span><ActionButton kind="secondary" disabled={isIncompatible || offer.vendor === null} onClick={onReview} title={isIncompatible ? "An incompatible offer cannot be selected" : offer.vendor === null ? "Vendor details are not present in this projection" : undefined}>{selected ? "Selected offer" : "Review quote"}<Icon name="arrow" size={15} /></ActionButton></div>
+      <div className="wb-paper-bottom"><span>{offer.quote ? taxBasisLabel(offer.quote.taxBasis) : "No quote terms"}</span><ActionButton kind="secondary" disabled={isIncompatible || offer.vendor === null} onClick={onReview} title={isIncompatible ? "An incompatible offer cannot be selected" : offer.vendor === null ? "Vendor details are not present in this projection" : undefined}>{selected ? "Selected offer" : "Review quote"}<Icon name="arrow" size={15} /></ActionButton></div>
       {hasUnknown && !isIncompatible ? <p className="wb-card-footnote"><Icon name="warning" size={13} /> Unknown charges block an unqualified saving claim.</p> : null}
     </article>
   );
@@ -476,6 +524,15 @@ function comparisonTapeFor(offers: readonly WorkbenchOffer[]): ComparisonTape | 
     for (const verdict of offer.comparisons) {
       const other = offers.find((candidate) => candidate.id === verdict.againstOfferId);
       if (other === undefined) continue;
+      // Strict consumer binding: a verdict is displayable only when it names
+      // both the opposing candidate and the exact opposing quote currently
+      // shown. A null, missing, or mismatched quote identity fails closed so
+      // a stale verdict for the same candidate but an unrelated quote is
+      // never rendered as the current comparison.
+      const displayedOpposingQuoteId = other.quote?.id ?? null;
+      if (displayedOpposingQuoteId === null) continue;
+      if (verdict.againstQuoteId === null) continue;
+      if (verdict.againstQuoteId !== displayedOpposingQuoteId) continue;
       const offerName = offer.vendor?.name ?? "First offer";
       const otherName = other.vendor?.name ?? "Second offer";
       if (verdict.status === "comparable") {
@@ -532,7 +589,7 @@ function ProjectView({ snapshot, onReview, onAction, onLoadMore, onTabChange, on
       setResearchPending(false);
     }
   };
-  return <div className="wb-page"><PageHeading eyebrow={`${snapshot.project.name} / your decision desk`} title="Everything on the table." description="Compare quotes. Check the small print. Choose with confidence." action={<div className="wb-page-heading-actions"><button className="wb-text-button" type="button" onClick={() => onTabChange("suppliers")}>All {offers.length} suppliers <Icon name="arrow" size={14} /></button><ActionButton kind="secondary" onClick={() => { void action(); }} disabled={researchDisabled || researchPending} title={!onAction ? "Actions wait for a connected projection" : !snapshot.access.capabilities.canResearch ? "Your role cannot start research" : snapshot.truncation.requirements ? "Research waits for a complete requirements projection" : undefined}><Icon name="spark" size={15} /> {researchPending ? "Starting…" : "Start bounded research"}</ActionButton></div>} /><div className="wb-scope-row"><span><Icon name="lock" size={13} /> {snapshot.project.region ?? "Region unknown"} · {snapshot.project.currency ?? "Currency unknown"}</span><span>Need by {formatDate(snapshot.project.needByAt)}</span><ProvenancePill mode={snapshot.provenance.mode} ownerAuthoredTerms={snapshot.provenance.ownerAuthoredTerms} /></div>{(snapshot.substitutes.some((proposal) => proposal.state === "pending") || snapshot.impacts.some((impact) => impact.orderImpact === "reviewRequired" || impact.orderImpact === "unknown")) ? <div className="wb-inline-warning" role="status"><Icon name="warning" size={16} /> Changed terms need review: {snapshot.substitutes.filter((proposal) => proposal.state === "pending").length} substitute {snapshot.substitutes.filter((proposal) => proposal.state === "pending").length === 1 ? "proposal awaits" : "proposals await"} fresh approval and {snapshot.impacts.filter((impact) => impact.orderImpact === "reviewRequired" || impact.orderImpact === "unknown").length} impact {snapshot.impacts.filter((impact) => impact.orderImpact === "reviewRequired" || impact.orderImpact === "unknown").length === 1 ? "assessment needs" : "assessments need"} review. See the Inbox and Recovery tabs. No order was placed.</div> : null}{primaryRequirement ? <><div className="wb-desk-layout"><aside className="wb-desk-product" aria-label={`Requirement under review: ${primaryRequirement.title}`}><div className="wb-polaroid"><div className="wb-polaroid-photo" role="img" aria-label={`Illustrative equipment photo for ${primaryRequirement.title}`} /><strong>{primaryRequirement.title}</strong><small>{primaryRequirement.quantity} {primaryRequirement.unit} · {primaryRequirement.key}</small></div><div className="wb-scope-note"><span className="wb-eyebrow">ON YOUR LIST</span><h2>{primaryRequirement.title}</h2><p>{primaryRequirement.quantity} {primaryRequirement.unit} · Need by {formatDate(primaryRequirement.needByAt)}</p><dl><div><dt>Fulfillment</dt><dd>{formatStateLabel(primaryRequirement.fulfillment)}</dd></div><div><dt>Delivered</dt><dd>{snapshot.deliveredQuantityByRequirement[primaryRequirement.id] ?? "Unknown"} / {primaryRequirement.quantity} {primaryRequirement.unit}</dd></div><div><dt>Allocation</dt><dd>{formatMoney(primaryRequirement.budgetMinorUnits, snapshot.project.currency)}</dd></div><div><dt>State</dt><dd>{formatStateLabel(primaryRequirement.state)}</dd></div></dl></div></aside><div className="wb-desk-papers"><section className="wb-section-heading"><div><span className="wb-eyebrow">COMPARABLE OFFERS</span><h2>Quotes you can actually compare.</h2><p>Unknown charges stay visible. An incomplete offer is not ranked as a saving.</p></div><button className="wb-text-button" type="button" onClick={() => onTabChange("suppliers")}>See all suppliers <Icon name="arrow" size={14} /></button></section>{visibleOffers.length > 0 ? <div className="wb-offer-grid">{visibleOffers.map((offer, index) => <OfferCard key={offer.id} offer={offer} index={index} selected={offer.id === selected} onReview={() => onReview(offer)} onOpenEvidence={onOpenEvidence} />)}</div> : <EmptyState icon="search" title="No offers have arrived" message="Research can continue independently, but this project has no verified quote to compare yet." action={<ActionButton kind="secondary" onClick={() => onTabChange("suppliers")}>Open supplier view</ActionButton>} />}{offers.length > 3 ? <button className="wb-load-more" type="button" onClick={() => setShowAll((value) => !value)}>{showAll ? "Show fewer offers" : `Show ${offers.length - 3} more offers`} <Icon name="chevron" size={14} /></button> : null}</div>{comparisonTape !== null ? <div className={`wb-comparison-tape ${comparisonTape.exact ? "" : "not-ranked"}`} role="status"><Icon name={comparisonTape.exact ? "arrow" : "warning"} size={15} /><span>{comparisonTape.text}</span><Icon name={comparisonTape.exact ? "arrow" : "lock"} size={15} /></div> : null}<div className="wb-bench-action"><div className="wb-bench-selected"><Icon name="check" size={19} /><div><span>{selected ? "Selected" : "Considering"}</span><strong>{selected ? visibleOffers.find((offer) => offer.id === selected)?.vendor?.name ?? "Selected offer" : reviewTarget ? `${reviewTarget.vendor?.name ?? "Vendor unavailable"} · ${formatMoney(reviewTarget.quote?.total?.minorUnits ?? null, reviewTarget.quote?.total?.currency ?? reviewTarget.quote?.currency ?? null)}` : "No reviewable offer"}</strong></div></div><button className="wb-assistant-launch" type="button" onClick={onOpenAssistant}><Icon name="spark" size={21} /><span>Ask about these quotes…</span><Icon name="arrow" size={17} /></button><div className="wb-bench-cta"><ActionButton kind="primary" disabled={reviewTarget === null} onClick={() => { if (reviewTarget) onReview(reviewTarget); }} title={reviewTarget === null ? "No compatible offer with vendor details is available in this projection" : undefined}>Review selected offer <Icon name="arrow" size={15} /></ActionButton><p className="wb-micro">No order is placed.</p></div></div></div></> : <EmptyState icon="compass" title="No requirements in scope" message="This project has no server-recorded requirement yet. OpeningOS will not invent one from the page brief." action={<ActionButton kind="secondary" disabled title="Requirement creation is a server-authorized workflow">Add a requirement</ActionButton>} />}<div className="wb-project-lower"><section className="wb-panel wb-financial-panel"><div className="wb-panel-heading"><div><span className="wb-eyebrow">FORECAST, NOT COMMITMENT</span><h2>One decision at a time.</h2></div><Icon name="trend" size={20} /></div><div className="wb-forecast-lines"><div><span>Selected forecast</span><strong>{formatMoney(snapshot.selectedForecastMinorUnits, snapshot.project.currency)}</strong></div><div><span>Committed expenditure</span><strong>{formatMoney(snapshot.committedMinorUnits, snapshot.project.currency)}</strong></div><div><span>Paid amount</span><strong>{formatMoney(snapshot.paidMinorUnits, snapshot.project.currency)}</strong></div></div><p className="wb-micro">Selecting an offer does not place an order. Only a recorded external order changes committed expenditure.</p></section><section className="wb-panel"><div className="wb-panel-heading"><div><span className="wb-eyebrow">RECENT CHANGES</span><h2>Activity with evidence.</h2></div><button className="wb-text-button" type="button" onClick={() => onTabChange("inbox")}>Open inbox <Icon name="arrow" size={14} /></button></div><ActivityList items={snapshot.activity.items.slice(0, 4)} compact />{!snapshot.activity.isDone && onLoadMore ? <ActionButton kind="secondary" onClick={onLoadMore}><Icon name="refresh" size={15} /> Load older activity</ActionButton> : null}</section></div></div>;
+  return <div className="wb-page wb-compare"><div className="wb-bench-heading"><div><div className="wb-eyebrow">{snapshot.project.name} / YOUR DECISION DESK</div><h1>Everything on the table.</h1><p>Compare quotes. Check the small print. Choose with confidence. Unknown charges stay visible. An incomplete offer is not ranked as a saving.</p><div className="wb-scope-row"><span><Icon name="lock" size={13} /> {snapshot.project.region ?? "Region unknown"} · {snapshot.project.currency ?? "Currency unknown"}</span><span>Need by {formatDate(snapshot.project.needByAt)}</span><ProvenancePill mode={snapshot.provenance.mode} ownerAuthoredTerms={snapshot.provenance.ownerAuthoredTerms} /></div></div><div className="wb-bench-heading-actions"><button className="wb-text-button" type="button" onClick={() => onTabChange("suppliers")}>All {offers.length} suppliers <Icon name="arrow" size={14} /></button><ActionButton kind="secondary" onClick={() => { void action(); }} disabled={researchDisabled || researchPending} title={!onAction ? "Actions wait for a connected projection" : !snapshot.access.capabilities.canResearch ? "Your role cannot start research" : snapshot.truncation.requirements ? "Research waits for a complete requirements projection" : undefined}><Icon name="spark" size={15} /> {researchPending ? "Starting…" : "Start bounded research"}</ActionButton></div></div>{(snapshot.substitutes.some((proposal) => proposal.state === "pending") || snapshot.impacts.some((impact) => impact.orderImpact === "reviewRequired" || impact.orderImpact === "unknown")) ? <div className="wb-inline-warning" role="status"><Icon name="warning" size={16} /> Changed terms need review: {snapshot.substitutes.filter((proposal) => proposal.state === "pending").length} substitute {snapshot.substitutes.filter((proposal) => proposal.state === "pending").length === 1 ? "proposal awaits" : "proposals await"} fresh approval and {snapshot.impacts.filter((impact) => impact.orderImpact === "reviewRequired" || impact.orderImpact === "unknown").length} impact {snapshot.impacts.filter((impact) => impact.orderImpact === "reviewRequired" || impact.orderImpact === "unknown").length === 1 ? "assessment needs" : "assessments need"} review. See the Inbox and Recovery tabs. No order was placed.</div> : null}{primaryRequirement ? <><div className="wb-desk-layout"><aside className="wb-desk-product" aria-label={`Requirement under review: ${primaryRequirement.title}`}><div className="wb-polaroid"><div className="wb-polaroid-photo" role="img" aria-label={`Illustrative equipment photo for ${primaryRequirement.title}`} /><strong>{primaryRequirement.title}</strong><small>{primaryRequirement.quantity} {primaryRequirement.unit} · {primaryRequirement.key}</small></div><div className="wb-scope-note"><span className="wb-eyebrow">ON YOUR LIST</span><h2>{primaryRequirement.title}</h2><p>{primaryRequirement.quantity} {primaryRequirement.unit} · Need by {formatDate(primaryRequirement.needByAt)}</p><dl><div><dt>Fulfillment</dt><dd>{formatStateLabel(primaryRequirement.fulfillment)}</dd></div><div><dt>Delivered</dt><dd>{snapshot.deliveredQuantityByRequirement[primaryRequirement.id] ?? "Unknown"} / {primaryRequirement.quantity} {primaryRequirement.unit}</dd></div><div><dt>Allocation</dt><dd>{formatMoney(primaryRequirement.budgetMinorUnits, snapshot.project.currency)}</dd></div><div><dt>State</dt><dd>{formatStateLabel(primaryRequirement.state)}</dd></div></dl></div></aside><div className="wb-desk-papers">{visibleOffers.length > 0 ? <div className="wb-offer-grid">{visibleOffers.map((offer, index) => <OfferCard key={offer.id} offer={offer} index={index} selected={offer.id === selected} onReview={() => onReview(offer)} onOpenEvidence={onOpenEvidence} />)}</div> : <EmptyState icon="search" title="No offers have arrived" message="Research can continue independently, but this project has no verified quote to compare yet." action={<ActionButton kind="secondary" onClick={() => onTabChange("suppliers")}>Open supplier view</ActionButton>} />}{offers.length > 3 ? <button className="wb-load-more" type="button" onClick={() => setShowAll((value) => !value)}>{showAll ? "Show fewer offers" : `Show ${offers.length - 3} more offers`} <Icon name="chevron" size={14} /></button> : null}</div>{comparisonTape !== null ? <div className={`wb-comparison-tape ${comparisonTape.exact ? "" : "not-ranked"}`} role="status"><Icon name={comparisonTape.exact ? "arrow" : "warning"} size={15} /><span>{comparisonTape.text}</span><Icon name={comparisonTape.exact ? "arrow" : "lock"} size={15} /></div> : null}<div className="wb-bench-action"><div className="wb-bench-selected"><Icon name="check" size={19} /><div><span>{selected ? "Selected" : "Considering"}</span><strong>{selected ? visibleOffers.find((offer) => offer.id === selected)?.vendor?.name ?? "Selected offer" : reviewTarget ? `${reviewTarget.vendor?.name ?? "Vendor unavailable"} · ${formatMoney(reviewTarget.quote?.total?.minorUnits ?? null, reviewTarget.quote?.total?.currency ?? reviewTarget.quote?.currency ?? null)}` : "No reviewable offer"}</strong></div></div><button className="wb-assistant-launch" type="button" onClick={onOpenAssistant}><Icon name="spark" size={21} /><span>Ask about these quotes…</span><Icon name="arrow" size={17} /></button><div className="wb-bench-cta"><ActionButton kind="primary" disabled={reviewTarget === null} onClick={() => { if (reviewTarget) onReview(reviewTarget); }} title={reviewTarget === null ? "No compatible offer with vendor details is available in this projection" : undefined}>Review selected offer <Icon name="arrow" size={15} /></ActionButton><p className="wb-micro">No order is placed.</p></div></div></div></> : <EmptyState icon="compass" title="No requirements in scope" message="This project has no server-recorded requirement yet. OpeningOS will not invent one from the page brief." action={<ActionButton kind="secondary" disabled title="Requirement creation is a server-authorized workflow">Add a requirement</ActionButton>} />}<OverviewStrip snapshot={snapshot} /><div className="wb-project-lower"><section className="wb-panel wb-financial-panel"><div className="wb-panel-heading"><div><span className="wb-eyebrow">FORECAST, NOT COMMITMENT</span><h2>One decision at a time.</h2></div><Icon name="trend" size={20} /></div><div className="wb-forecast-lines"><div><span>Selected forecast</span><strong>{formatMoney(snapshot.selectedForecastMinorUnits, snapshot.project.currency)}</strong></div><div><span>Committed expenditure</span><strong>{formatMoney(snapshot.committedMinorUnits, snapshot.project.currency)}</strong></div><div><span>Paid amount</span><strong>{formatMoney(snapshot.paidMinorUnits, snapshot.project.currency)}</strong></div></div><p className="wb-micro">Selecting an offer does not place an order. Only a recorded external order changes committed expenditure.</p></section><section className="wb-panel"><div className="wb-panel-heading"><div><span className="wb-eyebrow">RECENT CHANGES</span><h2>Activity with evidence.</h2></div><button className="wb-text-button" type="button" onClick={() => onTabChange("inbox")}>Open inbox <Icon name="arrow" size={14} /></button></div><ActivityList items={snapshot.activity.items.slice(0, 4)} compact />{!snapshot.activity.isDone && onLoadMore ? <ActionButton kind="secondary" onClick={onLoadMore}><Icon name="refresh" size={15} /> Load older activity</ActionButton> : null}</section></div></div>;
 }
 
 function SuppliersView({ snapshot, onReview, onOpenEvidence }: { readonly snapshot: WorkbenchSnapshot; readonly onReview: (offer: WorkbenchOffer) => void; readonly onOpenEvidence: (evidence: WorkbenchEvidence) => void }) {
@@ -971,6 +1028,30 @@ function intakeFingerprint(values: {
 }
 
 /**
+ * Exact decimal-string to minor-unit parsing for the intake budget. The
+ * shape is digits with at most two fractional digits; the magnitude is
+ * computed with BigInt so values near the safe-integer boundary are exact
+ * and never pass through floating-point multiplication. Anything else —
+ * exponents, signs, extra precision, NaN/Infinity text, or a magnitude
+ * above Number.MAX_SAFE_INTEGER — returns null and the caller fails closed
+ * without reaching the intake route.
+ */
+function parseIntakeBudgetMinorUnits(text: string): number | null {
+  const match = /^(\d+)(?:\.(\d{1,2}))?$/.exec(text.trim());
+  if (!match) return null;
+  const euros = match[1]!;
+  const cents = (match[2] ?? "").padEnd(2, "0");
+  let minor: bigint;
+  try {
+    minor = BigInt(euros) * 100n + BigInt(cents);
+  } catch {
+    return null;
+  }
+  if (minor < 0n || minor > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+  return Number(minor);
+}
+
+/**
  * P-01 connected intake inside the purchasing-desk visual system. The form
  * collects only the immediately relevant minimum facts for the chosen
  * entry point and submits once through the real Convex intake mutation.
@@ -1070,11 +1151,10 @@ export function WorkbenchIntakeView({ onIntake, onBack }: { readonly onIntake: W
       if (!/^\d+(?:\.\d{1,2})?$/.test(values.budget.trim())) {
         return "Enter the budget as whole euros and cents, for example 45000 or 45000.50.";
       }
-      // Over-precision is rejected by the pattern above; an unsafe integer
-      // (magnitude beyond the safe minor-unit range) must also fail closed
-      // here so the submission below can never silently omit it.
-      const budgetMinorUnits = Math.round(Number.parseFloat(values.budget.trim()) * 100);
-      if (!Number.isSafeInteger(budgetMinorUnits) || budgetMinorUnits < 0) {
+      // Exact decimal-string parsing (no floating-point multiplication); an
+      // unsafe magnitude fails closed here so the submission below can never
+      // silently omit it.
+      if (parseIntakeBudgetMinorUnits(values.budget) === null) {
         return "That budget is too large to record safely. Enter a smaller amount.";
       }
     }
@@ -1128,10 +1208,10 @@ export function WorkbenchIntakeView({ onIntake, onBack }: { readonly onIntake: W
       const trimmedCurrency = values.currency.trim();
       const budgetMinorUnits = values.budget.trim().length === 0
         ? undefined
-        : Math.round(Number.parseFloat(values.budget.trim()) * 100);
-      if (budgetMinorUnits !== undefined && (!Number.isSafeInteger(budgetMinorUnits) || budgetMinorUnits < 0)) {
-        // Fail closed: an unsafe or over-precision budget keeps the entered
-        // values in place and never reaches the intake route with an omission.
+        : parseIntakeBudgetMinorUnits(values.budget);
+      if (budgetMinorUnits === null) {
+        // Fail closed: an unsafe budget keeps the entered values in place
+        // and never reaches the intake route with an omission.
         setError("That budget is too large to record safely. Enter a smaller amount.");
         return;
       }
@@ -1433,5 +1513,5 @@ export default function WorkbenchView({ loadState, onRetry, onAction, onLoadMore
     );
   }
   const tabContent = activeTab === "project" ? <ProjectView snapshot={snapshot} onReview={setSelectedOffer} onAction={connectedAction} onLoadMore={onLoadMore} onTabChange={setActiveTab} onOpenAssistant={() => setAssistantOpen(true)} onOpenEvidence={setEvidence} onMessage={setMessage} /> : activeTab === "suppliers" ? <SuppliersView snapshot={snapshot} onReview={setSelectedOffer} onOpenEvidence={setEvidence} /> : activeTab === "inbox" ? <InboxView snapshot={snapshot} onAction={connectedAction} onMessage={setMessage} /> : activeTab === "recovery" ? <RecoveryView snapshot={snapshot} onAction={connectedAction} onMessage={setMessage} /> : <EquipmentView snapshot={snapshot} onAction={connectedAction} onMessage={setMessage} />;
-  return <div className="wb-app"><Header activeTab={activeTab} project={snapshot.project} onTabChange={setActiveTab} onOpenAssistant={() => setAssistantOpen(true)} /><LoadNotice loadState={loadState} onRetry={onRetry} /><OverviewStrip snapshot={snapshot} /><main id="workbench-main" tabIndex={-1}>{tabContent}</main>{message ? <div className="wb-toast" role="status" aria-live="polite"><span>{message}</span><button type="button" onClick={() => setMessage(null)} aria-label="Dismiss message"><Icon name="close" size={14} /></button></div> : null}{assistantOpen ? <AssistantRail snapshot={snapshot} onClose={() => setAssistantOpen(false)} /> : null}{evidence ? <EvidencePanel evidence={evidence} onClose={() => setEvidence(null)} /> : null}{selectedOffer ? <SelectionPanel offer={selectedOffer} snapshot={snapshot} onClose={() => setSelectedOffer(null)} onAction={connectedAction} onMessage={setMessage} /> : null}</div>;
+  return <div className="wb-app"><Header activeTab={activeTab} project={snapshot.project} onTabChange={setActiveTab} onOpenAssistant={() => setAssistantOpen(true)} /><LoadNotice loadState={loadState} onRetry={onRetry} />{activeTab === "project" ? null : <OverviewStrip snapshot={snapshot} />}<main id="workbench-main" tabIndex={-1}>{tabContent}</main>{message ? <div className="wb-toast" role="status" aria-live="polite"><span>{message}</span><button type="button" onClick={() => setMessage(null)} aria-label="Dismiss message"><Icon name="close" size={14} /></button></div> : null}{assistantOpen ? <AssistantRail snapshot={snapshot} onClose={() => setAssistantOpen(false)} /> : null}{evidence ? <EvidencePanel evidence={evidence} onClose={() => setEvidence(null)} /> : null}{selectedOffer ? <SelectionPanel offer={selectedOffer} snapshot={snapshot} onClose={() => setSelectedOffer(null)} onAction={connectedAction} onMessage={setMessage} /> : null}</div>;
 }

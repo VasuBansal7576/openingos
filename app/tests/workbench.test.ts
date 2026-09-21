@@ -2396,3 +2396,370 @@ test("stale sample success never overwrites a newer project context", async () =
     else actEnvironment.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment;
   }
 });
+
+// -- E16 workbench fidelity: decision desk above finance, paper-document cards --
+
+test("E16 compare journey keeps the decision desk above finance with paper-document cards", () => {
+  const snapshot = parseWorkbenchSnapshot(projection, projection.project.id);
+  if (snapshot === null) throw new Error("W1 projection should parse");
+  const html = renderToStaticMarkup(createElement(WorkbenchView, { loadState: { state: "ready", snapshot } }));
+  expect(html).toContain("wb-bench-heading");
+  expect(html).toContain("wb-desk-layout");
+  expect(html).toContain("wb-project-lower");
+  expect(html).toContain("Everything on the table.");
+  expect(html).toContain("Unknown charges stay visible.");
+  expect(html).toContain("An incomplete offer is not ranked as a saving.");
+  expect(html).toContain("All 1 suppliers");
+  const benchAt = html.indexOf("wb-bench-heading");
+  const deskAt = html.indexOf("wb-desk-layout");
+  const lowerAt = html.indexOf("wb-project-lower");
+  expect(benchAt).toBeGreaterThanOrEqual(0);
+  expect(deskAt).toBeGreaterThan(benchAt);
+  expect(lowerAt).toBeGreaterThan(deskAt);
+  // Paper-document hierarchy per card: vendor head, quote rule, charge lines, total, validity, action.
+  const headAt = html.indexOf("wb-paper-head");
+  const ruleAt = html.indexOf("wb-paper-rule");
+  const chargesAt = html.indexOf("wb-charge-list");
+  const totalAt = html.indexOf("wb-quote-total");
+  const readyAt = html.indexOf("wb-paper-ready");
+  const bottomAt = html.indexOf("wb-paper-bottom");
+  expect(headAt).toBeGreaterThan(deskAt);
+  expect(ruleAt).toBeGreaterThan(headAt);
+  expect(chargesAt).toBeGreaterThan(ruleAt);
+  expect(totalAt).toBeGreaterThan(chargesAt);
+  expect(readyAt).toBeGreaterThan(totalAt);
+  expect(bottomAt).toBeGreaterThan(readyAt);
+  expect(bottomAt).toBeLessThan(lowerAt);
+  // Honesty labels survive the denser layout.
+  expect(html).toContain("Harbor Equipment");
+  expect(html).toContain("Missing terms");
+  expect(html).toContain("Validity not confirmed");
+  expect(html).toContain("Unknown charges block an unqualified saving claim.");
+  expect(html).toContain("Recorded owner exchange");
+  expect(html).toContain("No order is placed.");
+  expect(html).toContain("Selecting an offer does not place an order.");
+});
+
+test("E16 quote cards preserve explicit charge states with native money and validity", () => {
+  const snapshot = parseWorkbenchSnapshot(twoOfferProjection(), projection.project.id);
+  if (snapshot === null) throw new Error("Two-offer projection should parse");
+  const html = renderToStaticMarkup(createElement(WorkbenchView, { loadState: { state: "ready", snapshot } }));
+  expect(html).toContain("Total (EUR)");
+  expect(html).toContain("Tax inclusive");
+  expect(html).toContain("Validity not confirmed");
+  expect(html).toContain("wb-paper-ready");
+  expect(html).toContain("wb-paper-bottom");
+  expect(html).toContain("Original quote document · View original");
+  expect(html).not.toContain("Quoted total");
+  // Estimated and not-applicable states never collapse to zero or a plain total.
+  const estimated = parseWorkbenchSnapshot(withQuoteTotals(projectionWithCurrentCompleteQuote(), (quote) => ({
+    ...quote,
+    lines: [{ lineId: "machine", description: "Atlas 2G", quantity: "1", unitPrice: { currency: "EUR", minorUnits: 750000 } }],
+    charges: [
+      { chargeId: "charge-freight", label: "freight", scope: { kind: "quote" }, state: { kind: "estimated", estimate: { kind: "point", amount: { currency: "EUR", minorUnits: 60000 } } } },
+      { chargeId: "charge-installation", label: "installation", scope: { kind: "quote" }, state: { kind: "notApplicable", reason: "Counter pickup has no installation." } },
+    ],
+  })), projection.project.id);
+  if (estimated === null) throw new Error("Estimated projection should parse");
+  const estimatedHtml = renderToStaticMarkup(createElement(WorkbenchView, { loadState: { state: "ready", snapshot: estimated } }));
+  expect(estimatedHtml).toContain("Estimated");
+  expect(estimatedHtml).toContain("Not applicable");
+});
+
+test("E16 responsive CSS keeps desk density without horizontal overflow", async () => {
+  const css = await Bun.file(new URL("../styles.css", import.meta.url)).text();
+  // Slim status strip keeps the desk above the fold.
+  expect(css).toContain(".wb-compare { padding-top: 1rem;");
+  expect(css).toContain(".wb-overview-intro strong { margin-top: .1rem;");
+  // Bench heading carries the compare journey without the tall page heading.
+  expect(css).toContain(".wb-bench-heading-actions");
+  expect(css).toContain(".wb-compare .wb-scope-row { margin-bottom: .7rem;");
+  // Paper-document density: tight kicker/tags, lines before total, ready + bottom rows.
+  expect(css).toContain(".wb-paper-kicker { margin: .1875rem 0 .8rem;");
+  expect(css).toContain(".wb-paper-ready");
+  expect(css).toContain(".wb-paper-bottom");
+  expect(css).toContain(".wb-desk-layout > .wb-load-more { grid-column: 1 / -1;");
+  // Narrow viewports stack the desk with no rotated-paper overflow.
+  const narrow = css.slice(css.indexOf("@media (max-width: 540px)"));
+  expect(narrow).toContain(".wb-desk-layout { grid-template-columns: minmax(0, 1fr);");
+  expect(narrow).toContain(".wb-desk-layout > .wb-empty { grid-column: 1;");
+  expect(narrow).toContain("transform: none;");
+});
+
+// -- E16 repair: strict comparison consumer binding --------------------------
+
+function twoOfferProjectionWithVerdicts(
+  rewrite: (verdict: Record<string, unknown>, index: number) => Record<string, unknown>,
+): Record<string, unknown> {
+  const value = twoOfferProjection();
+  const candidates = value.candidates as readonly Record<string, unknown>[];
+  return {
+    ...value,
+    candidates: candidates.map((candidate, index) => ({
+      ...candidate,
+      comparisons: (candidate.comparisons as readonly Record<string, unknown>[]).map((verdict) => rewrite(verdict, index)),
+    })),
+  };
+}
+
+test("a verdict for the same candidate but an unrelated quote fails closed", () => {
+  // Control: the backend-named opposing quote ids bind and the exact delta renders.
+  const control = parseWorkbenchSnapshot(twoOfferProjection(), projection.project.id);
+  if (control === null) throw new Error("Two-offer projection should parse");
+  const controlHtml = renderToStaticMarkup(createElement(WorkbenchView, { loadState: { state: "ready", snapshot: control } }));
+  expect(controlHtml).toContain("wb-comparison-tape");
+  expect(controlHtml).toContain("549.51");
+
+  // Same candidate ids, but the verdict names a quote that is not displayed.
+  const stale = parseWorkbenchSnapshot(
+    twoOfferProjectionWithVerdicts((verdict) => ({ ...verdict, againstQuoteId: "quote-stale-unrelated" })),
+    projection.project.id,
+  );
+  expect(stale).toBeNull();
+
+  // A verdict with no quote binding fails closed as well.
+  const unbound = parseWorkbenchSnapshot(
+    twoOfferProjectionWithVerdicts((verdict) => ({ ...verdict, againstQuoteId: null })),
+    projection.project.id,
+  );
+  expect(unbound).toBeNull();
+});
+
+test("a verdict fails closed when the opposing quote is absent", () => {
+  const value = twoOfferProjection();
+  const candidates = value.candidates as readonly Record<string, unknown>[];
+  const withoutOpposingQuote = parseWorkbenchSnapshot({
+    ...value,
+    candidates: candidates.map((candidate, index) => index === 1
+      ? { ...candidate, latestValidQuote: null }
+      : candidate),
+  }, projection.project.id);
+  expect(withoutOpposingQuote).toBeNull();
+});
+
+// -- E16 repair (F7): exact decimal-string intake budget parsing --------------
+
+test("the safe-limit budget parses to exact minor units and is accepted", async () => {
+  const seen: import("../workbench-state").WorkbenchIntakeInput[] = [];
+  const mounted = await mountIntakeView(async (input) => {
+    seen.push(input);
+    return { ok: true, projectId: "project-safe-limit" };
+  });
+  try {
+    await submitIntakeBudget(mounted.container, mounted.dom, {
+      projectName: "Northside café",
+      region: "Amsterdam",
+      budget: "90071992547409.90",
+    });
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.budgetMinorUnits).toBe(9007199254740990);
+    expect(mounted.container.textContent).toContain("Workspace created. Loading the persisted project.");
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("the exact safe-integer boundary budget is accepted without float drift", async () => {
+  const seen: import("../workbench-state").WorkbenchIntakeInput[] = [];
+  const mounted = await mountIntakeView(async (input) => {
+    seen.push(input);
+    return { ok: true, projectId: "project-boundary" };
+  });
+  try {
+    await submitIntakeBudget(mounted.container, mounted.dom, {
+      projectName: "Northside café",
+      region: "Amsterdam",
+      budget: "90071992547409.91",
+    });
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.budgetMinorUnits).toBe(Number.MAX_SAFE_INTEGER);
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("unsafe, malformed, and ambiguous budgets never reach the intake route", async () => {
+  const rejected: readonly string[] = [
+    "90071992547409.92",
+    "99999999999999999.99",
+    "45000.555",
+    "1e3",
+    "1E6",
+    "+45000",
+    "-45000",
+    "NaN",
+    "Infinity",
+    "45 000",
+    "$45000",
+  ];
+  for (const budget of rejected) {
+    const seen: unknown[] = [];
+    const mounted = await mountIntakeView(async (input) => {
+      seen.push(input);
+      return { ok: true, projectId: "project-rejected" };
+    });
+    try {
+      await submitIntakeBudget(mounted.container, mounted.dom, {
+        projectName: "Northside café",
+        region: "Amsterdam",
+        budget,
+      });
+      expect(seen).toHaveLength(0);
+      const text = mounted.container.textContent ?? "";
+      expect(text.includes("whole euros and cents") || text.includes("too large to record safely")).toBe(true);
+    } finally {
+      await mounted.cleanup();
+    }
+  }
+});
+
+// -- Pixel QA iteration 2: overview below the decision bar on Project --------
+
+test("the Project tab renders readiness and finance below the decision bar", () => {
+  const snapshot = parseWorkbenchSnapshot(projection, projection.project.id);
+  if (snapshot === null) throw new Error("W1 projection should parse");
+  const html = renderToStaticMarkup(createElement(WorkbenchView, { loadState: { state: "ready", snapshot } }));
+  expect(html).toContain("wb-overview-strip");
+  expect(html).toContain("PROCUREMENT READINESS");
+  expect(html).toContain("Approved budget");
+  const deskAt = html.indexOf("wb-desk-layout");
+  const actionAt = html.indexOf("wb-bench-action");
+  const stripAt = html.indexOf("wb-overview-strip");
+  const lowerAt = html.indexOf("wb-project-lower");
+  expect(deskAt).toBeGreaterThanOrEqual(0);
+  expect(actionAt).toBeGreaterThan(deskAt);
+  expect(stripAt).toBeGreaterThan(actionAt);
+  expect(lowerAt).toBeGreaterThan(stripAt);
+  // No honesty data is dropped by the move.
+  expect(html).toContain("Not assessed");
+  expect(html).toContain("Selected forecast");
+  expect(html).toContain("Committed");
+});
+
+test("non-Project tabs keep the readiness strip above the page content", async () => {
+  const snapshot = parseWorkbenchSnapshot(projection, projection.project.id);
+  if (snapshot === null) throw new Error("W1 projection should parse");
+  const mounted = await mountE8Tab({ state: "ready", snapshot }, () => ({ ok: false, message: "controlled test refusal" }));
+  try {
+    await mounted.clickTab("Suppliers");
+    const app = mounted.container.querySelector(".wb-app");
+    if (app === null) throw new Error("Workbench app not found");
+    const appHtml = app.innerHTML;
+    expect(appHtml).toContain("wb-overview-strip");
+    expect(appHtml.indexOf("wb-overview-strip")).toBeLessThan(appHtml.indexOf('id="workbench-main"'));
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+// -- Pixel QA iteration 2: compact controlled-fixture card headings ----------
+
+function controlledNameProjection(): Record<string, unknown> {
+  const value = twoOfferProjection();
+  const candidates = value.candidates as readonly Record<string, unknown>[];
+  const first = candidates[0]!;
+  const second = candidates[1]!;
+  return {
+    ...value,
+    candidates: [
+      {
+        ...first,
+        vendor: { id: "vendor-controlled-1", name: "Sample Vendor A (controlled demo)", regions: ["NL"], serviceCoverage: "Service coverage reported for this inquiry" },
+        provenance: { mode: "fixture", label: "Controlled fixture evidence", ownerAuthoredTerms: true },
+      },
+      {
+        ...second,
+        vendor: { id: "vendor-live-2", name: "Harbor Equipment (EU Satellite)", regions: ["NL"], serviceCoverage: "Service coverage reported for this inquiry" },
+        provenance: { mode: "live", label: "Live provider result", ownerAuthoredTerms: false },
+      },
+    ],
+  };
+}
+
+test("controlled fixture headings stay concise while the full name remains available", () => {
+  const snapshot = parseWorkbenchSnapshot(controlledNameProjection(), projection.project.id);
+  if (snapshot === null) throw new Error("Controlled-name projection should parse");
+  const html = renderToStaticMarkup(createElement(WorkbenchView, { loadState: { state: "ready", snapshot } }));
+  // Concise visible heading with the full name retained for assistive use.
+  expect(html).toContain(">Sample Vendor A</h3>");
+  expect(html).toContain('title="Sample Vendor A (controlled demo)"');
+  expect(html).toContain("Review quote from Sample Vendor A (controlled demo)");
+  // The honesty pill stays on the same card.
+  expect(html).toContain("Controlled fixture evidence");
+  // A live vendor keeps its full display name.
+  expect(html).toContain(">Harbor Equipment (EU Satellite)</h3>");
+  expect(html).toContain("Live provider result");
+});
+
+test("pixel-QA CSS keeps the tape and decision bar above the fold", async () => {
+  const css = await Bun.file(new URL("../styles.css", import.meta.url)).text();
+  // The real strip follows the decision bar instead of consuming top height.
+  expect(css).toContain(".wb-compare .wb-overview-strip { margin-top: 1.5rem;");
+  // Paper headings recover source density without hiding controlled labels.
+  expect(css).toContain(".wb-offer-header .wb-pill { margin-top: .35rem;");
+  expect(css).toContain(".wb-offer-card .wb-pill { font-size: .55rem;");
+  expect(css).not.toMatch(/\.wb-paper-version \{[^}]*white-space:\s*nowrap/);
+  // Tightened paper rhythm and decision-bar placement.
+  expect(css).toContain(".wb-quote-total strong { font-family: var(--wb-serif); font-size: 1.45rem;");
+  expect(css).toContain("margin: .7rem auto 1.2rem;");
+  expect(css).toContain(".wb-bench-action { display: grid; grid-column: 1 / -1;");
+  expect(css).toContain("margin: 1rem -2.625rem 0;");
+});
+
+// -- Mobile 390px fidelity: compact header, metadata, and product row --------
+
+test("narrow CSS compacts identity, heading, and product cards toward the first quote", async () => {
+  const css = await Bun.file(new URL("../styles.css", import.meta.url)).text();
+  const phone = css.slice(css.indexOf("@media (max-width: 480px)"));
+  // Project identity folds into the main header row instead of a tall block.
+  expect(phone).toContain(".wb-header { display: grid;");
+  expect(phone).toContain(".wb-project-picker { grid-row: 1; grid-column: 2;");
+  expect(phone).toContain(".wb-project-picker .wb-eyebrow { display: none;");
+  expect(phone).toContain(".wb-project-picker > span:last-child { display: none;");
+  expect(phone).toContain(".wb-nav { grid-row: 2;");
+  // Touch targets stay usable.
+  expect(phone).toContain(".wb-nav button { min-width: 0; flex: 1 1 20%;");
+  // Heading and metadata reflow without hiding copy.
+  expect(phone).toContain(".wb-bench-heading h1 { max-width: 100%; font-size: clamp(2rem, 10.5vw, 2.5rem);");
+  expect(phone).toContain(".wb-bench-heading p { font-size: .72rem; line-height: 1.55; }");
+  expect(phone).toContain(".wb-bench-heading-actions .wb-button { min-height: 2.4rem;");
+  // Asset and on-your-list cards share one compact row so the first quote
+  // starts near the prototype position.
+  expect(phone).toContain(".wb-desk-product { display: grid; grid-column: 1; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);");
+  expect(phone).toContain(".wb-polaroid { width: auto;");
+  expect(phone).toContain(".wb-scope-note h2 { font-size: 1.05rem; }");
+});
+
+test("narrow CSS hides no honest project, scope, or quote state from the markup", () => {
+  const snapshot = parseWorkbenchSnapshot(
+    {
+      ...projection,
+      project: { ...projection.project, sampleKind: "controlledSample", sampleLabel: "Controlled sample data" },
+    },
+    projection.project.id,
+  );
+  if (snapshot === null) throw new Error("Sample projection should parse");
+  const html = renderToStaticMarkup(createElement(WorkbenchView, { loadState: { state: "ready", snapshot } }));
+  // Narrow rules use display:none for duplicated decoration only; every
+  // honest fact below remains in the markup for all viewports.
+  for (const fact of [
+    "Northside caf",
+    "Controlled sample data",
+    "Netherlands",
+    "EUR",
+    "Need by",
+    "Recorded owner exchange",
+    "Two-group espresso machine",
+    "ON YOUR LIST",
+    "Allocation",
+    "Harbor Equipment",
+    "Missing terms",
+    "Validity not confirmed",
+    "Unknown charges block an unqualified saving claim.",
+    "Review selected offer",
+    "Ask about these quotes",
+    "No order is placed.",
+  ]) {
+    expect(html).toContain(fact);
+  }
+});
