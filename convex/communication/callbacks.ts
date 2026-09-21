@@ -93,6 +93,31 @@ const advanceMigrationRef = makeFunctionReference<
   { threadId: string; inboxId: string },
   { ok: true; state: string; verifiedReads: number; replayed: number; stillWaiting: number } | { ok: false; code: string; message: string }
 >("communication/callbacks:advanceThreadMigration");
+const settleRecoverySelfRef = makeFunctionReference<
+  "mutation",
+  {
+    jobId: Id<"jobs">;
+    reservationId: Id<"reservations">;
+    threadId: string;
+    inboxId: string;
+    messageId: string;
+    outcome: "recovered" | "unknown" | "rejected";
+  },
+  | { ok: true; retainedMicroUsd: number; releasedMicroUsd: number; readsSettled: number }
+  | { ok: false; code: string; message: string }
+>("communication/callbacks:settleRecoveryRun");
+const watchdogRecoverySelfRef = makeFunctionReference<
+  "mutation",
+  {
+    jobId: Id<"jobs">;
+    reservationId: Id<"reservations">;
+    threadId: string;
+    inboxId: string;
+    messageId: string;
+  },
+  | { ok: true; settled: boolean }
+  | { ok: false; code: string; message: string }
+>("communication/callbacks:watchdogRecoveryRun");
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -286,9 +311,20 @@ function normalizedInboundMessage(message: InboundMessage): InboundMessage {
 }
 
 async function legacyBindingRows(ctx: F1MutationCtx, provider: string) {
+  // Legacy-only recovery: rows that predate structured provider fields are
+  // precisely those missing the thread/inbox index fields, so this query
+  // returns only true legacy rows no matter how many structured rows share
+  // the provider. More than 64 actual legacy rows stays incomplete and
+  // fails closed instead of sampling.
   const rows = await ctx.db
     .query("processedEvents")
-    .withIndex("by_provider_environment_and_event", (q) => q.eq("provider", provider).eq("environment", "live"))
+    .withIndex("by_provider_environment_and_provider_thread_and_inbox", (q) =>
+      q
+        .eq("provider", provider)
+        .eq("environment", "live")
+        .eq("providerThreadId", undefined)
+        .eq("providerInboxId", undefined),
+    )
     .take(LEGACY_BINDING_RECOVERY_LIMIT + 1);
   return {
     rows: rows.slice(0, LEGACY_BINDING_RECOVERY_LIMIT),
@@ -451,13 +487,8 @@ interface ConversationBinding {
 /**
  * Best-effort lazy migration for threads that predate the durable thread
  * binding. Called only after a bounded scan has proven every visible
- * binding row unanimous for one conversation. Records the durable identity
- * so later routing is one exact read; a concurrently recorded conflicting
- * identity fails closed instead. Threads whose history cannot be proven
- * unanimous within the bounded horizon are never migrated: resolving a
- * sampled prefix into a durable identity could mask a conflict further
- * down the thread, so those threads stay on the explicit legacy
- * fail-closed path (waitingForBinding with reconciliation).
+ * binding row unanimous for one conversation. Threads beyond the bounded
+ * horizon are proven instead by advanceThreadMigration.
  */
 async function noteThreadBinding(
   ctx: F1MutationCtx,
@@ -871,6 +902,10 @@ interface WaitingOversizedMarker {
   readonly recoveryAttempts: number;
   readonly recoveryJobId?: string;
   readonly recoveryReservationId?: string;
+  /** Claimed reads when the current run was admitted; settlement counts only above this baseline. */
+  readonly recoveryRunStartAttempts?: number;
+  /** Watchdog retry executions already scheduled for a failed settlement. */
+  readonly watchdogAttempts?: number;
 }
 
 function inboundBodyBytes(message: Pick<InboundMessage, "text" | "html">): number {
@@ -897,8 +932,20 @@ function parseWaitingOversizedMarker(value: unknown): WaitingOversizedMarker | n
   ) return null;
   const recoveryJobId = value["recoveryJobId"];
   const recoveryReservationId = value["recoveryReservationId"];
-  if (recoveryJobId !== undefined && typeof recoveryJobId !== "string") return null;
-  if (recoveryReservationId !== undefined && typeof recoveryReservationId !== "string") return null;
+  if (recoveryJobId !== undefined && (typeof recoveryJobId !== "string" || recoveryJobId.length === 0)) return null;
+  if (recoveryReservationId !== undefined && (typeof recoveryReservationId !== "string" || recoveryReservationId.length === 0)) return null;
+  const recoveryRunStartAttempts = value["recoveryRunStartAttempts"];
+  if (
+    recoveryRunStartAttempts !== undefined &&
+    (typeof recoveryRunStartAttempts !== "number" ||
+      !Number.isInteger(recoveryRunStartAttempts) ||
+      recoveryRunStartAttempts < 0)
+  ) return null;
+  const watchdogAttempts = value["watchdogAttempts"];
+  if (
+    watchdogAttempts !== undefined &&
+    (typeof watchdogAttempts !== "number" || !Number.isInteger(watchdogAttempts) || watchdogAttempts < 0)
+  ) return null;
   return {
     messageId,
     threadId,
@@ -910,6 +957,8 @@ function parseWaitingOversizedMarker(value: unknown): WaitingOversizedMarker | n
     recoveryAttempts: typeof recoveryAttempts === "number" ? recoveryAttempts : 0,
     ...(recoveryJobId === undefined ? {} : { recoveryJobId }),
     ...(recoveryReservationId === undefined ? {} : { recoveryReservationId }),
+    ...(recoveryRunStartAttempts === undefined ? {} : { recoveryRunStartAttempts }),
+    ...(watchdogAttempts === undefined ? {} : { watchdogAttempts }),
   };
 }
 
@@ -1293,10 +1342,41 @@ export const prepareOversizedRecovery = f1InternalMutation({
       return { ok: false as const, code: "invalid-pricing-config", message: pricing.message };
     }
     const readsRemaining = MAX_RECONCILIATION_READS - marker.recoveryAttempts;
-    // Reuse a valid open run instead of admitting twice.
+    const amount = readsRemaining * pricing.pricing.readCostMicroUsd;
+    if (!Number.isSafeInteger(amount) || amount <= 0) {
+      return denial("invalid-payload", "recovery read budget overflow");
+    }
+    // Reuse a valid open run instead of admitting twice. Stored identifiers
+    // are normalized through the table binding and fail closed on null.
+    // Accounting is run-relative: the reservation lifetime total must equal
+    // exactly the capacity admitted for this run — (MAX minus the run's
+    // start baseline) reads at the current unit cost — and must still cover
+    // the reads claimed since that baseline. A rotated run therefore never
+    // re-retains reads an earlier run already settled, and a crashed run
+    // with an intact open reservation reuses it instead of stranding it
+    // beside a second open reservation.
     if (marker.recoveryJobId !== undefined && marker.recoveryReservationId !== undefined) {
-      const job = await ctx.db.get(marker.recoveryJobId as Id<"jobs">).catch(() => null);
-      const reservation = await ctx.db.get(marker.recoveryReservationId as Id<"reservations">).catch(() => null);
+      const storedJobId = ctx.db.normalizeId("jobs", marker.recoveryJobId);
+      const storedReservationId = ctx.db.normalizeId("reservations", marker.recoveryReservationId);
+      const job = storedJobId === null ? null : await ctx.db.get(storedJobId);
+      const reservation = storedReservationId === null ? null : await ctx.db.get(storedReservationId);
+      const baseline = marker.recoveryRunStartAttempts ?? 0;
+      const runClaims = marker.recoveryAttempts - baseline;
+      const expectedCapacity = (MAX_RECONCILIATION_READS - baseline) * pricing.pricing.readCostMicroUsd;
+      const lifetimeTotal = (reservation?.reservedMicroUsd ?? -1) +
+        (reservation?.unresolvedMicroUsd ?? -1) +
+        (reservation?.spentMicroUsd ?? -1);
+      if (baseline < 0 || baseline > marker.recoveryAttempts || marker.recoveryAttempts > MAX_RECONCILIATION_READS) {
+        return denial("invalid-payload", "recovery accounting baseline is inconsistent");
+      }
+      if (
+        !Number.isSafeInteger(expectedCapacity) ||
+        expectedCapacity <= 0 ||
+        !Number.isSafeInteger(runClaims) ||
+        runClaims < 0
+      ) {
+        return denial("invalid-payload", "recovery accounting baseline is inconsistent");
+      }
       if (
         job !== null &&
         job.organizationId === binding.organizationId &&
@@ -1308,8 +1388,20 @@ export const prepareOversizedRecovery = f1InternalMutation({
         reservation.organizationId === binding.organizationId &&
         reservation.jobId === job._id &&
         reservation.state === "open" &&
-        reservation.pricingBasis === pricing.pricing.basis
+        reservation.pricingBasis === pricing.pricing.basis &&
+        lifetimeTotal === expectedCapacity &&
+        lifetimeTotal >= runClaims * pricing.pricing.readCostMicroUsd
       ) {
+        // Admission watchdog: a crash after this admission but before any
+        // claim or settlement must still release the run. A normally
+        // completed run makes the firing a harmless no-op.
+        await ctx.scheduler.runAfter(RECOVERY_ADMISSION_WATCHDOG_DELAY_MS, watchdogRecoverySelfRef, {
+          jobId: job._id,
+          reservationId: reservation._id,
+          threadId,
+          inboxId,
+          messageId,
+        });
         return {
           ok: true as const,
           jobId: job._id,
@@ -1317,6 +1409,13 @@ export const prepareOversizedRecovery = f1InternalMutation({
           readsRemaining,
           readCostMicroUsd: pricing.pricing.readCostMicroUsd,
         };
+      }
+      // A referenced prior run that has not settled blocks rotation: admit
+      // no second open reservation beside it. Old watchdogs keep settling
+      // the old run through the same checks; only a closed or missing
+      // prior run may rotate. Fail closed until then.
+      if (reservation !== null && reservation.state !== "closed") {
+        return { ok: false as const, code: "unknown-charges-reserved", message: "prior recovery run is still open" };
       }
     }
     const grantJobs = await ctx.db
@@ -1339,10 +1438,6 @@ export const prepareOversizedRecovery = f1InternalMutation({
       createdAt: now,
       updatedAt: now,
     });
-    const amount = readsRemaining * pricing.pricing.readCostMicroUsd;
-    if (!Number.isSafeInteger(amount) || amount <= 0) {
-      return denial("invalid-payload", "recovery read budget overflow");
-    }
     const reserved: MutationReturn<typeof reservations.reserveServerRead> = await ctx.runMutation(reserveServerReadRef, {
       jobId,
       organizationId: binding.organizationId,
@@ -1363,7 +1458,24 @@ export const prepareOversizedRecovery = f1InternalMutation({
         ...(isRecord(outcomeValue) ? outcomeValue : {}),
         recoveryJobId: jobId,
         recoveryReservationId: reserved.reservationId,
+        // Per-run baseline: settlement later counts only reads claimed at
+        // or above this mark, so a rotated run never re-retains reads an
+        // earlier run already settled. Watchdog retries reset: a new run
+        // gets its own finite retry budget instead of inheriting the old
+        // run's consumed attempts.
+        recoveryRunStartAttempts: marker.recoveryAttempts,
+        watchdogAttempts: 0,
       }),
+    });
+    // Admission watchdog: a crash after this admission but before any
+    // claim or settlement must still release the zero-claim reservation.
+    // A normally completed run makes this firing a harmless no-op.
+    await ctx.scheduler.runAfter(RECOVERY_ADMISSION_WATCHDOG_DELAY_MS, watchdogRecoverySelfRef, {
+      jobId,
+      reservationId: reserved.reservationId,
+      threadId,
+      inboxId,
+      messageId,
     });
     return {
       ok: true as const,
@@ -1377,13 +1489,24 @@ export const prepareOversizedRecovery = f1InternalMutation({
 
 /**
  * Claim one recovery read before dispatch (claim-before-read, mirroring the
- * dispatch claim). The atomic check-and-increment keeps total provider reads
- * at or below the bound even across crashes and concurrent runs: a crash
- * after a claim only ever reduces future reads. Each claim revalidates the
- * live conversation and grant, so revoked authority stops the next read.
+ * dispatch claim). The claim binds to the admitted run: the waiting row
+ * must still reference this exact job and reservation, and that reservation
+ * must still be open. A watchdog (or a concurrent run) that already settled
+ * therefore denies every later claim before any HTTP read, so a closed run
+ * can never fund another provider read. The atomic check-and-increment
+ * keeps total reads at or below the bound across crashes and concurrent
+ * runs: a crash after a claim only ever reduces future reads. Each claim
+ * revalidates the live conversation and grant, so revoked authority stops
+ * the next read.
  */
 export const claimRecoveryRead = f1InternalMutation({
-  args: { threadId: v.string(), inboxId: v.string(), messageId: v.string() },
+  args: {
+    threadId: v.string(),
+    inboxId: v.string(),
+    messageId: v.string(),
+    jobId: v.id("jobs"),
+    reservationId: v.id("reservations"),
+  },
   returns: v.union(
     v.object({ ok: v.literal(true), attemptNumber: v.number() }),
     denialValidator,
@@ -1420,9 +1543,23 @@ export const claimRecoveryRead = f1InternalMutation({
     if (marker.recoveryAttempts >= MAX_RECONCILIATION_READS) {
       return { ok: false as const, code: "recovery-attempts-exhausted", message: "recovery read budget is exhausted" };
     }
+    // The claim belongs to exactly one admitted run. A rotated run (a newer
+    // gate admission) or a settled reservation denies before any HTTP read.
+    if (marker.recoveryJobId !== args.jobId || marker.recoveryReservationId !== args.reservationId) {
+      return { ok: false as const, code: "already-claimed", message: "recovery claim does not match the admitted run" };
+    }
     const binding = await conversationForMessage(ctx, { messageId, threadId, inboxId });
     if (binding === null) {
       return denial("invalid-payload", "thread has no verified conversation binding");
+    }
+    const reservation = await ctx.db.get(args.reservationId);
+    if (
+      reservation === null ||
+      reservation.organizationId !== binding.organizationId ||
+      reservation.jobId !== args.jobId ||
+      reservation.state !== "open"
+    ) {
+      return { ok: false as const, code: "allowance-exhausted", message: "recovery reservation is not open" };
     }
     const conversation = await ctx.db.get(binding.conversationId);
     if (
@@ -1452,53 +1589,188 @@ export const claimRecoveryRead = f1InternalMutation({
 });
 
 /**
- * Settle one recovery run: bind the settlement to the admitted run,
- * retain the used portion as unresolved (a read that may have executed is
- * never freed as if it cost nothing and no spend number is ever invented),
- * release the unused headroom, and close the run job as completed or
- * failed. A definitive provider rejection releases everything.
+ * Settle one recovery run. The settled read count always comes from the
+ * durable row marker minus the run's admission baseline — the exact reads
+ * claimed by this run across restarts — never from a single action's local
+ * counter, so a crash between reads cannot strand claimed reads outside
+ * the settlement and a rotated run cannot re-retain reads an earlier run
+ * already settled. The settlement binds to the admitted run: a mismatched
+ * job or reservation fails closed.
  */
 export const settleRecoveryRun = f1InternalMutation({
   args: {
     jobId: v.id("jobs"),
     reservationId: v.id("reservations"),
+    threadId: v.string(),
+    inboxId: v.string(),
+    messageId: v.string(),
     outcome: v.union(v.literal("recovered"), v.literal("unknown"), v.literal("rejected")),
-    readsUsed: v.number(),
   },
   returns: v.union(
-    v.object({ ok: v.literal(true), retainedMicroUsd: v.number(), releasedMicroUsd: v.number() }),
+    v.object({ ok: v.literal(true), retainedMicroUsd: v.number(), releasedMicroUsd: v.number(), readsSettled: v.number() }),
     denialValidator,
   ),
   handler: async (ctx, args) => {
+    const threadId = normalizedProviderId(args.threadId);
+    const inboxId = normalizedProviderId(args.inboxId);
+    const messageId = normalizedProviderId(args.messageId);
+    if (threadId === undefined || inboxId === undefined || messageId === undefined) {
+      return denial("invalid-payload", "thread, inbox, and message identifiers are required");
+    }
     const job = await ctx.db.get(args.jobId);
     if (job === null) {
       return denial("invalid-payload", "recovery job is not available");
     }
+    const retained = await ctx.db
+      .query("processedEvents")
+      .withIndex("by_provider_environment_and_provider_message_and_thread_and_inbox", (q) =>
+        q
+          .eq("provider", "agentmail-inbound")
+          .eq("environment", "live")
+          .eq("providerMessageId", messageId)
+          .eq("providerThreadId", threadId)
+          .eq("providerInboxId", inboxId),
+      )
+      .take(2);
+    if (retained.length !== 1) {
+      return denial("invalid-payload", "no single retained reply matches this run");
+    }
+    const row = retained[0];
+    if (row === undefined) return denial("invalid-payload", "retained reply is not available");
+    const marker = parseWaitingOversizedMarker(parseObject(row.outcome));
+    if (marker === null) {
+      return denial("invalid-payload", "retained reply has no recovery marker");
+    }
+    if (marker.recoveryJobId !== args.jobId || marker.recoveryReservationId !== args.reservationId) {
+      return denial("invalid-payload", "settlement does not match the admitted run");
+    }
+    const baseline = marker.recoveryRunStartAttempts ?? 0;
+    const readsSettled = marker.recoveryAttempts - baseline;
+    if (
+      !Number.isSafeInteger(readsSettled) ||
+      readsSettled < 0 ||
+      readsSettled > MAX_RECONCILIATION_READS
+    ) {
+      return denial("invalid-payload", "settlement read count is outside the bounded retry policy");
+    }
+    // A crash between a successful ingest and settlement must still close
+    // the run as completed: the durable row proves the bytes landed.
+    const effectiveOutcome = args.outcome === "recovered" || row.applicationState === "observedSuccess"
+      ? ("recovered" as const)
+      : args.outcome;
     const settled: MutationReturn<typeof reservations.settleServerRead> = await ctx.runMutation(settleServerReadRef, {
       reservationId: args.reservationId,
       organizationId: job.organizationId,
       jobId: args.jobId,
-      readsUsed: args.readsUsed,
-      mode: args.outcome === "rejected" ? "release" : "retainUnknown",
+      readsUsed: readsSettled,
+      mode: effectiveOutcome === "rejected" ? "release" : "retainUnknown",
     });
     if (!settled.ok) return settled;
     await ctx.db.patch(args.jobId, {
-      state: args.outcome === "recovered" ? "completed" : "failed",
+      state: effectiveOutcome === "recovered" ? "completed" : "failed",
       updatedAt: Date.now(),
     });
-    return { ok: true as const, retainedMicroUsd: settled.retainedMicroUsd, releasedMicroUsd: settled.releasedMicroUsd };
+    return {
+      ok: true as const,
+      retainedMicroUsd: settled.retainedMicroUsd,
+      releasedMicroUsd: settled.releasedMicroUsd,
+      readsSettled,
+    };
   },
 });
 
-// One migration transaction verifies at most this many binding rows. Larger
-// threads resume across transactions through the durable cursor below.
-const MIGRATION_CHUNK_LIMIT = 64;
-// A full chunk that cannot advance the creation-time cursor is re-verified;
-// after this many consecutive rounds the thread needs manual review instead
-// of another identical pass.
-const MIGRATION_SAME_CURSOR_ROUNDS = 3;
+/**
+ * Watchdog for a recovery run. Settles the admitted run from the durable
+ * claimed total when the driving action crashed, stalled past its
+ * deadlines, or otherwise never settled: an open reservation with
+ * exhausted attempts settles through this retry path instead of stranding
+ * allowance, and an already-settled run is a harmless no-op. Never reads
+ * the provider. A failed settlement schedules at most three bounded
+ * backoff retries; each retry re-reads the durable counter, so the total
+ * number of watchdog executions stays finite and no scheduler loop can
+ * run forever.
+ */
+// Admission watchdog delay: comfortably beyond one full action run
+// (overall deadline plus margins) so only a genuinely stranded admission
+// is ever settled by it.
+const RECOVERY_ADMISSION_WATCHDOG_DELAY_MS = 60_000;
+const WATCHDOG_MAX_ATTEMPTS = 3;
+const WATCHDOG_RETRY_DELAYS_MS = [30_000, 60_000, 120_000] as const;
 
-const migrationStateValidator = v.union(v.literal("verifying"), v.literal("complete"), v.literal("conflicted"), v.literal("needsReview"));
+export const watchdogRecoveryRun = f1InternalMutation({
+  args: {
+    jobId: v.id("jobs"),
+    reservationId: v.id("reservations"),
+    threadId: v.string(),
+    inboxId: v.string(),
+    messageId: v.string(),
+  },
+  returns: v.union(
+    v.object({ ok: v.literal(true), settled: v.boolean() }),
+    denialValidator,
+  ),
+  handler: async (ctx, args) => {
+    const reservation = await ctx.db.get(args.reservationId);
+    if (reservation === null || reservation.state !== "open") {
+      return { ok: true as const, settled: false };
+    }
+    const settled: MutationReturn<typeof settleRecoveryRun> = await ctx.runMutation(settleRecoverySelfRef, {
+      jobId: args.jobId,
+      reservationId: args.reservationId,
+      threadId: args.threadId,
+      inboxId: args.inboxId,
+      messageId: args.messageId,
+      outcome: "unknown",
+    });
+    if (settled.ok) return { ok: true as const, settled: true };
+    // A locked failed settlement retries on a bounded backoff without
+    // another provider read. The counter lives on the durable row, so
+    // concurrent watchdogs converge on the same finite budget.
+    const threadId = normalizedProviderId(args.threadId);
+    const inboxId = normalizedProviderId(args.inboxId);
+    const messageId = normalizedProviderId(args.messageId);
+    if (threadId !== undefined && inboxId !== undefined && messageId !== undefined) {
+      const retained = await ctx.db
+        .query("processedEvents")
+        .withIndex("by_provider_environment_and_provider_message_and_thread_and_inbox", (q) =>
+          q
+            .eq("provider", "agentmail-inbound")
+            .eq("environment", "live")
+            .eq("providerMessageId", messageId)
+            .eq("providerThreadId", threadId)
+            .eq("providerInboxId", inboxId),
+        )
+        .take(2);
+      const row = retained.length === 1 ? retained[0] : undefined;
+      const marker = row === undefined ? null : parseWaitingOversizedMarker(parseObject(row.outcome));
+      const attempts = marker?.watchdogAttempts ?? 0;
+      if (row !== undefined && marker !== null && attempts < WATCHDOG_MAX_ATTEMPTS) {
+        const outcomeValue = parseObject(row.outcome);
+        await ctx.db.patch(row._id, {
+          outcome: JSON.stringify({
+            ...(isRecord(outcomeValue) ? outcomeValue : {}),
+            watchdogAttempts: attempts + 1,
+          }),
+        });
+        await ctx.scheduler.runAfter(WATCHDOG_RETRY_DELAYS_MS[Math.min(attempts, WATCHDOG_RETRY_DELAYS_MS.length - 1)] ?? 30_000, watchdogRecoverySelfRef, {
+          jobId: args.jobId,
+          reservationId: args.reservationId,
+          threadId,
+          inboxId,
+          messageId,
+        });
+      }
+    }
+    return { ok: true as const, settled: false };
+  },
+});
+
+// One migration transaction reads at most one page of binding rows. Larger
+// threads resume across transactions through the durable pagination cursor
+// stored on the migration state.
+const MIGRATION_PAGE_SIZE = 64;
+
+const migrationStateValidator = v.union(v.literal("verifying"), v.literal("complete"), v.literal("conflicted"));
 
 /**
  * Advance the durable thread-identity migration by one bounded chunk
@@ -1529,11 +1801,11 @@ export const advanceThreadMigration = f1InternalMutation({
       return denial("invalid-payload", "thread and inbox identifiers are required");
     }
     const finish = async (
-      state: "complete" | "conflicted" | "needsReview",
+      state: "complete" | "conflicted",
       verifiedReads: number,
     ): Promise<{
       readonly ok: true;
-      readonly state: "complete" | "conflicted" | "needsReview";
+      readonly state: "complete" | "conflicted";
       readonly verifiedReads: number;
       readonly replayed: number;
       readonly stillWaiting: number;
@@ -1633,8 +1905,6 @@ export const advanceThreadMigration = f1InternalMutation({
             organizationId: operation.organizationId,
             projectId: operation.projectId,
             verifiedReads: 0,
-            cursorTime: -1,
-            sameCursorRounds: 0,
             state: "conflicted",
             createdAt: now,
             updatedAt: now,
@@ -1652,8 +1922,6 @@ export const advanceThreadMigration = f1InternalMutation({
         candidateConversationId: resolved.conversationId,
         ...(firstRow.operationId === undefined ? {} : { candidateOperationId: firstRow.operationId }),
         verifiedReads: 0,
-        cursorTime: -1,
-        sameCursorRounds: 0,
         state: "verifying",
         createdAt: now,
         updatedAt: now,
@@ -1669,7 +1937,11 @@ export const advanceThreadMigration = f1InternalMutation({
       await ctx.db.patch(verifying._id, { state: "conflicted", updatedAt: now });
       return finish("conflicted", verifying.verifiedReads);
     }
-    const chunk = await ctx.db
+    // One bounded page per transaction through the exact thread/inbox
+    // index. The positional continuation cursor advances past every
+    // returned row, so equal timestamps can never stall progress and no
+    // row is ever verified twice.
+    const page = await ctx.db
       .query("processedEvents")
       .withIndex("by_provider_environment_and_provider_thread_and_inbox", (q) =>
         q
@@ -1679,9 +1951,8 @@ export const advanceThreadMigration = f1InternalMutation({
           .eq("providerInboxId", inboxId),
       )
       .order("asc")
-      .filter((q) => q.gte(q.field("_creationTime"), verifying.cursorTime))
-      .take(MIGRATION_CHUNK_LIMIT + 1);
-    for (const row of chunk) {
+      .paginate({ cursor: verifying.cursor ?? null, numItems: MIGRATION_PAGE_SIZE });
+    for (const row of page.page) {
       const expected = bindingKey(row.providerMessageId, threadId, inboxId);
       const single = expected === null ? null : await resolveBindingRowConversation(ctx, row, expected);
       if (
@@ -1691,11 +1962,11 @@ export const advanceThreadMigration = f1InternalMutation({
         single.projectId !== verifying.projectId
       ) {
         await ctx.db.patch(verifying._id, { state: "conflicted", updatedAt: now });
-        return finish("conflicted", verifying.verifiedReads + chunk.length);
+        return finish("conflicted", verifying.verifiedReads + page.page.length);
       }
     }
-    const verifiedReads = verifying.verifiedReads + chunk.length;
-    if (chunk.length <= MIGRATION_CHUNK_LIMIT) {
+    const verifiedReads = verifying.verifiedReads + page.page.length;
+    if (page.isDone) {
       const noted = await noteThreadBinding(
         ctx,
         { threadId, inboxId },
@@ -1713,22 +1984,11 @@ export const advanceThreadMigration = f1InternalMutation({
       await ctx.db.patch(verifying._id, { state: "complete", verifiedReads, updatedAt: now });
       return finish("complete", verifiedReads);
     }
-    const maxTime = Math.max(...chunk.map((row) => row._creationTime));
-    if (maxTime > verifying.cursorTime) {
-      await ctx.db.patch(verifying._id, {
-        verifiedReads,
-        cursorTime: maxTime,
-        sameCursorRounds: 0,
-        updatedAt: now,
-      });
-    } else {
-      const rounds = verifying.sameCursorRounds + 1;
-      if (rounds >= MIGRATION_SAME_CURSOR_ROUNDS) {
-        await ctx.db.patch(verifying._id, { verifiedReads, sameCursorRounds: rounds, state: "needsReview", updatedAt: now });
-        return finish("needsReview", verifiedReads);
-      }
-      await ctx.db.patch(verifying._id, { verifiedReads, sameCursorRounds: rounds, updatedAt: now });
-    }
+    await ctx.db.patch(verifying._id, {
+      verifiedReads,
+      cursor: page.continueCursor,
+      updatedAt: now,
+    });
     await ctx.scheduler.runAfter(0, advanceMigrationRef, { threadId, inboxId });
     return { ok: true as const, state: "verifying" as const, verifiedReads, replayed: 0, stillWaiting: 0 };
   },

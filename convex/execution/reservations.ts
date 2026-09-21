@@ -396,14 +396,17 @@ export const settleServerRead = f1InternalMutation({
       return { ok: false as const, code: "invalid-payload", message: "settlement accounting overflow" };
     }
     const released = amount - retain;
+    // A missing budget row must fail closed: silently closing the
+    // reservation would lose the ledger side of this accounting.
     const budget = await ctx.db.get(reservation.budgetId);
-    if (budget !== null) {
-      await ctx.db.patch(reservation.budgetId, {
-        reservedMicroUsd: Math.max(0, budget.reservedMicroUsd - amount),
-        unresolvedMicroUsd: budget.unresolvedMicroUsd + retain,
-        updatedAt: now,
-      });
+    if (budget === null || budget.organizationId !== args.organizationId) {
+      return { ok: false as const, code: "allowance-exhausted", message: "reconciliation budget is unavailable" };
     }
+    await ctx.db.patch(reservation.budgetId, {
+      reservedMicroUsd: Math.max(0, budget.reservedMicroUsd - amount),
+      unresolvedMicroUsd: budget.unresolvedMicroUsd + retain,
+      updatedAt: now,
+    });
     await ctx.db.patch(reservation._id, {
       reservedMicroUsd: 0,
       unresolvedMicroUsd: reservation.unresolvedMicroUsd + retain,

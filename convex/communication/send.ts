@@ -82,6 +82,11 @@ const settleRecoveryRef = makeFunctionReference<
   MutationArgs<typeof callbacks.settleRecoveryRun>,
   MutationReturn<typeof callbacks.settleRecoveryRun>
 >("communication/callbacks:settleRecoveryRun");
+const watchdogRecoveryRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof callbacks.watchdogRecoveryRun>,
+  MutationReturn<typeof callbacks.watchdogRecoveryRun>
+>("communication/callbacks:watchdogRecoveryRun");
 
 const snapshotResultValidator = v.union(
   v.object({
@@ -458,13 +463,18 @@ async function backfillThreadBinding(
   }
   const legacy = await ctx.db
     .query("processedEvents")
-    .withIndex("by_provider_environment_and_event", (q) =>
-      q.eq("provider", "agentmail-binding").eq("environment", "live"),
+    .withIndex("by_provider_environment_and_provider_thread_and_inbox", (q) =>
+      q
+        .eq("provider", "agentmail-binding")
+        .eq("environment", "live")
+        .eq("providerThreadId", undefined)
+        .eq("providerInboxId", undefined),
     )
     .take(THREAD_BINDING_VERIFY_LIMIT + 1);
+  // Only true legacy rows are visible here, so this limit counts actual
+  // legacy history: more than 64 stays fail-closed instead of sampling.
   if (legacy.length > THREAD_BINDING_VERIFY_LIMIT) return;
   for (const row of legacy) {
-    if (row.providerThreadId !== undefined || row.providerInboxId !== undefined) continue;
     const facts = rowBindingFacts(row);
     if (facts === null || facts.threadId !== threadId || facts.inboxId !== inboxId) continue;
     const rowConversation = await rowThreadConversation(ctx, row, scope);
@@ -576,20 +586,22 @@ export const recordProviderBinding = f1InternalMutation({
     if (indexedCallbacks.length > 1) return denial("invalid-payload", "provider callback binding is ambiguous");
     let callback = indexedCallbacks[0];
     if (callback === undefined) {
+      // Legacy-only callback recovery: rows predating structured fields
+      // are exactly those missing the thread/inbox index fields, so
+      // hundreds of unrelated structured rows cannot push a true legacy
+      // callback out of this bounded read.
       const legacyRows = await ctx.db
         .query("processedEvents")
-        .withIndex("by_provider_environment_and_event", (q) =>
-          q.eq("provider", "agentmail-callback").eq("environment", "live"),
+        .withIndex("by_provider_environment_and_provider_thread_and_inbox", (q) =>
+          q
+            .eq("provider", "agentmail-callback")
+            .eq("environment", "live")
+            .eq("providerThreadId", undefined)
+            .eq("providerInboxId", undefined),
         )
         .take(LEGACY_BINDING_RECOVERY_LIMIT + 1);
       if (legacyRows.length <= LEGACY_BINDING_RECOVERY_LIMIT) {
-        const matches = legacyRows.filter(
-          (row) =>
-            row.providerMessageId === undefined &&
-            row.providerThreadId === undefined &&
-            row.providerInboxId === undefined &&
-            matchesBinding(row, expected),
-        );
+        const matches = legacyRows.filter((row) => matchesBinding(row, expected));
         if (matches.length > 1) return denial("invalid-payload", "legacy provider callback binding is ambiguous");
         callback = matches[0];
       }
@@ -884,6 +896,12 @@ function isDefinitiveProviderRejection(error: unknown): boolean {
   );
 }
 
+// Watchdog delay: one per-read deadline plus margin. A crashed or stalled
+// run is settled from the durable claimed total even if this run never
+// reaches its own settlement; a normally completed run makes the watchdog
+// a harmless no-op.
+const RECOVERY_WATCHDOG_DELAY_MS = 15_000;
+
 async function readExactMessage(
   client: AgentMail,
   ctx: Parameters<AgentMail["getMessage"]>[0],
@@ -962,18 +980,32 @@ export const recoverOversizedInbound = internalAction({
           result = { ok: true as const, outcome: "unknown" as const, reason: "recovery overall deadline exceeded" };
           break;
         }
-        // Claim before dispatch: the atomic check-and-increment keeps total
-        // reads at or below the bound across crashes and concurrent runs.
+        // Claim before dispatch: bound to the admitted run, so a watchdog
+        // (or a concurrent run) that already settled denies here before any
+        // HTTP read. The atomic check-and-increment keeps total reads at or
+        // below the bound across crashes and concurrent runs.
         const claim: MutationReturn<typeof callbacks.claimRecoveryRead> = await ctx.runMutation(claimRecoveryRef, {
           threadId,
           inboxId,
           messageId,
+          jobId: gate.jobId,
+          reservationId: gate.reservationId,
         });
         if (!claim.ok) {
           result = { ok: true as const, outcome: "unknown" as const, reason: claim.message };
           break;
         }
         claims += 1;
+        // Watchdog before dispatch: if this run crashes or stalls past its
+        // deadlines, the scheduled check settles the admitted run from the
+        // durable claimed total instead of stranding an open reservation.
+        await ctx.scheduler.runAfter(RECOVERY_WATCHDOG_DELAY_MS, watchdogRecoveryRef, {
+          jobId: gate.jobId,
+          reservationId: gate.reservationId,
+          threadId,
+          inboxId,
+          messageId,
+        });
         const readDeadline = Math.min(overallDeadline, Date.now() + DEFAULT_RECONCILIATION_READ_TIMEOUT_MS);
         let payload: unknown;
         try {
@@ -1030,14 +1062,17 @@ export const recoverOversizedInbound = internalAction({
         break;
       }
     } finally {
-      // The run always settles: definitive rejections release, everything
-      // else stays unresolved without inventing a spend number. A failed
-      // settlement leaves the reservation safely locked, never freed.
+      // The run always settles from the durable claimed total: definitive
+      // rejections release, everything else stays unresolved without
+      // inventing a spend number. A failed settlement leaves the reservation
+      // safely locked for the watchdog, never freed.
       await ctx.runMutation(settleRecoveryRef, {
         jobId: gate.jobId,
         reservationId: gate.reservationId,
+        threadId,
+        inboxId,
+        messageId,
         outcome,
-        readsUsed: claims,
       });
     }
     return result;

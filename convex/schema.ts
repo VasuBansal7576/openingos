@@ -986,11 +986,11 @@ export default defineSchema({
    * thread binding existed cannot be proven unanimous inside one bounded
    * read. This row carries the migration progress so successive bounded
    * transactions eventually prove exactly one identity: `candidate...`
-   * fields name the identity under proof, `cursorTime` is the creation-time
-   * horizon already verified, and `verifiedReads` counts cumulative
-   * verification reads (boundary rows are re-verified on overlap, so this
-   * can exceed the thread size). `conflicted` and `needsReview` are
-   * terminal and never produce a binding; only `complete` writes it.
+   * fields name the identity under proof, `cursor` is the opaque Convex
+   * pagination continuation for the exact thread/inbox index (absent at
+   * the start), and `verifiedReads` counts exactly verified rows.
+   * Positional cursors never stall on equal timestamps. `conflicted` is
+   * terminal and never produces a binding; only `complete` writes it.
    */
   threadMigrationStates: defineTable({
     provider: v.string(),
@@ -1002,13 +1002,11 @@ export default defineSchema({
     candidateConversationId: v.optional(v.id("conversations")),
     candidateOperationId: v.optional(v.id("operations")),
     verifiedReads: v.number(),
-    cursorTime: v.number(),
-    sameCursorRounds: v.number(),
+    cursor: v.optional(v.string()),
     state: v.union(
       v.literal("verifying"),
       v.literal("complete"),
       v.literal("conflicted"),
-      v.literal("needsReview"),
     ),
     createdAt: v.number(),
     updatedAt: v.number(),
