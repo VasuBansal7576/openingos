@@ -489,12 +489,23 @@ export function AdapterAwareApp({
     if (!isServerConfirmedForCurrentEpoch()) {
       return { ok: false, message: "Intake waits for server-confirmed authentication. Nothing was sent." };
     }
-    if (workbenchAdapter?.createIntake === undefined) {
+    const callingAdapter = adapterRef.current;
+    if (callingAdapter?.createIntake === undefined) {
       return { ok: false, message: "No server intake route is configured. Nothing was sent." };
     }
+    // Bind this creation to the connection/auth epoch that dispatched it. A
+    // completion from an older epoch (disconnect/reconnect, denial, or
+    // adapter replacement racing a slow mutation) must not adopt the
+    // returned project. See P-17, D-06, D-14.
+    const dispatchEpoch = connectionEpochRef.current;
     try {
-      const result = await workbenchAdapter.createIntake(input);
+      const result = await callingAdapter.createIntake(input);
       if (result.ok && result.projectId !== undefined) {
+        if (dispatchEpoch !== connectionEpochRef.current || backendStatusRef.current !== "connected" || adapterRef.current !== callingAdapter) {
+          const message = "The workspace may have been created but could not be loaded in this session. Reconnect or discovery can find authorized projects.";
+          setActionError(message);
+          return { ok: false, message };
+        }
         setResolvedProjectId(result.projectId);
       } else if (!result.ok) {
         setActionError(result.message ?? "The server did not create this workspace.");
@@ -524,10 +535,15 @@ export function AdapterAwareApp({
     if (callingAdapter?.createSample === undefined) {
       return { ok: false, message: "No server sample route is configured. Nothing was sent." };
     }
+    // Bind this creation to the connection/auth epoch that dispatched it. A
+    // completion from an older epoch (disconnect/reconnect, denial, or
+    // adapter replacement racing a slow mutation) must not adopt or load the
+    // returned project. See P-17, D-06, D-14.
+    const dispatchEpoch = connectionEpochRef.current;
     try {
       const result = await callingAdapter.createSample(input);
       if (result.ok && result.projectId !== undefined) {
-        if (backendStatusRef.current !== "connected" || adapterRef.current !== callingAdapter || workbenchRef.current?.state !== "empty") {
+        if (dispatchEpoch !== connectionEpochRef.current || backendStatusRef.current !== "connected" || adapterRef.current !== callingAdapter || workbenchRef.current?.state !== "empty") {
           const message = "The sample project may have been created but could not be loaded in this session. Reconnect or discovery can find authorized projects.";
           setActionError(message);
           return { ok: false, message };
