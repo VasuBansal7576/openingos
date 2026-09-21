@@ -79,7 +79,7 @@ h1, h2, h3, p { margin-top: 0; }
 
 .wb-page { max-width: 1380px; min-height: calc(100vh - 13rem); margin: auto; padding: 3rem 2.5rem 4rem; }
 .wb-page-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 2rem; margin-bottom: 1.4rem; }
-.wb-page-heading h1 { max-width: 52rem; margin: .45rem 0 .8rem; font-family: Georgia, serif; font-size: clamp(2.9rem, 5.5vw, 4.5rem); font-weight: 400; letter-spacing: -.06em; line-height: .95; }
+.wb-page-heading h1 { max-width: 52rem; margin: .45rem 0 .8rem; font-family: Georgia, serif; font-size: clamp(2.9rem, 5.5vw, 4.5rem); font-weight: 400; letter-spacing: -.06em; line-height: .95; overflow-wrap: break-word; }
 .wb-page-heading p { max-width: 40rem; margin: 0; color: #5d7266; font-size: .85rem; line-height: 1.75; }
 .wb-page-heading > .wb-button { margin-top: .9rem; }
 .wb-scope-row { display: flex; align-items: center; flex-wrap: wrap; gap: .65rem 1.4rem; margin-bottom: 2rem; color: #5d7266; font-size: .67rem; }
@@ -390,9 +390,10 @@ h1, h2, h3, p { margin-top: 0; }
   .wb-header { padding-inline: .8rem; }
   .wb-project-picker { min-width: 8.7rem; }
   .wb-project-picker strong { font-size: .68rem; }
-  .wb-nav button { padding-inline: .55rem; font-size: .56rem; }
-  .wb-nav button .ui-icon { width: 13px; }
-  .wb-page-heading h1 { font-size: 2.85rem; }
+  .wb-nav { gap: .1rem; }
+  .wb-nav button { padding-inline: .45rem; gap: .3rem; font-size: .56rem; }
+  .wb-nav button .ui-icon { width: 12px; }
+  .wb-page-heading h1 { max-width: 100%; font-size: clamp(2.2rem, 12vw, 2.85rem); overflow-wrap: break-word; }
   .wb-requirement-card, .wb-panel { padding: 1rem; }
   .wb-requirement-top { flex-direction: column; gap: .7rem; }
   .wb-requirement-facts { gap: .75rem; }

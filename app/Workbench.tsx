@@ -110,9 +110,15 @@ function focusableElements(container: HTMLElement): HTMLElement[] {
 type ModalElementRef = { readonly current: HTMLElement | null };
 
 /**
- * Shared modal contract for every workbench overlay.  The overlay is a child
- * of the workbench root, so its siblings can be made inert without hiding the
- * dialog itself from assistive technology.
+ * Shared modal contract for every workbench overlay.  The overlay can be a
+ * direct child of the workbench root (assistant, evidence, selection panels)
+ * or nested deep inside page content (the equipment service-case dialog), so
+ * the whole background is derived by walking the dialog's ancestor chain:
+ * every sibling of every ancestor up to the document body becomes inert and
+ * hidden from assistive technology, while the ancestor chain itself stays
+ * interactive so the dialog is never hidden by its own background handling.
+ * Each mounted dialog records the prior state it observed, so stacked dialogs
+ * restore exactly what the dialog beneath them left behind.
  */
 function useModalAccessibility(dialogRef: ModalElementRef, onClose: () => void, closeDisabled = false): void {
   const onCloseRef = useRef(onClose);
@@ -124,20 +130,30 @@ function useModalAccessibility(dialogRef: ModalElementRef, onClose: () => void, 
     const dialog = dialogRef.current;
     if (dialog === null || typeof document === "undefined") return;
     const previousActiveElement = document.activeElement as HTMLElement | null;
-    const modalRoot = dialog.closest<HTMLElement>(".wb-overlay");
-    const backgroundElements = modalRoot?.parentElement === null || modalRoot?.parentElement === undefined
-      ? []
-      : Array.from(modalRoot.parentElement.children)
-        .map((element) => element as HTMLElement)
-        .filter((element) => element !== modalRoot);
-    const previousBackgroundState = backgroundElements.map((element) => ({
-      element,
-      hadInert: element.hasAttribute("inert"),
-      ariaHidden: element.getAttribute("aria-hidden"),
-    }));
-    for (const element of backgroundElements) {
-      element.setAttribute("inert", "");
-      element.setAttribute("aria-hidden", "true");
+    const modalRoot = dialog.closest<HTMLElement>(".wb-overlay") ?? dialog;
+    const chain: HTMLElement[] = [];
+    let cursor: HTMLElement | null = modalRoot;
+    while (cursor !== null && cursor !== document.body) {
+      chain.push(cursor);
+      cursor = cursor.parentElement;
+    }
+    const previousBackgroundState: { readonly element: HTMLElement; readonly hadInert: boolean; readonly ariaHidden: string | null }[] = [];
+    const seen = new Set<HTMLElement>();
+    for (const chainElement of chain) {
+      const parent = chainElement.parentElement;
+      if (parent === null) continue;
+      for (const child of Array.from(parent.children)) {
+        const element = child as HTMLElement;
+        if (element === chainElement || seen.has(element)) continue;
+        seen.add(element);
+        previousBackgroundState.push({
+          element,
+          hadInert: element.hasAttribute("inert"),
+          ariaHidden: element.getAttribute("aria-hidden"),
+        });
+        element.setAttribute("inert", "");
+        element.setAttribute("aria-hidden", "true");
+      }
     }
 
     const focusFirst = (): void => {
