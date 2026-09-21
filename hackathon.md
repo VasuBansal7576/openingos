@@ -506,18 +506,20 @@ The separate GPT-6 Astra reviewer rejected unchanged PR #14 head `d582d0c` after
 Those defects were an unbound caller-selected AgentMail sender inbox, cross-currency and tax-basis comparison rendered as a valid delta, changed request content accepted as an idempotent replay, a View original control without retrieval, and a 200 ms wall-clock membership expiry test.
 Verified OpenCode Muse Spark 1.3 Contributor high repaired sender binding and exact replay conflicts at PR #15 head `e4a9e51`.
 Verified OpenCode GLM-5.3-Flash high replaced the expiry sleep with a deterministic controlled-clock boundary at PR #16 head `d3648f5`.
-The P01 workbench integration owns the money and original-source presentation repairs.
-All five repairs are integrated without conflict at combined code checkpoint `b5db30e`.
+The P01 workbench integration was intended to own the money and original-source presentation repairs, but the independent fixed-head review later reproduced both defects.
+Three of the five original repairs are integrated without conflict at combined code checkpoint `b5db30e`: server-owned sender binding, exact replay conflict handling and deterministic membership-expiry tests.
+The money-comparison and original-source findings remain open.
 
 The complete combined `bun run test` command passes at that checkpoint.
 Recorded suites include 23 repository tests, 77 money and Jev proof tests, 15 evaluation tests, 338 F1 tests, 155 browser-executor tests, 91 application tests, 18 application Jev tests, 32 communication-contract tests and 509 direct Convex tests.
 Both strict TypeScript checks and the production Vite build also pass.
 Controlled Chrome DevTools Protocol inspection of the actual application at 1440 by 1200 and exact 390 by 844 reports viewport width equal to document width and zero overflow offenders.
-The rendered unconfigured state uses the selected sage desk, paper surfaces, serif hierarchy, compact ivory navigation and yellow decision language without showing sample suppliers, invented prices or provider success.
+The rendered unconfigured state uses selected visual tokens without showing sample suppliers, invented prices or provider success, but it replaces the accepted public landing flow with a dominant backend-configuration error and therefore is not a prototype-fidelity pass.
 This is controlled local runtime evidence only.
 The populated connected journey, hosted Convex behavior, live providers and public origin remain unverified.
 
 The completed E6 and P01 worktrees were proven clean and remotely preserved, their exact worker terminals were closed, and Orca removed the worktrees non-forcibly.
 The disposable Chrome profiles used for verification were removed after screenshots and measurements were preserved, reclaiming about 367 MB.
-The fresh combined descendant still needs exact-head GitHub CI and a new independent Astra ACCEPT verdict before PR #14 can merge.
+Exact PR #14 head `1b2850c` passed all nine configured GitHub checks, but a separate GPT-6 Astra review returned `CHANGES REQUIRED` after reproducing six findings: the two still-open money/source defects, temporary organization authority becoming permanent project authority, unsafe budget omission, inaccurate evidence claims and low-contrast comparison guidance.
+PR #14 cannot merge until those repairs land, exact-head CI passes again and a separate reviewer accepts the replacement commit.
 No hosted Convex deployment, live provider call, owner-mailbox exchange, genuine supplier response, public origin, purchase, realized saving or commercial outcome was observed.
