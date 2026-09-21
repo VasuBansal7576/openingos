@@ -4,6 +4,7 @@ import { makeFunctionReference, type RegisteredMutation, type RegisteredQuery } 
 import { convexTest } from "convex-test";
 import { describe, expect, test } from "vitest";
 import type { Id } from "../_generated/dataModel.js";
+import type { Doc as SchemaDoc } from "../_generated/dataModel.js";
 import * as memberships from "../access/memberships.js";
 import * as requirements from "../domain/requirements.js";
 import * as sourcing from "../domain/sourcing.js";
@@ -742,6 +743,297 @@ describe("E1 equipment and service projection", () => {
     expect(result.decisions.length).toBeGreaterThan(0);
     expect(result.equipment.assets).toEqual([]);
     expect(result.equipment.assetsTruncated).toBe(false);
+  });
+});
+
+type QuoteLineRow = SchemaDoc["quotes"]["lines"][number];
+type QuoteChargeRow = SchemaDoc["quotes"]["charges"][number];
+type QuoteTaxBasisRow = SchemaDoc["quotes"]["taxBasis"];
+type QuoteScopeRow = NonNullable<SchemaDoc["quotes"]["comparisonScope"]>;
+
+async function insertQuote(
+  t: ReturnType<typeof convexTest>,
+  project: { organizationId: Id<"organizations">; projectId: Id<"projects"> },
+  graph: { requirementId: Id<"requirements">; vendorId: Id<"vendors"> },
+  options: {
+    readonly version: string;
+    readonly contentHash: string;
+    readonly supersedes?: string;
+    readonly createdAt: number;
+    readonly organizationId?: Id<"organizations">;
+    readonly lines?: readonly QuoteLineRow[];
+    readonly charges?: readonly QuoteChargeRow[];
+    readonly taxBasis?: QuoteTaxBasisRow;
+    readonly comparisonScope?: QuoteScopeRow;
+  },
+) {
+  return await t.run(async (ctx) =>
+    ctx.db.insert("quotes", {
+      organizationId: options.organizationId ?? project.organizationId,
+      projectId: project.projectId,
+      requirementId: graph.requirementId,
+      vendorId: graph.vendorId,
+      version: options.version,
+      contentHash: options.contentHash,
+      currency: "EUR",
+      lines: [...(options.lines ?? [{
+        lineId: "machine",
+        description: "Machine",
+        quantity: "1",
+        unitPrice: { currency: "EUR", minorUnits: 750000 },
+        evidenceRefs: [],
+      }])],
+      charges: [...(options.charges ?? [])],
+      taxBasis: options.taxBasis ?? { kind: "inclusive", basisId: "NL-EUR-INCLUSIVE", evidenceRefs: [] },
+      evidenceRefs: [],
+      counterpartyRole: "vendor",
+      executionMode: "recorded",
+      ...(options.supersedes === undefined ? {} : { supersedes: options.supersedes }),
+      ...(options.comparisonScope === undefined ? {} : { comparisonScope: options.comparisonScope }),
+      createdAt: options.createdAt,
+    }),
+  );
+}
+
+describe("E4 quote currentness and authoritative comparable total", () => {
+  const itemizedCharges = [
+    { chargeId: "freight", label: "Freight", scope: { kind: "quote" }, state: { kind: "known", amount: { currency: "EUR", minorUnits: 60000 } }, evidenceRefs: [] },
+    { chargeId: "installation", label: "Installation", scope: { kind: "quote" }, state: { kind: "known", amount: { currency: "EUR", minorUnits: 40000 } }, evidenceRefs: [] },
+  ] as const;
+  const machineScope = { requirementId: "", scopeId: "scope-e4", items: [{ itemId: "item-e4", lineId: "machine", unit: "piece", requiredQuantity: "1" }] };
+
+  test("projects an exact total always and a comparable total only with an accepted comparison scope", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, OWNER, "e4-total");
+    const included = await setupCandidate(t, project, "included-a");
+    const itemized = await setupCandidate(t, project, "itemized-b");
+    const unscooped = await setupCandidate(t, project, "unscooped-c");
+    await insertQuote(t, project, included, {
+      version: "v1",
+      contentHash: "e4-hash-a",
+      createdAt: 100,
+      lines: [{
+        lineId: "machine",
+        description: "Machine",
+        quantity: "1",
+        unitPrice: { currency: "EUR", minorUnits: 795000 },
+        evidenceRefs: [],
+      }],
+      charges: [{
+        chargeId: "delivery",
+        label: "Delivery",
+        scope: { kind: "quote" },
+        state: { kind: "included", coveringId: "machine" },
+        evidenceRefs: [],
+      }],
+      comparisonScope: { ...machineScope, requirementId: included.requirementId },
+    });
+    await insertQuote(t, project, itemized, {
+      version: "v1",
+      contentHash: "e4-hash-b",
+      createdAt: 110,
+      charges: [...itemizedCharges],
+      comparisonScope: { ...machineScope, requirementId: itemized.requirementId },
+    });
+    await insertQuote(t, project, unscooped, {
+      version: "v1",
+      contentHash: "e4-hash-c",
+      createdAt: 120,
+      charges: [...itemizedCharges],
+    });
+
+    const result = await t.withIdentity(OWNER).query(getProjectionRef, { projectId: project.projectId });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("projection denied");
+    const quoteIncluded = result.candidates.find((candidate) => candidate.id === included.candidateId)?.latestValidQuote;
+    const quoteItemized = result.candidates.find((candidate) => candidate.id === itemized.candidateId)?.latestValidQuote;
+    const quoteUnscooped = result.candidates.find((candidate) => candidate.id === unscooped.candidateId)?.latestValidQuote;
+    expect(quoteIncluded?.currentness).toBe("current");
+    expect(quoteIncluded?.superseded).toBe(false);
+    expect(quoteIncluded?.totalMinorUnits).toBe(795000);
+    expect(quoteIncluded?.comparableTotalMinorUnits).toBe(795000);
+    expect(quoteItemized?.totalMinorUnits).toBe(850000);
+    expect(quoteItemized?.comparableTotalMinorUnits).toBe(850000);
+    expect(quoteItemized?.currency).toBe("EUR");
+    // A complete quote without a recorded comparison scope keeps its own
+    // exact total but is never presented as comparable.
+    expect(quoteUnscooped?.totalMinorUnits).toBe(850000);
+    expect(quoteUnscooped?.comparableTotalMinorUnits).toBeNull();
+    expect(result.access.capabilities.canApprove).toBe(true);
+  });
+
+  test("estimated, unknown, unresolved-included, and malformed money never produce a total", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, OWNER, "e4-closed");
+    const unknownCandidate = await setupCandidate(t, project, "unknown");
+    const estimatedCandidate = await setupCandidate(t, project, "estimated");
+    const danglingCandidate = await setupCandidate(t, project, "dangling");
+    const malformedCandidate = await setupCandidate(t, project, "malformed");
+    await insertQuote(t, project, unknownCandidate, {
+      version: "v1",
+      contentHash: "e4-hash-unknown",
+      createdAt: 100,
+      charges: [{
+        chargeId: "freight",
+        label: "Freight",
+        scope: { kind: "quote" },
+        state: { kind: "unknown", reason: "not confirmed" },
+        evidenceRefs: [],
+      }],
+    });
+    await insertQuote(t, project, estimatedCandidate, {
+      version: "v1",
+      contentHash: "e4-hash-estimated",
+      createdAt: 101,
+      charges: [{
+        chargeId: "installation",
+        label: "Installation",
+        scope: { kind: "quote" },
+        state: { kind: "estimated", estimate: { kind: "point", amount: { currency: "EUR", minorUnits: 50000 } } },
+        evidenceRefs: [],
+      }],
+    });
+    await insertQuote(t, project, danglingCandidate, {
+      version: "v1",
+      contentHash: "e4-hash-dangling",
+      createdAt: 102,
+      charges: [{
+        chargeId: "delivery",
+        label: "Delivery",
+        scope: { kind: "quote" },
+        state: { kind: "included", coveringId: "ghost-line" },
+        evidenceRefs: [],
+      }],
+    });
+    await insertQuote(t, project, malformedCandidate, {
+      version: "v1",
+      contentHash: "e4-hash-malformed",
+      createdAt: 103,
+      lines: [{
+        lineId: "machine",
+        description: "Machine",
+        quantity: "1",
+        unitPrice: { currency: "EUR", minorUnits: 750000.5 },
+        evidenceRefs: [],
+      }],
+    });
+
+    const result = await t.withIdentity(OWNER).query(getProjectionRef, { projectId: project.projectId });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("projection denied");
+    const unknownQuote = result.candidates.find((candidate) => candidate.id === unknownCandidate.candidateId)?.latestValidQuote;
+    const estimatedQuote = result.candidates.find((candidate) => candidate.id === estimatedCandidate.candidateId)?.latestValidQuote;
+    const danglingQuote = result.candidates.find((candidate) => candidate.id === danglingCandidate.candidateId)?.latestValidQuote;
+    const malformedQuote = result.candidates.find((candidate) => candidate.id === malformedCandidate.candidateId)?.latestValidQuote;
+    expect(unknownQuote?.comparableTotalMinorUnits).toBeNull();
+    expect(unknownQuote?.totalMinorUnits).toBeNull();
+    expect(estimatedQuote?.comparableTotalMinorUnits).toBeNull();
+    expect(estimatedQuote?.totalMinorUnits).toBeNull();
+    // Unresolved included coverage is rendered with its state but fails
+    // closed on the total, so selection can never be enabled.
+    expect(danglingQuote?.comparableTotalMinorUnits).toBeNull();
+    expect(danglingQuote?.totalMinorUnits).toBeNull();
+    expect(danglingQuote?.charges[0]?.state.kind).toBe("included");
+    // Malformed money cannot render a quote at all.
+    expect(malformedQuote).toBeNull();
+  });
+
+  test("ambiguous current roots and quote-scan truncation never enable selection", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, OWNER, "e4-ambiguous");
+    const ambiguous = await setupCandidate(t, project, "ambiguous");
+    const truncated = await setupCandidate(t, project, "truncated");
+    await insertQuote(t, project, ambiguous, { version: "v1", contentHash: "e4-amb-1", createdAt: 100 });
+    await insertQuote(t, project, ambiguous, { version: "v2", contentHash: "e4-amb-2", createdAt: 200 });
+    for (let index = 0; index < projection.MAX_QUOTE_SCAN + 1; index += 1) {
+      await insertQuote(t, project, truncated, {
+        version: `v${index}`,
+        contentHash: `e4-trunc-${index}`,
+        createdAt: 300 + index,
+      });
+    }
+
+    const result = await t.withIdentity(OWNER).query(getProjectionRef, { projectId: project.projectId });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("projection denied");
+    expect(result.candidates.find((candidate) => candidate.id === ambiguous.candidateId)?.latestValidQuote).toBeNull();
+    expect(result.candidates.find((candidate) => candidate.id === truncated.candidateId)?.latestValidQuote).toBeNull();
+  });
+
+  test("successor presence keeps only the proven current revision with explicit currentness", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, OWNER, "e4-supersede");
+    const graph = await setupCandidate(t, project, "chain");
+    await insertQuote(t, project, graph, { version: "v1", contentHash: "e4-chain-1", createdAt: 100 });
+    await insertQuote(t, project, graph, {
+      version: "v2",
+      contentHash: "e4-chain-2",
+      supersedes: "e4-chain-1",
+      createdAt: 200,
+      comparisonScope: { ...machineScope, requirementId: graph.requirementId },
+    });
+
+    const result = await t.withIdentity(OWNER).query(getProjectionRef, { projectId: project.projectId });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("projection denied");
+    const quote = result.candidates[0]?.latestValidQuote;
+    expect(quote?.version).toBe("v2");
+    expect(quote?.currentness).toBe("current");
+    expect(quote?.superseded).toBe(false);
+    expect(quote?.totalMinorUnits).toBe(750000);
+    expect(quote?.comparableTotalMinorUnits).toBe(750000);
+  });
+
+  test("cross-organization rows in the same index range are excluded and never enable selection", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, OWNER, "e4-tenant");
+    const away = await setupProject(t, OWNER, "e4-tenant-away", "restricted");
+    const graph = await setupCandidate(t, project, "tenant");
+    await insertQuote(t, project, graph, {
+      version: "foreign",
+      contentHash: "e4-foreign-hash",
+      createdAt: 90,
+      organizationId: away.organizationId,
+    });
+    await insertQuote(t, project, graph, { version: "local", contentHash: "e4-local-hash", createdAt: 100, comparisonScope: { ...machineScope, requirementId: graph.requirementId } });
+
+    const result = await t.withIdentity(OWNER).query(getProjectionRef, { projectId: project.projectId });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("projection denied");
+    const quote = result.candidates[0]?.latestValidQuote;
+    expect(quote?.version).toBe("local");
+    expect(quote?.superseded).toBe(false);
+    expect(quote?.comparableTotalMinorUnits).toBe(750000);
+  });
+
+  test("projects canApprove only for approver-or-stronger roles and never invents order aggregates", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, OWNER, "e4-authority");
+    const viewerIdentity = "workbench-e4-viewer";
+    const asOwner = t.withIdentity(OWNER);
+    const grant = await asOwner.mutation(grantProjectAccessRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      targetIdentity: viewerIdentity,
+      role: "viewer",
+    });
+    if (!grant.ok) throw new Error(`viewer grant setup failed: ${JSON.stringify(grant)}`);
+
+    const ownerView = await t.withIdentity(OWNER).query(getProjectionRef, { projectId: project.projectId });
+    expect(ownerView.ok).toBe(true);
+    if (!ownerView.ok) throw new Error("owner projection denied");
+    expect(ownerView.access.capabilities.canApprove).toBe(true);
+
+    const viewerView = await t.withIdentity({ tokenIdentifier: viewerIdentity }).query(getProjectionRef, { projectId: project.projectId });
+    expect(viewerView.ok).toBe(true);
+    if (!viewerView.ok) throw new Error("viewer projection denied");
+    expect(viewerView.access.capabilities.canApprove).toBe(false);
+
+    const serialized = JSON.stringify(ownerView);
+    expect(serialized).not.toContain('"committed"');
+    expect(serialized).not.toContain('"paid"');
+    expect(Object.prototype.hasOwnProperty.call(ownerView, "committedMinorUnits")).toBe(false);
+    expect(Object.prototype.hasOwnProperty.call(ownerView, "paidMinorUnits")).toBe(false);
   });
 });
 

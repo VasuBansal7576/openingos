@@ -12,11 +12,14 @@ import type { Id } from "../_generated/dataModel.js";
 import { checkProjectAccess, denialValidator, identityOf, requireCapability, type DbRole } from "../access/checks.js";
 import { f1Query } from "../server.js";
 import { provenanceLabel, type ExecutionMode } from "../shared/provenance.js";
-import type {
-  StoredChargeState,
-  StoredQuoteCharge,
-  StoredQuoteLine,
-  StoredTaxBasis,
+import { roleSatisfies } from "../shared/scope.js";
+import { storedQuoteCost } from "../shared/quoteSemantics.js";
+import {
+  type StoredChargeState,
+  type StoredComparisonScope,
+  type StoredQuoteCharge,
+  type StoredQuoteLine,
+  type StoredTaxBasis,
 } from "../shared/quoteSemantics.js";
 
 export const MAX_PROJECT_PAGE = 12;
@@ -92,6 +95,7 @@ const capabilityFlagsValidator = v.object({
   canCompare: v.boolean(),
   canCommunicate: v.boolean(),
   canClarify: v.boolean(),
+  canApprove: v.boolean(),
 });
 
 const accessValidator = v.object({
@@ -179,6 +183,10 @@ const quoteValidator = v.object({
   taxBasis: quoteTaxBasisValidator,
   createdAt: v.number(),
   provenance: provenanceValidator,
+  currentness: v.literal("current"),
+  superseded: v.literal(false),
+  totalMinorUnits: v.union(v.number(), v.null()),
+  comparableTotalMinorUnits: v.union(v.number(), v.null()),
 });
 
 const vendorValidator = v.object({
@@ -375,6 +383,15 @@ type QuoteProjection = {
     | { readonly kind: "unknown"; readonly reason: string };
   readonly createdAt: number;
   readonly provenance: ProvenanceView;
+  /**
+   * E4 currentness: this quote is emitted only when the bounded indexed
+   * successor probe proved no successor for it and it is the scan range's
+   * only current root, so the emitted state is always proven current.
+   */
+  readonly currentness: "current";
+  readonly superseded: false;
+  readonly totalMinorUnits: number | null;
+  readonly comparableTotalMinorUnits: number | null;
 };
 
 type QuoteSelection = {
@@ -404,6 +421,10 @@ function capabilityFlags(role: DbRole) {
     canCompare: requireCapability("comparison.read", role).ok,
     canCommunicate: requireCapability("communication.send", role).ok,
     canClarify: requireCapability("communication.clarify", role).ok,
+    // Mirrors the exact authority the backend selection handler enforces
+    // (domain/decisions.ts requires approver access for recordSelection).
+    // This is a UI-gating projection of that authority, never a grant.
+    canApprove: roleSatisfies(role, "approver"),
   };
 }
 
@@ -490,6 +511,7 @@ function renderQuote(row: {
   readonly lines: readonly StoredQuoteLine[];
   readonly charges: readonly StoredQuoteCharge[];
   readonly taxBasis: StoredTaxBasis;
+  readonly comparisonScope?: StoredComparisonScope;
   readonly evidenceRefs: readonly { readonly sourceId: string; readonly version: string; readonly locator?: string }[];
   readonly counterpartyRole: string;
   readonly executionMode: string;
@@ -534,6 +556,13 @@ function renderQuote(row: {
   if (taxBasis === null) return null;
   const provenance = provenanceFor(row);
   if (provenance.mode === "unknown") return null;
+  // E4: the exact total comes only from the accepted stored quote
+  // semantics. Any estimated, unknown, or unresolved-included charge, an
+  // unknown tax basis, or a parse failure keeps both total fields null:
+  // nothing is invented and selection stays blocked. comparableTotal is
+  // additionally null unless the accepted comparison result itself is
+  // complete, which requires a recorded comparison scope.
+  const cost = storedQuoteCost(row);
   return {
     view: {
       id: row._id,
@@ -544,6 +573,10 @@ function renderQuote(row: {
       taxBasis,
       createdAt: row.createdAt,
       provenance,
+      currentness: "current",
+      superseded: false,
+      totalMinorUnits: cost.totalMinorUnits,
+      comparableTotalMinorUnits: cost.comparableTotalMinorUnits,
     },
     evidenceRefs: row.evidenceRefs.map((ref) => ({ sourceId: ref.sourceId, version: ref.version })),
   };

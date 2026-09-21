@@ -75,6 +75,10 @@ const projection = {
       taxBasis: { kind: "inclusive", basisId: "tax-w1-1" },
       createdAt: Date.UTC(2026, 8, 20),
       provenance: { mode: "recorded", label: "Recorded owner exchange", ownerAuthoredTerms: true },
+      currentness: "current",
+      superseded: false,
+      totalMinorUnits: null,
+      comparableTotalMinorUnits: null,
     },
     evidence: [{
       id: "product-evidence-w1-1",
@@ -174,6 +178,222 @@ test("rejects the obsolete top-level access fixture", () => {
 test("formats unknown money without turning missing charges into zero", () => {
   expect(formatMoney(null, "EUR")).toBe("Unknown");
   expect(formatMoney(795000, "EUR")).toContain("7,950");
+});
+
+// -- E4 quote currentness and authoritative comparable total ----------------
+
+function projectionWithCurrentCompleteQuote(): Record<string, unknown> {
+  const base = projection as unknown as Record<string, unknown>;
+  const candidate = (base.candidates as readonly Record<string, unknown>[])[0]!;
+  const quote = candidate.latestValidQuote as Record<string, unknown>;
+  return {
+    ...base,
+    access: withCanApprove(base.access as Record<string, unknown>, true),
+    candidates: [{
+      ...candidate,
+      compatibility: "pass",
+      latestValidQuote: {
+        ...quote,
+        lines: [{ lineId: "machine", description: "Atlas 2G", quantity: "1", unitPrice: { currency: "EUR", minorUnits: 750000 } }],
+        charges: [
+          { chargeId: "charge-freight", label: "freight", scope: { kind: "quote" }, state: { kind: "known", amount: { currency: "EUR", minorUnits: 60000 } } },
+          { chargeId: "charge-installation", label: "installation", scope: { kind: "quote" }, state: { kind: "known", amount: { currency: "EUR", minorUnits: 40000 } } },
+        ],
+        currentness: "current",
+        superseded: false,
+        totalMinorUnits: 850000,
+        comparableTotalMinorUnits: 850000,
+      },
+    }],
+  };
+}
+
+function withCanApprove(access: Record<string, unknown>, value: unknown): Record<string, unknown> {
+  return {
+    ...access,
+    capabilities: {
+      ...(access.capabilities as Record<string, unknown>),
+      canApprove: value,
+    },
+  };
+}
+
+function withQuoteTotals(payload: Record<string, unknown>, mutate: (quote: Record<string, unknown>) => Record<string, unknown>): Record<string, unknown> {
+  const candidates = payload.candidates as readonly Record<string, unknown>[];
+  return {
+    ...payload,
+    candidates: [{
+      ...candidates[0]!,
+      latestValidQuote: mutate(candidates[0]!.latestValidQuote as Record<string, unknown>),
+    }],
+  };
+}
+
+test("parses the authoritative E4 total only from server-supplied safe integers", () => {
+  const snapshot = parseWorkbenchSnapshot(projectionWithCurrentCompleteQuote(), projection.project.id);
+  if (snapshot === null) throw new Error("Complete E4 projection should parse");
+  const quote = snapshot.offers[0]?.quote;
+  expect(quote?.comparableTotalMinorUnits).toBe(850000);
+  expect(quote?.totalMinorUnits).toBe(850000);
+  expect(quote?.superseded).toBe(false);
+  expect(snapshot.access.capabilities.canApprove).toBe(true);
+});
+
+test("rejects malformed E4 total and currentness fields instead of synthesizing null", () => {
+  const projectId = projection.project.id;
+  const withTotals = (mutate: (quote: Record<string, unknown>) => Record<string, unknown>): Record<string, unknown> =>
+    withQuoteTotals(projectionWithCurrentCompleteQuote(), mutate);
+  expect(parseWorkbenchSnapshot(withTotals((quote) => ({ ...quote, comparableTotalMinorUnits: 850000.5 })), projectId)).toBeNull();
+  expect(parseWorkbenchSnapshot(withTotals((quote) => ({ ...quote, comparableTotalMinorUnits: Number.NaN })), projectId)).toBeNull();
+  expect(parseWorkbenchSnapshot(withTotals((quote) => ({ ...quote, totalMinorUnits: "850000" })), projectId)).toBeNull();
+  expect(parseWorkbenchSnapshot(withTotals(({ totalMinorUnits: _omitted, ...quote }) => quote), projectId)).toBeNull();
+  expect(parseWorkbenchSnapshot(withTotals((quote) => ({ ...quote, currentness: "superseded" })), projectId)).toBeNull();
+  expect(parseWorkbenchSnapshot(withTotals((quote) => ({ ...quote, superseded: true })), projectId)).toBeNull();
+  expect(parseWorkbenchSnapshot(withTotals(({ currentness: _omitted, ...quote }) => quote), projectId)).toBeNull();
+  const unauthorized = projectionWithCurrentCompleteQuote();
+  expect(parseWorkbenchSnapshot({ ...unauthorized, access: withCanApprove(unauthorized.access as Record<string, unknown>, "yes") }, projectId)).toBeNull();
+});
+
+test("rejects ambiguous total relationships between the exact and comparable totals", () => {
+  const projectId = projection.project.id;
+  // Comparable without an exact total is inconsistent wire data.
+  expect(parseWorkbenchSnapshot(withQuoteTotals(projectionWithCurrentCompleteQuote(), (quote) => ({ ...quote, totalMinorUnits: null })), projectId)).toBeNull();
+  // A comparable total that disagrees with the exact total is ambiguous.
+  expect(parseWorkbenchSnapshot(withQuoteTotals(projectionWithCurrentCompleteQuote(), (quote) => ({ ...quote, totalMinorUnits: 849999 })), projectId)).toBeNull();
+  // Negative money totals are rejected at the parser boundary.
+  expect(parseWorkbenchSnapshot(withQuoteTotals(projectionWithCurrentCompleteQuote(), (quote) => ({ ...quote, totalMinorUnits: -850000 })), projectId)).toBeNull();
+  expect(parseWorkbenchSnapshot(withQuoteTotals(projectionWithCurrentCompleteQuote(), (quote) => ({ ...quote, comparableTotalMinorUnits: -850000 })), projectId)).toBeNull();
+});
+
+test("accepts an exact total without a comparable total as complete but not comparable", () => {
+  const projectId = projection.project.id;
+  const snapshot = parseWorkbenchSnapshot(
+    withQuoteTotals(projectionWithCurrentCompleteQuote(), (quote) => ({ ...quote, comparableTotalMinorUnits: null })),
+    projectId,
+  );
+  if (snapshot === null) throw new Error("Complete but not comparable projection should parse");
+  const quote = snapshot.offers[0]?.quote;
+  expect(quote?.totalMinorUnits).toBe(850000);
+  expect(quote?.comparableTotalMinorUnits).toBeNull();
+  expect(quote?.superseded).toBe(false);
+});
+
+test("rejects a non-safe-integer total without synthesizing null for the backend money", () => {
+  const projectId = projection.project.id;
+  const snapshot = parseWorkbenchSnapshot(
+    withQuoteTotals(projectionWithCurrentCompleteQuote(), (quote) => ({ ...quote, comparableTotalMinorUnits: 850000.25 })),
+    projectId,
+  );
+  expect(snapshot).toBeNull();
+});
+
+async function mountSelectionFlow(
+  projectionPayload: Record<string, unknown>,
+  canApprove: boolean | null,
+) {
+  const dom = new HappyWindow({ url: "https://openingos.test/" });
+  const previousWindow = globalThis.window;
+  const previousDocument = globalThis.document;
+  const previousNavigator = globalThis.navigator;
+  const actEnvironment = globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean };
+  const previousActEnvironment = actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+  const browserGlobals = globalThis as unknown as { window: unknown; document: unknown; navigator: unknown };
+  browserGlobals.window = dom as unknown as globalThis.Window;
+  browserGlobals.document = dom.document as unknown as globalThis.Document;
+  browserGlobals.navigator = dom.navigator as unknown as globalThis.Navigator;
+  actEnvironment.IS_REACT_ACT_ENVIRONMENT = true;
+  const container = dom.document.createElement("div");
+  dom.document.body.append(container);
+  const actionCalls: string[] = [];
+  const root = createRoot(container as unknown as globalThis.Element);
+  const findButton = (label: string): HTMLButtonElement => {
+    const button = Array.from(container.querySelectorAll("button")).find((candidate) => candidate.textContent?.includes(label));
+    if (!(button instanceof dom.window.HTMLButtonElement)) throw new Error(`Button not found: ${label}`);
+    return button as unknown as HTMLButtonElement;
+  };
+  const restore = async () => {
+    await act(async () => {
+      root.unmount();
+    });
+    browserGlobals.window = previousWindow;
+    browserGlobals.document = previousDocument;
+    browserGlobals.navigator = previousNavigator;
+    if (previousActEnvironment === undefined) delete actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+    else actEnvironment.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment;
+  };
+  try {
+    const snapshot = parseWorkbenchSnapshot(projectionPayload, projection.project.id);
+    if (snapshot === null) throw new Error("E4 projection should parse");
+    const prepared = canApprove === null
+      ? snapshot
+      : {
+        ...snapshot,
+        access: {
+          ...snapshot.access,
+          capabilities: { ...snapshot.access.capabilities, canApprove },
+        },
+      };
+    await act(async () => {
+      root.render(createElement(WorkbenchView, {
+        loadState: { state: "ready", snapshot: prepared },
+        onAction: (action: WorkbenchAction): WorkbenchActionResult => {
+          actionCalls.push(action.type);
+          return { ok: false, message: "controlled test: no authority-bearing backend selection route is attached" };
+        },
+      }));
+    });
+    await act(async () => {
+      findButton("Review quote").click();
+    });
+    return {
+      container,
+      findButton,
+      actionCalls,
+      clickSelect: async () => {
+        await act(async () => {
+          findButton("Select exact quote").click();
+        });
+      },
+      cleanup: restore,
+    };
+  } catch (error) {
+    await restore();
+    throw error;
+  }
+}
+
+test("a current complete authorized quote becomes selectable with no order or payment claim", async () => {
+  const mounted = await mountSelectionFlow(projectionWithCurrentCompleteQuote(), true);
+  try {
+    expect(mounted.findButton("Select exact quote").disabled).toBe(false);
+    await mounted.clickSelect();
+    expect(mounted.actionCalls).toEqual(["selectOffer"]);
+    expect(mounted.container.textContent).toContain("Selection is not an order.");
+    expect(mounted.container.textContent).toContain("No order will be placed. No payment will be taken.");
+    expect(mounted.container.textContent).toContain("controlled test: no authority-bearing backend selection route is attached");
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("selection stays disabled without approval authority or an authoritative total", async () => {
+  const withoutAuthority = await mountSelectionFlow(projectionWithCurrentCompleteQuote(), false);
+  try {
+    expect(withoutAuthority.findButton("Select exact quote").disabled).toBe(true);
+    await withoutAuthority.clickSelect();
+    expect(withoutAuthority.actionCalls).toEqual([]);
+  } finally {
+    await withoutAuthority.cleanup();
+  }
+  const incompleteQuote = await mountSelectionFlow(projection, true);
+  try {
+    expect(incompleteQuote.findButton("Select exact quote").disabled).toBe(true);
+    await incompleteQuote.clickSelect();
+    expect(incompleteQuote.actionCalls).toEqual([]);
+    expect(incompleteQuote.container.textContent).toContain("Unknown");
+  } finally {
+    await incompleteQuote.cleanup();
+  }
 });
 
 function assetFixture(overrides: Record<string, unknown> = {}): Record<string, unknown> {
