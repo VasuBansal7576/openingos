@@ -3067,8 +3067,13 @@ describe("Astra E28: oversized accepted replies never truncate decision-critical
     return { text, prefixLength: prefix.length };
   }
 
-  async function seedAcceptedReply(fixture: Fixture, messageId: string, text: string): Promise<void> {
-    const capturedAt = Date.now();
+  async function seedAcceptedReply(
+    fixture: Fixture,
+    messageId: string,
+    text: string,
+    capturedAtOverride?: number,
+  ): Promise<number> {
+    const capturedAt = capturedAtOverride ?? Date.now();
     await fixture.t.run(async (ctx) => {
       const evidenceId = await ctx.db.insert("evidence", {
         organizationId: fixture.organizationId,
@@ -3108,6 +3113,7 @@ describe("Astra E28: oversized accepted replies never truncate decision-critical
         createdAt: Date.now(),
       });
     });
+    return capturedAt;
   }
 
   test("1333-plus-character accepted reply with trailing final-offer waits explicitly with zero model and zero send calls", async () => {
@@ -3197,8 +3203,63 @@ describe("Astra E28: oversized accepted replies never truncate decision-critical
     expect(JSON.stringify(result)).not.toContain(OWNER_MAILBOX);
     const counts = await tableCounts(t);
     expect(counts.negotiations).toEqual([{ roundsUsed: 0, state: "active" }]);
-});
   });
+
+  test("a strictly newer bounded accepted marker clears an older oversized hold", async () => {
+    const t = init();
+    const fixture = await createFixture(t, "clarify", {
+      conversation: { version: 1, state: "awaitingReply" },
+    });
+    const { text } = buildOversizedReply();
+    expect(text.length).toBeGreaterThan(1333);
+    const oversizedAt = await seedAcceptedReply(fixture, "e28-rec-oversized-old", text);
+    const boundedText =
+      "Owner reply: revised terms are freight included with no further discount. " +
+      "Please compare this bounded update against the current options.";
+    expect(boundedText.length).toBeLessThan(500);
+    await seedAcceptedReply(fixture, "e28-rec-bounded-new", boundedText, oversizedAt + 1000);
+    // The newest accepted marker is bounded, so the step recovers through
+    // the normal bounded path instead of holding on the older oversized
+    // row: the changed workload digest waits honestly for re-approval.
+    const { result, log } = await runPrepare(fixture, {});
+    expect(result).toMatchObject({ ok: true, outcome: "waiting", reason: "jev-stale" });
+    expect(JSON.stringify(result)).not.toContain("reply-exceeds-context");
+    expect(log.agentmail).toHaveLength(0);
+    const after = await tableCounts(t);
+    expect(after.negotiations).toEqual([{ roundsUsed: 0, state: "active" }]);
+    expect(after.outboundSnapshots).toBe(0);
+  });
+
+  test("a newer or tied oversized marker still holds with zero model and zero send calls", async () => {
+    for (const mode of ["newer", "tied"] as const) {
+      const t = init();
+      const fixture = await createFixture(t, "clarify", {
+        conversation: { version: 1, state: "awaitingReply" },
+      });
+      const boundedAt = await seedAcceptedReply(
+        fixture,
+        `e28-hold-bounded-${mode}`,
+        "Owner reply: freight is included in this supplier quote.",
+      );
+      const { text } = buildOversizedReply();
+      await seedAcceptedReply(
+        fixture,
+        `e28-hold-oversized-${mode}`,
+        text,
+        mode === "tied" ? boundedAt : boundedAt + 1000,
+      );
+      const { result, log } = await runPrepare(fixture, {});
+      expect(result).toMatchObject({ ok: true, outcome: "waiting", reason: "reply-exceeds-context" });
+      expect(log.jev).toHaveLength(0);
+      expect(log.openai).toHaveLength(0);
+      expect(log.agentmail).toHaveLength(0);
+      expect(JSON.stringify(result)).not.toContain("FINAL OFFER");
+      const counts = await tableCounts(t);
+      expect(counts.negotiations).toEqual([{ roundsUsed: 0, state: "active" }]);
+      expect(counts.outboundSnapshots).toBe(0);
+    }
+  });
+});
 
   test("one draft dispatches once across two request ids; the stale loser has no effect", async () => {
     const t = init();

@@ -593,11 +593,12 @@ type ReplyLoadResult =
   | { readonly kind: "incomplete" }
   | {
       /**
-       * An accepted (`source:1`) marker on the bound threads is longer than
-       * the preservation bound, so its trailing content — potentially a
-       * final-offer or stop instruction — cannot be carried into the Jev or
-       * draft workloads safely. The step must wait explicitly instead of
-       * negotiating from a truncated excerpt.
+       * The newest accepted (`source:1`) marker on the bound threads is
+       * longer than the preservation bound, so its trailing content —
+       * potentially a final-offer or stop instruction — cannot be carried
+       * into the Jev or draft workloads safely. The step must wait
+       * explicitly instead of negotiating from a truncated excerpt. A
+       * strictly newer bounded accepted marker clears this hold.
        */
       readonly kind: "oversized";
     };
@@ -639,8 +640,10 @@ async function loadLatestReply(
   let quarantinedNewestAt: number | null = null;
   // Astra P1: an accepted reply longer than the preservation bound must never
   // be silently truncated. Track the newest oversized accepted marker on the
-  // bound threads; when one exists the step waits explicitly even if an older
-  // bounded reply could otherwise supply meaning.
+  // bound threads; the NEWEST accepted marker is decisive, so a strictly
+  // newer bounded accepted reply clears an older oversized hold (its full
+  // terms were reviewed or ingested into the newer basis), while a newer or
+  // tied oversized marker still holds the step explicitly.
   let oversizedNewestAt: number | null = null;
   for (const candidate of candidates) {
     if (
@@ -711,7 +714,11 @@ async function loadLatestReply(
       };
     }
   }
-  if (oversizedNewestAt !== null) {
+  // The newest accepted marker is decisive: an oversized marker holds the
+  // step only when no strictly newer bounded accepted marker exists. A tied
+  // oversized marker still holds, so equal-timestamp ambiguity never resolves
+  // toward truncated meaning.
+  if (oversizedNewestAt !== null && (accepted === null || oversizedNewestAt >= accepted.capturedAt)) {
     return { kind: "oversized" };
   }
   if (accepted !== null) {
