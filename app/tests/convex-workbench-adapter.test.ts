@@ -998,3 +998,119 @@ test("rejects defined non-string optional display metadata", async () => {
     serviceCases: [{ ...seededCase[0], outcome: 42 }],
   })])).resolves.toBeNull();
 });
+
+function substituteFixture(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: "proposal-1",
+    requirementId: "requirement-1",
+    assessmentId: "assessment-1",
+    proposedCandidateId: "candidate-1",
+    proposedQuoteId: "quote-1",
+    proposedQuoteVersion: "v1",
+    state: "pending",
+    reason: "Selected revision was superseded; candidate B keeps current terms",
+    basisStale: false,
+    basisReason: "Proposed quote revision and requirement version are still current.",
+    createdAt: 2,
+    updatedAt: 2,
+    ...overrides,
+  };
+}
+
+function impactFixture(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: "assessment-1",
+    requirementId: "requirement-1",
+    trigger: "quoteRevision",
+    state: "recorded",
+    orderImpact: "reviewRequired",
+    reason: "Quote v1 was superseded by v2; 1 placed order(s) keep their history and need fresh approval before any substitute",
+    quoteVersion: "v2",
+    predecessorQuoteVersion: "v1",
+    placedOrderCount: 1,
+    createdAt: 1,
+    ...overrides,
+  };
+}
+
+function substituteProjection(substitute: Record<string, unknown>, impact: Record<string, unknown>): Record<string, unknown> {
+  return {
+    ...actionProjection(),
+    impacts: [impact],
+    impactsTruncated: false,
+    substitutes: [substitute],
+    substitutesTruncated: false,
+  };
+}
+
+test("decides a current pending substitute through the authorized impact mutation", async () => {
+  const calls: MutationCall[] = [];
+  const controls = controlledWatch(() => substituteProjection(substituteFixture(), impactFixture()));
+  const adapter = createConvexWorkbenchAdapter(actionClient(
+    substituteProjection(substituteFixture(), impactFixture()),
+    controls.watch,
+    calls,
+    { ok: true, decisionApprovalId: "approval-sub-1" },
+  ));
+
+  await adapter.load("project-1");
+  await expect(adapter.act({ type: "decideSubstituteProposal", projectId: "project-1", proposalId: "proposal-1", decision: "approved" })).resolves.toEqual({
+    ok: true,
+    message: "Substitute approved by the server; execute it as an explicit new selection.",
+  });
+  expect(calls).toHaveLength(1);
+  expect(getFunctionName(calls[0]?.reference as FunctionReference<"mutation">)).toBe("domain/impact:decideSubstituteProposal");
+  expect(calls[0]?.args).toEqual({
+    organizationId: "organization-1",
+    projectId: "project-1",
+    proposalId: "proposal-1",
+    decision: "approved",
+  });
+});
+
+test("stale-basis, decided, viewer, and missing substitute inputs make zero writes", async () => {
+  const loadAdapter = async (value: Record<string, unknown>, calls: MutationCall[]) => {
+    const controls = controlledWatch(() => value);
+    const adapter = createConvexWorkbenchAdapter(actionClient(value, controls.watch, calls, { ok: true }));
+    await adapter.load("project-1");
+    return adapter;
+  };
+
+  const staleCalls: MutationCall[] = [];
+  const stale = await loadAdapter(substituteProjection(substituteFixture({ basisStale: true, basisReason: "Proposed quote terms changed; renewed authority required." }), impactFixture()), staleCalls);
+  await expect(stale.act({ type: "decideSubstituteProposal", projectId: "project-1", proposalId: "proposal-1", decision: "approved" })).resolves.toMatchObject({ ok: false, message: expect.stringContaining("basis changed") });
+  expect(staleCalls).toHaveLength(0);
+
+  const decidedCalls: MutationCall[] = [];
+  const decided = await loadAdapter(substituteProjection(substituteFixture({ state: "approved" }), impactFixture()), decidedCalls);
+  await expect(decided.act({ type: "decideSubstituteProposal", projectId: "project-1", proposalId: "proposal-1", decision: "approved" })).resolves.toMatchObject({ ok: false });
+  expect(decidedCalls).toHaveLength(0);
+
+  const viewerCalls: MutationCall[] = [];
+  const viewerValue = { ...substituteProjection(substituteFixture(), impactFixture()), access: projection().access };
+  const viewer = await loadAdapter(viewerValue, viewerCalls);
+  await expect(viewer.act({ type: "decideSubstituteProposal", projectId: "project-1", proposalId: "proposal-1", decision: "rejected" })).resolves.toMatchObject({ ok: false, message: expect.stringContaining("not authorized") });
+  expect(viewerCalls).toHaveLength(0);
+
+  const missingCalls: MutationCall[] = [];
+  const missing = await loadAdapter(substituteProjection(substituteFixture(), impactFixture()), missingCalls);
+  await expect(missing.act({ type: "decideSubstituteProposal", projectId: "project-1", proposalId: "proposal-missing", decision: "approved" })).resolves.toMatchObject({ ok: false });
+  expect(missingCalls).toHaveLength(0);
+});
+
+test("parses stored impacts and substitutes without inventing outcomes", async () => {
+  const payload = substituteProjection(
+    substituteFixture(),
+    impactFixture({ state: "unknown", orderImpact: "unknown" }),
+  );
+  const snapshot = parseWorkbenchSnapshot(payload, "project-1");
+  if (snapshot === null) throw new Error("E8 projection should parse");
+  expect(snapshot.impacts).toHaveLength(1);
+  expect(snapshot.impacts[0]?.orderImpact).toBe("unknown");
+  expect(snapshot.impacts[0]?.reason).toContain("keep their history");
+  expect(snapshot.substitutes[0]?.basisStale).toBe(false);
+  expect(snapshot.truncation.impacts).toBe(false);
+  expect(snapshot.truncation.substitutes).toBe(false);
+  expect(parseWorkbenchSnapshot({ ...payload, impacts: [{ ...impactFixture(), reason: "" }] }, "project-1")).toBeNull();
+  expect(parseWorkbenchSnapshot({ ...payload, substitutes: "pending" }, "project-1")).toBeNull();
+});

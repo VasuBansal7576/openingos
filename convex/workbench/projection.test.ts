@@ -1216,3 +1216,199 @@ describe("W1 scheduled membership expiry", () => {
     });
   });
 });
+
+describe("E8 changed-term impact and substitute projection", () => {
+  async function insertImpact(
+    t: ReturnType<typeof convexTest>,
+    project: { organizationId: Id<"organizations">; projectId: Id<"projects"> },
+    requirementId: Id<"requirements">,
+    suffix: string,
+    overrides: Record<string, unknown> = {},
+  ) {
+    return await t.run(async (ctx) =>
+      ctx.db.insert("impactAssessments", {
+        organizationId: project.organizationId,
+        projectId: project.projectId,
+        idempotencyKey: `impact-${suffix}`,
+        requirementId,
+        trigger: "quoteRevision",
+        quoteVersion: "v2",
+        predecessorQuoteVersion: "v1",
+        orderImpact: "selectionOnly",
+        state: "recorded",
+        placedOrderCount: 0,
+        reason: "Quote v1 was superseded by v2; the unplaced selection basis changed and can be re-decided",
+        alternatives: [],
+        createdAt: 100,
+        ...overrides,
+      }),
+    );
+  }
+
+  async function insertProposal(
+    t: ReturnType<typeof convexTest>,
+    project: { organizationId: Id<"organizations">; projectId: Id<"projects"> },
+    requirementId: Id<"requirements">,
+    assessmentId: Id<"impactAssessments">,
+    candidateId: Id<"candidates">,
+    quoteId: Id<"quotes">,
+    suffix: string,
+    overrides: Record<string, unknown> = {},
+  ) {
+    const requirement = await t.run(async (ctx) => ctx.db.get(requirementId));
+    if (requirement === null) throw new Error("requirement missing for proposal");
+    return await t.run(async (ctx) =>
+      ctx.db.insert("substituteProposals", {
+        organizationId: project.organizationId,
+        projectId: project.projectId,
+        idempotencyKey: `proposal-${suffix}`,
+        assessmentId,
+        requirementId,
+        requirementVersion: requirement.version,
+        proposedCandidateId: candidateId,
+        proposedQuoteId: quoteId,
+        proposedQuoteVersion: "v1",
+        proposedLines: [{ quoteLineId: "machine", quantity: "1", unit: "piece" }],
+        reason: "Selected revision was superseded; candidate B keeps current terms",
+        state: "pending",
+        createdAt: 200,
+        updatedAt: 200,
+        ...overrides,
+      }),
+    );
+  }
+
+  test("projects stored impacts and a current-basis pending substitute with lineage", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, OWNER, "e8-current");
+    const graph = await setupCandidate(t, project, "e8");
+    await insertOwnerQuote(t, project, graph, "v1", "e8-hash-1", undefined, 100);
+    const assessmentId = await insertImpact(t, project, graph.requirementId, "current", {
+      orderImpact: "selectionOnly",
+      state: "recorded",
+    });
+    const quoteId = await t.run(async (ctx) => {
+      const rows = await ctx.db
+        .query("quotes")
+        .withIndex("by_project_and_contentHash", (q) =>
+          q.eq("projectId", project.projectId).eq("contentHash", "e8-hash-1"),
+        )
+        .take(1);
+      return rows[0]!._id;
+    });
+    await insertProposal(t, project, graph.requirementId, assessmentId, graph.candidateId, quoteId, "current", {
+      proposedQuoteVersion: "v1",
+    });
+
+    const result = await t.withIdentity(OWNER).query(getProjectionRef, { projectId: project.projectId });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("projection denied");
+    expect(result.impacts).toHaveLength(1);
+    expect(result.impacts[0]?.trigger).toBe("quoteRevision");
+    expect(result.impacts[0]?.state).toBe("recorded");
+    expect(result.impacts[0]?.orderImpact).toBe("selectionOnly");
+    expect(result.impacts[0]?.reason).toContain("unplaced selection basis changed");
+    expect(result.impacts[0]?.quoteVersion).toBe("v2");
+    expect(result.impacts[0]?.predecessorQuoteVersion).toBe("v1");
+    expect(result.impactsTruncated).toBe(false);
+    expect(result.substitutes).toHaveLength(1);
+    expect(result.substitutes[0]?.state).toBe("pending");
+    expect(result.substitutes[0]?.basisStale).toBe(false);
+    expect(result.substitutes[0]?.basisReason).toContain("still current");
+    expect(result.substitutes[0]?.reason).toContain("keeps current terms");
+    expect(result.substitutesTruncated).toBe(false);
+    const serialized = JSON.stringify(result);
+    expect(serialized).not.toContain("owner@example.test");
+    expect(serialized).not.toContain("secret");
+  });
+
+  test("stale quote, requirement, and selection bases fence pending approval", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, OWNER, "e8-stale");
+    const graph = await setupCandidate(t, project, "stale");
+    await insertOwnerQuote(t, project, graph, "v1", "e8-stale-1", undefined, 100);
+    const assessmentId = await insertImpact(t, project, graph.requirementId, "stale");
+    const quoteId = await t.run(async (ctx) => {
+      const rows = await ctx.db
+        .query("quotes")
+        .withIndex("by_project_and_contentHash", (q) =>
+          q.eq("projectId", project.projectId).eq("contentHash", "e8-stale-1"),
+        )
+        .take(1);
+      return rows[0]!._id;
+    });
+    await insertProposal(t, project, graph.requirementId, assessmentId, graph.candidateId, quoteId, "stale", {
+      proposedQuoteVersion: "v1",
+    });
+
+    // A recorded successor revision fences the basis.
+    await insertOwnerQuote(t, project, graph, "v2", "e8-stale-2", "e8-stale-1", 200);
+    const superseded = await t.withIdentity(OWNER).query(getProjectionRef, { projectId: project.projectId });
+    expect(superseded.ok).toBe(true);
+    if (!superseded.ok) throw new Error("projection denied");
+    expect(superseded.substitutes[0]?.basisStale).toBe(true);
+    expect(superseded.substitutes[0]?.basisReason).toContain("terms changed");
+    expect(superseded.substitutes[0]?.state).toBe("pending");
+  });
+
+  test("decided proposals are terminal history and over-bound pages truncate explicitly", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, OWNER, "e8-decided");
+    const graph = await setupCandidate(t, project, "decided");
+    const assessmentId = await insertImpact(t, project, graph.requirementId, "decided");
+    const quoteId = await t.run(async (ctx) => {
+      const rows = await ctx.db.query("quotes").withIndex("by_project", (q) => q.eq("projectId", project.projectId)).take(1);
+      return rows[0]?._id;
+    });
+    void quoteId;
+    const candidateQuote = await insertOwnerQuote(t, project, graph, "v1", "e8-decided-1", undefined, 100);
+    await insertProposal(t, project, graph.requirementId, assessmentId, graph.candidateId, candidateQuote, "decided", {
+      proposedQuoteVersion: "v1",
+      state: "approved",
+    });
+    for (let index = 0; index < projection.MAX_IMPACTS + 2; index += 1) {
+      await insertImpact(t, project, graph.requirementId, `overflow-${index}`);
+    }
+
+    const result = await t.withIdentity(OWNER).query(getProjectionRef, { projectId: project.projectId, limit: 12 });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("projection denied");
+    const decided = result.substitutes.find((proposal) => proposal.state === "approved");
+    expect(decided?.basisStale).toBe(false);
+    expect(decided?.basisReason).toContain("no fresh approval is required");
+    expect(result.impacts).toHaveLength(projection.MAX_IMPACTS);
+    expect(result.impactsTruncated).toBe(true);
+  });
+
+  test("excludes cross-project impact and substitute rows and denies foreign readers", async () => {
+    const t = convexTest(schema, modules);
+    const home = await setupProject(t, OWNER, "e8-home");
+    const away = await setupProject(t, OWNER, "e8-away", "restricted");
+    const graph = await setupCandidate(t, away, "foreign");
+    const assessmentId = await insertImpact(t, away, graph.requirementId, "foreign");
+
+    const denied = await t.withIdentity(OTHER).query(getProjectionRef, { projectId: away.projectId });
+    expect(denied).toEqual({ ok: false, code: "denied-membership", message: "not authorized for this project" });
+
+    const isolated = await t.withIdentity(OWNER).query(getProjectionRef, { projectId: home.projectId });
+    expect(isolated.ok).toBe(true);
+    if (!isolated.ok) throw new Error("projection denied");
+    expect(isolated.impacts).toEqual([]);
+    expect(isolated.substitutes).toEqual([]);
+    expect(isolated.impactsTruncated).toBe(false);
+    expect(isolated.substitutesTruncated).toBe(false);
+    expect(assessmentId).toBeDefined();
+  });
+
+  test("returns empty impact and substitute state for a fresh project", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, OWNER, "e8-bare");
+    const result = await t.withIdentity(OWNER).query(getProjectionRef, { projectId: project.projectId });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("projection denied");
+    expect(result.impacts).toEqual([]);
+    expect(result.substitutes).toEqual([]);
+    expect(result.impactsTruncated).toBe(false);
+    expect(result.substitutesTruncated).toBe(false);
+  });
+});

@@ -37,6 +37,8 @@ export const MAX_OPERATIONS_PER_JOB = 8;
 export const MAX_ATTEMPTS_PER_OPERATION = 4;
 export const MAX_ATTEMPTS_PER_JOB = MAX_OPERATIONS_PER_JOB * MAX_ATTEMPTS_PER_OPERATION;
 export const MAX_DECISIONS = 24;
+export const MAX_IMPACTS = 12;
+export const MAX_SUBSTITUTES = 12;
 export const MAX_ACTIVITY_PAGE = 24;
 export const MAX_EQUIPMENT_ASSETS = 12;
 export const MAX_ASSET_DOCUMENTS = 8;
@@ -289,6 +291,46 @@ const activityItemValidator = v.object({
   createdAt: v.number(),
 });
 
+// E8 due-decision and recovery state. Impact assessments project only the
+// stored trigger, state, order impact, bounded reason text, and lineage
+// versions — never invented savings, availability, readiness, or delivery
+// delay (no assessment field expresses delay). Substitute proposals project
+// the stored requirement/quote lineage plus a server-computed stale/current
+// basis fence so the client can disable obsolete approvals with zero writes.
+const impactValidator = v.object({
+  id: v.id("impactAssessments"),
+  requirementId: v.id("requirements"),
+  trigger: v.union(v.literal("quoteRevision"), v.literal("watchObservation")),
+  state: v.union(v.literal("recorded"), v.literal("unknown"), v.literal("incomplete")),
+  orderImpact: v.union(
+    v.literal("none"),
+    v.literal("selectionOnly"),
+    v.literal("reviewRequired"),
+    v.literal("unknown"),
+  ),
+  reason: v.string(),
+  quoteVersion: v.optional(v.string()),
+  predecessorQuoteVersion: v.optional(v.string()),
+  watchResult: v.optional(v.union(v.literal("ok"), v.literal("stale"), v.literal("error"), v.literal("unknown"))),
+  placedOrderCount: v.number(),
+  createdAt: v.number(),
+});
+
+const substituteValidator = v.object({
+  id: v.id("substituteProposals"),
+  requirementId: v.id("requirements"),
+  assessmentId: v.id("impactAssessments"),
+  proposedCandidateId: v.id("candidates"),
+  proposedQuoteId: v.id("quotes"),
+  proposedQuoteVersion: v.string(),
+  state: v.union(v.literal("pending"), v.literal("approved"), v.literal("rejected")),
+  reason: v.string(),
+  basisStale: v.boolean(),
+  basisReason: v.string(),
+  createdAt: v.number(),
+  updatedAt: v.number(),
+});
+
 // E1 installed-equipment views project only real bounded rows from the
 // assets, assetDocuments, and serviceCases tables. Asset documents expose
 // exactly kind and createdAt: no document id, storageRef, idempotency key,
@@ -357,6 +399,10 @@ const projectionValidator = v.object({
   jobsTruncated: v.boolean(),
   decisions: v.array(decisionValidator),
   decisionsTruncated: v.boolean(),
+  impacts: v.array(impactValidator),
+  impactsTruncated: v.boolean(),
+  substitutes: v.array(substituteValidator),
+  substitutesTruncated: v.boolean(),
   equipment: equipmentValidator,
   activity: activityValidator,
   provenance: provenanceValidator,
@@ -931,6 +977,245 @@ async function readEquipment(
   return { assets, assetsTruncated };
 }
 
+/**
+ * E8 changed-term impact projection (P-11, D-15). Reads only real bounded
+ * rows from impactAssessments inside the caller's project, newest first,
+ * one row past the bound so over-limit state is an explicit truncation
+ * flag. Reason text is stored-derived only; unknown/incomplete states and
+ * the selection/order distinction are preserved verbatim.
+ */
+async function readImpacts(
+  ctx: import("../server.js").F1QueryCtx,
+  organizationId: Id<"organizations">,
+  projectId: Id<"projects">,
+  bound: number,
+): Promise<{
+  readonly impacts: Array<{
+    readonly id: Id<"impactAssessments">;
+    readonly requirementId: Id<"requirements">;
+    readonly trigger: "quoteRevision" | "watchObservation";
+    readonly state: "recorded" | "unknown" | "incomplete";
+    readonly orderImpact: "none" | "selectionOnly" | "reviewRequired" | "unknown";
+    readonly reason: string;
+    readonly quoteVersion?: string;
+    readonly predecessorQuoteVersion?: string;
+    readonly watchResult?: "ok" | "stale" | "error" | "unknown";
+    readonly placedOrderCount: number;
+    readonly createdAt: number;
+  }>;
+  readonly impactsTruncated: boolean;
+}> {
+  const page = await ctx.db
+    .query("impactAssessments")
+    .withIndex("by_project", (q) => q.eq("projectId", projectId))
+    .order("desc")
+    .take(bound + 1);
+  const impactsTruncated = page.length > bound;
+  const impacts = page
+    .filter((row) => row.organizationId === organizationId && row.projectId === projectId)
+    .slice(0, bound)
+    .map((row) => ({
+      id: row._id,
+      requirementId: row.requirementId,
+      trigger: row.trigger,
+      state: row.state,
+      orderImpact: row.orderImpact,
+      reason: row.reason,
+      ...(row.quoteVersion === undefined ? {} : { quoteVersion: row.quoteVersion }),
+      ...(row.predecessorQuoteVersion === undefined ? {} : { predecessorQuoteVersion: row.predecessorQuoteVersion }),
+      ...(row.watchResult === undefined ? {} : { watchResult: row.watchResult }),
+      placedOrderCount: row.placedOrderCount,
+      createdAt: row.createdAt,
+    }));
+  return { impacts, impactsTruncated };
+}
+
+/**
+ * E8 substitute-proposal projection (P-12, P-13, D-15). Reads only real
+ * bounded rows from substituteProposals inside the caller's project. Each
+ * pending proposal carries a server-computed stale/current basis fence:
+ * the requirement version, proposed quote revision liveness (bounded
+ * successor probe), and current-selection identity are re-read, so a
+ * changed offer, edited requirement, or selection drift marks the basis
+ * stale before any approval. Decided proposals report their terminal
+ * state without a fence. No proposal ever implies an order or selection.
+ */
+async function readSubstitutes(
+  ctx: import("../server.js").F1QueryCtx,
+  organizationId: Id<"organizations">,
+  projectId: Id<"projects">,
+  bound: number,
+): Promise<{
+  readonly substitutes: Array<{
+    readonly id: Id<"substituteProposals">;
+    readonly requirementId: Id<"requirements">;
+    readonly assessmentId: Id<"impactAssessments">;
+    readonly proposedCandidateId: Id<"candidates">;
+    readonly proposedQuoteId: Id<"quotes">;
+    readonly proposedQuoteVersion: string;
+    readonly state: "pending" | "approved" | "rejected";
+    readonly reason: string;
+    readonly basisStale: boolean;
+    readonly basisReason: string;
+    readonly createdAt: number;
+    readonly updatedAt: number;
+  }>;
+  readonly substitutesTruncated: boolean;
+}> {
+  const page = await ctx.db
+    .query("substituteProposals")
+    .withIndex("by_project", (q) => q.eq("projectId", projectId))
+    .order("desc")
+    .take(bound + 1);
+  const substitutesTruncated = page.length > bound;
+  const rows = page
+    .filter((row) => row.organizationId === organizationId && row.projectId === projectId)
+    .slice(0, bound);
+  const substitutes: Awaited<ReturnType<typeof readSubstitutes>>["substitutes"] = [];
+  for (const row of rows) {
+    if (row.state !== "pending") {
+      substitutes.push({
+        id: row._id,
+        requirementId: row.requirementId,
+        assessmentId: row.assessmentId,
+        proposedCandidateId: row.proposedCandidateId,
+        proposedQuoteId: row.proposedQuoteId,
+        proposedQuoteVersion: row.proposedQuoteVersion,
+        state: row.state,
+        reason: row.reason,
+        basisStale: false,
+        basisReason: `Proposal ${row.state}; no fresh approval is required.`,
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt,
+      });
+      continue;
+    }
+    const requirement = await ctx.db.get(row.requirementId);
+    if (
+      requirement === null ||
+      requirement.organizationId !== organizationId ||
+      requirement.projectId !== projectId
+    ) {
+      substitutes.push({
+        id: row._id,
+        requirementId: row.requirementId,
+        assessmentId: row.assessmentId,
+        proposedCandidateId: row.proposedCandidateId,
+        proposedQuoteId: row.proposedQuoteId,
+        proposedQuoteVersion: row.proposedQuoteVersion,
+        state: row.state,
+        reason: row.reason,
+        basisStale: true,
+        basisReason: "Proposal requirement is not in this project; renewed authority required.",
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt,
+      });
+      continue;
+    }
+    if (requirement.version !== row.requirementVersion) {
+      substitutes.push({
+        id: row._id,
+        requirementId: row.requirementId,
+        assessmentId: row.assessmentId,
+        proposedCandidateId: row.proposedCandidateId,
+        proposedQuoteId: row.proposedQuoteId,
+        proposedQuoteVersion: row.proposedQuoteVersion,
+        state: row.state,
+        reason: row.reason,
+        basisStale: true,
+        basisReason: "Requirement changed since the proposal; renewed authority required.",
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt,
+      });
+      continue;
+    }
+    const quote = await ctx.db.get(row.proposedQuoteId);
+    if (
+      quote === null ||
+      quote.organizationId !== organizationId ||
+      quote.projectId !== projectId ||
+      quote.version !== row.proposedQuoteVersion
+    ) {
+      substitutes.push({
+        id: row._id,
+        requirementId: row.requirementId,
+        assessmentId: row.assessmentId,
+        proposedCandidateId: row.proposedCandidateId,
+        proposedQuoteId: row.proposedQuoteId,
+        proposedQuoteVersion: row.proposedQuoteVersion,
+        state: row.state,
+        reason: row.reason,
+        basisStale: true,
+        basisReason: "Proposed quote version changed; renewed authority required.",
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt,
+      });
+      continue;
+    }
+    const successor = await hasQuoteSuccessor(ctx, projectId, quote.contentHash);
+    if (successor) {
+      substitutes.push({
+        id: row._id,
+        requirementId: row.requirementId,
+        assessmentId: row.assessmentId,
+        proposedCandidateId: row.proposedCandidateId,
+        proposedQuoteId: row.proposedQuoteId,
+        proposedQuoteVersion: row.proposedQuoteVersion,
+        state: row.state,
+        reason: row.reason,
+        basisStale: true,
+        basisReason: "Proposed quote terms changed; renewed authority required.",
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt,
+      });
+      continue;
+    }
+    const latestSelection = await ctx.db
+      .query("selections")
+      .withIndex("by_requirement", (q) => q.eq("requirementId", row.requirementId))
+      .order("desc")
+      .take(1);
+    const current = latestSelection[0];
+    const currentId = current !== undefined &&
+      current.organizationId === organizationId &&
+      current.projectId === projectId
+      ? current._id
+      : undefined;
+    if ((currentId ?? undefined) !== row.currentSelectionId) {
+      substitutes.push({
+        id: row._id,
+        requirementId: row.requirementId,
+        assessmentId: row.assessmentId,
+        proposedCandidateId: row.proposedCandidateId,
+        proposedQuoteId: row.proposedQuoteId,
+        proposedQuoteVersion: row.proposedQuoteVersion,
+        state: row.state,
+        reason: row.reason,
+        basisStale: true,
+        basisReason: "The current selection changed since the proposal; renewed authority required.",
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt,
+      });
+      continue;
+    }
+    substitutes.push({
+      id: row._id,
+      requirementId: row.requirementId,
+      assessmentId: row.assessmentId,
+      proposedCandidateId: row.proposedCandidateId,
+      proposedQuoteId: row.proposedQuoteId,
+      proposedQuoteVersion: row.proposedQuoteVersion,
+      state: row.state,
+      reason: row.reason,
+      basisStale: false,
+      basisReason: "Proposed quote revision and requirement version are still current.",
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+    });
+  }
+  return { substitutes, substitutesTruncated };
+}
+
 /** List projects visible to the authenticated identity through authority pages. */
 export const listAccessibleProjects = f1Query({
   args: {
@@ -1291,6 +1576,20 @@ export const getProjection = f1Query({
       continueCursor: activityPage.isDone ? null : activityPage.continueCursor,
     };
     const equipment = await readEquipment(ctx, project.organizationId, args.projectId);
+    const impactBound = Math.min(pageSize, MAX_IMPACTS);
+    const substituteBound = Math.min(pageSize, MAX_SUBSTITUTES);
+    const { impacts, impactsTruncated: impactsOverBound } = await readImpacts(
+      ctx,
+      project.organizationId,
+      args.projectId,
+      impactBound,
+    );
+    const { substitutes, substitutesTruncated: substitutesOverBound } = await readSubstitutes(
+      ctx,
+      project.organizationId,
+      args.projectId,
+      substituteBound,
+    );
     const summary = await readProjectSummary(ctx, project);
     return {
       ok: true as const,
@@ -1304,6 +1603,10 @@ export const getProjection = f1Query({
       jobsTruncated: jobsPage.length > Math.min(pageSize, MAX_JOBS),
       decisions,
       decisionsTruncated,
+      impacts,
+      impactsTruncated: impactsOverBound,
+      substitutes,
+      substitutesTruncated: substitutesOverBound,
       equipment,
       activity,
       provenance: uniqueModes(provenanceEntries),

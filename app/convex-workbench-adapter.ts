@@ -46,6 +46,13 @@ type W1DecideApprovalArgs = Record<string, unknown> & {
   readonly decision: "approved" | "rejected";
 };
 
+type W1DecideSubstituteProposalArgs = Record<string, unknown> & {
+  readonly organizationId: Id<"organizations">;
+  readonly projectId: Id<"projects">;
+  readonly proposalId: Id<"substituteProposals">;
+  readonly decision: "approved" | "rejected";
+};
+
 type W1CancelJobArgs = Record<string, unknown> & {
   readonly jobId: Id<"jobs">;
   readonly reason: string;
@@ -90,6 +97,9 @@ type W1PublicApi = {
   readonly "domain/fulfillment": {
     readonly openServiceCase: FunctionReference<"mutation", "public", W1OpenServiceCaseArgs, unknown>;
   };
+  readonly "domain/impact": {
+    readonly decideSubstituteProposal: FunctionReference<"mutation", "public", W1DecideSubstituteProposalArgs, unknown>;
+  };
 };
 
 /**
@@ -109,6 +119,8 @@ const cancelJobReference = jobsApi.cancel;
 const startJobReference = jobsApi.start;
 const fulfillmentApi = (api as unknown as W1PublicApi)["domain/fulfillment"];
 const openServiceCaseReference = fulfillmentApi.openServiceCase;
+const impactApi = (api as unknown as W1PublicApi)["domain/impact"];
+const decideSubstituteProposalReference = impactApi.decideSubstituteProposal;
 
 const WORKBENCH_PROJECTION_LIMIT = 12;
 const PROJECT_DISCOVERY_LIMIT = 1;
@@ -302,6 +314,8 @@ export function createConvexWorkbenchAdapter(client: ConvexWorkbenchClient): Con
         return `${projectId}:selectOffer:${action.offerId}:${action.quoteId}:${action.quoteVersion}`;
       case "approveDecision":
         return `${projectId}:approveDecision:${action.decisionId}`;
+      case "decideSubstituteProposal":
+        return `${projectId}:decideSubstituteProposal:${action.proposalId}:${action.decision}`;
       case "cancelJob":
         return `${projectId}:cancelJob:${action.jobId}`;
       case "startResearch":
@@ -595,8 +609,49 @@ export function createConvexWorkbenchAdapter(client: ConvexWorkbenchClient): Con
       }
     }
 
-    if (action.type === "openServiceCase") {
-      if (current.access.capabilities.canOpenServiceCase !== true) {
+    if (action.type === "decideSubstituteProposal") {
+      const proposal = current.substitutes.find((candidate) => candidate.id === action.proposalId);
+      if (proposal === undefined || proposal.state !== "pending") {
+        return { ok: false, message: ACTION_REQUIRES_CURRENT_PROJECTION };
+      }
+      if (current.access.capabilities.canApprove !== true) {
+        return { ok: false, message: "Substitute approval is not authorized for this project role. Nothing was sent." };
+      }
+      if (proposal.basisStale) {
+        return { ok: false, message: `This substitute basis changed (${proposal.basisReason}); renewed authority required. Nothing was sent.` };
+      }
+      if (!isOneOf(action.decision, ["approved", "rejected"] as const)) {
+        return { ok: false, message: ACTION_REQUIRES_CURRENT_PROJECTION };
+      }
+      const args: W1DecideSubstituteProposalArgs = {
+        organizationId,
+        projectId,
+        proposalId: proposal.id as Id<"substituteProposals">,
+        decision: action.decision,
+      };
+      const mutationKey = claimMutation(projectId, action);
+      if (mutationKey === null) return { ok: false, message: ACTION_ALREADY_IN_FLIGHT };
+      const mutationGeneration = readVersions.get(projectId) ?? 0;
+      let settlement: MutationSettlement = "uncertain";
+      try {
+        const result = await client.mutation(decideSubstituteProposalReference, args);
+        settlement = mutationSettlement(result);
+        const failure = mutationFailure(result, "The server did not decide this substitute proposal.");
+        if (failure !== null) return failure;
+        return {
+          ok: true,
+          message: action.decision === "approved"
+            ? "Substitute approved by the server; execute it as an explicit new selection."
+            : "Substitute rejection recorded by the server.",
+        };
+      } catch (error) {
+        return { ok: false, message: error instanceof Error ? error.message : "The server did not decide this substitute proposal." };
+      } finally {
+        await finishMutation(projectId, mutationKey, mutationGeneration, settlement);
+      }
+    }
+
+    if (action.type === "openServiceCase") {      if (current.access.capabilities.canOpenServiceCase !== true) {
         return { ok: false, message: "Service-case creation is not authorized for this project. Nothing was sent." };
       }
       const asset = current.equipment.assets.find((candidate) => candidate.id === action.assetId);

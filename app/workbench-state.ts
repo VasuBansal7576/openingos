@@ -222,6 +222,37 @@ export interface WorkbenchAsset {
   readonly serviceCasesTruncated: boolean;
 }
 
+/** E8 stored changed-term impact: reason and order impact only, never invented outcomes. */
+export interface WorkbenchImpact {
+  readonly id: string;
+  readonly requirementId: string;
+  readonly trigger: "quoteRevision" | "watchObservation";
+  readonly state: "recorded" | "unknown" | "incomplete";
+  readonly orderImpact: "none" | "selectionOnly" | "reviewRequired" | "unknown";
+  readonly reason: string;
+  readonly quoteVersion: string | null;
+  readonly predecessorQuoteVersion: string | null;
+  readonly watchResult: string | null;
+  readonly placedOrderCount: number;
+  readonly createdAt: number;
+}
+
+/** E8 substitute proposal: fresh approval required while pending and basis current. */
+export interface WorkbenchSubstitute {
+  readonly id: string;
+  readonly requirementId: string;
+  readonly assessmentId: string;
+  readonly proposedCandidateId: string;
+  readonly proposedQuoteId: string;
+  readonly proposedQuoteVersion: string;
+  readonly state: "pending" | "approved" | "rejected";
+  readonly reason: string;
+  readonly basisStale: boolean;
+  readonly basisReason: string;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+}
+
 export interface WorkbenchEquipment {
   readonly assets: readonly WorkbenchAsset[];
   readonly assetsTruncated: boolean;
@@ -243,6 +274,8 @@ export interface WorkbenchSnapshot {
   readonly activity: WorkbenchActivityPage;
   readonly provenance: WorkbenchProvenance;
   readonly equipment: WorkbenchEquipment;
+  readonly impacts: readonly WorkbenchImpact[];
+  readonly substitutes: readonly WorkbenchSubstitute[];
   readonly selectedOfferId: string | null;
   readonly selectedForecastMinorUnits: number | null;
   readonly committedMinorUnits: number | null;
@@ -253,6 +286,8 @@ export interface WorkbenchSnapshot {
     readonly offers: boolean;
     readonly jobs: boolean;
     readonly decisions: boolean;
+    readonly impacts: boolean;
+    readonly substitutes: boolean;
     readonly equipment: boolean;
   };
 }
@@ -263,6 +298,7 @@ export type WorkbenchAction =
   | { readonly type: "cancelJob"; readonly projectId: string; readonly jobId: string }
   | { readonly type: "selectOffer"; readonly projectId: string; readonly offerId: string; readonly quoteId: string; readonly quoteVersion: string }
   | { readonly type: "approveDecision"; readonly projectId: string; readonly decisionId: string }
+  | { readonly type: "decideSubstituteProposal"; readonly projectId: string; readonly proposalId: string; readonly decision: "approved" | "rejected" }
   | {
       readonly type: "openServiceCase";
       readonly projectId: string;
@@ -742,6 +778,96 @@ function parseEquipment(value: unknown): WorkbenchEquipment | null {
 }
 
 /**
+ * E8 impact parser: stored trigger/state/order-impact plus bounded reason
+ * text only. Unknown charges, savings, availability, readiness, or delivery
+ * outcomes are never inferred here.
+ */
+function parseImpact(value: unknown): WorkbenchImpact | null {
+  if (!isRecord(value)) return null;
+  const id = requiredString(value.id);
+  const requirementId = requiredString(value.requirementId);
+  const reason = requiredString(value.reason);
+  const quoteVersion = optionalNonEmptyString(value.quoteVersion);
+  const predecessorQuoteVersion = optionalNonEmptyString(value.predecessorQuoteVersion);
+  const watchResult = optionalNonEmptyString(value.watchResult);
+  if (
+    id === null ||
+    requirementId === null ||
+    reason === null ||
+    reason.length > 2000 ||
+    quoteVersion === undefined ||
+    predecessorQuoteVersion === undefined ||
+    watchResult === undefined ||
+    !isOneOf(value.trigger, ["quoteRevision", "watchObservation"] as const) ||
+    !isOneOf(value.state, ["recorded", "unknown", "incomplete"] as const) ||
+    !isOneOf(value.orderImpact, ["none", "selectionOnly", "reviewRequired", "unknown"] as const) ||
+    !isFiniteNumber(value.placedOrderCount) ||
+    !Number.isSafeInteger(value.placedOrderCount) ||
+    (value.placedOrderCount as number) < 0 ||
+    !isFiniteNumber(value.createdAt)
+  ) return null;
+  return {
+    id,
+    requirementId,
+    trigger: value.trigger,
+    state: value.state,
+    orderImpact: value.orderImpact,
+    reason,
+    quoteVersion,
+    predecessorQuoteVersion,
+    watchResult,
+    placedOrderCount: value.placedOrderCount,
+    createdAt: value.createdAt,
+  };
+}
+
+/**
+ * E8 substitute parser: pending proposals require fresh approval while the
+ * server-projected basis is current. A stale basis disables approval with
+ * zero writes; decided proposals are terminal history.
+ */
+function parseSubstitute(value: unknown): WorkbenchSubstitute | null {
+  if (!isRecord(value)) return null;
+  const id = requiredString(value.id);
+  const requirementId = requiredString(value.requirementId);
+  const assessmentId = requiredString(value.assessmentId);
+  const proposedCandidateId = requiredString(value.proposedCandidateId);
+  const proposedQuoteId = requiredString(value.proposedQuoteId);
+  const proposedQuoteVersion = requiredString(value.proposedQuoteVersion);
+  const reason = requiredString(value.reason);
+  const basisReason = requiredString(value.basisReason);
+  if (
+    id === null ||
+    requirementId === null ||
+    assessmentId === null ||
+    proposedCandidateId === null ||
+    proposedQuoteId === null ||
+    proposedQuoteVersion === null ||
+    reason === null ||
+    reason.length > 2000 ||
+    basisReason === null ||
+    !isOneOf(value.state, ["pending", "approved", "rejected"] as const) ||
+    typeof value.basisStale !== "boolean" ||
+    !isFiniteNumber(value.createdAt) ||
+    !isFiniteNumber(value.updatedAt)
+  ) return null;
+  return {
+    id,
+    requirementId,
+    assessmentId,
+    proposedCandidateId,
+    proposedQuoteId,
+    proposedQuoteVersion,
+    state: value.state,
+    reason,
+    basisStale: value.basisStale,
+    basisReason,
+    createdAt: value.createdAt,
+    updatedAt: value.updatedAt,
+  };
+}
+
+/**
  * Transform and validate the exact W1 `workbench/getProjection` result.
  * Unsupported aggregate facts remain null instead of being inferred from
  * candidate, quote, job, decision, or activity rows.
@@ -754,6 +880,14 @@ export function parseWorkbenchSnapshot(value: unknown, expectedProjectId?: strin
   if (project === null || access === null || provenance === null || expectedProjectId !== undefined && project.id !== expectedProjectId) return null;
   if (!Array.isArray(value.requirements) || !Array.isArray(value.candidates) || !Array.isArray(value.jobs) || !Array.isArray(value.decisions)) return null;
   if (typeof value.requirementsTruncated !== "boolean" || typeof value.candidatesTruncated !== "boolean" || typeof value.jobsTruncated !== "boolean" || typeof value.decisionsTruncated !== "boolean") return null;
+  // E8 blocks are backward compatible: servers that predate them omit the
+  // arrays, which parse as empty without inventing due decisions.
+  const rawImpacts = value.impacts === undefined ? [] : value.impacts;
+  const rawSubstitutes = value.substitutes === undefined ? [] : value.substitutes;
+  if (!Array.isArray(rawImpacts) || !Array.isArray(rawSubstitutes)) return null;
+  const rawImpactsTruncated = value.impactsTruncated === undefined ? false : value.impactsTruncated;
+  const rawSubstitutesTruncated = value.substitutesTruncated === undefined ? false : value.substitutesTruncated;
+  if (typeof rawImpactsTruncated !== "boolean" || typeof rawSubstitutesTruncated !== "boolean") return null;
   if (!isRecord(value.activity) || !Array.isArray(value.activity.page) || typeof value.activity.isDone !== "boolean") return null;
   const continueCursor = nullableString(value.activity.continueCursor);
   if (continueCursor === undefined) return null;
@@ -764,11 +898,15 @@ export function parseWorkbenchSnapshot(value: unknown, expectedProjectId?: strin
   const jobs: WorkbenchJob[] = [];
   const decisions: WorkbenchDecision[] = [];
   const activity: WorkbenchActivityItem[] = [];
+  const impacts: WorkbenchImpact[] = [];
+  const substitutes: WorkbenchSubstitute[] = [];
   for (const entry of value.requirements) { const parsed = parseRequirement(entry); if (parsed === null) return null; requirements.push(parsed); }
   for (const entry of value.candidates) { const parsed = parseOffer(entry); if (parsed === null) return null; offers.push(parsed); }
   for (const entry of value.jobs) { const parsed = parseJob(entry); if (parsed === null) return null; jobs.push(parsed); }
   for (const entry of value.decisions) { const parsed = parseDecision(entry); if (parsed === null) return null; decisions.push(parsed); }
   for (const entry of value.activity.page) { const parsed = parseActivityItem(entry); if (parsed === null) return null; activity.push(parsed); }
+  for (const entry of rawImpacts) { const parsed = parseImpact(entry); if (parsed === null) return null; impacts.push(parsed); }
+  for (const entry of rawSubstitutes) { const parsed = parseSubstitute(entry); if (parsed === null) return null; substitutes.push(parsed); }
   return {
     project,
     access,
@@ -779,11 +917,13 @@ export function parseWorkbenchSnapshot(value: unknown, expectedProjectId?: strin
     activity: { items: activity, continueCursor, isDone: value.activity.isDone },
     provenance,
     equipment,
+    impacts,
+    substitutes,
     selectedOfferId: null,
     selectedForecastMinorUnits: null,
     committedMinorUnits: null,
     paidMinorUnits: null,
     deliveredQuantityByRequirement: {},
-    truncation: { requirements: value.requirementsTruncated, offers: value.candidatesTruncated, jobs: value.jobsTruncated, decisions: value.decisionsTruncated, equipment: equipment.assetsTruncated },
+    truncation: { requirements: value.requirementsTruncated, offers: value.candidatesTruncated, jobs: value.jobsTruncated, decisions: value.decisionsTruncated, impacts: rawImpactsTruncated, substitutes: rawSubstitutesTruncated, equipment: equipment.assetsTruncated },
   };
 }

@@ -1445,3 +1445,223 @@ test("makes all background content inert for the nested service dialog and resto
     await mounted.cleanup();
   }
 });
+
+function e8ImpactFixture(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: "assessment-e8-1",
+    requirementId: "requirement-w1-1",
+    trigger: "quoteRevision",
+    state: "recorded",
+    orderImpact: "reviewRequired",
+    reason: "Quote v1 was superseded by v2; 1 placed order(s) keep their history and need fresh approval before any substitute",
+    quoteVersion: "v2",
+    predecessorQuoteVersion: "v1",
+    placedOrderCount: 1,
+    createdAt: Date.UTC(2026, 8, 21),
+    ...overrides,
+  };
+}
+
+function e8SubstituteFixture(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: "proposal-e8-1",
+    requirementId: "requirement-w1-1",
+    assessmentId: "assessment-e8-1",
+    proposedCandidateId: "candidate-w1-1",
+    proposedQuoteId: "quote-w1-1",
+    proposedQuoteVersion: "2",
+    state: "pending",
+    reason: "Selected revision was superseded; Harbor Equipment keeps current terms",
+    basisStale: false,
+    basisReason: "Proposed quote revision and requirement version are still current.",
+    createdAt: Date.UTC(2026, 8, 22),
+    updatedAt: Date.UTC(2026, 8, 22),
+    ...overrides,
+  };
+}
+
+function e8Projection(extra: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    ...(projection as unknown as Record<string, unknown>),
+    impacts: [e8ImpactFixture()],
+    impactsTruncated: false,
+    substitutes: [e8SubstituteFixture()],
+    substitutesTruncated: false,
+    ...extra,
+  };
+}
+
+async function mountE8Tab(
+  loadState: Parameters<typeof WorkbenchView>[0]["loadState"],
+  onAction: (action: WorkbenchAction) => WorkbenchActionResult | Promise<WorkbenchActionResult>,
+): Promise<{
+  readonly container: HTMLElement;
+  readonly findButton: (label: string) => HTMLButtonElement;
+  readonly clickTab: (label: string) => Promise<void>;
+  readonly cleanup: () => Promise<void>;
+}> {
+  const dom = new HappyWindow({ url: "https://openingos.test/" });
+  const previousWindow = globalThis.window;
+  const previousDocument = globalThis.document;
+  const previousNavigator = globalThis.navigator;
+  const actEnvironment = globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean };
+  const previousActEnvironment = actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+  const browserGlobals = globalThis as unknown as { window: unknown; document: unknown; navigator: unknown };
+  browserGlobals.window = dom as unknown as globalThis.Window;
+  browserGlobals.document = dom.document as unknown as globalThis.Document;
+  browserGlobals.navigator = dom.navigator as unknown as globalThis.Navigator;
+  actEnvironment.IS_REACT_ACT_ENVIRONMENT = true;
+  const happyElement = dom.document.createElement("div");
+  dom.document.body.append(happyElement);
+  const container = happyElement as unknown as HTMLElement;
+  const root = createRoot(container as unknown as globalThis.Element);
+  await act(async () => {
+    root.render(createElement(WorkbenchView, { loadState, onAction }));
+  });
+  const findButton = (label: string): HTMLButtonElement => {
+    const button = Array.from(container.querySelectorAll("button")).find((candidate) => candidate.textContent?.includes(label));
+    if (!(button instanceof dom.window.HTMLButtonElement)) throw new Error(`Button not found: ${label}`);
+    return button as unknown as HTMLButtonElement;
+  };
+  return {
+    container,
+    findButton,
+    clickTab: async (label: string) => {
+      await act(async () => {
+        findButton(label).click();
+      });
+    },
+    cleanup: async () => {
+      await act(async () => {
+        root.unmount();
+      });
+      browserGlobals.window = previousWindow;
+      browserGlobals.document = previousDocument;
+      browserGlobals.navigator = previousNavigator;
+      if (previousActEnvironment === undefined) delete actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+      else actEnvironment.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment;
+    },
+  };
+}
+
+test("parses stored E8 impacts and substitutes with stale/current basis", () => {
+  const snapshot = parseWorkbenchSnapshot(e8Projection(), projection.project.id);
+  if (snapshot === null) throw new Error("E8 projection should parse");
+  expect(snapshot.impacts).toHaveLength(1);
+  expect(snapshot.impacts[0]?.orderImpact).toBe("reviewRequired");
+  expect(snapshot.impacts[0]?.reason).toContain("keep their history");
+  expect(snapshot.substitutes[0]?.state).toBe("pending");
+  expect(snapshot.substitutes[0]?.basisStale).toBe(false);
+  expect(snapshot.truncation.impacts).toBe(false);
+  expect(snapshot.truncation.substitutes).toBe(false);
+  expect(parseWorkbenchSnapshot(e8Projection({ impacts: [{ ...e8ImpactFixture(), orderImpact: "delayed" }] }), projection.project.id)).toBeNull();
+  expect(parseWorkbenchSnapshot(e8Projection({ substitutes: [{ ...e8SubstituteFixture(), basisStale: "no" }] }), projection.project.id)).toBeNull();
+});
+
+test("renders due decisions with reason, basis, and truncation in the inbox", async () => {
+  const snapshot = parseWorkbenchSnapshot(e8Projection({ impactsTruncated: true, substitutesTruncated: true }), projection.project.id);
+  if (snapshot === null) throw new Error("E8 projection should parse");
+  const mounted = await mountE8Tab({ state: "ready", snapshot }, () => ({ ok: false, message: "controlled test refusal" }));
+  try {
+    await mounted.clickTab("Inbox");
+    expect(mounted.container.textContent).toContain("Due decisions with their reason and basis.");
+    expect(mounted.container.textContent).toContain("keep their history");
+    expect(mounted.container.textContent).toContain("keeps current terms");
+    expect(mounted.container.textContent).toContain("still current");
+    expect(mounted.container.textContent).toContain("More changed-term assessments exist");
+    expect(mounted.container.textContent).toContain("More substitute proposals exist");
+    expect(mounted.findButton("Approve substitute").disabled).toBe(false);
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("stale substitute approval stays disabled and makes zero writes", async () => {
+  const snapshot = parseWorkbenchSnapshot(e8Projection({
+    substitutes: [e8SubstituteFixture({ basisStale: true, basisReason: "Proposed quote terms changed; renewed authority required." })],
+  }), projection.project.id);
+  if (snapshot === null) throw new Error("E8 projection should parse");
+  const actionCalls: string[] = [];
+  const mounted = await mountE8Tab({ state: "ready", snapshot }, (action: WorkbenchAction): WorkbenchActionResult => {
+    actionCalls.push(action.type);
+    return { ok: false, message: "controlled test refusal" };
+  });
+  try {
+    await mounted.clickTab("Inbox");
+    expect(mounted.container.textContent).toContain("Stale basis");
+    expect(mounted.container.textContent).toContain("Proposed quote terms changed");
+    expect(mounted.findButton("Approve substitute").disabled).toBe(true);
+    await act(async () => {
+      mounted.findButton("Approve substitute").click();
+    });
+    expect(actionCalls).toEqual([]);
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("approved substitute calls the authorized impact route and reports server text", async () => {
+  const snapshot = parseWorkbenchSnapshot(e8Projection(), projection.project.id);
+  if (snapshot === null) throw new Error("E8 projection should parse");
+  const actionCalls: WorkbenchAction[] = [];
+  const mounted = await mountE8Tab({ state: "ready", snapshot }, (action: WorkbenchAction): WorkbenchActionResult => {
+    actionCalls.push(action);
+    return { ok: true, message: "Substitute approved by the server; execute it as an explicit new selection." };
+  });
+  try {
+    await mounted.clickTab("Inbox");
+    await act(async () => {
+      mounted.findButton("Approve substitute").click();
+    });
+    expect(actionCalls).toEqual([{ type: "decideSubstituteProposal", projectId: projection.project.id, proposalId: "proposal-e8-1", decision: "approved" }]);
+    expect(mounted.container.textContent).toContain("Substitute approved by the server");
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("recovery lists changed-term impacts and pending substitutes with honest states", async () => {
+  const snapshot = parseWorkbenchSnapshot(e8Projection({
+    impacts: [e8ImpactFixture({ state: "unknown", orderImpact: "unknown", reason: "Watch check reported error; availability stays unknown and placed orders are unchanged" })],
+  }), projection.project.id);
+  if (snapshot === null) throw new Error("E8 projection should parse");
+  const mounted = await mountE8Tab({ state: "ready", snapshot }, () => ({ ok: false, message: "controlled test refusal" }));
+  try {
+    await mounted.clickTab("Recovery");
+    expect(mounted.container.textContent).toContain("availability stays unknown");
+    expect(mounted.container.textContent).toContain("placed orders are unchanged");
+    expect(mounted.container.textContent).toContain("keeps current terms");
+    expect(mounted.container.textContent).not.toContain("No recovery is waiting");
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("project tab banners due changed terms without claiming an order", async () => {
+  const snapshot = parseWorkbenchSnapshot(e8Projection(), projection.project.id);
+  if (snapshot === null) throw new Error("E8 projection should parse");
+  const mounted = await mountE8Tab({ state: "ready", snapshot }, () => ({ ok: false, message: "controlled test refusal" }));
+  try {
+    expect(mounted.container.textContent).toContain("Changed terms need review");
+    expect(mounted.container.textContent).toContain("No order was placed");
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("E8 cards reuse fluid panel layout with no fixed-width overflow", async () => {
+  const css = await Bun.file(new URL("../styles.css", import.meta.url)).text();
+  expect(css).not.toContain(".wb-impact-card {");
+  expect(css).not.toContain(".wb-substitute-card {");
+  expect(css).toContain("@media (max-width: 480px)");
+  const snapshot = parseWorkbenchSnapshot(e8Projection(), projection.project.id);
+  if (snapshot === null) throw new Error("E8 projection should parse");
+  const mounted = await mountE8Tab({ state: "ready", snapshot }, () => ({ ok: false, message: "controlled test refusal" }));
+  try {
+    await mounted.clickTab("Inbox");
+    expect(mounted.container.innerHTML).toContain("wb-impact-card");
+    expect(mounted.container.innerHTML).toContain("wb-substitute-card");
+  } finally {
+    await mounted.cleanup();
+  }
+});
