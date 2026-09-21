@@ -611,3 +611,21 @@ The OpenCode Go subscription endpoint returned insufficient account funds before
 This checkpoint is controlled evidence only.
 No hosted Convex deployment, live provider call, owner-mailbox exchange, genuine supplier response, public origin, purchase, realized saving or commercial outcome was observed.
 PR #14 still requires a pushed exact-head GitHub CI pass and a fresh separate GPT-6 Astra acceptance on the same commit before merge.
+
+### 2026-09-22 - exact-head intake recovery acceptance
+
+OpenCode Muse Spark 1.3 Free at high effort repaired the two final intake findings from the separate review.
+The real workbench adapter no longer performs an eager projection load after intake creation, so the parent connection, authentication and adapter epoch fence decides whether the returned project may be adopted.
+The application also reconciles an unchanged logical intake retry to its original server idempotency key across disconnect and remount, while an edited payload keeps a fresh key.
+
+The repair was integrated and pushed as exact PR #14 head `3fb685c`.
+The complete local `bun run test` command passed, including 24 direct Vitest files and 572 direct Convex tests; the 24 user-path tests passed with 230 assertions, both strict TypeScript checks passed and the production Vite build passed.
+All nine required GitHub application and repository checks passed on the same SHA, the exact-head delivery helper returned `pass`, and GitHub reported the PR mergeable.
+
+A separate Codex CLI GPT-6 Astra xhigh session accepted exact clean head `3fb685c` after 73 focused intake, user-path and adapter tests with 481 assertions, four prior independent probes and two new fully mounted real-adapter probes.
+Those controlled probes proved that a stale intake success performs no projection read, an unchanged reconnect retry reuses its original key, a changed payload gets a fresh key and a current-epoch success loads exactly once.
+No actionable finding remained in the assigned follow-up scope.
+
+This checkpoint is controlled evidence only.
+No hosted Convex deployment, live provider call, owner-mailbox exchange, genuine supplier response, public origin, purchase, realized saving or commercial outcome was observed.
+Greptile remains unavailable because its connected trial reports the 50-credit limit exhausted, and Devin's expired-trial skip is not treated as review approval.
