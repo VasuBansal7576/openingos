@@ -1,6 +1,7 @@
-import { convexTest } from "convex-test";
+import { convexTest, type TestConvex } from "convex-test";
+import agentmailTest from "@agentmail/convex/test";
 import { makeFunctionReference, type RegisteredAction, type RegisteredMutation } from "convex/server";
-import { describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import schema from "../schema.js";
 import type { Id } from "../_generated/dataModel.js";
 import * as callbacks from "./callbacks.js";
@@ -9,6 +10,11 @@ import * as send from "./send.js";
 import * as attempts from "../execution/attempts.js";
 import { canonicalJson, payloadHash } from "../shared/hashing.js";
 import { OUTBOUND_RETENTION_MS, reconciliationPricingBasis } from "./contracts.js";
+import { RECOVERY_READ_MAX_COST_ENV_VAR } from "./recoveryPolicy.js";
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 const rawModules = import.meta.glob([
   "../access/**/*.ts",
@@ -78,6 +84,16 @@ const recoveryGateRef = makeFunctionReference<
   MutationArgs<typeof callbacks.prepareOversizedRecovery>,
   MutationReturn<typeof callbacks.prepareOversizedRecovery>
 >("communication/callbacks:prepareOversizedRecovery");
+const claimRecoveryRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof callbacks.claimRecoveryRead>,
+  MutationReturn<typeof callbacks.claimRecoveryRead>
+>("communication/callbacks:claimRecoveryRead");
+const advanceMigrationRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof callbacks.advanceThreadMigration>,
+  MutationReturn<typeof callbacks.advanceThreadMigration>
+>("communication/callbacks:advanceThreadMigration");
 const recoverRef = makeFunctionReference<
   "action",
   ActionArgs<typeof send.recoverOversizedInbound>,
@@ -105,7 +121,7 @@ const DRAFT = {
 const CANONICAL_DRAFT = canonicalJson(DRAFT);
 
 interface Fixture {
-  readonly t: ReturnType<typeof convexTest>;
+  readonly t: TestConvex<typeof schema>;
   readonly organizationId: Id<"organizations">;
   readonly projectId: Id<"projects">;
   readonly conversationId: Id<"conversations">;
@@ -114,6 +130,15 @@ interface Fixture {
 
 async function fixture(state: "prepared" | "observedSuccess" | "outcomeUnknown" = "observedSuccess"): Promise<Fixture> {
   const t = convexTest(schema, modules);
+  // The official helper's internal glob evaluates empty under vitest, so
+  // register the compiled component entry directly with a relative import
+  // (bypassing the package export map, which exposes no dist subpaths).
+  // Only `lib.getMessage` is exercised; the marker satisfies module-root
+  // detection and is never loaded.
+  t.registerComponent("agentmail", agentmailTest.schema, {
+    lib: () => import("../../node_modules/@agentmail/convex/dist/component/lib.js"),
+    "_generated/component": () => Promise.resolve({}),
+  });
   const ids = await t.run(async (ctx) => {
     const now = Date.now();
     const organizationId = await ctx.db.insert("organizations", { name: "C1 controlled org", kind: "private", createdAt: now });
@@ -201,6 +226,181 @@ const inbound = (messageId: string, threadId: string, html = "", from = "owner@e
   references: [],
   attachments: [],
 });
+
+const RECOVERY_READ_COST = 10;
+
+function setRecoveryPricingEnv(cost: number | undefined): () => void {
+  const previous = process.env[RECOVERY_READ_MAX_COST_ENV_VAR];
+  if (cost === undefined) {
+    delete process.env[RECOVERY_READ_MAX_COST_ENV_VAR];
+  } else {
+    process.env[RECOVERY_READ_MAX_COST_ENV_VAR] = String(cost);
+  }
+  return () => {
+    if (previous === undefined) {
+      delete process.env[RECOVERY_READ_MAX_COST_ENV_VAR];
+    } else {
+      process.env[RECOVERY_READ_MAX_COST_ENV_VAR] = previous;
+    }
+  };
+}
+
+function setApiKeyEnv(key: string | undefined): () => void {
+  const previous = process.env.AGENTMAIL_API_KEY;
+  if (key === undefined) {
+    delete process.env.AGENTMAIL_API_KEY;
+  } else {
+    process.env.AGENTMAIL_API_KEY = key;
+  }
+  return () => {
+    if (previous === undefined) {
+      delete process.env.AGENTMAIL_API_KEY;
+    } else {
+      process.env.AGENTMAIL_API_KEY = previous;
+    }
+  };
+}
+
+async function ensureRecoveryBudget(f: Fixture, ceilingMicroUsd: number): Promise<void> {
+  await f.t.run(async (ctx) => {
+    const now = Date.now();
+    await ctx.db.insert("providerBudgets", {
+      organizationId: f.organizationId,
+      ceilingMicroUsd,
+      reservedMicroUsd: 0,
+      spentMicroUsd: 0,
+      unresolvedMicroUsd: 0,
+      pricingBasis: reconciliationPricingBasis(RECOVERY_READ_COST),
+      updatedAt: now,
+    });
+  });
+}
+
+async function readLedger(f: Fixture): Promise<{ reserved: number; spent: number; unresolved: number }> {
+  return await f.t.run(async (ctx) => {
+    const rows = await ctx.db.query("providerBudgets").take(2);
+    const budget = rows.find((row) => row.organizationId === f.organizationId);
+    if (budget === undefined) throw new Error("budget missing");
+    return {
+      reserved: budget.reservedMicroUsd,
+      spent: budget.spentMicroUsd,
+      unresolved: budget.unresolvedMicroUsd,
+    };
+  });
+}
+
+// Bounded verification reads used by the follow-up suite. Project evidence
+// and markers page their project indexes; thread identity and migration
+// state use their exact compound keys; job and reservation counts use
+// explicit take bounds. No verification read collects an unbounded table.
+async function projectEvidenceRows(f: Fixture) {
+  return await f.t.run(async (ctx) =>
+    await ctx.db.query("evidence").withIndex("by_project", (q) => q.eq("projectId", f.projectId)).take(16),
+  );
+}
+
+async function projectMarkerRows(f: Fixture) {
+  return await f.t.run(async (ctx) =>
+    await ctx.db.query("productEvidence").withIndex("by_project", (q) => q.eq("projectId", f.projectId)).take(32),
+  );
+}
+
+async function threadIdentityRows(f: Fixture, threadId: string) {
+  return await f.t.run(async (ctx) =>
+    await ctx.db
+      .query("threadBindings")
+      .withIndex("by_provider_environment_and_thread_and_inbox", (q) =>
+        q
+          .eq("provider", "agentmail-binding")
+          .eq("environment", "live")
+          .eq("providerThreadId", threadId)
+          .eq("providerInboxId", "owner-inbox"),
+      )
+      .take(2),
+  );
+}
+
+async function migrationStateRows(f: Fixture, threadId: string) {
+  return await f.t.run(async (ctx) =>
+    await ctx.db
+      .query("threadMigrationStates")
+      .withIndex("by_provider_environment_and_thread_and_inbox", (q) =>
+        q
+          .eq("provider", "agentmail-binding")
+          .eq("environment", "live")
+          .eq("providerThreadId", threadId)
+          .eq("providerInboxId", "owner-inbox"),
+      )
+      .take(2),
+  );
+}
+
+async function executionJobs(f: Fixture) {
+  return await f.t.run(async (ctx) =>
+    (await ctx.db.query("jobs").withIndex("by_project", (q) => q.eq("projectId", f.projectId)).take(65)).filter(
+      (row) => row.kind === "execution",
+    ),
+  );
+}
+
+async function reservationRows(f: Fixture) {
+  return await f.t.run(async (ctx) => await ctx.db.query("reservations").take(65));
+}
+
+/**
+ * Seed a retained oversized row directly with controlled marker fields.
+ * The row claims a byte size above the durable snapshot bound without
+ * shuttling a quarter-megabyte string through the test boundary, so
+ * fence tests stay deterministic; only the end-to-end bytes test moves
+ * real oversized content.
+ */
+async function seedOversizedRow(
+  f: Fixture,
+  messageId: string,
+  threadId: string,
+  marker: { readonly contentHash: string; readonly byteSize: number; readonly recoveryAttempts?: number },
+): Promise<void> {
+  await f.t.run(async (ctx) => {
+    const now = Date.now();
+    await ctx.db.insert("processedEvents", {
+      provider: "agentmail-inbound",
+      environment: "live",
+      eventId: `seed-${messageId}`,
+      processingVersion: 1,
+      outcome: JSON.stringify({
+        messageId,
+        threadId,
+        inboxId: "owner-inbox",
+        reason: "no verified conversation binding",
+        snapshotOversized: true,
+        contentHash: marker.contentHash,
+        byteSize: marker.byteSize,
+        ...(marker.recoveryAttempts === undefined ? {} : { recoveryAttempts: marker.recoveryAttempts }),
+      }),
+      providerMessageId: messageId,
+      providerThreadId: threadId,
+      providerInboxId: "owner-inbox",
+      applicationOutcome: "unknown",
+      applicationState: "outcomeUnknown",
+      createdAt: now,
+    });
+  });
+}
+
+function stubGetMessage(payload: unknown, status = 200): { calls: string[] } {
+  const calls: string[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: string | URL | Request) => {
+      calls.push(String(input instanceof Request ? input.url : input));
+      return new Response(JSON.stringify(payload), {
+        status,
+        headers: { "content-type": "application/json" },
+      });
+    }),
+  );
+  return { calls };
+}
 
 async function insertUnrelatedProcessedEvents(f: Fixture, count: number): Promise<void> {
   await f.t.run(async (ctx) => {
@@ -1000,9 +1200,7 @@ describe("C1 Astra follow-up repairs (F04/F05/F09/F10/F11/F12)", () => {
     expect(bound).toMatchObject({ ok: true });
     const replay = await f.t.mutation(replayRef, { threadId: "f10-big-thread", inboxId: "owner-inbox" });
     expect(replay).toMatchObject({ ok: true, replayed: 0, stillWaiting: 0 });
-    const evidence = await f.t.run(async (ctx) =>
-      (await ctx.db.query("evidence").collect()).filter((row) => row.projectId === f.projectId),
-    );
+    const evidence = await projectEvidenceRows(f);
     expect(evidence).toHaveLength(1);
     // The stored source hash covers the exact full body, never a truncation.
     expect(evidence[0]?.contentHash).toBe(payloadHash({ messageId: "f10-big", text: big, html: "" }));
@@ -1097,10 +1295,10 @@ describe("C1 Astra follow-up repairs (F04/F05/F09/F10/F11/F12)", () => {
       eventId: "f12-inbound",
     });
     expect(withAttachments).toMatchObject({ ok: true, state: "replyReceived", deduplicated: false });
-    const rows = await f.t.run(async (ctx) => ({
-      evidence: (await ctx.db.query("evidence").collect()).filter((row) => row.projectId === f.projectId),
-      markers: (await ctx.db.query("productEvidence").collect()).filter((row) => row.projectId === f.projectId),
-    }));
+    const rows = {
+      evidence: await projectEvidenceRows(f),
+      markers: await projectMarkerRows(f),
+    };
     expect(rows.evidence).toHaveLength(1);
     expect(rows.evidence[0]?.completeness).toBe("partial");
     expect(rows.markers.some((row) => row.idempotencyKey === "agentmail:f12-reply:source:1:missing:attachment")).toBe(true);
@@ -1110,10 +1308,8 @@ describe("C1 Astra follow-up repairs (F04/F05/F09/F10/F11/F12)", () => {
       eventId: "f12-inbound-plain",
     });
     expect(textOnly).toMatchObject({ ok: true, state: "replyReceived" });
-    const plain = await f.t.run(async (ctx) =>
-      (await ctx.db.query("evidence").collect()).filter(
-        (row) => row.projectId === f.projectId && row.contentHash !== rows.evidence[0]?.contentHash,
-      ),
+    const plain = (await projectEvidenceRows(f)).filter(
+      (row) => row.contentHash !== rows.evidence[0]?.contentHash,
     );
     expect(plain).toHaveLength(1);
     expect(plain[0]?.completeness).toBe("complete");
@@ -1144,65 +1340,62 @@ describe("C1 Greptile P1 replay/scale repairs (r4058523015/r4058523016/r40585230
     expect(second).toEqual({ ok: true, replayed: 4, stillWaiting: 0 });
     const drained = await f.t.mutation(replayRef, { threadId: "starve-thread", inboxId: "owner-inbox" });
     expect(drained).toEqual({ ok: true, replayed: 0, stillWaiting: 0 });
-    const evidence = await f.t.run(async (ctx) =>
-      (await ctx.db.query("evidence").collect()).filter((row) => row.projectId === f.projectId),
-    );
+    const evidence = await projectEvidenceRows(f);
     expect(evidence).toHaveLength(12);
-    const markers = await f.t.run(async (ctx) =>
-      (await ctx.db.query("productEvidence").collect()).filter(
-        (row) => row.projectId === f.projectId && row.field === "agentmail.message",
-      ),
-    );
+    const markers = (await projectMarkerRows(f)).filter((row) => row.field === "agentmail.message");
     expect(markers).toHaveLength(12);
   });
 
-  test("bodies past the durable snapshot bound wait explicitly and resume with exact bytes", async () => {
+  test("oversized replies wait explicitly and schedule their bounded recovery", async () => {
     const f = await fixture();
-    // Minimal just-over-bound body: one byte past the durable snapshot
-    // bound, so the oversized path is exercised without oversized cost.
     const giant = `z`.repeat(262_145);
-    const giantMessage = { ...inbound("giant-reply", "giant-thread"), text: giant };
     const early = await f.t.mutation(ingestMessageRef, {
-      message: giantMessage,
-      thread: { thread_id: "giant-thread" },
-      eventId: "giant-early",
+      message: { ...inbound("sched-reply", "sched-thread"), text: giant },
+      thread: { thread_id: "sched-thread" },
+      eventId: "sched-early",
     });
     expect(early).toMatchObject({ ok: true, state: "waitingForBinding" });
     const bound = await f.t.mutation(bindingRef, {
       operationId: f.operationId,
-      messageId: "giant-outbound",
-      threadId: "giant-thread",
+      messageId: "sched-outbound",
+      threadId: "sched-thread",
       inboxId: "owner-inbox",
     });
     expect(bound).toMatchObject({ ok: true });
-    const replay = await f.t.mutation(replayRef, { threadId: "giant-thread", inboxId: "owner-inbox" });
+    // The retained marker carries the exact source hash without truncation.
+    const marker = await f.t.run(async (ctx) => {
+      const rows = await ctx.db
+        .query("processedEvents")
+        .withIndex("by_provider_environment_and_provider_message_and_thread_and_inbox", (q) =>
+          q
+            .eq("provider", "agentmail-inbound")
+            .eq("environment", "live")
+            .eq("providerMessageId", "sched-reply")
+            .eq("providerThreadId", "sched-thread")
+            .eq("providerInboxId", "owner-inbox"),
+        )
+        .take(2);
+      return rows[0] === undefined ? null : JSON.parse(rows[0].outcome as string) as Record<string, unknown>;
+    });
+    expect(marker).toMatchObject({
+      snapshotOversized: true,
+      contentHash: payloadHash({ messageId: "sched-reply", text: giant, html: "" }),
+      byteSize: 262_145,
+    });
+    const replay = await f.t.mutation(replayRef, { threadId: "sched-thread", inboxId: "owner-inbox" });
     expect(replay).toMatchObject({ ok: true, replayed: 0, stillWaiting: 1 });
-    const before = await f.t.run(async (ctx) =>
-      (await ctx.db.query("evidence").collect()).filter((row) => row.projectId === f.projectId),
-    );
-    expect(before).toHaveLength(0);
-    // Conflicting bytes fail closed: no evidence and no success claim.
-    const tampered = await f.t.mutation(resumeRef, {
-      message: { ...giantMessage, text: `${giant}x` },
-      eventId: "giant-resume-tampered",
-    });
-    expect(tampered).toMatchObject({ ok: false, code: "invalid-payload" });
-    // The exact bytes resume through the same validated ingest core.
-    const resumed = await f.t.mutation(resumeRef, { message: giantMessage, eventId: "giant-resume" });
-    expect(resumed).toMatchObject({ ok: true, state: "replyReceived", deduplicated: false });
-    const evidence = await f.t.run(async (ctx) =>
-      (await ctx.db.query("evidence").collect()).filter((row) => row.projectId === f.projectId),
-    );
-    expect(evidence).toHaveLength(1);
-    expect(evidence[0]?.contentHash).toBe(payloadHash({ messageId: "giant-reply", text: giant, html: "" }));
-    // Re-delivery through the live callback path deduplicates by marker.
-    const redelivery = await f.t.mutation(ingestMessageRef, {
-      message: giantMessage,
-      thread: { thread_id: "giant-thread" },
-      eventId: "giant-resume-redelivery",
-    });
-    expect(redelivery).toMatchObject({ ok: true, state: "replyReceived", deduplicated: true });
-  }, 120_000);
+    // Reachable scheduling: the replay enqueued the recovery action, which
+    // runs here and denies before any provider read (no pricing configured).
+    const { calls } = stubGetMessage(null, 500);
+    await f.t.finishAllScheduledFunctions(() => {});
+    expect(calls).toHaveLength(0);
+    const evidence = await projectEvidenceRows(f);
+    expect(evidence).toHaveLength(0);
+    const replayed = await f.t.mutation(replayRef, { threadId: "sched-thread", inboxId: "owner-inbox" });
+    expect(replayed).toMatchObject({ ok: true, replayed: 0, stillWaiting: 1 });
+    // Drain the recovery scheduled by the trailing replay as well.
+    await f.t.finishAllScheduledFunctions(() => {});
+  });
 
   test("more than 64 compatible thread bindings keep routing and quote proof; conflicts fail closed", async () => {
     const f = await fixture();
@@ -1245,11 +1438,23 @@ describe("C1 Greptile P1 replay/scale repairs (r4058523015/r4058523016/r40585230
       });
       expect(bound).toMatchObject({ ok: true });
     }
-    const identities = await f.t.run(async (ctx) =>
-      (await ctx.db.query("threadBindings").collect()).filter((row) => row.providerThreadId === "scale-thread"),
-    );
+    const identities = await threadIdentityRows(f, "scale-thread");
     expect(identities).toHaveLength(1);
     expect(identities[0]?.conversationId).toBe(f.conversationId);
+    // Coordinated R1 bridge: the project-scoped requestKey index resolves
+    // one operation without grant enumeration.
+    // Coordinated R1 bridge: the project-scoped requestKey index resolves
+    // one operation without grant enumeration.
+    const indexed = await f.t.run(async (ctx) =>
+      await ctx.db
+        .query("operations")
+        .withIndex("by_project_and_requestKey", (q) =>
+          q.eq("projectId", f.projectId).eq("requestKey", "scale-request-key-0"),
+        )
+        .unique(),
+    );
+    expect(indexed?.requestId).toBe("scale-request-0");
+    expect(indexed?.requestId).toBe("scale-request-0");
     const reply = await f.t.mutation(ingestMessageRef, {
       message: inbound("scale-reply", "scale-thread", "<p>Long-thread terms</p>"),
       thread: { thread_id: "scale-thread" },
@@ -1397,142 +1602,613 @@ describe("C1 Greptile P1 replay/scale repairs (r4058523015/r4058523016/r40585230
       eventId: "legacy-inbound",
     });
     expect(reply).toMatchObject({ ok: true, state: "replyReceived", deduplicated: false });
-    const identities = await f.t.run(async (ctx) => (await ctx.db.query("threadBindings").collect()));
+    const identities = await threadIdentityRows(f, "legacy-thread");
     expect(identities).toHaveLength(1);
     expect(identities[0]?.conversationId).toBe(f.conversationId);
     expect(identities[0]?.providerThreadId).toBe("legacy-thread");
   });
 
-  test("recovery gate fails closed without a waiting oversized row and never fetches", async () => {
+  test("recovery gate fails closed on identity, attempts, authority, pricing, and allowance", async () => {
     const f = await fixture();
-    const gated = await f.t.mutation(recoveryGateRef, {
+    const absent = await f.t.mutation(recoveryGateRef, {
       threadId: "absent-thread",
       inboxId: "owner-inbox",
       messageId: "absent-message",
     });
-    expect(gated).toMatchObject({ ok: false, code: "invalid-payload" });
-    const originalFetch = globalThis.fetch;
-    let calls = 0;
-    globalThis.fetch = (async () => {
-      calls += 1;
-      throw new Error("must not fetch before the gate passes");
-    }) as unknown as typeof fetch;
-    try {
-      const recovered = await f.t.action(recoverRef, {
-        threadId: "absent-thread",
-        inboxId: "owner-inbox",
-        messageId: "absent-message",
-      });
-      expect(recovered).toMatchObject({ ok: false, code: "invalid-payload" });
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
-    expect(calls).toBe(0);
+    expect(absent).toMatchObject({ ok: false, code: "invalid-payload" });
+    // A snapshot (non-oversized) waiting row is not a recovery candidate.
+    await f.t.mutation(ingestMessageRef, {
+      message: inbound("small-reply", "small-thread", "<p>Small</p>"),
+      thread: { thread_id: "small-thread" },
+      eventId: "small-early",
+    });
+    const notOversized = await f.t.mutation(recoveryGateRef, {
+      threadId: "small-thread",
+      inboxId: "owner-inbox",
+      messageId: "small-reply",
+    });
+    expect(notOversized).toMatchObject({ ok: false, code: "invalid-payload" });
+    // An exhausted budget admits no run.
+    await seedOversizedRow(f, "done-reply", "done-thread", {
+      contentHash: "controlled",
+      byteSize: 300_000,
+      recoveryAttempts: 3,
+    });
+    const exhausted = await f.t.mutation(recoveryGateRef, {
+      threadId: "done-thread",
+      inboxId: "owner-inbox",
+      messageId: "done-reply",
+    });
+    expect(exhausted).toMatchObject({ ok: false, code: "recovery-attempts-exhausted" });
+    // A revoked grant stops admission even with a bound thread.
+    await f.t.mutation(bindingRef, {
+      operationId: f.operationId,
+      messageId: "revoked-outbound",
+      threadId: "revoked-thread",
+      inboxId: "owner-inbox",
+    });
+    await seedOversizedRow(f, "revoked-reply", "revoked-thread", { contentHash: "controlled", byteSize: 300_000 });
+    await f.t.run(async (ctx) => {
+      const conversation = await ctx.db.get(f.conversationId);
+      if (conversation === null) throw new Error("conversation missing");
+      await ctx.db.patch(conversation.grantId, { status: "revoked" });
+    });
+    const revoked = await f.t.mutation(recoveryGateRef, {
+      threadId: "revoked-thread",
+      inboxId: "owner-inbox",
+      messageId: "revoked-reply",
+    });
+    expect(revoked).toMatchObject({ ok: false, code: "alternate-channel-denied" });
+    // Drain the recovery scheduled at bind time so it cannot leak into
+    // later tests: without pricing it denies with zero reads.
+    await f.t.finishAllScheduledFunctions(() => {});
   });
 
-  test("bounded provider read recovers an oversized reply end to end", async () => {
+  test("recovery gate requires pricing and allowance before admitting a run", async () => {
     const f = await fixture();
+    await f.t.mutation(bindingRef, {
+      operationId: f.operationId,
+      messageId: "price-outbound",
+      threadId: "price-thread",
+      inboxId: "owner-inbox",
+    });
+    await seedOversizedRow(f, "price-reply", "price-thread", { contentHash: "controlled", byteSize: 300_000 });
+    const restorePricing = setRecoveryPricingEnv(undefined);
+    try {
+      const unpriced = await f.t.mutation(recoveryGateRef, {
+        threadId: "price-thread",
+        inboxId: "owner-inbox",
+        messageId: "price-reply",
+      });
+      expect(unpriced).toMatchObject({ ok: false, code: "invalid-pricing-config" });
+    } finally {
+      restorePricing();
+    }
+    const restoreCost = setRecoveryPricingEnv(RECOVERY_READ_COST);
+    try {
+      await ensureRecoveryBudget(f, 5);
+      const exhausted = await f.t.mutation(recoveryGateRef, {
+        threadId: "price-thread",
+        inboxId: "owner-inbox",
+        messageId: "price-reply",
+      });
+      expect(exhausted).toMatchObject({ ok: false, code: "allowance-exhausted" });
+    } finally {
+      restoreCost();
+    }
+  });
+
+  test("denied admission leaves no orphan execution job", async () => {
+    const f = await fixture();
+    const restorePricing = setRecoveryPricingEnv(RECOVERY_READ_COST);
+    try {
+      await ensureRecoveryBudget(f, 5);
+      await f.t.mutation(bindingRef, {
+        operationId: f.operationId,
+        messageId: "orphan-outbound",
+        threadId: "orphan-thread",
+        inboxId: "owner-inbox",
+      });
+      await seedOversizedRow(f, "orphan-reply", "orphan-thread", { contentHash: "controlled", byteSize: 300_000 });
+      const denied = await f.t.mutation(recoveryGateRef, {
+        threadId: "orphan-thread",
+        inboxId: "owner-inbox",
+        messageId: "orphan-reply",
+      });
+      expect(denied).toMatchObject({ ok: false, code: "allowance-exhausted" });
+      expect(await executionJobs(f)).toHaveLength(0);
+      expect(await reservationRows(f)).toHaveLength(0);
+      expect(await readLedger(f)).toEqual({ reserved: 0, spent: 0, unresolved: 0 });
+    } finally {
+      restorePricing();
+    }
+  });
+
+  test("recovery gate admits one reserved run and reuses it", async () => {
+    const f = await fixture();
+    const restorePricing = setRecoveryPricingEnv(RECOVERY_READ_COST);
+    try {
+      await ensureRecoveryBudget(f, 1_000);
+      await f.t.mutation(bindingRef, {
+        operationId: f.operationId,
+        messageId: "run-outbound",
+        threadId: "run-thread",
+        inboxId: "owner-inbox",
+      });
+      await seedOversizedRow(f, "run-reply", "run-thread", { contentHash: "controlled", byteSize: 300_000 });
+      const first = await f.t.mutation(recoveryGateRef, {
+        threadId: "run-thread",
+        inboxId: "owner-inbox",
+        messageId: "run-reply",
+      });
+      expect(first).toMatchObject({ ok: true, readsRemaining: 3, readCostMicroUsd: RECOVERY_READ_COST });
+      if (!first.ok) throw new Error("gate denied");
+      expect(await readLedger(f)).toEqual({ reserved: 30, spent: 0, unresolved: 0 });
+      const second = await f.t.mutation(recoveryGateRef, {
+        threadId: "run-thread",
+        inboxId: "owner-inbox",
+        messageId: "run-reply",
+      });
+      expect(second).toMatchObject({ ok: true, jobId: first.jobId, reservationId: first.reservationId });
+      expect(await executionJobs(f)).toHaveLength(1);
+      const runReservations = await reservationRows(f);
+      expect(runReservations).toHaveLength(1);
+      expect(runReservations[0]?.pricingBasis).toBe(reconciliationPricingBasis(RECOVERY_READ_COST));
+      expect(await readLedger(f)).toEqual({ reserved: 30, spent: 0, unresolved: 0 });
+    } finally {
+      restorePricing();
+    }
+  });
+
+  test("recovery claims stop after three admitted reads", async () => {
+    const f = await fixture();
+    await f.t.mutation(bindingRef, {
+      operationId: f.operationId,
+      messageId: "claim-outbound",
+      threadId: "claim-thread",
+      inboxId: "owner-inbox",
+    });
+    await seedOversizedRow(f, "claim-reply", "claim-thread", { contentHash: "controlled", byteSize: 300_000 });
+    expect(await f.t.mutation(claimRecoveryRef, {
+      threadId: "claim-thread",
+      inboxId: "owner-inbox",
+      messageId: "claim-reply",
+    })).toMatchObject({ ok: true, attemptNumber: 1 });
+    expect(await f.t.mutation(claimRecoveryRef, {
+      threadId: "claim-thread",
+      inboxId: "owner-inbox",
+      messageId: "claim-reply",
+    })).toMatchObject({ ok: true, attemptNumber: 2 });
+    expect(await f.t.mutation(claimRecoveryRef, {
+      threadId: "claim-thread",
+      inboxId: "owner-inbox",
+      messageId: "claim-reply",
+    })).toMatchObject({ ok: true, attemptNumber: 3 });
+    expect(await f.t.mutation(claimRecoveryRef, {
+      threadId: "claim-thread",
+      inboxId: "owner-inbox",
+      messageId: "claim-reply",
+    })).toMatchObject({ ok: false, code: "recovery-attempts-exhausted" });
+  });
+
+  test("resume denies conflicting bytes without exact content", async () => {
+    const f = await fixture();
+    await f.t.mutation(bindingRef, {
+      operationId: f.operationId,
+      messageId: "tamper-outbound",
+      threadId: "tamper-thread",
+      inboxId: "owner-inbox",
+    });
+    await seedOversizedRow(f, "tamper-reply", "tamper-thread", { contentHash: "controlled-mismatch", byteSize: 300_000 });
+    const tampered = await f.t.mutation(resumeRef, {
+      message: inbound("tamper-reply", "tamper-thread", "<p>Different bytes</p>"),
+      eventId: "tamper-resume",
+    });
+    expect(tampered).toMatchObject({ ok: false, code: "invalid-payload" });
+    expect(await projectEvidenceRows(f)).toHaveLength(0);
+  });
+
+  test("exact component get with conflicting bytes fails closed without success", async () => {
+    const f = await fixture();
+    const restorePricing = setRecoveryPricingEnv(RECOVERY_READ_COST);
+    const restoreKey = setApiKeyEnv("controlled-recovery-key");
+    try {
+      await ensureRecoveryBudget(f, 1_000);
+      await f.t.mutation(bindingRef, {
+        operationId: f.operationId,
+        messageId: "exact-outbound",
+        threadId: "exact-thread",
+        inboxId: "owner-inbox",
+      });
+      await seedOversizedRow(f, "exact-reply", "exact-thread", {
+        contentHash: "controlled-mismatch",
+        byteSize: 300_000,
+      });
+      // The stub answers the official exact-getMessage call with bytes that
+      // do not match the retained source hash.
+      const { calls } = stubGetMessage({
+        message_id: "exact-reply",
+        thread_id: "exact-thread",
+        inbox_id: "owner-inbox",
+        from: "owner@example.test",
+        to: ["owner@example.test"],
+        subject: "Controlled RFQ reply",
+        text: "Different terms",
+        html: "",
+        timestamp: Date.now(),
+      });
+      const recovered = await f.t.action(recoverRef, {
+        threadId: "exact-thread",
+        inboxId: "owner-inbox",
+        messageId: "exact-reply",
+      });
+      expect(calls).toHaveLength(1);
+      expect(calls[0]).toBe("https://api.agentmail.to/v0/inboxes/owner-inbox/messages/exact-reply");
+      expect(recovered).toMatchObject({ ok: false, code: "invalid-payload" });
+      expect(await projectEvidenceRows(f)).toHaveLength(0);
+      const replay = await f.t.mutation(replayRef, { threadId: "exact-thread", inboxId: "owner-inbox" });
+      expect(replay).toMatchObject({ ok: true, replayed: 0, stillWaiting: 1 });
+      expect(await readLedger(f)).toEqual({ reserved: 0, spent: 0, unresolved: 10 });
+    } finally {
+      restorePricing();
+      restoreKey();
+    }
+    // Drain the recovery scheduled by the trailing replay: without pricing
+    // it denies with zero reads instead of leaking into later tests.
+    await f.t.finishAllScheduledFunctions(() => {});
+  });
+
+  test("bounded component read recovers an oversized reply end to end", async () => {
+    const f = await fixture();
+    // Minimal just-over-bound body: one byte past the durable snapshot
+    // bound. Only the stubbed provider read and the resume sink move these
+    // bytes; the retained row carries their exact hash.
     const giant = `z`.repeat(262_145);
     const giantMessage = { ...inbound("recover-reply", "recover-thread"), text: giant };
-    const early = await f.t.mutation(ingestMessageRef, {
-      message: giantMessage,
-      thread: { thread_id: "recover-thread" },
-      eventId: "recover-early",
-    });
-    expect(early).toMatchObject({ ok: true, state: "waitingForBinding" });
-    const bound = await f.t.mutation(bindingRef, {
-      operationId: f.operationId,
-      messageId: "recover-outbound",
-      threadId: "recover-thread",
-      inboxId: "owner-inbox",
-    });
-    expect(bound).toMatchObject({ ok: true });
-    const gated = await f.t.mutation(recoveryGateRef, {
-      threadId: "recover-thread",
-      inboxId: "owner-inbox",
-      messageId: "recover-reply",
-    });
-    expect(gated).toEqual({ ok: true });
-    const originalFetch = globalThis.fetch;
-    const originalKey = process.env.AGENTMAIL_API_KEY;
-    let calls = 0;
-    globalThis.fetch = (async () => {
-      calls += 1;
-      return { ok: true, status: 200, text: async () => JSON.stringify({ messages: [giantMessage] }) };
-    }) as unknown as typeof fetch;
-    process.env.AGENTMAIL_API_KEY = "controlled-recovery-key";
+    const restorePricing = setRecoveryPricingEnv(RECOVERY_READ_COST);
+    const restoreKey = setApiKeyEnv("controlled-recovery-key");
     try {
+      await ensureRecoveryBudget(f, 1_000);
+      await f.t.mutation(bindingRef, {
+        operationId: f.operationId,
+        messageId: "recover-outbound",
+        threadId: "recover-thread",
+        inboxId: "owner-inbox",
+      });
+      await seedOversizedRow(f, "recover-reply", "recover-thread", {
+        contentHash: payloadHash({ messageId: "recover-reply", text: giant, html: "" }),
+        byteSize: 262_145,
+      });
+      const { calls } = stubGetMessage(giantMessage);
       const recovered = await f.t.action(recoverRef, {
         threadId: "recover-thread",
         inboxId: "owner-inbox",
         messageId: "recover-reply",
       });
+      expect(calls).toHaveLength(1);
+      expect(calls[0]).toBe("https://api.agentmail.to/v0/inboxes/owner-inbox/messages/recover-reply");
       expect(recovered).toMatchObject({ ok: true, state: "replyReceived", deduplicated: false });
+      const evidence = await projectEvidenceRows(f);
+      expect(evidence).toHaveLength(1);
+      expect(evidence[0]?.contentHash).toBe(payloadHash({ messageId: "recover-reply", text: giant, html: "" }));
+      expect(await readLedger(f)).toEqual({ reserved: 0, spent: 0, unresolved: 10 });
+      // A second recovery finds no waiting row, so it denies with zero reads.
+      const again = await f.t.action(recoverRef, {
+        threadId: "recover-thread",
+        inboxId: "owner-inbox",
+        messageId: "recover-reply",
+      });
+      expect(again).toMatchObject({ ok: false, code: "invalid-payload" });
+      expect(calls).toHaveLength(1);
+      expect(await projectEvidenceRows(f)).toHaveLength(1);
     } finally {
-      globalThis.fetch = originalFetch;
-      if (originalKey === undefined) {
-        delete process.env.AGENTMAIL_API_KEY;
-      } else {
-        process.env.AGENTMAIL_API_KEY = originalKey;
-      }
+      restorePricing();
+      restoreKey();
     }
-    expect(calls).toBe(1);
-    const evidence = await f.t.run(async (ctx) =>
-      (await ctx.db.query("evidence").collect()).filter((row) => row.projectId === f.projectId),
-    );
-    expect(evidence).toHaveLength(1);
-    expect(evidence[0]?.contentHash).toBe(payloadHash({ messageId: "recover-reply", text: giant, html: "" }));
-    // A second recovery finds no waiting row, so it denies before fetching.
-    const again = await f.t.action(recoverRef, {
-      threadId: "recover-thread",
-      inboxId: "owner-inbox",
-      messageId: "recover-reply",
-    });
-    expect(again).toMatchObject({ ok: false, code: "invalid-payload" });
+  }, 120_000);
+
+  test("transient provider failures stop after three admitted reads", async () => {
+    const f = await fixture();
+    const restorePricing = setRecoveryPricingEnv(RECOVERY_READ_COST);
+    const restoreKey = setApiKeyEnv("controlled-recovery-key");
+    try {
+      await ensureRecoveryBudget(f, 1_000);
+      await f.t.mutation(bindingRef, {
+        operationId: f.operationId,
+        messageId: "flaky-outbound",
+        threadId: "flaky-thread",
+        inboxId: "owner-inbox",
+      });
+      await seedOversizedRow(f, "flaky-reply", "flaky-thread", { contentHash: "controlled", byteSize: 300_000 });
+      const { calls } = stubGetMessage({ error: "transient" }, 500);
+      const recovered = await f.t.action(recoverRef, {
+        threadId: "flaky-thread",
+        inboxId: "owner-inbox",
+        messageId: "flaky-reply",
+      });
+      expect(calls).toHaveLength(3);
+      expect(recovered).toMatchObject({ ok: true, outcome: "unknown" });
+      expect(await readLedger(f)).toEqual({ reserved: 0, spent: 0, unresolved: 30 });
+      const replay = await f.t.mutation(replayRef, { threadId: "flaky-thread", inboxId: "owner-inbox" });
+      expect(replay).toMatchObject({ ok: true, replayed: 0, stillWaiting: 1 });
+      const again = await f.t.action(recoverRef, {
+        threadId: "flaky-thread",
+        inboxId: "owner-inbox",
+        messageId: "flaky-reply",
+      });
+      expect(again).toMatchObject({ ok: false, code: "recovery-attempts-exhausted" });
+      expect(calls).toHaveLength(3);
+    } finally {
+      restorePricing();
+      restoreKey();
+    }
   });
 
-  test("empty provider list stays unknown and keeps the reply waiting", async () => {
+  test("definitive provider rejection releases the run", async () => {
     const f = await fixture();
-    const giant = `z`.repeat(262_145);
-    await f.t.mutation(ingestMessageRef, {
-      message: { ...inbound("unknown-reply", "unknown-thread"), text: giant },
-      thread: { thread_id: "unknown-thread" },
-      eventId: "unknown-early",
+    const restorePricing = setRecoveryPricingEnv(RECOVERY_READ_COST);
+    const restoreKey = setApiKeyEnv("controlled-recovery-key");
+    try {
+      await ensureRecoveryBudget(f, 1_000);
+      await f.t.mutation(bindingRef, {
+        operationId: f.operationId,
+        messageId: "gone-outbound",
+        threadId: "gone-thread",
+        inboxId: "owner-inbox",
+      });
+      await seedOversizedRow(f, "gone-reply", "gone-thread", { contentHash: "controlled", byteSize: 300_000 });
+      const { calls } = stubGetMessage({ error: "gone" }, 404);
+      const recovered = await f.t.action(recoverRef, {
+        threadId: "gone-thread",
+        inboxId: "owner-inbox",
+        messageId: "gone-reply",
+      });
+      expect(calls).toHaveLength(1);
+      expect(recovered).toMatchObject({ ok: true, outcome: "unknown", reason: "provider definitively rejected the read" });
+      expect(await readLedger(f)).toEqual({ reserved: 0, spent: 0, unresolved: 0 });
+      const jobs = await executionJobs(f);
+      expect(jobs).toHaveLength(1);
+      expect(jobs[0]?.state).toBe("failed");
+    } finally {
+      restorePricing();
+      restoreKey();
+    }
+  });
+
+  test("missing credentials cause zero provider reads", async () => {
+    const f = await fixture();
+    const restorePricing = setRecoveryPricingEnv(RECOVERY_READ_COST);
+    const restoreKey = setApiKeyEnv(undefined);
+    try {
+      await ensureRecoveryBudget(f, 1_000);
+      await f.t.mutation(bindingRef, {
+        operationId: f.operationId,
+        messageId: "nokey-outbound",
+        threadId: "nokey-thread",
+        inboxId: "owner-inbox",
+      });
+      await seedOversizedRow(f, "nokey-reply", "nokey-thread", { contentHash: "controlled", byteSize: 300_000 });
+      const { calls } = stubGetMessage({ error: "must-not-read" }, 500);
+      const recovered = await f.t.action(recoverRef, {
+        threadId: "nokey-thread",
+        inboxId: "owner-inbox",
+        messageId: "nokey-reply",
+      });
+      expect(recovered).toMatchObject({ ok: false, code: "provider-rejection" });
+      expect(calls).toHaveLength(0);
+      // A config denial admits nothing: no run job, no reservation.
+      expect(await executionJobs(f)).toHaveLength(0);
+      expect(await reservationRows(f)).toHaveLength(0);
+      expect(await readLedger(f)).toEqual({ reserved: 0, spent: 0, unresolved: 0 });
+    } finally {
+      restorePricing();
+      restoreKey();
+    }
+  });
+
+  test("a hung provider read trips the per-read deadline", async () => {
+    const f = await fixture();
+    const restorePricing = setRecoveryPricingEnv(RECOVERY_READ_COST);
+    const restoreKey = setApiKeyEnv("controlled-recovery-key");
+    try {
+      await ensureRecoveryBudget(f, 1_000);
+      await f.t.mutation(bindingRef, {
+        operationId: f.operationId,
+        messageId: "hung-outbound",
+        threadId: "hung-thread",
+        inboxId: "owner-inbox",
+      });
+      await seedOversizedRow(f, "hung-reply", "hung-thread", {
+        contentHash: "controlled",
+        byteSize: 300_000,
+        recoveryAttempts: 2,
+      });
+      const calls: string[] = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: string | URL | Request) => {
+          calls.push(String(input instanceof Request ? input.url : input));
+          return new Promise<Response>(() => {});
+        }),
+      );
+      const recovered = await f.t.action(recoverRef, {
+        threadId: "hung-thread",
+        inboxId: "owner-inbox",
+        messageId: "hung-reply",
+      });
+      expect(calls).toHaveLength(1);
+      expect(calls).toHaveLength(1);
+      expect(recovered).toMatchObject({ ok: true, outcome: "unknown" });
+      expect(await readLedger(f)).toEqual({ reserved: 0, spent: 0, unresolved: 10 });
+    } finally {
+      restorePricing();
+      restoreKey();
+    }
+  }, 60_000);
+
+  async function seedThreadBindings(
+    f: Fixture,
+    threadId: string,
+    count: number,
+    operationId: Id<"operations">,
+    messagePrefix: string,
+  ): Promise<void> {
+    await f.t.run(async (ctx) => {
+      const now = Date.now();
+      for (let index = 0; index < count; index += 1) {
+        const messageId = `${messagePrefix}-${index}`;
+        await ctx.db.insert("processedEvents", {
+          provider: "agentmail-binding",
+          environment: "live",
+          eventId: messageId,
+          processingVersion: 1,
+          outcome: JSON.stringify({ messageId, threadId, inboxId: "owner-inbox" }),
+          providerMessageId: messageId,
+          providerThreadId: threadId,
+          providerInboxId: "owner-inbox",
+          organizationId: f.organizationId,
+          projectId: f.projectId,
+          operationId,
+          applicationOutcome: "unknown",
+          applicationState: "outcomeUnknown",
+          createdAt: now + index,
+        });
+      }
     });
-    await f.t.mutation(bindingRef, {
-      operationId: f.operationId,
-      messageId: "unknown-outbound",
-      threadId: "unknown-thread",
+  }
+
+  test("threads beyond 64 compatible rows migrate in bounded chunks then route", async () => {
+    const f = await fixture();
+    await seedThreadBindings(f, "mig-thread", 70, f.operationId, "mig-outbound");
+    // The bounded horizon fails closed for this trigger: no binding yet.
+    const early = await f.t.mutation(ingestMessageRef, {
+      message: inbound("mig-reply", "mig-thread", "<p>Migration terms</p>"),
+      thread: { thread_id: "mig-thread" },
+      eventId: "mig-early",
+    });
+    expect(early).toMatchObject({ ok: true, state: "waitingForBinding" });
+    // First bounded pass proves 65 rows without writing any identity: the
+    // cap is a page size, not a verdict.
+    const first = await f.t.mutation(advanceMigrationRef, { threadId: "mig-thread", inboxId: "owner-inbox" });
+    expect(first).toMatchObject({ ok: true, state: "verifying", verifiedReads: 65, replayed: 0, stillWaiting: 0 });
+    const noBindingYet = await threadIdentityRows(f, "mig-thread");
+    expect(noBindingYet).toHaveLength(0);
+    // The second pass proves the remainder, writes one durable identity,
+    // and replays the waiting reply.
+    const second = await f.t.mutation(advanceMigrationRef, { threadId: "mig-thread", inboxId: "owner-inbox" });
+    expect(second).toMatchObject({ ok: true, state: "complete", replayed: 1, stillWaiting: 0 });
+    const identities = await threadIdentityRows(f, "mig-thread");
+    expect(identities).toHaveLength(1);
+    expect(identities[0]?.conversationId).toBe(f.conversationId);
+    expect(await projectEvidenceRows(f)).toHaveLength(1);
+    // Routing now resolves through the durable identity.
+    const followup = await f.t.mutation(ingestMessageRef, {
+      message: inbound("mig-reply-2", "mig-thread", "<p>Follow-up terms</p>"),
+      thread: { thread_id: "mig-thread" },
+      eventId: "mig-late",
+    });
+    expect(followup).toMatchObject({ ok: true, state: "replyReceived", deduplicated: false });
+    // Drain the continuation scheduled by the first bounded pass.
+    await f.t.finishAllScheduledFunctions(() => {});
+  });
+
+  test("threads beyond 64 conflicting rows fail closed without any binding", async () => {
+    const f = await fixture();
+    const other = await f.t.run(async (ctx) => {
+      const now = Date.now();
+      const operation = await ctx.db.get(f.operationId);
+      if (operation === null) throw new Error("operation missing");
+      const grantId = await ctx.db.insert("grants", {
+        organizationId: f.organizationId,
+        projectId: f.projectId,
+        operations: ["communication.send"],
+        communicationProfile: "ownerRoleplay",
+        recipientConfigVersion: 1,
+        inputVersions: { brief: "v1" },
+        canonicalPayload: CANONICAL_DRAFT,
+        payloadHash: payloadHash(DRAFT),
+        costCeilingMicroUsd: 1_000,
+        roundLimit: 2,
+        expiresAt: now + 60_000,
+        revocationVersion: 1,
+        status: "active",
+        createdAt: now,
+      });
+      const conversationId = await ctx.db.insert("conversations", {
+        organizationId: f.organizationId,
+        projectId: f.projectId,
+        grantId,
+        version: 1,
+        state: "awaitingReply",
+        recipientConfigVersion: 1,
+        updatedAt: now,
+      });
+      await ctx.db.patch(grantId, { conversationId });
+      const jobId = await ctx.db.insert("jobs", {
+        organizationId: f.organizationId,
+        projectId: f.projectId,
+        grantId,
+        grantVersion: 1,
+        kind: "communication",
+        state: "running",
+        inputVersions: { brief: "v1" },
+        createdAt: now,
+        updatedAt: now,
+      });
+      const operationId = await ctx.db.insert("operations", {
+        organizationId: f.organizationId,
+        projectId: f.projectId,
+        jobId,
+        kind: "communication.send",
+        requestId: "mig-conflict-request",
+        requestKey: "mig-conflict-request-key",
+        normalizedPayload: CANONICAL_DRAFT,
+        normalizedPayloadHash: payloadHash(DRAFT),
+        inputVersions: { brief: "v1" },
+        grantId,
+        grantVersion: 1,
+        recipientConfigVersion: 1,
+        conversationVersion: 1,
+        state: "observedSuccess",
+        attemptToken: "mig-conflict-token",
+        createdAt: now,
+        updatedAt: now,
+      });
+      return { operationId };
+    });
+    await seedThreadBindings(f, "mig-conflict-thread", 35, f.operationId, "mig-mine");
+    await seedThreadBindings(f, "mig-conflict-thread", 35, other.operationId, "mig-other");
+    await f.t.mutation(ingestMessageRef, {
+      message: inbound("mig-conflict-reply", "mig-conflict-thread", "<p>Conflicted</p>"),
+      thread: { thread_id: "mig-conflict-thread" },
+      eventId: "mig-conflict-early",
+    });
+    const migrated = await f.t.mutation(advanceMigrationRef, {
+      threadId: "mig-conflict-thread",
       inboxId: "owner-inbox",
     });
-    const originalFetch = globalThis.fetch;
-    const originalKey = process.env.AGENTMAIL_API_KEY;
-    globalThis.fetch = (async () => ({
-      ok: true,
-      status: 200,
-      text: async () => JSON.stringify({ messages: [] }),
-    })) as unknown as typeof fetch;
-    process.env.AGENTMAIL_API_KEY = "controlled-recovery-key";
-    try {
-      const recovered = await f.t.action(recoverRef, {
-        threadId: "unknown-thread",
-        inboxId: "owner-inbox",
-        messageId: "unknown-reply",
-      });
-      expect(recovered).toEqual({ ok: true, outcome: "unknown", reason: "provider list has no such message" });
-    } finally {
-      globalThis.fetch = originalFetch;
-      if (originalKey === undefined) {
-        delete process.env.AGENTMAIL_API_KEY;
-      } else {
-        process.env.AGENTMAIL_API_KEY = originalKey;
-      }
-    }
-    const evidence = await f.t.run(async (ctx) =>
-      (await ctx.db.query("evidence").collect()).filter((row) => row.projectId === f.projectId),
-    );
-    expect(evidence).toHaveLength(0);
-    const replay = await f.t.mutation(replayRef, { threadId: "unknown-thread", inboxId: "owner-inbox" });
-    expect(replay).toMatchObject({ ok: true, replayed: 0, stillWaiting: 1 });
+    expect(migrated).toMatchObject({ ok: true, state: "conflicted" });
+    expect(await threadIdentityRows(f, "mig-conflict-thread")).toHaveLength(0);
+    expect(await projectEvidenceRows(f)).toHaveLength(0);
+  });
+
+  test("inbound activity kicks off migration and routing recovers", async () => {
+    const f = await fixture();
+    await seedThreadBindings(f, "kick-thread", 70, f.operationId, "kick-outbound");
+    const early = await f.t.mutation(ingestMessageRef, {
+      message: inbound("kick-reply", "kick-thread", "<p>Kick terms</p>"),
+      thread: { thread_id: "kick-thread" },
+      eventId: "kick-early",
+    });
+    // Finite prefix fails closed temporarily while migration is scheduled.
+    expect(early).toMatchObject({ ok: true, state: "waitingForBinding" });
+    await f.t.finishAllScheduledFunctions(() => {});
+    const identities = await threadIdentityRows(f, "kick-thread");
+    expect(identities).toHaveLength(1);
+    expect(identities[0]?.conversationId).toBe(f.conversationId);
+    expect(await projectEvidenceRows(f)).toHaveLength(1);
+    const states = await migrationStateRows(f, "kick-thread");
+    expect(states).toHaveLength(1);
+    expect(states[0]?.state).toBe("complete");
   });
 });

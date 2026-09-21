@@ -979,6 +979,46 @@ export default defineSchema({
     ])
     .index("by_conversation", ["conversationId"]),
 
+  /**
+   * C1 resumable thread-identity migration (Greptile r4058523017 follow-up).
+   *
+   * Threads that accumulated more than 64 binding rows before the durable
+   * thread binding existed cannot be proven unanimous inside one bounded
+   * read. This row carries the migration progress so successive bounded
+   * transactions eventually prove exactly one identity: `candidate...`
+   * fields name the identity under proof, `cursorTime` is the creation-time
+   * horizon already verified, and `verifiedReads` counts cumulative
+   * verification reads (boundary rows are re-verified on overlap, so this
+   * can exceed the thread size). `conflicted` and `needsReview` are
+   * terminal and never produce a binding; only `complete` writes it.
+   */
+  threadMigrationStates: defineTable({
+    provider: v.string(),
+    environment: v.string(),
+    providerThreadId: v.string(),
+    providerInboxId: v.string(),
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    candidateConversationId: v.optional(v.id("conversations")),
+    candidateOperationId: v.optional(v.id("operations")),
+    verifiedReads: v.number(),
+    cursorTime: v.number(),
+    sameCursorRounds: v.number(),
+    state: v.union(
+      v.literal("verifying"),
+      v.literal("complete"),
+      v.literal("conflicted"),
+      v.literal("needsReview"),
+    ),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  }).index("by_provider_environment_and_thread_and_inbox", [
+    "provider",
+    "environment",
+    "providerThreadId",
+    "providerInboxId",
+  ]),
+
   conversations: defineTable({
     organizationId: v.id("organizations"),
     projectId: v.id("projects"),

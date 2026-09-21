@@ -12,11 +12,14 @@ import { v } from "convex/values";
 import type { Id } from "../_generated/dataModel.js";
 import { f1InternalMutation, type F1MutationCtx } from "../server.js";
 import * as reconciliation from "../execution/reconciliation.js";
+import * as reservations from "../execution/reservations.js";
 import * as quotes from "../purchasing/contracts/quotes.js";
 import { parseBoundedPayloadJson, payloadHash } from "../shared/hashing.js";
+import { MAX_JOBS_PER_GRANT } from "../shared/scope.js";
 import { normalizeMailbox } from "../shared/mailbox.js";
 import { denialValidator } from "../access/checks.js";
 import {
+  MAX_RECONCILIATION_READS,
   parseInboundMessage,
   sanitizeInboundContent,
   serializeProviderEventForBinding,
@@ -25,6 +28,7 @@ import {
   type InboundMessage,
   type ParsedProviderEvent,
 } from "./contracts.js";
+import { loadRecoveryReadPricing } from "./recoveryPolicy.js";
 
 type MutationArgs<T> = T extends RegisteredMutation<infer _Visibility, infer Args, infer _Return> ? Args : never;
 type MutationReturn<T> = T extends RegisteredMutation<infer _Visibility, infer _Args, infer Return> ? Awaited<Return> : never;
@@ -69,6 +73,26 @@ const quoteIngestRef = makeFunctionReference<
   MutationArgs<typeof quotes.ingestProviderQuote>,
   MutationReturn<typeof quotes.ingestProviderQuote>
 >("purchasing/contracts/quotes:ingestProviderQuote");
+const reserveServerReadRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof reservations.reserveServerRead>,
+  MutationReturn<typeof reservations.reserveServerRead>
+>("execution/reservations:reserveServerRead");
+const settleServerReadRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof reservations.settleServerRead>,
+  MutationReturn<typeof reservations.settleServerRead>
+>("execution/reservations:settleServerRead");
+const recoverActionRef = makeFunctionReference<
+  "action",
+  { threadId: string; inboxId: string; messageId: string },
+  unknown
+>("communication/send:recoverOversizedInbound");
+const advanceMigrationRef = makeFunctionReference<
+  "mutation",
+  { threadId: string; inboxId: string },
+  { ok: true; state: string; verifiedReads: number; replayed: number; stillWaiting: number } | { ok: false; code: string; message: string }
+>("communication/callbacks:advanceThreadMigration");
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -437,7 +461,7 @@ interface ConversationBinding {
  */
 async function noteThreadBinding(
   ctx: F1MutationCtx,
-  expected: BindingKey,
+  expected: Pick<BindingKey, "threadId" | "inboxId">,
   binding: ConversationBinding,
   operationId: Id<"operations"> | undefined,
 ): Promise<"recorded" | "present" | "conflict"> {
@@ -553,7 +577,13 @@ async function conversationForMessage(
         .eq("providerInboxId", expected.inboxId),
     )
     .take(THREAD_BINDING_RESOLVE_LIMIT + 1);
-  if (indexedRows.length > THREAD_BINDING_RESOLVE_LIMIT) return null;
+  if (indexedRows.length > THREAD_BINDING_RESOLVE_LIMIT) {
+    // The bounded horizon cannot prove this thread. Kick off the resumable
+    // migration, which eventually proves one identity or fails closed, and
+    // keep failing closed for this trigger.
+    await maybeScheduleThreadMigration(ctx, expected.threadId, expected.inboxId);
+    return null;
+  }
   // Legacy fallback for threads that predate the durable thread binding.
   // Several binding rows routinely share one thread (one per provider
   // message). Compatible rows that resolve to the same conversation return
@@ -837,6 +867,10 @@ interface WaitingOversizedMarker {
   readonly snapshotOversized: true;
   readonly contentHash: string;
   readonly byteSize: number;
+  /** Provider-read attempts already claimed against this row (default 0). */
+  readonly recoveryAttempts: number;
+  readonly recoveryJobId?: string;
+  readonly recoveryReservationId?: string;
 }
 
 function inboundBodyBytes(message: Pick<InboundMessage, "text" | "html">): number {
@@ -856,7 +890,27 @@ function parseWaitingOversizedMarker(value: unknown): WaitingOversizedMarker | n
     reason === undefined || contentHash === undefined || byteSize === undefined ||
     !Number.isInteger(byteSize) || byteSize <= WAITING_SNAPSHOT_DURABLE_MAX_BYTES
   ) return null;
-  return { messageId, threadId, inboxId, reason, snapshotOversized: true as const, contentHash, byteSize };
+  const recoveryAttempts = value["recoveryAttempts"];
+  if (
+    recoveryAttempts !== undefined &&
+    (typeof recoveryAttempts !== "number" || !Number.isInteger(recoveryAttempts) || recoveryAttempts < 0)
+  ) return null;
+  const recoveryJobId = value["recoveryJobId"];
+  const recoveryReservationId = value["recoveryReservationId"];
+  if (recoveryJobId !== undefined && typeof recoveryJobId !== "string") return null;
+  if (recoveryReservationId !== undefined && typeof recoveryReservationId !== "string") return null;
+  return {
+    messageId,
+    threadId,
+    inboxId,
+    reason,
+    snapshotOversized: true as const,
+    contentHash,
+    byteSize,
+    recoveryAttempts: typeof recoveryAttempts === "number" ? recoveryAttempts : 0,
+    ...(recoveryJobId === undefined ? {} : { recoveryJobId }),
+    ...(recoveryReservationId === undefined ? {} : { recoveryReservationId }),
+  };
 }
 
 async function replayWaitingForThread(
@@ -871,8 +925,9 @@ async function replayWaitingForThread(
   // trigger keeps every pass finite; each pass applies up to
   // WAITING_REPLAY_LIMIT rows, which guarantees forward progress.
   // Oversized rows without a replayable snapshot stay explicitly waiting
-  // for `resumeWaitingInbound`; anything unparseable also stays waiting
-  // rather than being dropped.
+  // and schedule their bounded provider-read recovery while attempts
+  // remain; anything unparseable also stays waiting rather than being
+  // dropped.
   const rows = await ctx.db
     .query("processedEvents")
     .withIndex("by_provider_environment_and_thread_inbox_and_state", (q) =>
@@ -895,6 +950,24 @@ async function replayWaitingForThread(
       row.providerMessageId === undefined ||
       stored.messageId !== row.providerMessageId
     ) {
+      const oversized = parseWaitingOversizedMarker(parseObject(row.outcome));
+      if (
+        oversized !== null &&
+        oversized.threadId === threadId &&
+        oversized.inboxId === inboxId &&
+        row.providerMessageId !== undefined &&
+        oversized.messageId === row.providerMessageId &&
+        oversized.recoveryAttempts < MAX_RECONCILIATION_READS
+      ) {
+        // Durable scheduling: the recovery action gates, claims, reads,
+        // and settles; attempts are shared, so concurrent triggers cannot
+        // exceed the bound.
+        await ctx.scheduler.runAfter(0, recoverActionRef, {
+          threadId,
+          inboxId,
+          messageId: oversized.messageId,
+        });
+      }
       stillWaiting += 1;
       continue;
     }
@@ -1143,13 +1216,26 @@ export const resumeWaitingInbound = f1InternalMutation({
 /**
  * Authority gate for the bounded provider-read recovery (S-15). Verifies
  * that exactly one oversized retained reply waits for the given identity,
- * that its thread resolves to a live conversation, and that the owning
- * grant is still active and unexpired. No provider call may happen before
- * this gate passes, and no row is modified by it.
+ * that its thread resolves to a live conversation, that the owning grant is
+ * still active and unexpired, and that owner-configured read pricing
+ * exists. It then admits one recovery run: a server-owned execution job
+ * plus one explicit reservation sized for the remaining read budget under
+ * the canonical reconciliation pricing basis. A valid open run is reused
+ * instead of admitted twice. No provider call may happen before this gate
+ * passes; denied gates cause zero HTTP reads.
  */
 export const prepareOversizedRecovery = f1InternalMutation({
   args: { threadId: v.string(), inboxId: v.string(), messageId: v.string() },
-  returns: v.union(v.object({ ok: v.literal(true) }), denialValidator),
+  returns: v.union(
+    v.object({
+      ok: v.literal(true),
+      jobId: v.id("jobs"),
+      reservationId: v.id("reservations"),
+      readsRemaining: v.number(),
+      readCostMicroUsd: v.number(),
+    }),
+    denialValidator,
+  ),
   handler: async (ctx, args) => {
     const threadId = normalizedProviderId(args.threadId);
     const inboxId = normalizedProviderId(args.inboxId);
@@ -1175,15 +1261,23 @@ export const prepareOversizedRecovery = f1InternalMutation({
     if (row === undefined || row.applicationState !== "outcomeUnknown") {
       return denial("invalid-payload", "retained reply is not waiting for recovery");
     }
-    if (parseWaitingOversizedMarker(parseObject(row.outcome)) === null) {
+    const marker = parseWaitingOversizedMarker(parseObject(row.outcome));
+    if (marker === null) {
       return denial("invalid-payload", "retained reply is not oversized; use the standard replay");
+    }
+    if (marker.recoveryAttempts >= MAX_RECONCILIATION_READS) {
+      return { ok: false as const, code: "recovery-attempts-exhausted", message: "recovery read budget is exhausted" };
     }
     const binding = await conversationForMessage(ctx, { messageId, threadId, inboxId });
     if (binding === null) {
       return denial("invalid-payload", "thread has no verified conversation binding");
     }
     const conversation = await ctx.db.get(binding.conversationId);
-    if (conversation === null) return denial("invalid-payload", "conversation is not available");
+    if (
+      conversation === null ||
+      conversation.state === "cancelled" ||
+      conversation.state === "closed"
+    ) return denial("invalid-payload", "conversation is not available for recovery");
     const grant = await ctx.db.get(conversation.grantId);
     if (
       grant === null ||
@@ -1194,9 +1288,476 @@ export const prepareOversizedRecovery = f1InternalMutation({
     ) {
       return denial("alternate-channel-denied", "communication grant is not active for recovery");
     }
-    return { ok: true as const };
+    const pricing = loadRecoveryReadPricing();
+    if (!pricing.ok) {
+      return { ok: false as const, code: "invalid-pricing-config", message: pricing.message };
+    }
+    const readsRemaining = MAX_RECONCILIATION_READS - marker.recoveryAttempts;
+    // Reuse a valid open run instead of admitting twice.
+    if (marker.recoveryJobId !== undefined && marker.recoveryReservationId !== undefined) {
+      const job = await ctx.db.get(marker.recoveryJobId as Id<"jobs">).catch(() => null);
+      const reservation = await ctx.db.get(marker.recoveryReservationId as Id<"reservations">).catch(() => null);
+      if (
+        job !== null &&
+        job.organizationId === binding.organizationId &&
+        job.projectId === binding.projectId &&
+        job.grantId === grant._id &&
+        job.state !== "cancelled" &&
+        job.state !== "cancelling" &&
+        reservation !== null &&
+        reservation.organizationId === binding.organizationId &&
+        reservation.jobId === job._id &&
+        reservation.state === "open" &&
+        reservation.pricingBasis === pricing.pricing.basis
+      ) {
+        return {
+          ok: true as const,
+          jobId: job._id,
+          reservationId: reservation._id,
+          readsRemaining,
+          readCostMicroUsd: pricing.pricing.readCostMicroUsd,
+        };
+      }
+    }
+    const grantJobs = await ctx.db
+      .query("jobs")
+      .withIndex("by_grant", (q) => q.eq("grantId", grant._id))
+      .take(MAX_JOBS_PER_GRANT + 1);
+    if (grantJobs.length > MAX_JOBS_PER_GRANT) {
+      return { ok: false as const, code: "operation-admission-limit", message: "grant job admission limit reached" };
+    }
+    const now = Date.now();
+    const jobId = await ctx.db.insert("jobs", {
+      organizationId: binding.organizationId,
+      projectId: binding.projectId,
+      grantId: grant._id,
+      grantVersion: grant.revocationVersion,
+      kind: "execution",
+      workflowPurpose: "purchasingCommunication",
+      state: "running",
+      inputVersions: { ...grant.inputVersions },
+      createdAt: now,
+      updatedAt: now,
+    });
+    const amount = readsRemaining * pricing.pricing.readCostMicroUsd;
+    if (!Number.isSafeInteger(amount) || amount <= 0) {
+      return denial("invalid-payload", "recovery read budget overflow");
+    }
+    const reserved: MutationReturn<typeof reservations.reserveServerRead> = await ctx.runMutation(reserveServerReadRef, {
+      jobId,
+      organizationId: binding.organizationId,
+      projectId: binding.projectId,
+      grantId: grant._id,
+      amountMicroUsd: amount,
+      pricingBasis: pricing.pricing.basis,
+    });
+    if (!reserved.ok) {
+      // A denied admission must not orphan a running job: remove the run
+      // this gate just created so no ownerless execution row remains.
+      await ctx.db.delete(jobId);
+      return reserved;
+    }
+    const outcomeValue = parseObject(row.outcome);
+    await ctx.db.patch(row._id, {
+      outcome: JSON.stringify({
+        ...(isRecord(outcomeValue) ? outcomeValue : {}),
+        recoveryJobId: jobId,
+        recoveryReservationId: reserved.reservationId,
+      }),
+    });
+    return {
+      ok: true as const,
+      jobId,
+      reservationId: reserved.reservationId,
+      readsRemaining,
+      readCostMicroUsd: pricing.pricing.readCostMicroUsd,
+    };
   },
 });
+
+/**
+ * Claim one recovery read before dispatch (claim-before-read, mirroring the
+ * dispatch claim). The atomic check-and-increment keeps total provider reads
+ * at or below the bound even across crashes and concurrent runs: a crash
+ * after a claim only ever reduces future reads. Each claim revalidates the
+ * live conversation and grant, so revoked authority stops the next read.
+ */
+export const claimRecoveryRead = f1InternalMutation({
+  args: { threadId: v.string(), inboxId: v.string(), messageId: v.string() },
+  returns: v.union(
+    v.object({ ok: v.literal(true), attemptNumber: v.number() }),
+    denialValidator,
+  ),
+  handler: async (ctx, args) => {
+    const threadId = normalizedProviderId(args.threadId);
+    const inboxId = normalizedProviderId(args.inboxId);
+    const messageId = normalizedProviderId(args.messageId);
+    if (threadId === undefined || inboxId === undefined || messageId === undefined) {
+      return denial("invalid-payload", "thread, inbox, and message identifiers are required");
+    }
+    const retained = await ctx.db
+      .query("processedEvents")
+      .withIndex("by_provider_environment_and_provider_message_and_thread_and_inbox", (q) =>
+        q
+          .eq("provider", "agentmail-inbound")
+          .eq("environment", "live")
+          .eq("providerMessageId", messageId)
+          .eq("providerThreadId", threadId)
+          .eq("providerInboxId", inboxId),
+      )
+      .take(2);
+    if (retained.length !== 1) {
+      return denial("invalid-payload", "no single retained oversized reply matches this message");
+    }
+    const row = retained[0];
+    if (row === undefined || row.applicationState !== "outcomeUnknown") {
+      return denial("invalid-payload", "retained reply is not waiting for recovery");
+    }
+    const marker = parseWaitingOversizedMarker(parseObject(row.outcome));
+    if (marker === null) {
+      return denial("invalid-payload", "retained reply is not oversized; use the standard replay");
+    }
+    if (marker.recoveryAttempts >= MAX_RECONCILIATION_READS) {
+      return { ok: false as const, code: "recovery-attempts-exhausted", message: "recovery read budget is exhausted" };
+    }
+    const binding = await conversationForMessage(ctx, { messageId, threadId, inboxId });
+    if (binding === null) {
+      return denial("invalid-payload", "thread has no verified conversation binding");
+    }
+    const conversation = await ctx.db.get(binding.conversationId);
+    if (
+      conversation === null ||
+      conversation.state === "cancelled" ||
+      conversation.state === "closed"
+    ) return denial("invalid-payload", "conversation is not available for recovery");
+    const grant = await ctx.db.get(conversation.grantId);
+    if (
+      grant === null ||
+      grant.organizationId !== binding.organizationId ||
+      grant.projectId !== binding.projectId ||
+      grant.status !== "active" ||
+      grant.expiresAt <= Date.now()
+    ) {
+      return denial("alternate-channel-denied", "communication grant is not active for recovery");
+    }
+    const outcomeValue = parseObject(row.outcome);
+    await ctx.db.patch(row._id, {
+      outcome: JSON.stringify({
+        ...(isRecord(outcomeValue) ? outcomeValue : {}),
+        recoveryAttempts: marker.recoveryAttempts + 1,
+      }),
+    });
+    return { ok: true as const, attemptNumber: marker.recoveryAttempts + 1 };
+  },
+});
+
+/**
+ * Settle one recovery run: bind the settlement to the admitted run,
+ * retain the used portion as unresolved (a read that may have executed is
+ * never freed as if it cost nothing and no spend number is ever invented),
+ * release the unused headroom, and close the run job as completed or
+ * failed. A definitive provider rejection releases everything.
+ */
+export const settleRecoveryRun = f1InternalMutation({
+  args: {
+    jobId: v.id("jobs"),
+    reservationId: v.id("reservations"),
+    outcome: v.union(v.literal("recovered"), v.literal("unknown"), v.literal("rejected")),
+    readsUsed: v.number(),
+  },
+  returns: v.union(
+    v.object({ ok: v.literal(true), retainedMicroUsd: v.number(), releasedMicroUsd: v.number() }),
+    denialValidator,
+  ),
+  handler: async (ctx, args) => {
+    const job = await ctx.db.get(args.jobId);
+    if (job === null) {
+      return denial("invalid-payload", "recovery job is not available");
+    }
+    const settled: MutationReturn<typeof reservations.settleServerRead> = await ctx.runMutation(settleServerReadRef, {
+      reservationId: args.reservationId,
+      organizationId: job.organizationId,
+      jobId: args.jobId,
+      readsUsed: args.readsUsed,
+      mode: args.outcome === "rejected" ? "release" : "retainUnknown",
+    });
+    if (!settled.ok) return settled;
+    await ctx.db.patch(args.jobId, {
+      state: args.outcome === "recovered" ? "completed" : "failed",
+      updatedAt: Date.now(),
+    });
+    return { ok: true as const, retainedMicroUsd: settled.retainedMicroUsd, releasedMicroUsd: settled.releasedMicroUsd };
+  },
+});
+
+// One migration transaction verifies at most this many binding rows. Larger
+// threads resume across transactions through the durable cursor below.
+const MIGRATION_CHUNK_LIMIT = 64;
+// A full chunk that cannot advance the creation-time cursor is re-verified;
+// after this many consecutive rounds the thread needs manual review instead
+// of another identical pass.
+const MIGRATION_SAME_CURSOR_ROUNDS = 3;
+
+const migrationStateValidator = v.union(v.literal("verifying"), v.literal("complete"), v.literal("conflicted"), v.literal("needsReview"));
+
+/**
+ * Advance the durable thread-identity migration by one bounded chunk
+ * (Greptile r4058523017 follow-up). Every step is an exact indexed read or
+ * a bounded take; unanimity is proven row by row through the same
+ * conversation resolution as live routing, and only a fully proven thread
+ * earns its durable binding. Conflicting rows terminate as `conflicted`
+ * without ever producing a binding. Incomplete work schedules its own
+ * continuation, so a finite prefix may fail closed temporarily but normal
+ * routing is eventually restored.
+ */
+export const advanceThreadMigration = f1InternalMutation({
+  args: { threadId: v.string(), inboxId: v.string() },
+  returns: v.union(
+    v.object({
+      ok: v.literal(true),
+      state: migrationStateValidator,
+      verifiedReads: v.number(),
+      replayed: v.number(),
+      stillWaiting: v.number(),
+    }),
+    denialValidator,
+  ),
+  handler: async (ctx, args) => {
+    const threadId = normalizedProviderId(args.threadId);
+    const inboxId = normalizedProviderId(args.inboxId);
+    if (threadId === undefined || inboxId === undefined) {
+      return denial("invalid-payload", "thread and inbox identifiers are required");
+    }
+    const finish = async (
+      state: "complete" | "conflicted" | "needsReview",
+      verifiedReads: number,
+    ): Promise<{
+      readonly ok: true;
+      readonly state: "complete" | "conflicted" | "needsReview";
+      readonly verifiedReads: number;
+      readonly replayed: number;
+      readonly stillWaiting: number;
+    }> => {
+      let replayed = 0;
+      let stillWaiting = 0;
+      if (state === "complete") {
+        const replay = await replayWaitingForThread(ctx, threadId, inboxId);
+        replayed = replay.replayed;
+        stillWaiting = replay.stillWaiting;
+      }
+      return { ok: true as const, state, verifiedReads, replayed, stillWaiting };
+    };
+    const threaded = await ctx.db
+      .query("threadBindings")
+      .withIndex("by_provider_environment_and_thread_and_inbox", (q) =>
+        q
+          .eq("provider", "agentmail-binding")
+          .eq("environment", "live")
+          .eq("providerThreadId", threadId)
+          .eq("providerInboxId", inboxId),
+      )
+      .take(2);
+    const firstIdentity = threaded[0];
+    if (firstIdentity !== undefined) {
+      const compatible = threaded.every(
+        (row) =>
+          row.organizationId === firstIdentity.organizationId &&
+          row.projectId === firstIdentity.projectId &&
+          row.conversationId === firstIdentity.conversationId,
+      );
+      if (!compatible) {
+        return denial("invalid-payload", "durable thread identity is ambiguous");
+      }
+      const states = await ctx.db
+        .query("threadMigrationStates")
+        .withIndex("by_provider_environment_and_thread_and_inbox", (q) =>
+          q
+            .eq("provider", "agentmail-binding")
+            .eq("environment", "live")
+            .eq("providerThreadId", threadId)
+            .eq("providerInboxId", inboxId),
+        )
+        .take(2);
+      for (const stateRow of states) {
+        if (stateRow.state !== "complete") {
+          await ctx.db.patch(stateRow._id, { state: "complete", updatedAt: Date.now() });
+        }
+      }
+      return finish("complete", 0);
+    }
+    const states = await ctx.db
+      .query("threadMigrationStates")
+      .withIndex("by_provider_environment_and_thread_and_inbox", (q) =>
+        q
+          .eq("provider", "agentmail-binding")
+          .eq("environment", "live")
+          .eq("providerThreadId", threadId)
+          .eq("providerInboxId", inboxId),
+      )
+      .take(2);
+    if (states.length > 1) {
+      return denial("invalid-payload", "thread migration state is ambiguous");
+    }
+    const existing = states[0];
+    if (existing !== undefined && existing.state !== "verifying") {
+      return finish(existing.state, existing.verifiedReads);
+    }
+    const now = Date.now();
+    let verifying = existing;
+    if (verifying === undefined) {
+      const first = await ctx.db
+        .query("processedEvents")
+        .withIndex("by_provider_environment_and_provider_thread_and_inbox", (q) =>
+          q
+            .eq("provider", "agentmail-binding")
+            .eq("environment", "live")
+            .eq("providerThreadId", threadId)
+            .eq("providerInboxId", inboxId),
+        )
+        .order("asc")
+        .take(1);
+      const firstRow = first[0];
+      if (firstRow === undefined) {
+        return denial("invalid-payload", "thread has no binding rows to migrate");
+      }
+      const expected = bindingKey(firstRow.providerMessageId, threadId, inboxId);
+      const resolved = expected === null ? null : await resolveBindingRowConversation(ctx, firstRow, expected);
+      const operation = firstRow.operationId === undefined ? null : await ctx.db.get(firstRow.operationId);
+      if (resolved === null || operation === null) {
+        if (operation !== null) {
+          await ctx.db.insert("threadMigrationStates", {
+            provider: "agentmail-binding",
+            environment: "live",
+            providerThreadId: threadId,
+            providerInboxId: inboxId,
+            organizationId: operation.organizationId,
+            projectId: operation.projectId,
+            verifiedReads: 0,
+            cursorTime: -1,
+            sameCursorRounds: 0,
+            state: "conflicted",
+            createdAt: now,
+            updatedAt: now,
+          });
+        }
+        return finish("conflicted", 0);
+      }
+      const stateId = await ctx.db.insert("threadMigrationStates", {
+        provider: "agentmail-binding",
+        environment: "live",
+        providerThreadId: threadId,
+        providerInboxId: inboxId,
+        organizationId: resolved.organizationId,
+        projectId: resolved.projectId,
+        candidateConversationId: resolved.conversationId,
+        ...(firstRow.operationId === undefined ? {} : { candidateOperationId: firstRow.operationId }),
+        verifiedReads: 0,
+        cursorTime: -1,
+        sameCursorRounds: 0,
+        state: "verifying",
+        createdAt: now,
+        updatedAt: now,
+      });
+      const created = await ctx.db.get(stateId);
+      if (created === null || created.state !== "verifying" || created.candidateConversationId === undefined) {
+        return denial("invalid-payload", "thread migration state could not start");
+      }
+      verifying = created;
+    }
+    const candidateConversationId = verifying.candidateConversationId;
+    if (candidateConversationId === undefined) {
+      await ctx.db.patch(verifying._id, { state: "conflicted", updatedAt: now });
+      return finish("conflicted", verifying.verifiedReads);
+    }
+    const chunk = await ctx.db
+      .query("processedEvents")
+      .withIndex("by_provider_environment_and_provider_thread_and_inbox", (q) =>
+        q
+          .eq("provider", "agentmail-binding")
+          .eq("environment", "live")
+          .eq("providerThreadId", threadId)
+          .eq("providerInboxId", inboxId),
+      )
+      .order("asc")
+      .filter((q) => q.gte(q.field("_creationTime"), verifying.cursorTime))
+      .take(MIGRATION_CHUNK_LIMIT + 1);
+    for (const row of chunk) {
+      const expected = bindingKey(row.providerMessageId, threadId, inboxId);
+      const single = expected === null ? null : await resolveBindingRowConversation(ctx, row, expected);
+      if (
+        single === null ||
+        single.conversationId !== candidateConversationId ||
+        single.organizationId !== verifying.organizationId ||
+        single.projectId !== verifying.projectId
+      ) {
+        await ctx.db.patch(verifying._id, { state: "conflicted", updatedAt: now });
+        return finish("conflicted", verifying.verifiedReads + chunk.length);
+      }
+    }
+    const verifiedReads = verifying.verifiedReads + chunk.length;
+    if (chunk.length <= MIGRATION_CHUNK_LIMIT) {
+      const noted = await noteThreadBinding(
+        ctx,
+        { threadId, inboxId },
+        {
+          conversationId: candidateConversationId,
+          organizationId: verifying.organizationId,
+          projectId: verifying.projectId,
+        },
+        verifying.candidateOperationId,
+      );
+      if (noted === "conflict") {
+        await ctx.db.patch(verifying._id, { state: "conflicted", verifiedReads, updatedAt: now });
+        return finish("conflicted", verifiedReads);
+      }
+      await ctx.db.patch(verifying._id, { state: "complete", verifiedReads, updatedAt: now });
+      return finish("complete", verifiedReads);
+    }
+    const maxTime = Math.max(...chunk.map((row) => row._creationTime));
+    if (maxTime > verifying.cursorTime) {
+      await ctx.db.patch(verifying._id, {
+        verifiedReads,
+        cursorTime: maxTime,
+        sameCursorRounds: 0,
+        updatedAt: now,
+      });
+    } else {
+      const rounds = verifying.sameCursorRounds + 1;
+      if (rounds >= MIGRATION_SAME_CURSOR_ROUNDS) {
+        await ctx.db.patch(verifying._id, { verifiedReads, sameCursorRounds: rounds, state: "needsReview", updatedAt: now });
+        return finish("needsReview", verifiedReads);
+      }
+      await ctx.db.patch(verifying._id, { verifiedReads, sameCursorRounds: rounds, updatedAt: now });
+    }
+    await ctx.scheduler.runAfter(0, advanceMigrationRef, { threadId, inboxId });
+    return { ok: true as const, state: "verifying" as const, verifiedReads, replayed: 0, stillWaiting: 0 };
+  },
+});
+
+/**
+ * Schedule migration work for a thread the bounded scan cannot prove.
+ * Skipped when migration already settled; the advance step itself is
+ * idempotent, so concurrent triggers converge instead of duplicating
+ * bindings.
+ */
+export async function maybeScheduleThreadMigration(
+  ctx: F1MutationCtx,
+  threadId: string,
+  inboxId: string,
+): Promise<void> {
+  const states = await ctx.db
+    .query("threadMigrationStates")
+    .withIndex("by_provider_environment_and_thread_and_inbox", (q) =>
+      q
+        .eq("provider", "agentmail-binding")
+        .eq("environment", "live")
+        .eq("providerThreadId", threadId)
+        .eq("providerInboxId", inboxId),
+    )
+    .take(2);
+  if (states.every((row) => row.state !== "verifying") && states.length > 0) return;
+  await ctx.scheduler.runAfter(0, advanceMigrationRef, { threadId, inboxId });
+}
 
 const quoteResultValidator = v.union(
   v.object({ ok: v.literal(true), quoteId: v.id("quotes"), deduplicated: v.boolean(), executionMode: v.string() }),

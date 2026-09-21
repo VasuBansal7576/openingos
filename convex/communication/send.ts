@@ -6,11 +6,12 @@
  * outcome. It never uses AgentMail's independent outbound queue.
  */
 
+import { AgentMail, type AgentMailComponent } from "@agentmail/convex";
 import { makeFunctionReference, type RegisteredMutation } from "convex/server";
 import { v } from "convex/values";
 import type { Id } from "../_generated/dataModel.js";
 import { env, internalAction } from "../_generated/server.js";
-import { f1InternalMutation, type F1MutationCtx } from "../server.js";
+import { f1InternalMutation, type F1ActionCtx, type F1MutationCtx } from "../server.js";
 import * as attempts from "../execution/attempts.js";
 import * as operations from "../execution/operations.js";
 import * as reconciliation from "../execution/reconciliation.js";
@@ -23,9 +24,12 @@ import {
   isCommunicationDenial,
   DEFAULT_AGENTMAIL_BASE_URL,
   EU_AGENTMAIL_BASE_URL,
+  DEFAULT_RECONCILIATION_OVERALL_TIMEOUT_MS,
+  DEFAULT_RECONCILIATION_READ_TIMEOUT_MS,
   type CommunicationDenial,
 } from "./contracts.js";
-import { inboundResultValidator } from "./callbacks.js";
+import { inboundResultValidator, maybeScheduleThreadMigration } from "./callbacks.js";
+import { components } from "../models/components.js";
 import { operationLabel, sendAgentMailOneShot } from "./transport.js";
 import type * as callbacks from "./callbacks.js";
 
@@ -68,6 +72,16 @@ const prepareRecoveryRef = makeFunctionReference<
   MutationArgs<typeof callbacks.prepareOversizedRecovery>,
   MutationReturn<typeof callbacks.prepareOversizedRecovery>
 >("communication/callbacks:prepareOversizedRecovery");
+const claimRecoveryRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof callbacks.claimRecoveryRead>,
+  MutationReturn<typeof callbacks.claimRecoveryRead>
+>("communication/callbacks:claimRecoveryRead");
+const settleRecoveryRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof callbacks.settleRecoveryRun>,
+  MutationReturn<typeof callbacks.settleRecoveryRun>
+>("communication/callbacks:settleRecoveryRun");
 
 const snapshotResultValidator = v.union(
   v.object({
@@ -430,7 +444,12 @@ async function backfillThreadBinding(
         .eq("providerInboxId", inboxId),
     )
     .take(THREAD_BINDING_VERIFY_LIMIT + 1);
-  if (structured.length > THREAD_BINDING_VERIFY_LIMIT) return;
+  if (structured.length > THREAD_BINDING_VERIFY_LIMIT) {
+    // The horizon cannot prove this thread here. Hand it to the resumable
+    // migration instead of leaving routing permanently broken.
+    await maybeScheduleThreadMigration(ctx, threadId, inboxId);
+    return;
+  }
   for (const row of structured) {
     const facts = rowBindingFacts(row);
     if (facts === null || facts.threadId !== threadId || facts.inboxId !== inboxId) return;
@@ -761,24 +780,23 @@ export const dispatch = internalAction({
 // A retained oversized reply has no replayable snapshot, so the standard
 // replay leaves it waiting forever. This internal action is the reachable
 // recovery trigger: after the `prepareOversizedRecovery` gate proves the
-// waiting row, its conversation binding, and its live grant, the action
-// performs one bounded, allowlisted GET against the provider message list,
-// matches the exact provider identity, projects the entry to the documented
-// resume fields, and sinks it through `resumeWaitingInbound`, which
-// hash-verifies the exact bytes and ingests marker-idempotently. Anything
-// else — missing row, stale grant, missing credentials, oversized or
-// ambiguous provider response, identity mismatch — stays waiting or returns
-// unknown; success is never claimed without the exact bytes.
+// waiting row, its conversation binding, its live grant, and admits one
+// reserved run under the canonical reconciliation pricing basis, the action
+// performs up to three exact reads through the installed official AgentMail
+// component path (`getMessage`), each claimed before dispatch with per-read
+// and overall deadlines. Bytes sink through `resumeWaitingInbound`, which
+// hash-verifies the exact content and ingests marker-idempotently. Anything
+// else — missing row, stale grant, missing pricing/allowance/credentials,
+// transport failure, identity mismatch — stays waiting or returns unknown;
+// success is never claimed without the exact bytes. The run always
+// settles: definitive rejections release, everything else stays unresolved
+// without inventing a spend number.
 //
 // Owner-only and idempotency rules are unchanged: the recovered bytes take
 // the same validated path as a live callback, so a non-owner sender lands
-// in needsReview and a repeated recovery deduplicates by marker. Provider
-// read spend accounting beyond the grant gate stays with the execution
-// owner as a reported follow-up; this action performs no send and claims
-// no operation.
-const RECOVERY_READ_TIMEOUT_MS = 10_000;
-const RECOVERY_READ_MAX_BYTES = 1_048_576;
-const RECOVERY_LIST_LIMIT = 25;
+// in needsReview and a repeated recovery deduplicates by marker. Live use
+// additionally requires the foundation owner's component mount; controlled
+// tests register the official component helper instead.
 
 const recoveryResultValidator = v.union(
   inboundResultValidator,
@@ -797,8 +815,14 @@ function recoveryString(value: unknown, maxLength: number): string | undefined {
   return normalized;
 }
 
+function normalizedRecoveryId(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim();
+  return normalized.length > 0 ? normalized : undefined;
+}
+
 /**
- * Project a raw provider list entry to the documented resume fields.
+ * Project a provider getMessage payload to the documented resume fields.
  * Unknown provider fields are dropped at this boundary; attachment
  * descriptors that are not plain string maps keep a placeholder so the
  * entry count — which drives evidence completeness — stays exact.
@@ -841,6 +865,47 @@ function projectRecoveryMessage(entry: Record<string, unknown>): Record<string, 
   return projected;
 }
 
+function readTimeoutError(): Error {
+  return new Error("recovery read deadline exceeded");
+}
+
+/**
+ * The official component surfaces definitive provider rejections (unknown
+ * inbox or message, denied credentials) as an error carrying a permanent
+ * marker. Those reads provably caused no charge, so the run may release
+ * instead of retaining. Everything else stays unresolved.
+ */
+function isDefinitiveProviderRejection(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    (error as { readonly permanent?: unknown }).permanent === true &&
+    typeof (error as { readonly status?: unknown }).status === "number"
+  );
+}
+
+async function readExactMessage(
+  client: AgentMail,
+  ctx: Parameters<AgentMail["getMessage"]>[0],
+  inboxId: string,
+  messageId: string,
+  deadlineAt: number,
+): Promise<unknown> {
+  const remaining = deadlineAt - Date.now();
+  if (remaining <= 0) throw readTimeoutError();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      client.getMessage(ctx, inboxId, messageId),
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(readTimeoutError()), remaining);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 /** Internal bounded recovery read. Never exposed to browsers. */
 export const recoverOversizedInbound = internalAction({
   args: {
@@ -859,14 +924,9 @@ export const recoverOversizedInbound = internalAction({
     if (!/^[A-Za-z0-9._:-]{1,160}$/.test(inboxId)) {
       return recoveryDenial("invalid-payload", "provider inbox id is invalid");
     }
-    // Authority first: no provider call before the gate proves the waiting
-    // row, its conversation binding, and its live grant.
-    const gate: MutationReturn<typeof callbacks.prepareOversizedRecovery> = await ctx.runMutation(prepareRecoveryRef, {
-      threadId,
-      inboxId,
-      messageId,
-    });
-    if (!gate.ok) return gate;
+    // Zero-read configuration first: credentials and origin are validated
+    // before the gate admits anything, so a config denial can never leak
+    // an admitted reservation.
     const apiKey = env.AGENTMAIL_API_KEY;
     if (apiKey === undefined || apiKey.trim().length === 0) {
       return recoveryDenial("provider-rejection", "AgentMail allowance or credentials are unavailable");
@@ -875,81 +935,111 @@ export const recoverOversizedInbound = internalAction({
     if (baseUrl !== DEFAULT_AGENTMAIL_BASE_URL && baseUrl !== EU_AGENTMAIL_BASE_URL) {
       return recoveryDenial("provider-origin-denied", "AgentMail origin is not allowlisted");
     }
-    const endpoint = `${baseUrl.replace(/\/$/, "")}/inboxes/${encodeURIComponent(inboxId)}/messages?limit=${RECOVERY_LIST_LIMIT}`;
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), RECOVERY_READ_TIMEOUT_MS);
-    try {
-      const response = await fetch(endpoint, {
-        method: "GET",
-        redirect: "error",
-        cache: "no-store",
-        signal: controller.signal,
-        headers: { Authorization: `Bearer ${apiKey}` },
-      });
-      const bodyText = await response.text();
-      if (new TextEncoder().encode(bodyText).byteLength > RECOVERY_READ_MAX_BYTES) {
-        return { ok: true as const, outcome: "unknown" as const, reason: "provider response exceeded the recovery size bound" };
-      }
-      let body: unknown = null;
-      try {
-        body = bodyText.trim().length > 0 ? (JSON.parse(bodyText) as unknown) : null;
-      } catch {
-        return { ok: true as const, outcome: "unknown" as const, reason: "provider returned malformed recovery JSON" };
-      }
-      if (typeof body !== "object" || body === null || Array.isArray(body)) {
-        return { ok: true as const, outcome: "unknown" as const, reason: "provider recovery response is not an object" };
-      }
-      const candidates = (body as Record<string, unknown>)["messages"] ??
-        (body as Record<string, unknown>)["data"] ??
-        (body as Record<string, unknown>)["items"];
-      if (!Array.isArray(candidates)) {
-        return { ok: true as const, outcome: "unknown" as const, reason: "provider recovery response has no message list" };
-      }
-      const matches = candidates.filter(
-        (candidate) =>
-          typeof candidate === "object" && candidate !== null && !Array.isArray(candidate) &&
-          recoveryString((candidate as Record<string, unknown>)["message_id"], 1024) === messageId,
-      );
-      if (matches.length === 0) {
-        return { ok: true as const, outcome: "unknown" as const, reason: "provider list has no such message" };
-      }
-      if (matches.length > 1) {
-        return { ok: true as const, outcome: "unknown" as const, reason: "provider list match is ambiguous" };
-      }
-      const entry = matches[0] as Record<string, unknown>;
-      if (
-        recoveryString(entry["thread_id"], 1024) !== threadId ||
-        recoveryString(entry["inbox_id"], 1024) !== inboxId
-      ) {
-        return { ok: true as const, outcome: "unknown" as const, reason: "recovered message identity conflicts" };
-      }
-      const projected = projectRecoveryMessage(entry);
-      if (
-        typeof projected["message_id"] !== "string" ||
-        typeof projected["thread_id"] !== "string" ||
-        typeof projected["inbox_id"] !== "string" ||
-        typeof projected["from"] !== "string"
-      ) {
-        return { ok: true as const, outcome: "unknown" as const, reason: "recovered message lacks provider identity" };
-      }
-      let resumed: MutationReturn<typeof callbacks.resumeWaitingInbound>;
-      try {
-        resumed = await ctx.runMutation(resumeWaitingRef, {
-          message: projected as MutationArgs<typeof callbacks.resumeWaitingInbound>["message"],
-          eventId: `recovery:${messageId}`,
-        });
-      } catch {
-        return { ok: true as const, outcome: "unknown" as const, reason: "recovered payload failed boundary validation" };
-      }
-      return resumed;
-    } catch (error) {
-      return {
+    // Authority and admission next: no provider call before the gate proves
+    // the waiting row, its conversation binding, its live grant, and
+    // reserves the run under the canonical pricing basis.
+    const gate: MutationReturn<typeof callbacks.prepareOversizedRecovery> = await ctx.runMutation(prepareRecoveryRef, {
+      threadId,
+      inboxId,
+      messageId,
+    });
+    if (!gate.ok) return gate;
+    const client = new AgentMail(components.agentmail as unknown as AgentMailComponent);
+    const overallDeadline = Date.now() + DEFAULT_RECONCILIATION_OVERALL_TIMEOUT_MS;
+    let claims = 0;
+    let outcome: "recovered" | "unknown" | "rejected" = "unknown";
+    let result:
+      | MutationReturn<typeof callbacks.resumeWaitingInbound>
+      | { ok: true; outcome: "unknown"; reason: string }
+      | { ok: false; code: string; message: string } = {
         ok: true as const,
         outcome: "unknown" as const,
-        reason: error instanceof Error ? `AgentMail recovery read failed: ${error.message}` : "AgentMail recovery read failed",
+        reason: "recovery read budget exhausted",
       };
+    try {
+      while (claims < gate.readsRemaining) {
+        if (Date.now() > overallDeadline) {
+          result = { ok: true as const, outcome: "unknown" as const, reason: "recovery overall deadline exceeded" };
+          break;
+        }
+        // Claim before dispatch: the atomic check-and-increment keeps total
+        // reads at or below the bound across crashes and concurrent runs.
+        const claim: MutationReturn<typeof callbacks.claimRecoveryRead> = await ctx.runMutation(claimRecoveryRef, {
+          threadId,
+          inboxId,
+          messageId,
+        });
+        if (!claim.ok) {
+          result = { ok: true as const, outcome: "unknown" as const, reason: claim.message };
+          break;
+        }
+        claims += 1;
+        const readDeadline = Math.min(overallDeadline, Date.now() + DEFAULT_RECONCILIATION_READ_TIMEOUT_MS);
+        let payload: unknown;
+        try {
+          payload = await readExactMessage(
+            client,
+            ctx as unknown as Parameters<AgentMail["getMessage"]>[0],
+            inboxId,
+            messageId,
+            readDeadline,
+          );
+        } catch (error) {
+          if (isDefinitiveProviderRejection(error)) {
+            outcome = "rejected";
+            result = { ok: true as const, outcome: "unknown" as const, reason: "provider definitively rejected the read" };
+            break;
+          }
+          continue;
+        }
+        if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+          result = { ok: true as const, outcome: "unknown" as const, reason: "recovered payload is not an object" };
+          break;
+        }
+        const entry = payload as Record<string, unknown>;
+        if (
+          normalizedRecoveryId(entry["message_id"]) !== messageId ||
+          normalizedRecoveryId(entry["thread_id"]) !== threadId ||
+          normalizedRecoveryId(entry["inbox_id"]) !== inboxId
+        ) {
+          result = { ok: true as const, outcome: "unknown" as const, reason: "recovered message identity conflicts" };
+          break;
+        }
+        const projected = projectRecoveryMessage(entry);
+        if (
+          typeof projected["message_id"] !== "string" ||
+          typeof projected["thread_id"] !== "string" ||
+          typeof projected["inbox_id"] !== "string" ||
+          typeof projected["from"] !== "string"
+        ) {
+          result = { ok: true as const, outcome: "unknown" as const, reason: "recovered message lacks provider identity" };
+          break;
+        }
+        let resumed: MutationReturn<typeof callbacks.resumeWaitingInbound>;
+        try {
+          resumed = await ctx.runMutation(resumeWaitingRef, {
+            message: projected as MutationArgs<typeof callbacks.resumeWaitingInbound>["message"],
+            eventId: `recovery:${messageId}`,
+          });
+        } catch {
+          result = { ok: true as const, outcome: "unknown" as const, reason: "recovered payload failed boundary validation" };
+          break;
+        }
+        if (resumed.ok) outcome = "recovered";
+        result = resumed;
+        break;
+      }
     } finally {
-      clearTimeout(timer);
+      // The run always settles: definitive rejections release, everything
+      // else stays unresolved without inventing a spend number. A failed
+      // settlement leaves the reservation safely locked, never freed.
+      await ctx.runMutation(settleRecoveryRef, {
+        jobId: gate.jobId,
+        reservationId: gate.reservationId,
+        outcome,
+        readsUsed: claims,
+      });
     }
+    return result;
   },
 });
