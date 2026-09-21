@@ -29,17 +29,27 @@ import {
 import {
   assetDocumentInputValidator,
   assetInputValidator,
+  COMMISSIONING_ASSET_CONSTRAINTS_MAX_LENGTH,
+  COMMISSIONING_ASSET_PROVENANCE_MAX_LENGTH,
+  COMMISSIONING_ASSET_SERIAL_MAX_LENGTH,
+  commissioningAssetIdempotencyKey,
   costEntryInputValidator,
+  isValidServiceCaseTransition,
+  normalizeCommissioningLabel,
   normalizeLineQuantity,
   normalizeLineUnit,
+  normalizeOptionalCommissioningText,
+  normalizeServiceOutcome,
   orderEventInputValidator,
   orderInputValidator,
+  requiresServiceOutcome,
   scopedLineUnit,
   serviceCaseInputValidator,
   sortLinesById,
   storedOrderLineValidator,
   type NormalizedAcceptanceLine,
   type NormalizedOrderLine,
+  type ServiceCaseLifecycleState,
 } from "../shared/domainContracts.js";
 import { checkMoney } from "../shared/money.js";
 import { requireDomainAccess, requireOwnedRef } from "./guards.js";
@@ -586,11 +596,31 @@ export const listOrders = f1Query({
  * line; the legacy scalar `acceptedQuantity` derives the single
  * acceptance for one-line orders only and is rejected as ambiguous
  * otherwise.
+ *
+ * E11 commissioning-to-asset (P-18, P-14): a `commissioning` event may
+ * carry an explicit optional `commissioningAsset` payload. When present
+ * with a nonempty label, the handler records the installed asset in the
+ * same mutation using the exact order, selection, requirement, quote,
+ * and event provenance — never inferred serials, warranty facts,
+ * locations, or vendor outcomes. The asset replays under the
+ * deterministic project-scoped key
+ * `commissioning:<event idempotency key>`, so duplicate callbacks and
+ * event replays resolve to the same asset row instead of a second
+ * installed record. A commissioning event without the payload records
+ * the milestone with honest incomplete state (no asset is created or
+ * inferred); a non-commissioning kind carrying the payload is denied.
+ * Prior orders, events, and cost entries are never mutated here.
  */
 export const appendOrderEvent = f1Mutation({
   args: orderEventInputValidator.fields,
   returns: v.union(
-    v.object({ ok: v.literal(true), eventId: v.id("orderEvents"), deduplicated: v.boolean() }),
+    v.object({
+      ok: v.literal(true),
+      eventId: v.id("orderEvents"),
+      deduplicated: v.boolean(),
+      assetId: v.optional(v.id("assets")),
+      assetDeduplicated: v.optional(v.boolean()),
+    }),
     denialValidator,
   ),
   handler: async (ctx, args) => {
@@ -608,6 +638,44 @@ export const appendOrderEvent = f1Mutation({
     }
     if (args.acceptanceLines !== undefined && args.acceptedQuantity !== undefined) {
       return { ok: false as const, code: "invalid-payload", message: "supply either acceptance lines or a single accepted quantity, not both" };
+    }
+    // E11: the installed-asset proposal rides only on a commissioning
+    // milestone. Any other kind carrying the payload is denied before
+    // any read, so purchase intent alone can never invent an asset.
+    // Field shapes validate here so malformed payloads write nothing.
+    let commissioningLabel: string | undefined;
+    let commissioningSerial: string | undefined;
+    let commissioningConstraints: string | undefined;
+    let commissioningProvenance: string | undefined;
+    if (args.commissioningAsset !== undefined) {
+      if (args.kind !== "commissioning") {
+        return { ok: false as const, code: "invalid-payload", message: "commissioning asset payload requires a commissioning event" };
+      }
+      try {
+        commissioningLabel = args.commissioningAsset.label === undefined
+          ? undefined
+          : normalizeCommissioningLabel(args.commissioningAsset.label);
+        commissioningSerial = normalizeOptionalCommissioningText(
+          args.commissioningAsset.serial,
+          "commissioning asset serial",
+          COMMISSIONING_ASSET_SERIAL_MAX_LENGTH,
+        );
+        commissioningConstraints = normalizeOptionalCommissioningText(
+          args.commissioningAsset.constraints,
+          "commissioning asset constraints",
+          COMMISSIONING_ASSET_CONSTRAINTS_MAX_LENGTH,
+        );
+        commissioningProvenance = normalizeOptionalCommissioningText(
+          args.commissioningAsset.purchaseProvenance,
+          "commissioning asset provenance",
+          COMMISSIONING_ASSET_PROVENANCE_MAX_LENGTH,
+        );
+      } catch (error) {
+        return { ok: false as const, code: "invalid-payload", message: error instanceof Error ? error.message : "commissioning asset payload is invalid" };
+      }
+      if (commissioningLabel === undefined) {
+        return { ok: false as const, code: "invalid-payload", message: "commissioning asset label required" };
+      }
     }
     // Shape-normalize explicit acceptances before any read, so replay
     // binds the complete normalized line payload. Accepted quantities
@@ -680,7 +748,68 @@ export const appendOrderEvent = f1Mutation({
       ) {
         return { ok: false as const, code: "duplicate-conflict", message: "idempotency key already used with different fields" };
       }
-      return { ok: true as const, eventId: existing._id, deduplicated: true };
+      // E11 replay (P-14 composite idempotency): the event row carries
+      // no asset payload (no schema change), so the asset intent binds
+      // through the deterministic derived asset row instead. Replays
+      // never create a second asset: the same payload resolves to the
+      // same row, a changed payload conflicts, and a payload that was
+      // never stored conflicts so a replay can never silently add an
+      // asset to a milestone that was recorded without one.
+      if (args.kind !== "commissioning" || args.commissioningAsset === undefined) {
+        const priorKey = commissioningAssetIdempotencyKey(args.idempotencyKey);
+        const priorAsset = await ctx.db
+          .query("assets")
+          .withIndex("by_project_and_key", (q) =>
+            q.eq("projectId", args.projectId).eq("idempotencyKey", priorKey),
+          )
+          .unique();
+        if (
+          priorAsset !== null &&
+          priorAsset.organizationId === args.organizationId
+        ) {
+          return {
+            ok: true as const,
+            eventId: existing._id,
+            deduplicated: true,
+            assetId: priorAsset._id,
+            assetDeduplicated: true,
+          };
+        }
+        return { ok: true as const, eventId: existing._id, deduplicated: true };
+      }
+      if (commissioningLabel === undefined) {
+        return { ok: false as const, code: "invalid-payload", message: "commissioning asset label required" };
+      }
+      const replayAssetKey = commissioningAssetIdempotencyKey(args.idempotencyKey);
+      const replayedAsset = await ctx.db
+        .query("assets")
+        .withIndex("by_project_and_key", (q) =>
+          q.eq("projectId", args.projectId).eq("idempotencyKey", replayAssetKey),
+        )
+        .unique();
+      if (replayedAsset === null) {
+        return { ok: false as const, code: "duplicate-conflict", message: "idempotency key already used without a commissioning asset; use a new key for a new asset intent" };
+      }
+      if (replayedAsset.organizationId !== args.organizationId) {
+        return { ok: false as const, code: "denied-project", message: "reference is not in this project" };
+      }
+      if (
+        replayedAsset.label !== commissioningLabel ||
+        (replayedAsset.serial ?? undefined) !== commissioningSerial ||
+        (replayedAsset.locationId ?? undefined) !== args.commissioningAsset.locationId ||
+        (replayedAsset.constraints ?? undefined) !== commissioningConstraints ||
+        (commissioningProvenance !== undefined &&
+          (replayedAsset.purchaseProvenance ?? undefined) !== commissioningProvenance)
+      ) {
+        return { ok: false as const, code: "duplicate-conflict", message: "idempotency key already used with different fields" };
+      }
+      return {
+        ok: true as const,
+        eventId: existing._id,
+        deduplicated: true,
+        assetId: replayedAsset._id,
+        assetDeduplicated: true,
+      };
     }
     const order = await requireOwnedRef(
       await ctx.db.get(args.orderId),
@@ -820,6 +949,54 @@ export const appendOrderEvent = f1Mutation({
         }
       }
     }
+    // E11 commissioning asset for a new intent. Every reference fails
+    // closed before any write: the location must live in the caller's
+    // organization, and the derived asset key must not already bind a
+    // different asset. The order, selection, requirement, and quote
+    // above were already verified in-project, so the asset inherits
+    // that exact lineage. Nothing here patches prior orders, events,
+    // or cost entries — history stays immutable.
+    let commissionedAssetId: Id<"assets"> | null = null;
+    let commissionedAssetDeduplicated = false;
+    let derivedProvenance: string | undefined;
+    if (args.commissioningAsset !== undefined) {
+      if (commissioningLabel === undefined) {
+        return { ok: false as const, code: "invalid-payload", message: "commissioning asset label required" };
+      }
+      if (args.commissioningAsset.locationId !== undefined) {
+        const location = await ctx.db.get(args.commissioningAsset.locationId);
+        if (location === null || location.organizationId !== args.organizationId) {
+          return { ok: false as const, code: "denied-project", message: "location is not in this organization" };
+        }
+      }
+      const assetKey = commissioningAssetIdempotencyKey(args.idempotencyKey);
+      const keyedAsset = await ctx.db
+        .query("assets")
+        .withIndex("by_project_and_key", (q) =>
+          q.eq("projectId", args.projectId).eq("idempotencyKey", assetKey),
+        )
+        .unique();
+      if (keyedAsset !== null) {
+        if (keyedAsset.organizationId !== args.organizationId) {
+          return { ok: false as const, code: "denied-project", message: "reference is not in this project" };
+        }
+        if (
+          keyedAsset.label !== commissioningLabel ||
+          (keyedAsset.serial ?? undefined) !== commissioningSerial ||
+          (keyedAsset.locationId ?? undefined) !== args.commissioningAsset.locationId ||
+          (keyedAsset.constraints ?? undefined) !== commissioningConstraints ||
+          (commissioningProvenance !== undefined &&
+            (keyedAsset.purchaseProvenance ?? undefined) !== commissioningProvenance)
+        ) {
+          return { ok: false as const, code: "duplicate-conflict", message: "idempotency key already used with different fields" };
+        }
+        commissionedAssetId = keyedAsset._id;
+        commissionedAssetDeduplicated = true;
+      } else {
+        derivedProvenance = commissioningProvenance ??
+          `commissioned order ${args.orderId} selection ${order.value.selectionId} requirement ${order.value.requirementId} quote ${selection.value.quoteId}@${quote.version} event ${args.idempotencyKey}`;
+      }
+    }
     // The stored row keeps the authoritative per-line acceptances. The
     // legacy scalar mirror is written only for single-acceptance events.
     const eventId = await ctx.db.insert("orderEvents", {
@@ -838,6 +1015,34 @@ export const appendOrderEvent = f1Mutation({
       idempotencyKey: args.idempotencyKey,
       createdAt: Date.now(),
     });
+    if (args.commissioningAsset !== undefined && commissionedAssetId === null) {
+      if (commissioningLabel === undefined || derivedProvenance === undefined) {
+        throw new Error("commissioning asset payload failed to resolve");
+      }
+      commissionedAssetId = await ctx.db.insert("assets", {
+        organizationId: args.organizationId,
+        projectId: args.projectId,
+        ...(args.commissioningAsset.locationId === undefined
+          ? {}
+          : { locationId: args.commissioningAsset.locationId }),
+        orderId: args.orderId,
+        label: commissioningLabel,
+        ...(commissioningSerial === undefined ? {} : { serial: commissioningSerial }),
+        ...(commissioningConstraints === undefined ? {} : { constraints: commissioningConstraints }),
+        purchaseProvenance: derivedProvenance,
+        idempotencyKey: commissioningAssetIdempotencyKey(args.idempotencyKey),
+        createdAt: Date.now(),
+      });
+    }
+    if (commissionedAssetId !== null) {
+      return {
+        ok: true as const,
+        eventId,
+        deduplicated: false,
+        assetId: commissionedAssetId,
+        assetDeduplicated: commissionedAssetDeduplicated,
+      };
+    }
     return { ok: true as const, eventId, deduplicated: false };
   },
 });
@@ -1839,7 +2044,23 @@ export const openServiceCase = f1Mutation({
   },
 });
 
-/** Advance a service case; terminal cases never reopen. */
+/**
+ * Advance a service case (E11 outcome semantics, P-18). Transitions
+ * follow a stable table: non-terminal states move among
+ * open/inProgress/waitingForSupplier and forward to resolved/closed; a
+ * resolved case may only replay itself or close; a closed case may only
+ * replay itself. Anything else — including any reopen of a terminal
+ * case — fails with a stable denial and writes nothing.
+ *
+ * Outcomes are terminal-only, explicit, and bounded: a non-terminal
+ * target carrying an outcome is denied, and a supplied outcome must be
+ * nonempty within `SERVICE_OUTCOME_MAX_LENGTH`. A recorded terminal
+ * outcome is stable — the same state plus the same outcome replays
+ * idempotently, while a different outcome is denied instead of
+ * silently overwriting. A terminal case without an outcome stays
+ * explicitly outcome-less (absent, never inferred). Cross-project and
+ * cross-organization cases fail closed through ownership checks.
+ */
 export const updateServiceCase = f1Mutation({
   args: {
     organizationId: v.id("organizations"),
@@ -1873,12 +2094,43 @@ export const updateServiceCase = f1Mutation({
     if (!serviceCase.ok) {
       return { ok: false as const, code: serviceCase.code, message: serviceCase.message };
     }
-    if (serviceCase.value.state === "closed" && args.state !== "closed") {
-      return { ok: false as const, code: "invalid-payload", message: "closed cases never reopen" };
+    const from = serviceCase.value.state as ServiceCaseLifecycleState;
+    const to = args.state as ServiceCaseLifecycleState;
+    if (!isValidServiceCaseTransition(from, to)) {
+      if (from === "closed") {
+        return { ok: false as const, code: "invalid-payload", message: "closed cases never reopen" };
+      }
+      if (from === "resolved") {
+        return { ok: false as const, code: "invalid-payload", message: "resolved cases never reopen except by closing" };
+      }
+      return { ok: false as const, code: "invalid-payload", message: "invalid service case transition" };
+    }
+    let normalizedOutcome: string | undefined;
+    if (args.outcome !== undefined) {
+      try {
+        normalizedOutcome = normalizeServiceOutcome(args.outcome);
+      } catch (error) {
+        return { ok: false as const, code: "invalid-payload", message: error instanceof Error ? error.message : "service case outcome is invalid" };
+      }
+      if (!requiresServiceOutcome(to)) {
+        return { ok: false as const, code: "invalid-payload", message: "service case outcome is only recorded on resolved or closed" };
+      }
+    }
+    const storedOutcome = serviceCase.value.outcome ?? undefined;
+    if (
+      normalizedOutcome !== undefined &&
+      storedOutcome !== undefined &&
+      storedOutcome !== normalizedOutcome
+    ) {
+      return { ok: false as const, code: "invalid-payload", message: "service case outcome cannot be changed" };
+    }
+    const nextOutcome = normalizedOutcome ?? storedOutcome;
+    if (from === to && (nextOutcome ?? undefined) === (storedOutcome ?? undefined)) {
+      return { ok: true as const };
     }
     await ctx.db.patch(args.caseId, {
       state: args.state,
-      ...(args.outcome === undefined ? {} : { outcome: args.outcome }),
+      ...(normalizedOutcome === undefined ? {} : { outcome: normalizedOutcome }),
       updatedAt: Date.now(),
     });
     return { ok: true as const };
