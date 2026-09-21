@@ -55,6 +55,8 @@ export interface WorkbenchProject {
   readonly currency: string | null;
   readonly budgetMinorUnits: number | null;
   readonly needByAt: number | null;
+  readonly sampleKind?: "controlledSample" | null;
+  readonly sampleLabel?: string | null;
 }
 
 export interface WorkbenchAccess {
@@ -390,11 +392,24 @@ export interface WorkbenchIntakeResult {
   readonly message?: string;
 }
 
+export interface WorkbenchSampleInput {
+  readonly idempotencyKey: string;
+}
+
+export interface WorkbenchSampleResult {
+  readonly ok: boolean;
+  readonly projectId?: string;
+  readonly message?: string;
+}
+
+export type WorkbenchSampleHandler = (input: WorkbenchSampleInput) => Promise<WorkbenchSampleResult>;
+
 export interface WorkbenchServerAdapter {
   readonly load: (projectId: string, cursor?: string | null) => Promise<unknown>;
   readonly subscribe?: (projectId: string, onSnapshot: (snapshot: unknown) => void, onError: (error: unknown) => void) => (() => void);
   readonly act: (action: WorkbenchAction) => Promise<WorkbenchActionResult>;
   readonly createIntake?: (input: WorkbenchIntakeInput) => Promise<WorkbenchIntakeResult>;
+  readonly createSample?: (input: WorkbenchSampleInput) => Promise<WorkbenchSampleResult>;
 }
 
 export function formatMoney(minorUnits: number | null, currency: string | null, unknownLabel = "Unknown"): string {
@@ -858,6 +873,20 @@ function parseActivityItem(value: unknown): WorkbenchActivityItem | null {
   return { id, type, occurredAt: value.createdAt, actorLabel: null, state: "unknown", summary: null, evidenceIds: [] };
 }
 
+const CONTROLLED_SAMPLE_KIND = "controlledSample" as const;
+const SAMPLE_LABEL_MAX_LENGTH = 200;
+
+function parseSampleMarker(value: Record<string, unknown>): { readonly sampleKind: "controlledSample" | null; readonly sampleLabel: string | null } | null {
+  const rawKind = value.sampleKind;
+  const rawLabel = value.sampleLabel;
+  if (rawKind === undefined && rawLabel === undefined) return { sampleKind: null, sampleLabel: null };
+  if (typeof rawKind !== "string" || typeof rawLabel !== "string") return null;
+  if (rawKind !== CONTROLLED_SAMPLE_KIND) return null;
+  if (rawLabel.trim().length === 0 || rawLabel.length > SAMPLE_LABEL_MAX_LENGTH) return null;
+  if (rawLabel !== rawLabel.trim()) return null;
+  return { sampleKind: CONTROLLED_SAMPLE_KIND, sampleLabel: rawLabel };
+}
+
 function parseProject(value: unknown): WorkbenchProject | null {
   if (!isRecord(value)) return null;
   const id = requiredString(value.id);
@@ -866,6 +895,8 @@ function parseProject(value: unknown): WorkbenchProject | null {
   const needByAt = nullableNumber(value.needByAt);
   const organizationId = requiredString(value.organizationId);
   if (id === null || organizationId === null || name === null || !isOneOf(value.visibility, ["open", "restricted"] as const) || !isFiniteNumber(value.createdAt) || budgetMinorUnits === undefined || needByAt === undefined) return null;
+  const sample = parseSampleMarker(value);
+  if (sample === null) return null;
   let region: string | null = null;
   let locationCurrency: string | null = null;
   if (value.location !== undefined) {
@@ -878,7 +909,7 @@ function parseProject(value: unknown): WorkbenchProject | null {
   }
   const currency = nullableString(value.currency);
   if (currency === undefined) return null;
-  return { id, organizationId, name, region, currency: currency ?? locationCurrency, budgetMinorUnits, needByAt };
+  return { id, organizationId, name, region, currency: currency ?? locationCurrency, budgetMinorUnits, needByAt, sampleKind: sample.sampleKind, sampleLabel: sample.sampleLabel };
 }
 
 function parseAccess(value: unknown): WorkbenchAccess | null {

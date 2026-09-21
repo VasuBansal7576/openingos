@@ -2142,3 +2142,257 @@ test("a valid intake budget still reaches the intake route in minor units", asyn
     await mounted.cleanup();
   }
 });
+
+test("rejects malformed or partial controlled sample markers at the browser boundary", async () => {
+  const projectId = projection.project.id;
+  const valid = parseWorkbenchSnapshot({
+    ...projection,
+    project: { ...projection.project, sampleKind: "controlledSample", sampleLabel: "Controlled sample data" },
+  }, projectId);
+  if (valid === null) throw new Error("Controlled sample projection should parse");
+  expect(valid.project.sampleKind).toBe("controlledSample");
+  expect(valid.project.sampleLabel).toBe("Controlled sample data");
+  expect(parseWorkbenchSnapshot({
+    ...projection,
+    project: { ...projection.project, sampleKind: "controlledSample" },
+  }, projectId)).toBeNull();
+  expect(parseWorkbenchSnapshot({
+    ...projection,
+    project: { ...projection.project, sampleLabel: "Controlled sample data" },
+  }, projectId)).toBeNull();
+  expect(parseWorkbenchSnapshot({
+    ...projection,
+    project: { ...projection.project, sampleKind: "liveSample", sampleLabel: "Controlled sample data" },
+  }, projectId)).toBeNull();
+  expect(parseWorkbenchSnapshot({
+    ...projection,
+    project: { ...projection.project, sampleKind: "controlledSample", sampleLabel: "   " },
+  }, projectId)).toBeNull();
+  expect(parseWorkbenchSnapshot({
+    ...projection,
+    project: { ...projection.project, sampleKind: "controlledSample", sampleLabel: 42 },
+  }, projectId)).toBeNull();
+  expect(parseWorkbenchSnapshot(projection, projectId)?.project.sampleKind ?? null).toBeNull();
+});
+
+test("renders the durable sample label for controlled projects and never for normal projects", async () => {
+  const sampleSnapshot = parseWorkbenchSnapshot({
+    ...projection,
+    project: { ...projection.project, sampleKind: "controlledSample", sampleLabel: "Controlled sample data" },
+  }, projection.project.id);
+  if (sampleSnapshot === null) throw new Error("Sample projection should parse");
+  const sampleHtml = renderToStaticMarkup(createElement(WorkbenchView, {
+    loadState: { state: "ready", snapshot: sampleSnapshot },
+  }));
+  expect(sampleHtml).toContain("Controlled sample data");
+  expect(sampleHtml).not.toContain("Live vendor");
+  expect(sampleHtml).not.toContain("genuine quote");
+  expect(sampleHtml).not.toContain("realized savings");
+
+  const normalSnapshot = parseWorkbenchSnapshot(projection, projection.project.id);
+  if (normalSnapshot === null) throw new Error("Normal projection should parse");
+  const normalHtml = renderToStaticMarkup(createElement(WorkbenchView, {
+    loadState: { state: "ready", snapshot: normalSnapshot },
+  }));
+  expect(normalHtml).not.toContain("Controlled sample data");
+});
+
+test("sample creation transitions an empty connected app to the returned project load", async () => {
+  const sampleProjection = {
+    ...projection,
+    project: { ...projection.project, id: "project-sample-1", sampleKind: "controlledSample", sampleLabel: "Controlled sample data" },
+  };
+  const loads: string[] = [];
+  const sampleCalls: { idempotencyKey: string }[] = [];
+  const adapter = {
+    load: async (projectId: string) => {
+      loads.push(projectId);
+      if (projectId === "project-sample-1") return sampleProjection;
+      return null;
+    },
+    subscribe: (_projectId: string, onSnapshot: (snapshot: unknown) => void) => {
+      onSnapshot(sampleProjection);
+      return () => undefined;
+    },
+    act: async () => ({ ok: true }),
+    discoverProject: async () => null,
+    createSample: async (input: { idempotencyKey: string }) => {
+      sampleCalls.push(input);
+      return { ok: true, projectId: "project-sample-1", message: "Sample project created by the server." };
+    },
+  };
+  const dom = new HappyWindow({ url: "https://openingos.test/" });
+  const previousWindow = globalThis.window;
+  const previousDocument = globalThis.document;
+  const previousNavigator = globalThis.navigator;
+  const actEnvironment = globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean };
+  const previousActEnvironment = actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+  const browserGlobals = globalThis as unknown as { window: unknown; document: unknown; navigator: unknown };
+  browserGlobals.window = dom as unknown as globalThis.Window;
+  browserGlobals.document = dom.document as unknown as globalThis.Document;
+  browserGlobals.navigator = dom.navigator as unknown as globalThis.Navigator;
+  actEnvironment.IS_REACT_ACT_ENVIRONMENT = true;
+  const container = dom.document.createElement("div");
+  dom.document.body.append(container);
+  const root = createRoot(container as unknown as globalThis.Element);
+  const findButton = (label: string): HTMLButtonElement => {
+    const button = Array.from(container.querySelectorAll("button")).find((candidate) => candidate.textContent?.includes(label));
+    if (!(button instanceof dom.window.HTMLButtonElement)) throw new Error(`Button not found: ${label}`);
+    return button as unknown as HTMLButtonElement;
+  };
+  try {
+    await act(async () => {
+      root.render(createElement(AdapterAwareApp, {
+        backendStatus: "connected",
+        onRetry: () => undefined,
+        workbenchAdapter: adapter,
+      }));
+    });
+    const deadline = Date.now() + 1500;
+    while (!container.textContent?.includes("NO AUTHORIZED PROJECT") && Date.now() < deadline) {
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      });
+    }
+    expect(container.textContent).toContain("NO AUTHORIZED PROJECT");
+    expect(sampleCalls).toHaveLength(0);
+    await act(async () => {
+      findButton("Try the Northside").click();
+    });
+    const loadedDeadline = Date.now() + 1500;
+    while (!loads.includes("project-sample-1") && Date.now() < loadedDeadline) {
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      });
+    }
+    expect(sampleCalls).toHaveLength(1);
+    expect(sampleCalls[0]?.idempotencyKey.trim().length).toBeGreaterThan(0);
+    expect(loads).toContain("project-sample-1");
+    const viewDeadline = Date.now() + 1500;
+    while (!container.textContent?.includes("Controlled sample data") && Date.now() < viewDeadline) {
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      });
+    }
+    expect(container.textContent).toContain("Controlled sample data");
+    expect(container.textContent).not.toContain("Live vendor");
+  } finally {
+    await act(async () => {
+      root.unmount();
+    });
+    browserGlobals.window = previousWindow;
+    browserGlobals.document = previousDocument;
+    browserGlobals.navigator = previousNavigator;
+    if (previousActEnvironment === undefined) delete actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+    else actEnvironment.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment;
+  }
+});
+
+test("stale sample success never overwrites a newer project context", async () => {
+  const newerProjection = {
+    ...projection,
+    project: { ...projection.project, id: "project-newer-1", name: "Newer authorized project" },
+  };
+  const loads: string[] = [];
+  const sampleCalls: { idempotencyKey: string }[] = [];
+  let resolveSample: ((value: { ok: boolean; projectId?: string; message?: string }) => void) | undefined;
+  const sampleGate = new Promise<{ ok: boolean; projectId?: string; message?: string }>((resolve) => {
+    resolveSample = resolve;
+  });
+  const adapter = {
+    load: async (projectId: string) => {
+      loads.push(projectId);
+      if (projectId === "project-newer-1") return newerProjection;
+      return null;
+    },
+    subscribe: (_projectId: string, _onSnapshot: (snapshot: unknown) => void, _onError: (error: unknown) => void) => () => undefined,
+    act: async () => ({ ok: true }),
+    discoverProject: async () => null,
+    createSample: async (input: { idempotencyKey: string }) => {
+      sampleCalls.push(input);
+      return sampleGate;
+    },
+  };
+  const dom = new HappyWindow({ url: "https://openingos.test/" });
+  const previousWindow = globalThis.window;
+  const previousDocument = globalThis.document;
+  const previousNavigator = globalThis.navigator;
+  const actEnvironment = globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean };
+  const previousActEnvironment = actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+  const browserGlobals = globalThis as unknown as { window: unknown; document: unknown; navigator: unknown };
+  browserGlobals.window = dom as unknown as globalThis.Window;
+  browserGlobals.document = dom.document as unknown as globalThis.Document;
+  browserGlobals.navigator = dom.navigator as unknown as globalThis.Navigator;
+  actEnvironment.IS_REACT_ACT_ENVIRONMENT = true;
+  const container = dom.document.createElement("div");
+  dom.document.body.append(container);
+  const root = createRoot(container as unknown as globalThis.Element);
+  const findButton = (label: string): HTMLButtonElement => {
+    const button = Array.from(container.querySelectorAll("button")).find((candidate) => candidate.textContent?.includes(label));
+    if (!(button instanceof dom.window.HTMLButtonElement)) throw new Error(`Button not found: ${label}`);
+    return button as unknown as HTMLButtonElement;
+  };
+  try {
+    await act(async () => {
+      root.render(createElement(AdapterAwareApp, {
+        backendStatus: "connected",
+        onRetry: () => undefined,
+        workbenchAdapter: adapter,
+      }));
+    });
+    const emptyDeadline = Date.now() + 1500;
+    while (!container.textContent?.includes("NO AUTHORIZED PROJECT") && Date.now() < emptyDeadline) {
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      });
+    }
+    expect(container.textContent).toContain("NO AUTHORIZED PROJECT");
+    await act(async () => {
+      findButton("Try the Northside").click();
+    });
+    const startedDeadline = Date.now() + 1500;
+    while (sampleCalls.length === 0 && Date.now() < startedDeadline) {
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      });
+    }
+    expect(sampleCalls).toHaveLength(1);
+    await act(async () => {
+      root.render(createElement(AdapterAwareApp, {
+        backendStatus: "connected",
+        onRetry: () => undefined,
+        projectId: "project-newer-1",
+        workbenchAdapter: adapter,
+      }));
+    });
+    const newerDeadline = Date.now() + 1500;
+    while (!container.textContent?.includes("Newer authorized project") && Date.now() < newerDeadline) {
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      });
+    }
+    expect(container.textContent).toContain("Newer authorized project");
+    await act(async () => {
+      resolveSample?.({ ok: true, projectId: "project-sample-stale" });
+      await sampleGate;
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+    expect(sampleCalls).toHaveLength(1);
+    expect(loads).not.toContain("project-sample-stale");
+    expect(container.textContent).toContain("Newer authorized project");
+    expect(container.textContent).not.toContain("Controlled sample data");
+    const alert = container.querySelector('[role="alert"]');
+    expect(alert?.textContent ?? "").toContain("may have been created");
+  } finally {
+    await act(async () => {
+      root.unmount();
+    });
+    browserGlobals.window = previousWindow;
+    browserGlobals.document = previousDocument;
+    browserGlobals.navigator = previousNavigator;
+    if (previousActEnvironment === undefined) delete actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+    else actEnvironment.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment;
+  }
+});

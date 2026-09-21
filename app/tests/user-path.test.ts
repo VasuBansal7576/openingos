@@ -448,14 +448,15 @@ async function mountLanding(
   };
 }
 
-test("unconfigured demo entry stays an unavailable state naming the missing backend contract", async () => {
+test("unconfigured demo entry stays an unavailable state without obsolete route wording", async () => {
   const mounted = await mountLanding({ backendStatus: "unconfigured" });
   try {
     expect(mounted.container.textContent).toContain("Less chasing.");
     await mounted.clickButton("Try the Northside");
     expect(mounted.container.textContent).toContain("The sample demo is not available in this build.");
-    expect(mounted.container.textContent).toContain("Missing backend contract");
-    expect(mounted.container.textContent).toContain("domain/intake:createWorkspace");
+    expect(mounted.container.textContent).toContain("nothing was created");
+    expect(mounted.container.textContent).not.toContain("This backend does not provide a sample-project route");
+    expect(mounted.container.textContent).not.toContain("Missing backend contract");
     expect(mounted.container.textContent).not.toContain("Harbor Equipment");
     await mounted.pressEscape();
     expect(mounted.container.textContent).not.toContain("The sample demo is not available in this build.");
@@ -520,6 +521,128 @@ test("landing keeps keyboard entry points, skip link, and status retry", async (
     if (demo === undefined) throw new Error("Demo button not found");
     demo.focus();
     expect((mounted.dom.document.activeElement as unknown) === (demo as unknown)).toBe(true);
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("connected sample entry starts on the first CTA click with pending and one mutation", async () => {
+  const seen: { idempotencyKey: string }[] = [];
+  let resolveSample: ((value: { ok: boolean; projectId?: string; message?: string }) => void) | undefined;
+  const pendingSample = new Promise<{ ok: boolean; projectId?: string; message?: string }>((resolve) => {
+    resolveSample = resolve;
+  });
+  const mounted = await mountLanding({
+    backendStatus: "connected",
+    workbench: { state: "empty", message: "No authorized project projection is available yet." },
+    onSample: async (input) => {
+      seen.push(input);
+      return pendingSample;
+    },
+  });
+  try {
+    await mounted.clickButton("Try the Northside");
+    expect(mounted.container.textContent).toContain("Open a controlled sample project.");
+    expect(mounted.container.textContent).toContain("Creating sample project.");
+    const createButton = Array.from(mounted.container.querySelectorAll("button")).find((candidate) =>
+      candidate.textContent?.includes("Creating sample project"),
+    ) as unknown as HTMLButtonElement | undefined;
+    expect(createButton?.disabled).toBe(true);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.idempotencyKey.trim().length).toBeGreaterThan(0);
+    await mounted.clickButton("Open demo");
+    expect(seen).toHaveLength(1);
+    expect(mounted.container.textContent).toContain("Open a controlled sample project.");
+    await mounted.pressEscape();
+    expect(mounted.container.textContent).toContain("Open a controlled sample project.");
+    expect(seen).toHaveLength(1);
+    resolveSample?.({ ok: true, projectId: "project-sample-1", message: "Sample project created by the server." });
+    await act(async () => {
+      await pendingSample;
+    });
+    expect(mounted.container.textContent).toContain("Sample project created. Loading the persisted project.");
+    expect(seen).toHaveLength(1);
+    const submitButton = Array.from(mounted.container.querySelectorAll("button")).find((candidate) =>
+      candidate.textContent?.includes("Sample project created"),
+    ) as unknown as HTMLButtonElement | undefined;
+    expect(submitButton?.disabled).toBe(true);
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("connected sample failure shows truthful error and retries with the same key", async () => {
+  const keys: string[] = [];
+  let calls = 0;
+  const mounted = await mountLanding({
+    backendStatus: "connected",
+    workbench: { state: "empty", message: "No authorized project projection is available yet." },
+    onSample: async (input) => {
+      calls += 1;
+      keys.push(input.idempotencyKey);
+      if (calls === 1) return { ok: false, message: "Controlled sample denial." };
+      return { ok: true, projectId: "project-sample-retry" };
+    },
+  });
+  try {
+    await mounted.clickButton("Try the Northside");
+    expect(keys).toHaveLength(1);
+    expect(mounted.container.textContent).toContain("Controlled sample denial.");
+    const focused = mounted.dom.document.activeElement as unknown as { tagName?: string; textContent?: string | null } | null;
+    expect(focused?.tagName).toBe("BUTTON");
+    expect(focused?.textContent ?? "").toContain("Retry sample creation");
+    await mounted.clickButton("Retry sample creation");
+    expect(keys).toHaveLength(2);
+    expect(keys[0]).toBe(keys[1]);
+    expect(mounted.container.textContent).toContain("Sample project created. Loading the persisted project.");
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("non-connected states never offer the sample mutation", async () => {
+  for (const status of ["unconfigured", "configured-unverified", "authenticating", "unavailable", "reconnecting"] as const) {
+    const seen: unknown[] = [];
+    const mounted = await mountLanding({
+      backendStatus: status,
+      onSample: async (input) => {
+        seen.push(input);
+        return { ok: true, projectId: "project-sample-never" };
+      },
+    });
+    try {
+      await mounted.clickButton("Try the Northside");
+      expect(mounted.container.textContent).toContain("The sample demo is not available in this build.");
+      expect(mounted.container.textContent).not.toContain("Create controlled sample project");
+      expect(seen).toHaveLength(0);
+      await mounted.pressEscape();
+    } finally {
+      await mounted.cleanup();
+    }
+  }
+});
+
+test("demo and brief entries keep Escape and focus return behavior", async () => {
+  const mounted = await mountLanding({
+    backendStatus: "connected",
+    workbench: { state: "empty", message: "No authorized project projection is available yet." },
+    onSample: async () => ({ ok: true, projectId: "project-sample-focus" }),
+    onIntake: async () => ({ ok: true, projectId: "project-intake-focus" }),
+  });
+  try {
+    await mounted.clickButton("Try the Northside");
+    expect(mounted.container.textContent).toContain("Open a controlled sample project.");
+    const deadline = Date.now() + 1500;
+    while (!mounted.container.textContent?.includes("Sample project created. Loading the persisted project.") && Date.now() < deadline) {
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      });
+    }
+    expect(mounted.container.textContent).toContain("Sample project created. Loading the persisted project.");
+    await mounted.pressEscape();
+    expect(mounted.container.textContent).not.toContain("Open a controlled sample project.");
+    await mounted.clickButton("Start your own brief");
+    expect(mounted.container.textContent).toContain("Open a workspace");
   } finally {
     await mounted.cleanup();
   }

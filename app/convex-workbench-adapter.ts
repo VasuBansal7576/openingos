@@ -9,6 +9,8 @@ import {
   type WorkbenchActionResult,
   type WorkbenchIntakeInput,
   type WorkbenchIntakeResult,
+  type WorkbenchSampleInput,
+  type WorkbenchSampleResult,
   type WorkbenchServerAdapter,
   type WorkbenchSnapshot,
 } from "./workbench-state";
@@ -93,6 +95,10 @@ type W1CreateIntakeArgs = Record<string, unknown> & {
   readonly urgency?: "urgent" | "high" | "normal" | "low";
 };
 
+type W1CreateSampleArgs = Record<string, unknown> & {
+  readonly idempotencyKey: string;
+};
+
 type W1PublicApi = {
   readonly "workbench/projection": {
     readonly listAccessibleProjects: FunctionReference<
@@ -120,6 +126,9 @@ type W1PublicApi = {
   readonly "domain/intake": {
     readonly createWorkspace: FunctionReference<"mutation", "public", W1CreateIntakeArgs, unknown>;
   };
+  readonly "domain/sampleProject": {
+    readonly createSampleGuestProject: FunctionReference<"mutation", "public", W1CreateSampleArgs, unknown>;
+  };
 };
 
 /**
@@ -143,6 +152,8 @@ const impactApi = (api as unknown as W1PublicApi)["domain/impact"];
 const decideSubstituteProposalReference = impactApi.decideSubstituteProposal;
 const intakeApi = (api as unknown as W1PublicApi)["domain/intake"];
 const createWorkspaceReference = intakeApi.createWorkspace;
+const sampleApi = (api as unknown as W1PublicApi)["domain/sampleProject"];
+const createSampleGuestProjectReference = sampleApi.createSampleGuestProject;
 
 const WORKBENCH_PROJECTION_LIMIT = 12;
 const PROJECT_DISCOVERY_LIMIT = 1;
@@ -155,6 +166,7 @@ export interface ConvexWorkbenchAdapter extends WorkbenchServerAdapter {
   readonly discoverProject: () => Promise<string | null>;
   readonly dispose: () => void;
   readonly createIntake: (input: WorkbenchIntakeInput) => Promise<WorkbenchIntakeResult>;
+  readonly createSample: (input: WorkbenchSampleInput) => Promise<WorkbenchSampleResult>;
 }
 
 /** Browser-safe intake key: one stable opaque key per logical submission. */
@@ -165,6 +177,16 @@ export function createIntakeIdempotencyKey(): string {
     // Fall through to a local opaque key in runtimes without Web Crypto.
   }
   return `intake-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+/** Browser-safe sample key: one stable opaque key per logical demo attempt. */
+export function createSampleIdempotencyKey(): string {
+  try {
+    if (typeof globalThis.crypto?.randomUUID === "function") return globalThis.crypto.randomUUID();
+  } catch {
+    // Fall through to a local opaque key in runtimes without Web Crypto.
+  }
+  return `sample-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
 type WorkbenchWatch = Watch<unknown>;
@@ -222,6 +244,7 @@ const ACTION_ALREADY_IN_FLIGHT = "This action is already in progress. Wait for t
 const RETRY_UNAVAILABLE = "Retry is unavailable because no safe retry contract is configured. Nothing was sent.";
 const SERVICE_CASE_SUMMARY_MAX_LENGTH = 800;
 const IDEMPOTENCY_KEY_MAX_LENGTH = 160;
+const SAMPLE_IDEMPOTENCY_KEY_MAX_LENGTH = 128;
 const SERVICE_CASE_URGENCIES = ["urgent", "high", "normal", "low"] as const;
 
 const RESEARCH_COLLECT_OPERATION_ID = "research.collect" as const;
@@ -878,5 +901,29 @@ export function createConvexWorkbenchAdapter(client: ConvexWorkbenchClient): Con
     }
   };
 
-  return { load, subscribe, act, discoverProject, dispose, createIntake };
+  const createSample = async (input: WorkbenchSampleInput): Promise<WorkbenchSampleResult> => {
+    if (disposed) return { ok: false, message: "The workbench connection is no longer active. Nothing was sent." };
+    const idempotencyKey = input.idempotencyKey.trim();
+    if (idempotencyKey.length === 0 || idempotencyKey.length > SAMPLE_IDEMPOTENCY_KEY_MAX_LENGTH) {
+      return { ok: false, message: "A submission key is required. Nothing was sent." };
+    }
+    const key = `sample:${idempotencyKey}`;
+    if (inFlightMutations.has(key)) return { ok: false, message: ACTION_ALREADY_IN_FLIGHT };
+    inFlightMutations.add(key);
+    try {
+      const args: W1CreateSampleArgs = { idempotencyKey };
+      const result = await client.mutation(createSampleGuestProjectReference, args);
+      const failure = mutationFailure(result, "The server did not create this sample project.");
+      if (failure !== null) return failure;
+      const projectId = isRecord(result) ? requiredString(result.projectId) : null;
+      if (projectId === null) return { ok: false, message: "The server did not return a valid sample project." };
+      return { ok: true, projectId, message: "Sample project created by the server." };
+    } catch (error) {
+      return { ok: false, message: error instanceof Error ? error.message : "The server did not create this sample project." };
+    } finally {
+      inFlightMutations.delete(key);
+    }
+  };
+
+  return { load, subscribe, act, discoverProject, dispose, createIntake, createSample };
 }

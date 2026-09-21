@@ -80,6 +80,8 @@ h1, h2, h3, p { margin-top: 0; }
 .wb-project-picker { display: grid; gap: .08rem; min-width: 11.5rem; max-width: 15rem; overflow: hidden; padding-left: 1.25rem; border-left: 1px solid var(--wb-border); text-align: left; }
 .wb-project-picker strong { overflow: hidden; font-size: .82rem; text-overflow: ellipsis; white-space: nowrap; }
 .wb-project-picker > span:last-child { color: var(--wb-muted); font-size: .64rem; }
+.wb-sample-pill { display: inline-flex; margin-top: .25rem; }
+.wb-overview-intro .wb-sample-pill { margin-top: .4rem; }
 .wb-nav { display: flex; height: 4.5625rem; align-items: center; gap: .3rem; margin-left: auto; }
 .wb-nav button { display: flex; height: 2.25rem; align-items: center; gap: .45rem; padding: 0 .9rem; border: 0; border-radius: 999px; color: var(--wb-ink); background: transparent; font-size: .7rem; font-weight: 600; white-space: nowrap; }
 .wb-nav button:hover { background: #76858c13; }

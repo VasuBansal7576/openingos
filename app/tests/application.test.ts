@@ -82,6 +82,29 @@ describe("public landing fidelity", () => {
     expect(html).not.toContain("Harbor Equipment");
   });
 
+  test("connected empty state keeps sample and intake routes distinct", async () => {
+    const html = renderToStaticMarkup(createElement(App, {
+      backendStatus: "connected",
+      workbench: { state: "empty", message: "No authorized project projection is available yet." },
+      onIntake: () => Promise.resolve({ ok: true, projectId: "project-1" }),
+      onSample: () => Promise.resolve({ ok: true, projectId: "project-sample-1" }),
+    }));
+    expect(html).toContain("Open a workspace");
+    expect(html).toContain("Try the Northside");
+    expect(html).not.toContain("Harbor Equipment");
+  });
+
+  test("connected sample entry without a sample route stays unavailable without obsolete wording", async () => {
+    const html = renderToStaticMarkup(createElement(App, {
+      backendStatus: "connected",
+      workbench: { state: "empty", message: "No authorized project projection is available yet." },
+      onIntake: () => Promise.resolve({ ok: true, projectId: "project-1" }),
+    }));
+    expect(html).toContain("Less chasing.");
+    expect(html).not.toContain("This backend does not provide a sample-project route");
+    expect(html).not.toContain("Missing backend contract");
+  });
+
   test("does not create a hosting binding", async () => {
     const vite = await Bun.file(new URL("../../vite.config.ts", import.meta.url)).text();
     expect(vite).toContain("defineConfig");

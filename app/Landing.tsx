@@ -1,7 +1,8 @@
 import { useEffect, useId, useRef, useState } from "react";
 import type { BackendStatus } from "./backend-state";
+import { createSampleIdempotencyKey } from "./convex-workbench-adapter";
 import { WorkbenchIntakeView, type WorkbenchIntakeHandler } from "./Workbench";
-import type { WorkbenchLoadState } from "./workbench-state";
+import type { WorkbenchLoadState, WorkbenchSampleHandler } from "./workbench-state";
 
 /**
  * Espresso-machine visual for the landing polaroid. Resolved as a relative
@@ -15,6 +16,7 @@ export interface LandingViewProps {
   readonly onRetry?: (() => void) | undefined;
   readonly workbench?: WorkbenchLoadState | undefined;
   readonly onIntake?: WorkbenchIntakeHandler | undefined;
+  readonly onSample?: WorkbenchSampleHandler | undefined;
 }
 
 type LandingPanel = "none" | "briefBlocked" | "demo";
@@ -92,20 +94,30 @@ const HOW_IT_WORKS: readonly { readonly step: string; readonly title: string; re
  * language follow the accepted `design/purchasing-workbench.html` reference:
  * sage desk canvas, cream quote papers, forest-green controls, warm yellow
  * actions, and editorial serif/sans pairing. Every displayed outcome comes
- * from real application state; the sample demo has no backend route and stays
- * an explicit unavailable state instead of fixture data.
+ * from real application state; without a connected sample route the demo
+ * stays an explicit unavailable state instead of fixture data.
  *
  * When a live connected intake route is attached, the real intake form is
  * embedded below the hero so "Start your own brief" enters the configured
  * flow. Without that route the brief entry stays an honest blocked state.
+ * When a live connected sample route is attached, either demo entry opens
+ * the demo panel and immediately starts one isolated sample guest project
+ * through the real sample mutation in one click.
  */
-export default function LandingView({ backendStatus, onRetry, workbench, onIntake }: LandingViewProps) {
+export default function LandingView({ backendStatus, onRetry, workbench, onIntake, onSample }: LandingViewProps) {
   const [panel, setPanel] = useState<LandingPanel>("none");
   const idPrefix = useId().replace(/:/g, "");
   const panelHeadingRef = useRef<HTMLHeadingElement | null>(null);
   const briefSectionRef = useRef<HTMLElement | null>(null);
   const lastTriggerRef = useRef<HTMLButtonElement | null>(null);
   const notice = statusNotice(backendStatus, workbench);
+  const [sampleKey, setSampleKey] = useState<string | null>(null);
+  const [samplePending, setSamplePending] = useState(false);
+  const [sampleError, setSampleError] = useState<string | null>(null);
+  const [sampleNotice, setSampleNotice] = useState<string | null>(null);
+  const [sampleSucceeded, setSampleSucceeded] = useState(false);
+  const sampleSubmittingRef = useRef(false);
+  const sampleRetryRef = useRef<HTMLButtonElement | null>(null);
 
   useEffect(() => {
     if (panel !== "none") {
@@ -115,7 +127,14 @@ export default function LandingView({ backendStatus, onRetry, workbench, onIntak
   }, [panel, idPrefix]);
 
   const closePanel = (): void => {
+    if (sampleSubmittingRef.current) return;
     setPanel("none");
+    setSampleKey(null);
+    setSamplePending(false);
+    setSampleError(null);
+    setSampleNotice(null);
+    setSampleSucceeded(false);
+    sampleSubmittingRef.current = false;
     lastTriggerRef.current?.focus();
   };
 
@@ -144,9 +163,62 @@ export default function LandingView({ backendStatus, onRetry, workbench, onIntak
     setPanel("briefBlocked");
   };
 
+  const submitSample = async (): Promise<void> => {
+    if (onSample === undefined || samplePending || sampleSubmittingRef.current || sampleSucceeded) return;
+    const key = sampleKey ?? createSampleIdempotencyKey();
+    setSampleKey(key);
+    sampleSubmittingRef.current = true;
+    setSamplePending(true);
+    setSampleError(null);
+    setSampleNotice(null);
+    try {
+      const result = await onSample({ idempotencyKey: key });
+      if (result.ok) {
+        setSampleSucceeded(true);
+        setSampleNotice("Sample project created. Loading the persisted project.");
+        return;
+      }
+      setSampleError(result.message ?? "The server did not create this sample project.");
+    } catch (error) {
+      setSampleError(error instanceof Error ? error.message : "The server did not create this sample project.");
+    } finally {
+      sampleSubmittingRef.current = false;
+      setSamplePending(false);
+    }
+  };
+
   const openDemo = (trigger: HTMLButtonElement | null): void => {
-    lastTriggerRef.current = trigger;
+    if (sampleSubmittingRef.current) {
+      if (trigger !== null) lastTriggerRef.current = trigger;
+      return;
+    }
+    if (trigger !== null) lastTriggerRef.current = trigger;
+    if (sampleSucceeded) {
+      setPanel("demo");
+      return;
+    }
     setPanel("demo");
+    if (onSample === undefined) {
+      setSampleError(null);
+      setSampleNotice(null);
+      return;
+    }
+    setSampleError(null);
+    setSampleNotice(null);
+    void submitSample();
+  };
+
+  useEffect(() => {
+    if (panel === "demo" && sampleError !== null && !samplePending) {
+      sampleRetryRef.current?.focus();
+    }
+  }, [panel, sampleError, samplePending]);
+
+  const startFreshSampleRequest = (): void => {
+    if (sampleSubmittingRef.current || samplePending || sampleSucceeded) return;
+    setSampleKey(createSampleIdempotencyKey());
+    setSampleError(null);
+    setSampleNotice(null);
   };
 
   return (
@@ -228,28 +300,65 @@ export default function LandingView({ backendStatus, onRetry, workbench, onIntak
         {panel !== "none" ? (
           <section className="wb-landing-entry" id={`${idPrefix}-entry-panel`} aria-label={panel === "demo" ? "Sample demo status" : "Start your own brief"}>
             {panel === "demo" ? (
-              <div className="wb-landing-entry-card wb-landing-entry-unavailable" role="status">
-                <p className="wb-eyebrow">NORTHSIDE CAF&Eacute; DEMO &middot; UNAVAILABLE</p>
-                <h2 ref={panelHeadingRef} tabIndex={-1}>The sample demo is not available in this build.</h2>
-                <p>
-                  The Northside caf&eacute; demo needs a real isolated backend-created sample guest project.
-                  This backend does not provide a sample-project route, so the demo cannot start without
-                  inventing fixture vendors, quotes, or savings, which OpeningOS will not do.
-                </p>
-                <p className="wb-micro">
-                  Missing backend contract: isolated sample-guest-project creation. Only workspace creation
-                  through the intake flow (<code>domain/intake:createWorkspace</code>) is configured. This
-                  blocker has been reported and no fixture data was substituted.
-                </p>
-                <div className="wb-landing-entry-actions">
-                  {onIntake !== undefined ? (
-                    <button type="button" className="wb-button wb-button-primary" onClick={(event) => openBrief(event.currentTarget)}>
-                      Start your own brief instead
+              onSample !== undefined ? (
+                <div className="wb-landing-entry-card" aria-label="Northside cafe demo">
+                  <p className="wb-eyebrow">NORTHSIDE CAF&Eacute; DEMO &middot; CONTROLLED SAMPLE</p>
+                  <h2 ref={panelHeadingRef} tabIndex={-1}>Open a controlled sample project.</h2>
+                  <p>
+                    This creates one fresh isolated guest project through the connected sample route
+                    (<code>domain/sampleProject:createSampleGuestProject</code>). Vendors, quotes, and
+                    equipment come from the controlled sample dataset only. No live vendor discovery
+                    or provider send occurs, and no fixture data is invented in the browser.
+                  </p>
+                  {samplePending ? <p role="status" aria-live="polite">Creating sample project. No duplicate was sent.</p> : null}
+                  {sampleNotice !== null && !samplePending ? <p role="status">{sampleNotice}</p> : null}
+                  {sampleError !== null && !samplePending ? <p role="alert">{sampleError}</p> : null}
+                  <div className="wb-landing-entry-actions">
+                    <button
+                      type="button"
+                      className="wb-button wb-button-primary"
+                      onClick={() => { void submitSample(); }}
+                      disabled={samplePending || sampleSucceeded}
+                      aria-busy={samplePending}
+                      ref={sampleRetryRef}
+                    >
+                      {samplePending ? "Creating sample project" : sampleSucceeded ? "Sample project created" : sampleError !== null ? "Retry sample creation" : "Create controlled sample project"}
                     </button>
-                  ) : null}
-                  <button type="button" className="wb-button wb-button-secondary" onClick={closePanel}>Back to the landing</button>
+                    {sampleError !== null && !samplePending && !sampleSucceeded ? (
+                      <button type="button" className="wb-button wb-button-secondary" onClick={startFreshSampleRequest}>
+                        Use a fresh key for a new demo request
+                      </button>
+                    ) : null}
+                    <button type="button" className="wb-button wb-button-secondary" onClick={closePanel} disabled={samplePending}>Back to the landing</button>
+                  </div>
+                  <p className="wb-micro">
+                    One logical attempt reuses its submission key across retries. A deliberate fresh request
+                    may use a fresh key. The created project loads through the normal authorized projection.
+                  </p>
                 </div>
-              </div>
+              ) : (
+                <div className="wb-landing-entry-card wb-landing-entry-unavailable" role="status">
+                  <p className="wb-eyebrow">NORTHSIDE CAF&Eacute; DEMO &middot; UNAVAILABLE</p>
+                  <h2 ref={panelHeadingRef} tabIndex={-1}>The sample demo is not available in this build.</h2>
+                  <p>
+                    The Northside caf&eacute; demo needs a connected sample route with an authorized empty
+                    project state. This session does not have that route attached, so nothing was created
+                    and no fixture vendors, quotes, or savings were substituted.
+                  </p>
+                  <p className="wb-micro">
+                    No sample guest project was created in this session. The intake flow remains available
+                    when a connected intake route is attached.
+                  </p>
+                  <div className="wb-landing-entry-actions">
+                    {onIntake !== undefined ? (
+                      <button type="button" className="wb-button wb-button-primary" onClick={(event) => openBrief(event.currentTarget)}>
+                        Start your own brief instead
+                      </button>
+                    ) : null}
+                    <button type="button" className="wb-button wb-button-secondary" onClick={closePanel}>Back to the landing</button>
+                  </div>
+                </div>
+              )
             ) : (
               <div className="wb-landing-entry-card wb-landing-entry-unavailable" role="status">
                 <p className="wb-eyebrow">YOUR OWN BRIEF &middot; BACKEND REQUIRED</p>

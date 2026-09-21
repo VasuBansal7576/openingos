@@ -265,7 +265,11 @@ function LoadNotice({ loadState, onRetry }: { readonly loadState: WorkbenchLoadS
   );
 }
 
-function Header({ activeTab, project, onTabChange, onOpenAssistant, disabled = false }: { readonly activeTab: Tab; readonly project: Pick<WorkbenchSnapshot["project"], "name" | "region" | "currency">; readonly onTabChange: (tab: Tab) => void; readonly onOpenAssistant: () => void; readonly disabled?: boolean }) {
+function isControlledSampleProject(project: Pick<WorkbenchSnapshot["project"], "sampleKind" | "sampleLabel">): project is Pick<WorkbenchSnapshot["project"], "sampleKind" | "sampleLabel"> & { readonly sampleKind: "controlledSample"; readonly sampleLabel: string } {
+  return project.sampleKind === "controlledSample" && typeof project.sampleLabel === "string" && project.sampleLabel.trim().length > 0;
+}
+
+function Header({ activeTab, project, onTabChange, onOpenAssistant, disabled = false }: { readonly activeTab: Tab; readonly project: Pick<WorkbenchSnapshot["project"], "name" | "region" | "currency" | "sampleKind" | "sampleLabel">; readonly onTabChange: (tab: Tab) => void; readonly onOpenAssistant: () => void; readonly disabled?: boolean }) {
   const tabs: readonly [Tab, string, string][] = [
     ["project", "Project", "compass"],
     ["suppliers", "Suppliers", "search"],
@@ -287,6 +291,7 @@ function Header({ activeTab, project, onTabChange, onOpenAssistant, disabled = f
         <div className="wb-project-picker" aria-label="Current project">
           <span className="wb-eyebrow">PROJECT</span>
           <strong>{project.name}</strong>
+          {isControlledSampleProject(project) ? <span className="wb-sample-pill"><Pill>{project.sampleLabel}</Pill></span> : null}
           <span>{project.region ?? "Region unknown"} · {project.currency ?? "Currency unknown"}</span>
         </div>
         <nav className="wb-nav" aria-label="Project navigation">
@@ -366,7 +371,7 @@ function OverviewStrip({ snapshot }: { readonly snapshot: WorkbenchSnapshot }) {
   return (
     <>
       <section className="wb-overview-strip" aria-label="Project financial overview">
-        <div className="wb-overview-intro"><span className="wb-eyebrow">PROCUREMENT READINESS</span><strong>{readinessLabel}</strong><span>{readinessDescription}</span></div>
+        <div className="wb-overview-intro"><span className="wb-eyebrow">PROCUREMENT READINESS</span><strong>{readinessLabel}</strong><span>{readinessDescription}</span>{isControlledSampleProject(snapshot.project) ? <span className="wb-sample-pill"><Pill>{snapshot.project.sampleLabel}</Pill></span> : null}</div>
       <div className="wb-metric"><span>Approved budget</span><strong>{formatMoney(budget, snapshot.project.currency)}</strong><small>Planning allocation</small></div>
       <div className="wb-metric"><span>Selected forecast</span><strong>{formatMoney(forecast, snapshot.project.currency)}</strong><small>Expected, not yet ordered</small></div>
       <div className="wb-metric"><span>Committed</span><strong>{formatMoney(snapshot.committedMinorUnits, snapshot.project.currency)}</strong><small>Recorded orders only</small></div>

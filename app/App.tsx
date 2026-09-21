@@ -1,12 +1,15 @@
 import type { BackendStatus } from "./backend-state";
 import LandingView from "./Landing";
 import WorkbenchView, { type WorkbenchViewProps } from "./Workbench";
-import type { WorkbenchLoadState } from "./workbench-state";
+import type { WorkbenchLoadState, WorkbenchSampleInput, WorkbenchSampleResult } from "./workbench-state";
+
+export type AppSampleHandler = (input: WorkbenchSampleInput) => Promise<WorkbenchSampleResult>;
 
 export interface AppProps extends Pick<WorkbenchViewProps, "onAction" | "onLoadMore" | "onIntake"> {
   readonly backendStatus?: BackendStatus;
   readonly onRetry?: () => void;
   readonly workbench?: WorkbenchLoadState | undefined;
+  readonly onSample?: AppSampleHandler | undefined;
 }
 
 /**
@@ -19,16 +22,18 @@ export interface AppProps extends Pick<WorkbenchViewProps, "onAction" | "onLoadM
  * stays a compact integrated notice that never replaces the whole design and
  * never implies a live connection.
  */
-export default function App({ backendStatus = "unconfigured", onRetry, workbench, onAction, onLoadMore, onIntake }: AppProps) {
+export default function App({ backendStatus = "unconfigured", onRetry, workbench, onAction, onLoadMore, onIntake, onSample }: AppProps) {
   if (workbench !== undefined && (backendStatus === "connected" || backendStatus === "reconnecting")) {
-    // Intake is offered only on a live connected empty state through the
-    // real adapter route, rendered inside the landing below. Ready and
-    // last-known projections render the full workbench directly.
+    // Intake and the controlled sample demo are offered only on a live
+    // connected empty state through their real adapter routes, rendered
+    // inside the landing below. Ready and last-known projections render
+    // the full workbench directly.
     const connectedIntake = workbench.state === "empty" && backendStatus === "connected" ? onIntake : undefined;
+    const connectedSample = workbench.state === "empty" && backendStatus === "connected" ? onSample : undefined;
     if (workbench.state === "ready" || workbench.state === "reconnecting" || "lastKnown" in workbench) {
       return <WorkbenchView loadState={workbench} onRetry={onRetry} onAction={onAction} onLoadMore={onLoadMore} onIntake={connectedIntake} />;
     }
-    return <LandingView backendStatus={backendStatus} onRetry={onRetry} workbench={workbench} onIntake={connectedIntake} />;
+    return <LandingView backendStatus={backendStatus} onRetry={onRetry} workbench={workbench} onIntake={connectedIntake} onSample={connectedSample} />;
   }
-  return <LandingView backendStatus={backendStatus} onRetry={onRetry} workbench={workbench} onIntake={undefined} />;
+  return <LandingView backendStatus={backendStatus} onRetry={onRetry} workbench={workbench} onIntake={undefined} onSample={undefined} />;
 }
