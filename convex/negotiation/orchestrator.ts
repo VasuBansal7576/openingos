@@ -95,6 +95,11 @@ import type * as jev from "../models/jev.js";
 import type * as openai from "../models/openai.js";
 import type * as send from "../communication/send.js";
 import type * as operations from "../execution/operations.js";
+import type {
+  StoredQuoteCharge,
+  StoredQuoteLine,
+  StoredTaxBasis,
+} from "../shared/quoteSemantics.js";
 
 type ActionArgs<T> = T extends RegisteredAction<infer _V, infer A, infer _R> ? A : never;
 type ActionReturn<T> = T extends RegisteredAction<infer _V, infer _A, infer R> ? Awaited<R> : never;
@@ -125,9 +130,11 @@ const createOperationRef = makeFunctionReference<
 >("execution/operations:create");
 
 /** Pinned input version for the server-built Jev move workload. */
-export const NEGOTIATION_JEV_INPUT_VERSION = "e6-negotiation-workload-v1" as const;
+export const NEGOTIATION_JEV_INPUT_VERSION = "e6-negotiation-workload-v2" as const;
 /** Pinned input version for the server-built OpenAI draft workload. */
-export const NEGOTIATION_DRAFT_INPUT_VERSION = "e6-negotiation-draft-v1" as const;
+export const NEGOTIATION_DRAFT_INPUT_VERSION = "e6-negotiation-draft-v2" as const;
+/** Version tag for the bounded quote-terms derivation below. */
+export const NEGOTIATION_QUOTE_TERMS_VERSION = "e6-negotiation-quote-terms-v1" as const;
 /** Orchestrator lineage version for review. */
 export const NEGOTIATION_ORCHESTRATOR_VERSION = "e12-negotiation-orchestrator-v1" as const;
 /**
@@ -140,10 +147,170 @@ const PENDING_SEND_GRANT = "send-grant-pending" as const;
 
 const INBOX_ID_PATTERN = /^[A-Za-z0-9._:-]{1,160}$/;
 
+/**
+ * Bounded versioned quote-terms derivation (Astra repair: complete terms
+ * must alter workloads).
+ *
+ * The Jev move state previously carried a fixed
+ * `missingTerms: "freight,installation,warranty"` constant and the draft
+ * workload a thin 4-line `description: quantity` excerpt, so a quote whose
+ * freight/installation terms became complete (or changed at all) produced
+ * byte-identical model workloads. These helpers derive bounded, versioned
+ * summaries from the ACTUAL live quote row instead:
+ * - `missingTermsOf` lists the charge labels still blocking comparison
+ *   (`unknown`/`estimated` states only; `known`/`included` terms are
+ *   complete and `notApplicable` terms are not missing), or
+ *   `"none-complete"` when every charge is resolved.
+ * - `summarizeQuoteTerms` renders every line (id, description, quantity,
+ *   unit price), every charge state, and the tax basis, tagged with the
+ *   quote version and content-hash prefix so any term change alters the
+ *   workload bytes.
+ *
+ * Bounds: at most 8 lines and 8 charges, 2000 chars of terms, 240 chars of
+ * missing-terms. Truncation is explicit (`…[truncated]`) so a capped
+ * summary never masquerades as the complete quote. Quote unit prices are
+ * supplier-provided comparison terms (the negotiation subject), never
+ * confidential mandate targets — those must never enter these summaries.
+ */
+const NEGOTIATION_MAX_TERM_LINES = 8;
+const NEGOTIATION_MAX_TERM_CHARGES = 8;
+const NEGOTIATION_MAX_TERMS_CHARS = 2000;
+const NEGOTIATION_MAX_MISSING_TERMS = 12;
+const NEGOTIATION_MAX_MISSING_TERMS_CHARS = 240;
+/** Bounded latest owner-reply excerpt carried into draft workloads. */
+const NEGOTIATION_MAX_REPLY_CHARS = 1000;
+
+/**
+ * Neutralize clause-boundary punctuation inside supplier-derived workload
+ * text.
+ *
+ * The F1 scope contract splits operation bodies into clauses on `.`, `;`,
+ * `!`, `?` (plus newlines and `and`/`but` before independent starters) and
+ * requires EVERY clause to carry a purchasing anchor; otherwise it stores
+ * the canonical supported projection and the exact-payload binding the
+ * negotiation grants depend on breaks. Raw quote terms ("charges: none",
+ * trailing periods in descriptions) would therefore silently break grant
+ * binding. This collapases those boundaries to spaces (preserving
+ * digit-dot-digit decimals) so the brief stays anchored; the complete
+ * structured terms remain digest-bound through the workload sources.
+ */
+function sanitizeClauseBoundary(text: string): string {
+  return text
+    .replace(/[;!?…\n\r\t]+/g, " ")
+    .replace(/(?<![0-9])\.|\.(?![0-9])/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function renderChargeState(
+  charge: StoredQuoteCharge,
+): string {
+  const state = charge.state;
+  switch (state.kind) {
+    case "known":
+      return `${charge.label}: known ${state.amount.minorUnits}${state.amount.currency}`;
+    case "included":
+      return `${charge.label}: included in ${state.coveringId}`;
+    case "estimated":
+      return state.estimate.kind === "point"
+        ? `${charge.label}: estimated ${state.estimate.amount.minorUnits}${state.estimate.amount.currency}`
+        : `${charge.label}: estimated ${state.estimate.minimum.minorUnits}-${state.estimate.maximum.minorUnits}${state.estimate.minimum.currency}`;
+    case "unknown":
+      return `${charge.label}: unknown (${state.reason})`;
+    case "notApplicable":
+      return `${charge.label}: n/a (${state.reason})`;
+  }
+}
+
+export function missingTermsOf(
+  charges: readonly StoredQuoteCharge[],
+): string {
+  const missing: string[] = [];
+  for (const charge of charges) {
+    if (missing.length >= NEGOTIATION_MAX_MISSING_TERMS) break;
+    if (charge.state.kind === "unknown") {
+      missing.push(`unknown:${charge.label}`);
+    } else if (charge.state.kind === "estimated") {
+      missing.push(`estimated:${charge.label}`);
+    }
+  }
+  if (missing.length === 0) return "none-complete";
+  return sanitizeClauseBoundary(missing.join(",")).slice(0, NEGOTIATION_MAX_MISSING_TERMS_CHARS);
+}
+
+function renderTaxBasis(taxBasis: StoredTaxBasis): string {
+  if (taxBasis.kind === "unknown") return `tax: unknown (${taxBasis.reason})`;
+  return `tax: ${taxBasis.kind} (${taxBasis.basisId})`;
+}
+
+export function summarizeQuoteTerms(args: {
+  readonly version: string;
+  readonly contentHash: string;
+  readonly currency: string;
+  readonly lines: readonly StoredQuoteLine[];
+  readonly charges: readonly StoredQuoteCharge[];
+  readonly taxBasis: StoredTaxBasis;
+}): string {
+  const hashPrefix = args.contentHash.slice(0, 8);
+  const lineParts: string[] = [];
+  for (const line of args.lines.slice(0, NEGOTIATION_MAX_TERM_LINES)) {
+    lineParts.push(
+      `${line.lineId} ${line.description} x${line.quantity} @${line.unitPrice.minorUnits}${line.unitPrice.currency}`,
+    );
+  }
+  if (args.lines.length > NEGOTIATION_MAX_TERM_LINES) lineParts.push("…[truncated]");
+  const chargeParts: string[] = [];
+  for (const charge of args.charges.slice(0, NEGOTIATION_MAX_TERM_CHARGES)) {
+    chargeParts.push(renderChargeState(charge));
+  }
+  if (args.charges.length > NEGOTIATION_MAX_TERM_CHARGES) chargeParts.push("…[truncated]");
+  const summary =
+    `quote ${args.version} (${hashPrefix}) ${args.currency}: ` +
+    `lines: ${lineParts.length > 0 ? lineParts.join("; ") : "none"}; ` +
+    `charges: ${chargeParts.length > 0 ? chargeParts.join("; ") : "none"}; ` +
+    renderTaxBasis(args.taxBasis);
+  if (summary.length <= NEGOTIATION_MAX_TERMS_CHARS) return sanitizeClauseBoundary(summary);
+  return `${sanitizeClauseBoundary(summary).slice(0, NEGOTIATION_MAX_TERMS_CHARS - 13)}…[truncated]`;
+}
+
+/**
+ * Reply digest for the Jev move state: the reply version tag plus a short
+ * hash of the bounded excerpt, or `"no-reply"` when no bound reply exists.
+ * Any new or changed reply alters this digest and therefore the workload.
+ */
+export function replyDigestOf(pinned: {
+  readonly replyExcerpt: string | undefined;
+  readonly replyVersion: string | undefined;
+}): string {
+  if (pinned.replyExcerpt === undefined || pinned.replyVersion === undefined) return "no-reply";
+  return `${pinned.replyVersion}#${payloadHash(pinned.replyExcerpt).slice(0, 8)}`;
+}
+
+/**
+ * Permissible mandate context for draft workloads: mandate identity,
+ * state, and round accounting plus the permitted move catalog. Carries no
+ * confidential figures (targets/ceilings) and no mailbox.
+ */
+export function mandateContextSummary(pinned: {
+  readonly negotiationId: string;
+  readonly quoteVersion: string;
+  readonly mandateState: string;
+  readonly roundsUsed: number;
+  readonly roundLimit: number;
+}): string {
+  return (
+    `Active negotiation mandate ${pinned.negotiationId} for quote ${pinned.quoteVersion} ` +
+    `(state ${pinned.mandateState}, round ${pinned.roundsUsed}/${pinned.roundLimit}); ` +
+    `permitted moves clarify and counter within the approved round limit.`
+  );
+}
+
 const pinnedQuoteValidator = v.object({
   version: v.string(),
   contentHash: v.string(),
   excerpt: v.string(),
+  terms: v.string(),
+  missingTerms: v.string(),
 });
 
 const pinnedContextValidator = v.object({
@@ -171,6 +338,9 @@ const pinnedContextValidator = v.object({
   quoteSuperseded: v.boolean(),
   currentConversationVersion: v.optional(v.number()),
   conversationState: v.optional(v.string()),
+  replyExcerpt: v.optional(v.string()),
+  replyCapturedAt: v.optional(v.number()),
+  replyVersion: v.optional(v.string()),
   recipientConfigured: v.boolean(),
   recipientConfigVersion: v.optional(v.number()),
   recipientMailboxNormalized: v.optional(v.string()),
@@ -195,9 +365,14 @@ interface PinnedContext {
   quoteVersion: string;
   quoteContentHash: string;
   quoteExcerpt: string;
+  quoteTerms: string;
+  missingTerms: string;
   quoteSuperseded: boolean;
   conversationVersion: number | undefined;
   conversationState: string | undefined;
+  replyExcerpt: string | undefined;
+  replyCapturedAt: number | undefined;
+  replyVersion: string | undefined;
   recipientConfigured: boolean;
   recipientConfigVersion: number | undefined;
   recipientMailboxNormalized: string | undefined;
@@ -261,6 +436,86 @@ function serverScopeBrief(projectName: string, quoteVersion: string): string {
     `Negotiate the supplier quote ${quoteVersion} for project ${projectName}: ` +
     `clarify freight and installation inclusion and compare vendor options.`
   );
+}
+
+/**
+ * Bounded latest owner-reply excerpt for model workloads (Astra repair:
+ * changed replies must alter workloads).
+ *
+ * The bound conversation's provider threads come from the existing
+ * `threadBindings` contract; the latest inbound message under those threads
+ * is resolved through `productEvidence` (sanitized `normalizedValue`
+ * excerpt, never raw protected bytes) linked via `sourceEvidenceId`.
+ * Every read is bounded; when nothing proves a reply, the workload carries
+ * no reply context and the conversation version pin remains the staleness
+ * fence. Returns the excerpt, its capture time, and a version tag binding
+ * the conversation version to that capture.
+ */
+const LATEST_REPLY_SCAN = 32;
+const REPLY_BINDING_WINDOW = 65;
+
+async function loadLatestReply(
+  ctx: F1QueryCtx,
+  scope: {
+    readonly organizationId: Id<"organizations">;
+    readonly projectId: Id<"projects">;
+    readonly conversationId: Id<"conversations"> | undefined;
+    readonly conversationVersion: number | undefined;
+  },
+): Promise<
+  { readonly excerpt: string; readonly capturedAt: number; readonly version: string } | null
+> {
+  if (scope.conversationId === undefined || scope.conversationVersion === undefined) return null;
+  const bindings = await ctx.db
+    .query("threadBindings")
+    .withIndex("by_conversation", (q) => q.eq("conversationId", scope.conversationId as Id<"conversations">))
+    .take(REPLY_BINDING_WINDOW + 1);
+  if (bindings.length > REPLY_BINDING_WINDOW) return null;
+  const threads = new Set<string>();
+  for (const binding of bindings) {
+    if (binding.organizationId !== scope.organizationId || binding.projectId !== scope.projectId) continue;
+    threads.add(binding.providerThreadId);
+  }
+  if (threads.size === 0) return null;
+  const candidates = await ctx.db
+    .query("productEvidence")
+    .withIndex("by_project", (q) => q.eq("projectId", scope.projectId))
+    .order("desc")
+    .take(LATEST_REPLY_SCAN);
+  for (const candidate of candidates) {
+    if (
+      candidate.field !== "agentmail.message" ||
+      candidate.organizationId !== scope.organizationId ||
+      candidate.sourceEvidenceId === undefined
+    ) {
+      continue;
+    }
+    const evidence = await ctx.db.get(candidate.sourceEvidenceId);
+    if (
+      evidence === null ||
+      evidence.organizationId !== scope.organizationId ||
+      evidence.projectId !== scope.projectId ||
+      evidence.sourceKind !== "agentmail.message" ||
+      typeof evidence.providerIds !== "string"
+    ) {
+      continue;
+    }
+    let threadId: string | undefined;
+    try {
+      threadId = (JSON.parse(evidence.providerIds) as { threadId?: unknown }).threadId as string | undefined;
+    } catch {
+      continue;
+    }
+    if (typeof threadId !== "string" || !threads.has(threadId)) continue;
+    const excerpt = candidate.normalizedValue.slice(0, NEGOTIATION_MAX_REPLY_CHARS);
+    if (excerpt.trim().length === 0) continue;
+    return {
+      excerpt,
+      capturedAt: evidence.capturedAt,
+      version: `v${scope.conversationVersion}@${evidence.capturedAt}`,
+    };
+  }
+  return null;
 }
 
 /**
@@ -329,6 +584,7 @@ export const loadNegotiationContext = f1InternalQuery({
     }
     let conversationVersion: number | undefined;
     let conversationState: string | undefined;
+    let conversationId: Id<"conversations"> | undefined;
     if (negotiation.conversationId !== undefined) {
       if (
         negotiation.conversationVersion === undefined ||
@@ -350,7 +606,14 @@ export const loadNegotiationContext = f1InternalQuery({
       }
       conversationVersion = conversation.version;
       conversationState = conversation.state;
+      conversationId = conversation._id;
     }
+    const latestReply = await loadLatestReply(ctx, {
+      organizationId: negotiation.organizationId,
+      projectId: negotiation.projectId,
+      conversationId,
+      conversationVersion,
+    });
     const successors = await ctx.db
       .query("quotes")
       .withIndex("by_project_and_supersedes", (q) =>
@@ -367,6 +630,15 @@ export const loadNegotiationContext = f1InternalQuery({
       .map((line) => `${line.description}: ${line.quantity}`)
       .join("; ")
       .slice(0, 480);
+    const terms = summarizeQuoteTerms({
+      version: quote.version,
+      contentHash: quote.contentHash,
+      currency: quote.currency,
+      lines: quote.lines,
+      charges: quote.charges,
+      taxBasis: quote.taxBasis,
+    });
+    const missingTerms = missingTermsOf(quote.charges);
     return {
       ok: true as const,
       organizationId: String(negotiation.organizationId),
@@ -374,7 +646,7 @@ export const loadNegotiationContext = f1InternalQuery({
       projectName: project.name,
       negotiationId: String(negotiation._id),
       quoteId: String(quote._id),
-      quote: { version: quote.version, contentHash: quote.contentHash, excerpt },
+      quote: { version: quote.version, contentHash: quote.contentHash, excerpt, terms, missingTerms },
       mandateState: negotiation.state,
       mandateQuoteVersion: negotiation.quoteVersion,
       // The row stores no content hash; pin the live hash as the mandate
@@ -400,6 +672,9 @@ export const loadNegotiationContext = f1InternalQuery({
       quoteSuperseded: successors.length > 0,
       ...(conversationVersion === undefined ? {} : { currentConversationVersion: conversationVersion }),
       ...(conversationState === undefined ? {} : { conversationState }),
+      ...(latestReply === null ? {} : { replyExcerpt: latestReply.excerpt }),
+      ...(latestReply === null ? {} : { replyCapturedAt: latestReply.capturedAt }),
+      ...(latestReply === null ? {} : { replyVersion: latestReply.version }),
       recipientConfigured: recipient !== undefined,
       ...(recipient === undefined ? {} : { recipientConfigVersion: recipient.version }),
       ...(recipient === undefined ? {} : { recipientMailboxNormalized: recipient.mailboxNormalized }),
@@ -416,11 +691,20 @@ const loadContextRef = makeFunctionReference<
 /**
  * Build the deterministic Jev move workload from pinned snapshots only.
  * Fixtures reuse this builder so workload digests match exactly.
+ *
+ * The move state carries the ACTUAL bounded quote terms, the derived
+ * missing-terms list, and the latest-reply digest — never a fixed constant —
+ * so complete terms and changed replies produce different workloads (and
+ * therefore different workload digests bound into grants).
  */
 export function buildNegotiationJevWorkload(pinned: {
   readonly negotiationId: string;
   readonly quoteId: string;
   readonly quoteVersion: string;
+  readonly quoteContentHash: string;
+  readonly quoteTerms: string;
+  readonly missingTerms: string;
+  readonly replyDigest: string;
   readonly conversationVersion: number | undefined;
   readonly roundsUsed: number;
   readonly roundLimit: number;
@@ -433,11 +717,13 @@ export function buildNegotiationJevWorkload(pinned: {
 } {
   const state = {
     negotiation: pinned.negotiationId,
-    quote: `${pinned.quoteId}@${pinned.quoteVersion}`,
+    quote: `${pinned.quoteId}@${pinned.quoteVersion}#${pinned.quoteContentHash.slice(0, 8)}`,
+    terms: pinned.quoteTerms,
+    missingTerms: pinned.missingTerms,
+    reply: pinned.replyDigest,
     conversation: pinned.conversationVersion === undefined ? "unbound" : `v${pinned.conversationVersion}`,
     rounds: `${pinned.roundsUsed}/${pinned.roundLimit}`,
     mandate: pinned.mandateState,
-    missingTerms: "freight,installation,warranty",
   };
   const questions = {
     move: {
@@ -455,22 +741,37 @@ export function buildNegotiationJevWorkload(pinned: {
     state,
     questions,
     inputVersion: NEGOTIATION_JEV_INPUT_VERSION,
-    queryText: `Research supplier negotiation move for quote ${pinned.quoteVersion}`,
+    queryText: `Research supplier negotiation move for quote ${pinned.quoteVersion} [${pinned.missingTerms}]`,
   };
 }
 
 /**
  * Build the deterministic supplier-draft workload from pinned snapshots.
  * The brief never carries confidential figures or the private mailbox.
+ *
+ * Sources are the versioned quote-terms derivation (locator
+ * `quote-terms`), the permissible mandate context (locator
+ * `mandate-brief`, no figures), and — when a bound reply exists — the
+ * bounded latest-reply excerpt (locator `latest-reply`, versioned by
+ * conversation version and capture time). Any term completion or new reply
+ * changes these bytes, so the workload digest bound into the draft grant
+ * changes with them.
  */
 export function buildNegotiationDraftWorkload(
   pinned: {
     readonly negotiationId: string;
     readonly quoteId: string;
     readonly quoteVersion: string;
+    readonly quoteContentHash: string;
+    readonly quoteTerms: string;
+    readonly missingTerms: string;
+    readonly mandateState: string;
+    readonly conversationId: string | undefined;
     readonly conversationVersion: number | undefined;
+    readonly replyExcerpt: string | undefined;
+    readonly replyVersion: string | undefined;
     readonly roundsUsed: number;
-    readonly quoteExcerpt: string;
+    readonly roundLimit: number;
   },
   move: Extract<NegotiationMove, "clarify" | "counter">,
 ): {
@@ -490,9 +791,17 @@ export function buildNegotiationDraftWorkload(
   // supported projection and the exact-payload binding breaks. The brief
   // never carries confidential figures or the private mailbox.
   const brief =
-    `Negotiation mandate ${pinned.negotiationId}: ${move} the supplier on freight and ` +
-    `installation inclusion for quote ${pinned.quoteVersion} and negotiate the comparison ` +
-    `using only the pinned quote and mandate sources without disclosing internal targets.`;
+    `Negotiation mandate ${pinned.negotiationId}: ${move} the supplier on the pinned quote ` +
+    `${pinned.quoteVersion} terms (${pinned.quoteTerms}) with missing comparison terms ` +
+    `${pinned.missingTerms}, and negotiate the comparison using only the pinned quote and ` +
+    `mandate sources without disclosing internal targets.`;
+  const mandateSummary = mandateContextSummary({
+    negotiationId: pinned.negotiationId,
+    quoteVersion: pinned.quoteVersion,
+    mandateState: pinned.mandateState,
+    roundsUsed: pinned.roundsUsed,
+    roundLimit: pinned.roundLimit,
+  });
   return {
     kind: "supplierDraft",
     inputVersion: NEGOTIATION_DRAFT_INPUT_VERSION,
@@ -502,17 +811,27 @@ export function buildNegotiationDraftWorkload(
       {
         sourceId: `quote:${pinned.quoteId}`,
         version: pinned.quoteVersion,
-        locator: "quote-lines",
-        content: pinned.quoteExcerpt.length > 0 ? pinned.quoteExcerpt : `quote ${pinned.quoteVersion}`,
+        locator: "quote-terms",
+        content: pinned.quoteTerms,
       },
       {
         sourceId: `negotiation:${pinned.negotiationId}`,
         version: `mandate-round-${pinned.roundsUsed}`,
         locator: "mandate-brief",
-        content:
-          `Active negotiation mandate for quote ${pinned.quoteVersion}; ` +
-          `permitted moves clarify and counter within the approved round limit.`,
+        content: mandateSummary,
       },
+      ...(pinned.replyExcerpt === undefined ||
+      pinned.replyVersion === undefined ||
+      pinned.conversationId === undefined
+        ? []
+        : [
+            {
+              sourceId: `conversation:${pinned.conversationId}`,
+              version: pinned.replyVersion,
+              locator: "latest-reply",
+              content: pinned.replyExcerpt,
+            },
+          ]),
     ],
   };
 }
@@ -596,9 +915,14 @@ async function resolvePins(
       quoteVersion: loaded.quote.version,
       quoteContentHash: loaded.quote.contentHash,
       quoteExcerpt: loaded.quote.excerpt,
+      quoteTerms: loaded.quote.terms,
+      missingTerms: loaded.quote.missingTerms,
       quoteSuperseded: loaded.quoteSuperseded,
       conversationVersion: loaded.currentConversationVersion,
       conversationState: loaded.conversationState,
+      replyExcerpt: loaded.replyExcerpt,
+      replyCapturedAt: loaded.replyCapturedAt,
+      replyVersion: loaded.replyVersion,
       recipientConfigured: loaded.recipientConfigured,
       recipientConfigVersion: loaded.recipientConfigVersion,
       recipientMailboxNormalized: loaded.recipientMailboxNormalized,
@@ -659,6 +983,118 @@ function validateApprovedEnvelope(
 }
 
 /**
+ * Exact saved-draft bindings for one prepared negotiation draft. Every
+ * value is written server-side at preparation from the live pins; dispatch
+ * and approval recheck each one against the current pins before the first
+ * send. Optional so the checker (not the schema) decides staleness.
+ */
+export interface SavedDraftBindings {
+  readonly projectId: string;
+  readonly negotiationId: string;
+  readonly quoteId: string;
+  readonly quoteVersion: string;
+  readonly quoteContentHash: string;
+  readonly conversationVersion: number | undefined;
+  readonly replyVersion: string | undefined;
+  readonly roundsUsed: number;
+  readonly move: string;
+  readonly payloadHash: string;
+}
+
+/**
+ * Enforce the exact saved-draft bindings before the first dispatch (Astra
+ * repair: cross-negotiation first dispatch and stale rounds).
+ *
+ * The live mandate/quote/conversation fences alone cannot stop a draft
+ * prepared under one negotiation, quote version, conversation version,
+ * reply, round, or payload from sending under another: the live pins stay
+ * self-consistent while the DRAFT is stale. This check compares the stored
+ * bundle byte-for-byte against the current pins — project, negotiation,
+ * quote id/version/hash, conversation version (both directions),
+ * reply version (both directions), rounds used, permitted move, and the
+ * payload hash recomputed from the stored canonical envelope. Any drift
+ * denies with zero provider calls. The operation claim then preserves these
+ * pins: `operations.create` re-pins them server-side from the same live
+ * rows at operation creation and `claim` rechecks them atomically before
+ * provider effect.
+ */
+export function checkDraftBindings(
+  draft: SavedDraftBindings,
+  live: {
+    readonly projectId: string;
+    readonly negotiationId: string;
+    readonly quoteId: string;
+    readonly quoteVersion: string;
+    readonly quoteContentHash: string;
+    readonly conversationVersion: number | undefined;
+    readonly replyVersion: string | undefined;
+    readonly roundsUsed: number;
+  },
+  envelopeCanonical: string,
+): { readonly ok: true } | { readonly ok: false; readonly code: string; readonly message: string } {
+  if (
+    draft.projectId !== live.projectId ||
+    draft.negotiationId !== live.negotiationId ||
+    draft.quoteId !== live.quoteId
+  ) {
+    return {
+      ok: false as const,
+      code: "draft-negotiation-mismatch",
+      message: "prepared draft was approved for another project, negotiation, or quote",
+    };
+  }
+  if (draft.move !== "clarify" && draft.move !== "counter") {
+    return {
+      ok: false as const,
+      code: "draft-move-unknown",
+      message: "prepared draft carries no permitted negotiation move",
+    };
+  }
+  if (draft.quoteVersion !== live.quoteVersion || draft.quoteContentHash !== live.quoteContentHash) {
+    return {
+      ok: false as const,
+      code: "draft-quote-stale",
+      message: "prepared draft quote version is no longer current",
+    };
+  }
+  if ((draft.conversationVersion ?? null) !== (live.conversationVersion ?? null)) {
+    return {
+      ok: false as const,
+      code: "draft-conversation-changed",
+      message: "prepared draft conversation version is no longer current",
+    };
+  }
+  if ((draft.replyVersion ?? null) !== (live.replyVersion ?? null)) {
+    return {
+      ok: false as const,
+      code: "draft-reply-changed",
+      message: "a newer owner reply arrived after this draft was prepared",
+    };
+  }
+  if (draft.roundsUsed !== live.roundsUsed) {
+    return {
+      ok: false as const,
+      code: "draft-round-stale",
+      message: "negotiation round advanced after this draft was prepared",
+    };
+  }
+  let envelopeValue: unknown;
+  try {
+    envelopeValue = JSON.parse(envelopeCanonical) as unknown;
+  } catch {
+    return { ok: false as const, code: "draft-payload-mismatch", message: "prepared draft envelope is not valid JSON" };
+  }
+  if (payloadHash(envelopeValue) !== draft.payloadHash) {
+    return {
+      ok: false as const,
+      code: "draft-payload-mismatch",
+      message: "prepared draft payload no longer matches its approved hash",
+    };
+  }
+  return { ok: true as const };
+}
+
+/**
  * E17 mailbox-privacy repair: prepared drafts persist server-side only.
  *
  * The unredacted owner envelope (containing the private `To` mailbox) is
@@ -680,6 +1116,7 @@ export const savePreparedNegotiationDraft = f1InternalMutation({
     quoteVersion: v.string(),
     quoteContentHash: v.string(),
     conversationVersion: v.optional(v.number()),
+    replyVersion: v.optional(v.string()),
     roundsUsed: v.number(),
     move: v.string(),
     envelopeCanonical: v.string(),
@@ -723,9 +1160,11 @@ export const savePreparedNegotiationDraft = f1InternalMutation({
         move: args.move,
         negotiationId: String(args.negotiationId),
         payloadHash: args.payloadHash,
+        projectId: String(args.projectId),
         quoteContentHash: args.quoteContentHash,
         quoteId: String(args.quoteId),
         quoteVersion: args.quoteVersion,
+        replyVersion: args.replyVersion ?? null,
         roundsUsed: args.roundsUsed,
       }),
       completeness: "complete",
@@ -755,9 +1194,13 @@ export const loadPreparedNegotiationDraft = f1InternalQuery({
     v.object({
       ok: v.literal(true),
       envelopeCanonical: v.string(),
+      projectId: v.string(),
+      negotiationId: v.string(),
+      quoteId: v.string(),
       quoteVersion: v.string(),
       quoteContentHash: v.string(),
       conversationVersion: v.optional(v.number()),
+      replyVersion: v.optional(v.string()),
       roundsUsed: v.number(),
       move: v.string(),
       payloadHash: v.string(),
@@ -781,14 +1224,18 @@ export const loadPreparedNegotiationDraft = f1InternalQuery({
       return { ok: false as const, code: access.code, message: access.message };
     }
     const row = await ctx.db.get(args.draftId);
-    // Tenant isolation is organization-scoped (request keys are
-    // organization-scoped). Project/negotiation mismatches are left for the
-    // F3 exact-replay conflict check downstream so reused keys conflict
-    // rather than reporting a false generic denial; no envelope ever returns
-    // to the caller on any path.
+    // Tenant isolation is organization- AND project-scoped: the row must
+    // live in the caller's project, otherwise the private envelope (owner
+    // mailbox and draft text) could leak across projects. Negotiation
+    // mismatches within the project are NOT denied here: the F3
+    // exact-replay inspection downstream must still see a reused request
+    // key as a conflict, and the exact draft bindings deny a
+    // cross-negotiation first dispatch with zero provider calls. No
+    // envelope ever returns to the caller on any denial path.
     if (
       row === null ||
       row.organizationId !== args.organizationId ||
+      row.projectId !== args.projectId ||
       row.sourceKind !== DRAFT_EVIDENCE_SOURCE_KIND ||
       typeof row.protectedSourceText !== "string"
     ) {
@@ -806,12 +1253,23 @@ export const loadPreparedNegotiationDraft = f1InternalQuery({
     const record = bundle as Record<string, unknown>;
     if (
       typeof record["envelopeCanonical"] !== "string" ||
+      typeof record["projectId"] !== "string" ||
+      typeof record["negotiationId"] !== "string" ||
+      typeof record["quoteId"] !== "string" ||
       typeof record["quoteVersion"] !== "string" ||
       typeof record["quoteContentHash"] !== "string" ||
       typeof record["move"] !== "string" ||
       typeof record["payloadHash"] !== "string" ||
       typeof record["roundsUsed"] !== "number"
     ) {
+      return genericDenial();
+    }
+    // The bundle must name this project; a cross-project draft id fails
+    // closed here with no oracle. Negotiation mismatches within the
+    // project stay visible so the F3 inspection in dispatch still reports
+    // a reused request key as a conflict, while the exact draft bindings
+    // deny a cross-negotiation first dispatch with zero provider calls.
+    if (record["projectId"] !== String(args.projectId)) {
       return genericDenial();
     }
     const conversationVersion =
@@ -823,12 +1281,25 @@ export const loadPreparedNegotiationDraft = f1InternalQuery({
     if (record["conversationVersion"] !== null && record["conversationVersion"] !== undefined && conversationVersion === undefined) {
       return genericDenial();
     }
+    const replyVersion =
+      record["replyVersion"] === null || record["replyVersion"] === undefined
+        ? undefined
+        : typeof record["replyVersion"] === "string"
+          ? (record["replyVersion"] as string)
+          : undefined;
+    if (record["replyVersion"] !== null && record["replyVersion"] !== undefined && replyVersion === undefined) {
+      return genericDenial();
+    }
     return {
       ok: true as const,
       envelopeCanonical: record["envelopeCanonical"] as string,
+      projectId: record["projectId"] as string,
+      negotiationId: record["negotiationId"] as string,
+      quoteId: record["quoteId"] as string,
       quoteVersion: record["quoteVersion"] as string,
       quoteContentHash: record["quoteContentHash"] as string,
       ...(conversationVersion === undefined ? {} : { conversationVersion }),
+      ...(replyVersion === undefined ? {} : { replyVersion }),
       roundsUsed: record["roundsUsed"] as number,
       move: record["move"] as string,
       payloadHash: record["payloadHash"] as string,
@@ -1777,8 +2248,8 @@ function mapJevToInjected(
 function mapDraftToInjected(
   result: ActionReturn<typeof openai.draft>,
   currentInputVersion: string,
-  quoteId: string,
-  quoteVersion: string,
+  quote: { readonly id: string; readonly version: string },
+  reply: { readonly conversationId: string; readonly version: string } | null,
   conversationVersion: number | undefined,
 ): { ok: true; value: InjectedDraftResult } | { ok: false; code: string; message: string } {
   const denial = actionDenialOf(result);
@@ -1829,11 +2300,33 @@ function mapDraftToInjected(
       (source) =>
         typeof source === "object" &&
         source !== null &&
-        (source as Record<string, unknown>)["sourceId"] === `quote:${quoteId}` &&
-        (source as Record<string, unknown>)["version"] === quoteVersion,
+        (source as Record<string, unknown>)["sourceId"] === `quote:${quote.id}` &&
+        (source as Record<string, unknown>)["version"] === quote.version,
     );
   if (!quotePinned) {
     return { ok: false, code: "draft-malformed", message: "draft is not pinned to the current quote source" };
+  }
+  if (reply !== null) {
+    const replyPinned =
+      Array.isArray(sources) &&
+      sources.some(
+        (source) =>
+          typeof source === "object" &&
+          source !== null &&
+          (source as Record<string, unknown>)["sourceId"] === `conversation:${reply.conversationId}` &&
+          (source as Record<string, unknown>)["version"] === reply.version,
+      );
+    if (!replyPinned) {
+      return {
+        ok: true,
+        value: {
+          outcome: "stale",
+          model: NEGOTIATION_OPENAI_MODEL,
+          inputVersion,
+          currentInputVersion,
+        },
+      };
+    }
   }
   const model = record["model"];
   if (typeof model !== "string" || model.length === 0) {
@@ -1850,7 +2343,7 @@ function mapDraftToInjected(
       outcome: "completed",
       draftKind,
       content,
-      sourceQuoteVersion: quoteVersion,
+      sourceQuoteVersion: quote.version,
       ...(conversationVersion === undefined ? {} : { sourceConversationVersion: conversationVersion }),
       model,
       inputVersion,
@@ -2019,6 +2512,10 @@ export const prepareNegotiationDraft = f1Action({
       negotiationId: String(pinned.negotiationId),
       quoteId: String(pinned.quoteId),
       quoteVersion: pinned.quoteVersion,
+      quoteContentHash: pinned.quoteContentHash,
+      quoteTerms: pinned.quoteTerms,
+      missingTerms: pinned.missingTerms,
+      replyDigest: replyDigestOf(pinned),
       conversationVersion: pinned.conversationVersion,
       roundsUsed: pinned.roundsUsed,
       roundLimit: pinned.roundLimit,
@@ -2074,9 +2571,17 @@ export const prepareNegotiationDraft = f1Action({
         negotiationId: String(pinned.negotiationId),
         quoteId: String(pinned.quoteId),
         quoteVersion: pinned.quoteVersion,
+        quoteContentHash: pinned.quoteContentHash,
+        quoteTerms: pinned.quoteTerms,
+        missingTerms: pinned.missingTerms,
+        mandateState: pinned.mandateState,
+        conversationId:
+          pinned.mandateConversationId === undefined ? undefined : String(pinned.mandateConversationId),
         conversationVersion: pinned.conversationVersion,
+        replyExcerpt: pinned.replyExcerpt,
+        replyVersion: pinned.replyVersion,
         roundsUsed: pinned.roundsUsed,
-        quoteExcerpt: pinned.quoteExcerpt,
+        roundLimit: pinned.roundLimit,
       },
       move,
     );
@@ -2100,8 +2605,10 @@ export const prepareNegotiationDraft = f1Action({
     const injectedDraft = mapDraftToInjected(
       draftResult,
       draftWorkload.inputVersion,
-      String(pinned.quoteId),
-      pinned.quoteVersion,
+      { id: String(pinned.quoteId), version: pinned.quoteVersion },
+      pinned.mandateConversationId === undefined || pinned.replyVersion === undefined
+        ? null
+        : { conversationId: String(pinned.mandateConversationId), version: pinned.replyVersion },
       pinned.conversationVersion,
     );
     if (!injectedDraft.ok) return deniedResult(injectedDraft.code, injectedDraft.message);
@@ -2188,6 +2695,7 @@ export const prepareNegotiationDraft = f1Action({
       quoteVersion: pinned.quoteVersion,
       quoteContentHash: pinned.quoteContentHash,
       ...(pinned.conversationVersion === undefined ? {} : { conversationVersion: pinned.conversationVersion }),
+      ...(pinned.replyVersion === undefined ? {} : { replyVersion: pinned.replyVersion }),
       roundsUsed: pinned.roundsUsed,
       move,
       envelopeCanonical,
@@ -2217,6 +2725,156 @@ const prepareDraftRef = makeFunctionReference<
   ActionArgs<typeof prepareNegotiationDraft>,
   ActionReturn<typeof prepareNegotiationDraft>
 >("negotiation/orchestrator:prepareNegotiationDraft");
+
+const approvalResultValidator = v.union(
+  v.object({
+    ok: v.literal(true),
+    outcome: v.literal("approved"),
+    draftId: v.id("evidence"),
+    move: v.string(),
+    quoteVersion: v.string(),
+    quoteContentHash: v.string(),
+    conversationVersion: v.optional(v.number()),
+    replyVersion: v.optional(v.string()),
+    roundsUsed: v.number(),
+    payloadHash: v.string(),
+    redactedPreview: v.string(),
+  }),
+  denialValidator,
+);
+
+/**
+ * Public authorized draft-id approval boundary (Astra repair: opaque
+ * approve).
+ *
+ * The caller supplies only the opaque server-side draft id; the exact
+ * canonical envelope (containing the private owner mailbox) is resolved
+ * server-side under approver authority and never returns to the client.
+ * The response carries the approved move, quote/round/reply pins, payload
+ * hash, and a redacted advance preview — enough to approve with
+ * understanding — but no mailbox, no draft text, and no canonical
+ * envelope. Read-only: makes no model calls, creates no operation, and
+ * consumes no round. `dispatchApprovedDraft` re-enforces every binding
+ * live before the single send.
+ */
+export const approveNegotiationDraft = f1Query({
+  args: {
+    negotiationId: v.id("negotiations"),
+    draftId: v.id("evidence"),
+  },
+  returns: approvalResultValidator,
+  handler: async (ctx, args) => {
+    const authIdentity = await ctx.auth.getUserIdentity();
+    const identity = authIdentity?.tokenIdentifier ?? null;
+    if (identity === null || identity.trim().length === 0) {
+      return { ok: false as const, code: "forged-identity", message: "unauthenticated" };
+    }
+    const loaded = await ctx.runQuery(loadContextRef, {
+      negotiationId: args.negotiationId,
+      identity,
+    });
+    if (!loaded.ok) return { ok: false as const, code: loaded.code, message: loaded.message };
+    const pinned: PinnedContext = {
+      organizationId: loaded.organizationId as Id<"organizations">,
+      projectId: loaded.projectId as Id<"projects">,
+      projectName: loaded.projectName,
+      negotiationId: loaded.negotiationId as Id<"negotiations">,
+      quoteId: loaded.quoteId as Id<"quotes">,
+      mandateState: loaded.mandateState,
+      mandateQuoteVersion: loaded.mandateQuoteVersion,
+      mandateQuoteContentHash: loaded.mandateQuoteContentHash,
+      mandateConversationId:
+        loaded.mandateHasConversation && loaded.currentConversationId !== undefined
+          ? (loaded.currentConversationId as Id<"conversations">)
+          : undefined,
+      mandateConversationVersion: loaded.mandateConversationVersion,
+      mandateConversationState: loaded.mandateConversationState,
+      roundsUsed: loaded.roundsUsed,
+      roundLimit: loaded.roundLimit,
+      expiresAt: loaded.expiresAt,
+      targetMinorUnits: loaded.targetMinorUnits,
+      quoteVersion: loaded.quote.version,
+      quoteContentHash: loaded.quote.contentHash,
+      quoteExcerpt: loaded.quote.excerpt,
+      quoteTerms: loaded.quote.terms,
+      missingTerms: loaded.quote.missingTerms,
+      quoteSuperseded: loaded.quoteSuperseded,
+      conversationVersion: loaded.currentConversationVersion,
+      conversationState: loaded.conversationState,
+      replyExcerpt: loaded.replyExcerpt,
+      replyCapturedAt: loaded.replyCapturedAt,
+      replyVersion: loaded.replyVersion,
+      recipientConfigured: loaded.recipientConfigured,
+      recipientConfigVersion: loaded.recipientConfigVersion,
+      recipientMailboxNormalized: loaded.recipientMailboxNormalized,
+    };
+    const mandate = mandateSnapshotOf(pinned);
+    const bounds = checkNegotiationBounds(mandate, currentSnapshotOf(pinned, null));
+    if (bounds !== null) return { ok: false as const, code: bounds.code, message: bounds.message };
+    const fence = checkNegotiationFences(mandate, currentSnapshotOf(pinned, null));
+    if (fence !== null) {
+      return { ok: false as const, code: "mandate-not-current", message: "negotiation mandate is not currently sendable" };
+    }
+    if (approvedConversationGate(pinned).stopped) {
+      return { ok: false as const, code: "mandate-not-current", message: "bound reply arrived; ingestion must update the mandate basis first" };
+    }
+    const approvedDraft = await ctx.runQuery(loadDraftRef, {
+      organizationId: pinned.organizationId,
+      projectId: pinned.projectId,
+      negotiationId: pinned.negotiationId,
+      draftId: args.draftId,
+      identity,
+    });
+    if (!approvedDraft.ok) return { ok: false as const, code: approvedDraft.code, message: approvedDraft.message };
+    const approved = validateApprovedEnvelope(
+      approvedDraft.envelopeCanonical,
+      pinned.recipientMailboxNormalized,
+      pinned.targetMinorUnits,
+    );
+    if (!approved.ok) return { ok: false as const, code: approved.code, message: approved.message };
+    const binding = checkDraftBindings(
+      {
+        projectId: approvedDraft.projectId,
+        negotiationId: approvedDraft.negotiationId,
+        quoteId: approvedDraft.quoteId,
+        quoteVersion: approvedDraft.quoteVersion,
+        quoteContentHash: approvedDraft.quoteContentHash,
+        conversationVersion: approvedDraft.conversationVersion,
+        replyVersion: approvedDraft.replyVersion,
+        roundsUsed: approvedDraft.roundsUsed,
+        move: approvedDraft.move,
+        payloadHash: approvedDraft.payloadHash,
+      },
+      {
+        projectId: String(pinned.projectId),
+        negotiationId: String(pinned.negotiationId),
+        quoteId: String(pinned.quoteId),
+        quoteVersion: pinned.quoteVersion,
+        quoteContentHash: pinned.quoteContentHash,
+        conversationVersion: pinned.conversationVersion,
+        replyVersion: pinned.replyVersion,
+        roundsUsed: pinned.roundsUsed,
+      },
+      approvedDraft.envelopeCanonical,
+    );
+    if (!binding.ok) return { ok: false as const, code: binding.code, message: binding.message };
+    return {
+      ok: true as const,
+      outcome: "approved" as const,
+      draftId: args.draftId,
+      move: approvedDraft.move,
+      quoteVersion: approvedDraft.quoteVersion,
+      quoteContentHash: approvedDraft.quoteContentHash,
+      ...(approvedDraft.conversationVersion === undefined
+        ? {}
+        : { conversationVersion: approvedDraft.conversationVersion }),
+      ...(approvedDraft.replyVersion === undefined ? {} : { replyVersion: approvedDraft.replyVersion }),
+      roundsUsed: approvedDraft.roundsUsed,
+      payloadHash: approvedDraft.payloadHash,
+      redactedPreview: approved.redactedPreview,
+    };
+  },
+});
 
 /**
  * Phase two of the two-phase flow: send a previously prepared and approved
@@ -2297,10 +2955,6 @@ export const dispatchApprovedDraft = f1Action({
       identity,
     });
     if (!approvedDraft.ok) return deniedResult(approvedDraft.code, approvedDraft.message);
-    // The stored draft is bound to one negotiation; a draft id from another
-    // negotiation fails closed here with no oracle and zero provider calls.
-    // Quote/round drift still fails closed through the live fences below and
-    // the exact-grant equality check.
     const envelopeCanonical: string = approvedDraft.envelopeCanonical;
     const approved = validateApprovedEnvelope(
       envelopeCanonical,
@@ -2308,6 +2962,8 @@ export const dispatchApprovedDraft = f1Action({
       pinned.targetMinorUnits,
     );
     if (!approved.ok) return deniedResult(approved.code, approved.message);
+    const approvedMove = approvedDraft.move;
+    const approvedPreview = approved.redactedPreview;
 
     // F3: replay inspection binds project/negotiation/payload/sender before
     // any deduplication, so a changed same-key replay conflicts here rather
@@ -2332,23 +2988,57 @@ export const dispatchApprovedDraft = f1Action({
       return {
         ok: true as const,
         outcome: "deduplicated" as const,
-        move: "none",
+        move: approvedMove,
         requestKey: prior.requestKey,
         payloadHash: prior.payloadHash ?? "unknown",
         roundsUsedAfter: pinned.roundsUsed,
-        redactedPreview: "deduplicated — no supplier-visible text prepared",
+        redactedPreview: approvedPreview,
       };
     }
     if (prior.status === "unknown") {
       return {
         ok: true as const,
         outcome: "waiting" as const,
-        move: "none",
+        move: approvedMove,
         reason: "outcome-unknown",
         roundsUsedAfter: pinned.roundsUsed,
-        redactedPreview: "waiting — prior attempt outcome is unknown under reconciliation",
+        redactedPreview: approvedPreview,
       };
     }
+    // Exact saved-draft bindings before the first dispatch: the stored
+    // bundle must equal the current pins (project, negotiation, quote,
+    // conversation, reply, round, move, payload). This runs after replay
+    // inspection so an identical retry still deduplicates (its bundle is
+    // necessarily from before the round advanced) while a
+    // cross-negotiation draft id or any drift since preparation denies
+    // with zero provider calls. The operation claim preserves these pins
+    // through the send.
+    const binding = checkDraftBindings(
+      {
+        projectId: approvedDraft.projectId,
+        negotiationId: approvedDraft.negotiationId,
+        quoteId: approvedDraft.quoteId,
+        quoteVersion: approvedDraft.quoteVersion,
+        quoteContentHash: approvedDraft.quoteContentHash,
+        conversationVersion: approvedDraft.conversationVersion,
+        replyVersion: approvedDraft.replyVersion,
+        roundsUsed: approvedDraft.roundsUsed,
+        move: approvedDraft.move,
+        payloadHash: approvedDraft.payloadHash,
+      },
+      {
+        projectId: String(pinned.projectId),
+        negotiationId: String(pinned.negotiationId),
+        quoteId: String(pinned.quoteId),
+        quoteVersion: pinned.quoteVersion,
+        quoteContentHash: pinned.quoteContentHash,
+        conversationVersion: pinned.conversationVersion,
+        replyVersion: pinned.replyVersion,
+        roundsUsed: pinned.roundsUsed,
+      },
+      envelopeCanonical,
+    );
+    if (!binding.ok) return deniedResult(binding.code, binding.message);
 
     // F1: the caller-selected inbox must exactly equal the server-owned
     // organization/project/conversation binding before any grant, operation,
@@ -2388,20 +3078,20 @@ export const dispatchApprovedDraft = f1Action({
         return {
           ok: true as const,
           outcome: "stopped" as const,
-          move: "none",
+          move: approvedMove,
           reason: fenced.reason,
           roundsUsedAfter: pinned.roundsUsed,
-          redactedPreview: approved.redactedPreview,
+          redactedPreview: approvedPreview,
         };
       }
       if (fenced.kind === "waiting") {
         return {
           ok: true as const,
           outcome: "waiting" as const,
-          move: "none",
+          move: approvedMove,
           reason: fenced.reason,
           roundsUsedAfter: pinned.roundsUsed,
-          redactedPreview: approved.redactedPreview,
+          redactedPreview: approvedPreview,
         };
       }
       return deniedResult(fenced.code, fenced.message);
@@ -2431,11 +3121,11 @@ export const dispatchApprovedDraft = f1Action({
       return {
         ok: true as const,
         outcome: "deduplicated" as const,
-        move: "none",
+        move: approvedMove,
         requestKey: key,
         payloadHash: hash,
         roundsUsedAfter: pinned.roundsUsed,
-        redactedPreview: approved.redactedPreview,
+        redactedPreview: approvedPreview,
       };
     }
     const expectedRoundsUsedAfter = pinned.roundsUsed + 1;
@@ -2491,10 +3181,10 @@ export const dispatchApprovedDraft = f1Action({
       return {
         ok: true as const,
         outcome: "waiting" as const,
-        move: "none",
+        move: approvedMove,
         reason: "send-failure",
         roundsUsedAfter,
-        redactedPreview: approved.redactedPreview,
+        redactedPreview: approvedPreview,
       };
     }
     if (success.outcome === "unknown" || !success.recorded || success.providerMessageId === null) {
@@ -2509,10 +3199,10 @@ export const dispatchApprovedDraft = f1Action({
       return {
         ok: true as const,
         outcome: "waiting" as const,
-        move: "none",
+        move: approvedMove,
         reason: "outcome-unknown",
         roundsUsedAfter: expectedRoundsUsedAfter,
-        redactedPreview: approved.redactedPreview,
+        redactedPreview: approvedPreview,
       };
     }
     const applied = await ctx.runMutation(applyOutcomeRef, {
@@ -2527,12 +3217,12 @@ export const dispatchApprovedDraft = f1Action({
     return {
       ok: true as const,
       outcome: "sent" as const,
-      move: "none",
+      move: approvedMove,
       requestKey: key,
       payloadHash: hash,
       roundsUsedAfter: expectedRoundsUsedAfter,
       providerMessageId: success.providerMessageId,
-      redactedPreview: approved.redactedPreview,
+      redactedPreview: approvedPreview,
     };
   },
 });
