@@ -3048,6 +3048,158 @@ describe("Astra review2: reply meaning, quarantine, scan bounds, money, draft ra
     expect(log.agentmail).toHaveLength(0);
   });
 
+describe("Astra E28: oversized accepted replies never truncate decision-critical content", () => {
+  const TRAILING_INSTRUCTION =
+    "FINAL OFFER: this is our final offer on the espresso machine. " +
+    "Stop further negotiation and do not send another counter.";
+  // Filler keeps the trailing decision instruction beyond BOTH downstream
+  // truncation limits (the 1000-char reply excerpt and the Jev reply
+  // meaning), so a silent truncation would lose the final-offer/stop
+  // instruction entirely.
+  const FILLER_SENTENCE =
+    "The supplier confirms the espresso machine configuration, freight handling, " +
+    "installation scheduling, and warranty coverage terms for this project phase. ";
+
+  function buildOversizedReply(): { text: string; prefixLength: number } {
+    let prefix = "";
+    while (prefix.length <= 1100) prefix += FILLER_SENTENCE;
+    const text = `${prefix}${TRAILING_INSTRUCTION}`;
+    return { text, prefixLength: prefix.length };
+  }
+
+  async function seedAcceptedReply(fixture: Fixture, messageId: string, text: string): Promise<void> {
+    const capturedAt = Date.now();
+    await fixture.t.run(async (ctx) => {
+      const evidenceId = await ctx.db.insert("evidence", {
+        organizationId: fixture.organizationId,
+        projectId: fixture.projectId,
+        sourceKind: "agentmail.message",
+        providerIds: JSON.stringify({
+          messageId,
+          threadId: "seed-thread-e12-conversation",
+          inboxId: INBOX_ID,
+        }),
+        capturedAt,
+        contentHash: `hash-${messageId}`,
+        protectedSourceText: text,
+        completeness: "complete",
+        counterpartyRole: "ownerStandIn",
+        executionMode: "recorded",
+        locator: `redacted:hash-${messageId}`,
+      });
+      await ctx.db.insert("productEvidence", {
+        organizationId: fixture.organizationId,
+        projectId: fixture.projectId,
+        field: "agentmail.message",
+        sourceKind: "agentmail.message",
+        capturedAt,
+        originalValue: text,
+        normalizedValue: text,
+        verification: "unverified",
+        freshness: "fresh",
+        counterpartyRole: "ownerStandIn",
+        executionMode: "recorded",
+        origin: "ownerImport",
+        conflictEvidenceIds: [],
+        idempotencyKey: messageId,
+        ingestionIdentity: messageId,
+        sourceEvidenceId: evidenceId,
+        version: "source:1",
+        createdAt: Date.now(),
+      });
+    });
+  }
+
+  test("1333-plus-character accepted reply with trailing final-offer waits explicitly with zero model and zero send calls", async () => {
+    const t = init();
+    const fixture = await createFixture(t, "clarify", {
+      conversation: { version: 1, state: "awaitingReply" },
+    });
+    const { text, prefixLength } = buildOversizedReply();
+    expect(prefixLength).toBeGreaterThan(1000);
+    expect(text.length).toBeGreaterThan(1333);
+    await seedAcceptedReply(fixture, "e28-oversized-1", text);
+    const { result, log } = await runPrepare(fixture, {});
+    // Explicit incomplete/context handling before any Jev, draft, model, or
+    // outbound send effect: no truncated meaning is ever accepted.
+    expect(result).toMatchObject({ ok: true, outcome: "waiting", reason: "reply-exceeds-context" });
+    expect(log.jev).toHaveLength(0);
+    expect(log.openai).toHaveLength(0);
+    expect(log.agentmail).toHaveLength(0);
+    // The truncated tail never enters the response: no partial meaning is
+    // promoted and the private mailbox never leaks.
+    const serialized = JSON.stringify(result);
+    expect(serialized).not.toContain("FINAL OFFER");
+    expect(serialized).not.toContain("final offer");
+    expect(serialized).not.toContain(OWNER_MAILBOX);
+    const counts = await tableCounts(t);
+    expect(counts.negotiations).toEqual([{ roundsUsed: 0, state: "active" }]);
+    expect(counts.outboundSnapshots).toBe(0);
+  });
+
+  test("single-step flow with the same oversized reply stops before any model or send call", async () => {
+    const t = init();
+    const fixture = await createFixture(t, "clarify", {
+      conversation: { version: 1, state: "awaitingReply" },
+    });
+    const { text } = buildOversizedReply();
+    await seedAcceptedReply(fixture, "e28-oversized-2", text);
+    const { result, log } = await runStep(fixture, "req-e28-oversized-step", {});
+    expect(result).toMatchObject({ ok: true, outcome: "waiting", reason: "reply-exceeds-context" });
+    expect(log.jev).toHaveLength(0);
+    expect(log.openai).toHaveLength(0);
+    expect(log.agentmail).toHaveLength(0);
+    expect(JSON.stringify(result)).not.toContain("FINAL OFFER");
+    const rounds = await t.run(async (ctx) => (await ctx.db.get(fixture.negotiationId))?.roundsUsed);
+    expect(rounds).toBe(0);
+  });
+
+  test("dispatch of a previously prepared draft waits on the oversized reply with zero sends", async () => {
+    const t = init();
+    const fixture = await createFixture(t, "clarify", {
+      conversation: { version: 1, state: "awaitingReply" },
+    });
+    const draftId = await prepareValidDraftId(fixture);
+    const { text } = buildOversizedReply();
+    await seedAcceptedReply(fixture, "e28-oversized-3", text);
+    const { result, log } = await runDispatch(fixture, "req-e28-oversized-dispatch", draftId, {});
+    expect(result).toMatchObject({ ok: true, outcome: "waiting", reason: "reply-exceeds-context" });
+    expect(log.jev).toHaveLength(0);
+    expect(log.openai).toHaveLength(0);
+    expect(log.agentmail).toHaveLength(0);
+    const state = await t.run(async (ctx) => ({
+      rounds: (await ctx.db.get(fixture.negotiationId))?.roundsUsed,
+      snapshots: await ctx.db.query("outboundSnapshots").take(5),
+    }));
+    expect(state.rounds).toBe(0);
+    expect(state.snapshots).toHaveLength(0);
+  });
+
+  test("normal bounded replies still pass the oversize gate with mailbox redaction intact", async () => {
+    const t = init();
+    const fixture = await createFixture(t, "clarify", {
+      conversation: { version: 1, state: "awaitingReply" },
+    });
+    const boundedText =
+      "Owner reply: freight is included in this supplier quote. " +
+      "Please compare it against the current options for the espresso machine.";
+    expect(boundedText.length).toBeLessThan(500);
+    await seedAcceptedReply(fixture, "e28-bounded-1", boundedText);
+    const { result, log } = await runPrepare(fixture, {});
+    // The bounded reply is still found past the gate, so the Jev workload
+    // digest changes and preparation waits honestly for re-approval instead
+    // of negotiating past it — and it is never flagged as oversized. The
+    // stale binding is detected before any provider fetch, so zero Jev
+    // calls still accompany an honest wait here.
+    expect(result).toMatchObject({ ok: true, outcome: "waiting", reason: "jev-stale" });
+    expect(log.jev).toHaveLength(0);
+    expect(log.agentmail).toHaveLength(0);
+    expect(JSON.stringify(result)).not.toContain(OWNER_MAILBOX);
+    const counts = await tableCounts(t);
+    expect(counts.negotiations).toEqual([{ roundsUsed: 0, state: "active" }]);
+});
+  });
+
   test("one draft dispatches once across two request ids; the stale loser has no effect", async () => {
     const t = init();
     const fixture = await createFixture(t);

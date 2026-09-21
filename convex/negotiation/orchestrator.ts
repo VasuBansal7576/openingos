@@ -185,6 +185,18 @@ const NEGOTIATION_MAX_MISSING_TERMS = 12;
 const NEGOTIATION_MAX_MISSING_TERMS_CHARS = 240;
 /** Bounded latest owner-reply excerpt carried into draft workloads. */
 const NEGOTIATION_MAX_REPLY_CHARS = 1000;
+/**
+ * Bounded accepted-reply meaning carried into the Jev move state.
+ *
+ * Astra P1 (P-23, D-12, D-13): this bound is deliberately equal to
+ * `NEGOTIATION_MAX_REPLY_CHARS` so a single oversize gate covers both
+ * downstream contexts. A reply whose full redacted text exceeds this bound
+ * never reaches either workload: `loadLatestReply` reports it as oversized
+ * and `replyGate` holds the step before any Jev, draft, model, or outbound
+ * send effect, instead of silently truncating a trailing final-offer or
+ * stop instruction.
+ */
+const NEGOTIATION_MAX_JEV_REPLY_MEANING_CHARS = 1000;
 
 /**
  * Neutralize clause-boundary punctuation inside supplier-derived workload
@@ -367,6 +379,7 @@ const pinnedContextValidator = v.object({
   replySourceLocator: v.optional(v.string()),
   replyReviewPending: v.optional(v.boolean()),
   replyScanIncomplete: v.optional(v.boolean()),
+  replyOversized: v.optional(v.boolean()),
   recipientConfigured: v.boolean(),
   recipientConfigVersion: v.optional(v.number()),
   recipientMailboxNormalized: v.optional(v.string()),
@@ -404,6 +417,7 @@ interface PinnedContext {
   replySourceLocator: string | undefined;
   replyReviewPending: boolean;
   replyScanIncomplete: boolean;
+  replyOversized: boolean;
   recipientConfigured: boolean;
   recipientConfigVersion: number | undefined;
   recipientMailboxNormalized: string | undefined;
@@ -462,17 +476,25 @@ function approvedConversationGate(pinned: PinnedContext): {
  * Quarantine/incompleteness gate over the bound-reply scan (Astra repair).
  *
  * Runs after the conversation gate and before any model call, grant lookup,
- * operation, claim, or provider effect. A truncated scan (`incomplete`) or
- * a quarantined marker newer than the accepted basis (`review`) holds the
- * step honestly instead of negotiating past unreviewed or unprovable owner
- * content. Query-shaped callers surface the code as a denial; action-shaped
- * callers surface it as a waiting outcome with the same reason string.
+ * operation, claim, or provider effect. A truncated scan (`incomplete`), an
+ * accepted reply longer than the preservation bound (`oversized`), or a
+ * quarantined marker newer than the accepted basis (`review`) holds the
+ * step honestly instead of negotiating past unreviewed, unprovable, or
+ * truncated owner content. Query-shaped callers surface the code as a
+ * denial; action-shaped callers surface it as a waiting outcome with the
+ * same reason string.
  */
 function replyGate(pinned: PinnedContext): { readonly code: string; readonly message: string } | null {
   if (pinned.replyScanIncomplete) {
     return {
       code: "reply-scan-incomplete",
       message: "bound reply scan exceeded its bound without proving exhaustion; reconcile before another automated step",
+    };
+  }
+  if (pinned.replyOversized) {
+    return {
+      code: "reply-exceeds-context",
+      message: "bound accepted reply exceeds the preserved context bound; manual review must ingest its full terms before another automated step",
     };
   }
   if (pinned.replyReviewPending) {
@@ -521,6 +543,13 @@ function serverScopeBrief(projectName: string, quoteVersion: string): string {
  * read is bounded. The excerpt is mailbox-redacted before it enters any
  * workload, and carries its source identity (message key, accepted version,
  * locator) so models receive bounded source-linked meaning.
+ *
+ * Astra P1 (P-23, D-12, D-13): an accepted reply whose full redacted text
+ * exceeds `NEGOTIATION_MAX_REPLY_CHARS` is reported as oversized instead of
+ * promoted as a truncated excerpt, so a trailing final-offer or stop
+ * instruction beyond the preservation bound can never be silently lost from
+ * the Jev or draft workloads. `replyGate` holds the step before any model,
+ * draft, or send effect until the full terms are ingested and reviewed.
  */
 const LATEST_REPLY_SCAN = 256;
 const REPLY_BINDING_WINDOW = 65;
@@ -528,17 +557,18 @@ const REPLY_BINDING_WINDOW = 65;
 const ACCEPTED_REPLY_VERSION = "source:1" as const;
 /** Quarantined inbound marker: unexpected sender or review-gated content. */
 const QUARANTINED_REPLY_VERSION = "source:1:review" as const;
-/** Bounded accepted-reply meaning carried into the Jev move state. */
-const NEGOTIATION_MAX_JEV_REPLY_MEANING_CHARS = 500;
 
 /**
  * Mailbox-redacted reply excerpt. Supplier-derived text must never leak the
  * private owner mailbox into model workloads; redact before bounding.
+ *
+ * Oversize detection must use `redactFullReply` (no slicing) and compare
+ * against `NEGOTIATION_MAX_REPLY_CHARS` before this bounded excerpt is ever
+ * built: slicing first would silently discard a trailing final-offer or stop
+ * instruction that falls beyond the bound.
  */
-function redactReplyExcerpt(text: string): string {
-  return text
-    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[redacted-mailbox]")
-    .slice(0, NEGOTIATION_MAX_REPLY_CHARS);
+function redactFullReply(text: string): string {
+  return text.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[redacted-mailbox]");
 }
 
 type ReplyLoadResult =
@@ -560,7 +590,17 @@ type ReplyLoadResult =
       readonly reviewPending: boolean;
     }
   | { readonly kind: "review" }
-  | { readonly kind: "incomplete" };
+  | { readonly kind: "incomplete" }
+  | {
+      /**
+       * An accepted (`source:1`) marker on the bound threads is longer than
+       * the preservation bound, so its trailing content — potentially a
+       * final-offer or stop instruction — cannot be carried into the Jev or
+       * draft workloads safely. The step must wait explicitly instead of
+       * negotiating from a truncated excerpt.
+       */
+      readonly kind: "oversized";
+    };
 
 async function loadLatestReply(
   ctx: F1QueryCtx,
@@ -597,6 +637,11 @@ async function loadLatestReply(
     readonly locator: string;
   } | null = null;
   let quarantinedNewestAt: number | null = null;
+  // Astra P1: an accepted reply longer than the preservation bound must never
+  // be silently truncated. Track the newest oversized accepted marker on the
+  // bound threads; when one exists the step waits explicitly even if an older
+  // bounded reply could otherwise supply meaning.
+  let oversizedNewestAt: number | null = null;
   for (const candidate of candidates) {
     if (
       candidate.field !== "agentmail.message" ||
@@ -641,7 +686,20 @@ async function loadLatestReply(
       }
       continue;
     }
-    const excerpt = redactReplyExcerpt(candidate.normalizedValue);
+    // Measure the full mailbox-redacted text BEFORE bounding. An accepted
+    // reply that does not fit the preservation bound is oversized: its
+    // trailing content (potentially a final-offer or stop instruction beyond
+    // both downstream truncation limits) cannot be promoted as a truncated
+    // excerpt, so record it and keep scanning for the newest marker.
+    const fullRedacted = redactFullReply(candidate.normalizedValue);
+    if (fullRedacted.trim().length === 0) continue;
+    if (fullRedacted.length > NEGOTIATION_MAX_REPLY_CHARS) {
+      if (oversizedNewestAt === null || evidence.capturedAt > oversizedNewestAt) {
+        oversizedNewestAt = evidence.capturedAt;
+      }
+      continue;
+    }
+    const excerpt = fullRedacted.slice(0, NEGOTIATION_MAX_REPLY_CHARS);
     if (excerpt.trim().length === 0) continue;
     if (accepted === null || evidence.capturedAt > accepted.capturedAt) {
       accepted = {
@@ -652,6 +710,9 @@ async function loadLatestReply(
         locator: `message:${messageId}`,
       };
     }
+  }
+  if (oversizedNewestAt !== null) {
+    return { kind: "oversized" };
   }
   if (accepted !== null) {
     return {
@@ -767,6 +828,7 @@ export const loadNegotiationContext = f1InternalQuery({
       latestReply.kind === "review" ||
       (latestReply.kind === "accepted" && latestReply.reviewPending);
     const replyScanIncomplete = latestReply.kind === "incomplete";
+    const replyOversized = latestReply.kind === "oversized";
     const successors = await ctx.db
       .query("quotes")
       .withIndex("by_project_and_supersedes", (q) =>
@@ -833,6 +895,7 @@ export const loadNegotiationContext = f1InternalQuery({
       ...(acceptedReply === null ? {} : { replySourceLocator: acceptedReply.locator }),
       ...(replyReviewPending ? { replyReviewPending: true as const } : {}),
       ...(replyScanIncomplete ? { replyScanIncomplete: true as const } : {}),
+      ...(replyOversized ? { replyOversized: true as const } : {}),
       recipientConfigured: recipient !== undefined,
       ...(recipient === undefined ? {} : { recipientConfigVersion: recipient.version }),
       ...(recipient === undefined ? {} : { recipientMailboxNormalized: recipient.mailboxNormalized }),
@@ -1096,6 +1159,7 @@ async function resolvePins(
       replySourceLocator: loaded.replySourceLocator,
       replyReviewPending: loaded.replyReviewPending ?? false,
       replyScanIncomplete: loaded.replyScanIncomplete ?? false,
+      replyOversized: loaded.replyOversized ?? false,
       recipientConfigured: loaded.recipientConfigured,
       recipientConfigVersion: loaded.recipientConfigVersion,
       recipientMailboxNormalized: loaded.recipientMailboxNormalized,
@@ -3030,6 +3094,7 @@ export const approveNegotiationDraft = f1Query({
       replySourceLocator: loaded.replySourceLocator,
       replyReviewPending: loaded.replyReviewPending ?? false,
       replyScanIncomplete: loaded.replyScanIncomplete ?? false,
+      replyOversized: loaded.replyOversized ?? false,
       recipientConfigured: loaded.recipientConfigured,
       recipientConfigVersion: loaded.recipientConfigVersion,
       recipientMailboxNormalized: loaded.recipientMailboxNormalized,
