@@ -1695,3 +1695,117 @@ test("inbox never claims nothing needs review while E8 due items exist", async (
     await mountedEmpty.cleanup();
   }
 });
+
+// -- E8 prototype-fidelity desk composition (real projection data only) ------
+
+function candidateWithCompleteQuote(overrides: Record<string, unknown>): Record<string, unknown> {
+  const base = (projection as unknown as Record<string, unknown>).candidates as readonly Record<string, unknown>[];
+  const template = base[0]!;
+  return { ...template, compatibility: "pass", ...overrides };
+}
+
+function completeQuote(totalMinorUnits: number): Record<string, unknown> {
+  return {
+    id: `quote-complete-${totalMinorUnits}`,
+    version: "2",
+    currency: "EUR",
+    lines: [{ lineId: "machine", description: "Atlas 2G", quantity: "1", unitPrice: { currency: "EUR", minorUnits: totalMinorUnits - 100000 } }],
+    charges: [
+      { chargeId: "charge-freight", label: "freight", scope: { kind: "quote" }, state: { kind: "known", amount: { currency: "EUR", minorUnits: 60000 } } },
+      { chargeId: "charge-installation", label: "installation", scope: { kind: "quote" }, state: { kind: "known", amount: { currency: "EUR", minorUnits: 40000 } } },
+      { chargeId: "charge-machine", label: "machine", scope: { kind: "line", lineId: "machine" }, state: { kind: "known", amount: { currency: "EUR", minorUnits: totalMinorUnits - 100000 } } },
+    ],
+    taxBasis: { kind: "inclusive", basisId: "tax-w1-1" },
+    createdAt: Date.UTC(2026, 8, 20),
+    provenance: { mode: "recorded", label: "Recorded owner exchange", ownerAuthoredTerms: true },
+    currentness: "current",
+    superseded: false,
+    totalMinorUnits,
+    comparableTotalMinorUnits: totalMinorUnits,
+  };
+}
+
+function twoOfferProjection(): Record<string, unknown> {
+  const base = projection as unknown as Record<string, unknown>;
+  const template = (base.candidates as readonly Record<string, unknown>[])[0]!;
+  const firstQuote = template.latestValidQuote as Record<string, unknown>;
+  return {
+    ...base,
+    candidates: [
+      candidateWithCompleteQuote({
+        id: "candidate-w1-1",
+        vendor: { id: "vendor-w1-1", name: "Harbor Equipment", regions: ["NL"], serviceCoverage: "Service coverage reported for this inquiry" },
+        latestValidQuote: { ...firstQuote, ...completeQuote(850000), id: "quote-w1-complete" },
+      }),
+      candidateWithCompleteQuote({
+        id: "candidate-w1-2",
+        vendor: { id: "vendor-w1-2", name: "Elm Supply", regions: ["NL"], serviceCoverage: "Service coverage reported for this inquiry" },
+        latestValidQuote: { ...firstQuote, ...completeQuote(795000), id: "quote-w1-2-complete" },
+      }),
+    ],
+  };
+}
+
+test("renders the decision desk from real requirement and offer records", async () => {
+  const snapshot = parseWorkbenchSnapshot(projection, projection.project.id);
+  if (snapshot === null) throw new Error("W1 projection should parse");
+  const mounted = await mountE8Tab({ state: "ready", snapshot }, () => ({ ok: false, message: "controlled test refusal" }));
+  try {
+    expect(mounted.container.textContent).toContain("Two-group espresso machine");
+    expect(mounted.container.textContent).toContain("ON YOUR LIST");
+    expect(mounted.container.textContent).toContain("Need by");
+    expect(mounted.container.textContent).toContain("Allocation");
+    expect(mounted.container.textContent).toContain("Harbor Equipment");
+    expect(mounted.container.textContent).toContain("Missing terms");
+    expect(mounted.container.textContent).toContain("Validity not confirmed");
+    expect(mounted.container.textContent).toContain("Review selected offer");
+    expect(mounted.container.textContent).toContain("Ask about these quotes");
+    expect(mounted.container.textContent).toContain("No order is placed.");
+    expect(mounted.container.textContent).toContain("All 1 suppliers");
+    expect(mounted.container.querySelector(".wb-comparison-tape")).toBeNull();
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("shows an honest comparable-total difference only for complete papers", async () => {
+  const snapshot = parseWorkbenchSnapshot(twoOfferProjection(), projection.project.id);
+  if (snapshot === null) throw new Error("Two-offer projection should parse");
+  const mounted = await mountE8Tab({ state: "ready", snapshot }, () => ({ ok: false, message: "controlled test refusal" }));
+  try {
+    const tape = mounted.container.querySelector(".wb-comparison-tape");
+    if (tape === null) throw new Error("Comparison tape should render for two complete offers");
+    expect(tape.textContent).toContain("Elm Supply");
+    expect(tape.textContent).toContain("Harbor Equipment");
+    expect(tape.textContent).toContain("apart in comparable totals");
+    expect(tape.textContent).not.toContain("saving");
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("bench actions open the real review dialog and assistant rail", async () => {
+  const snapshot = parseWorkbenchSnapshot(twoOfferProjection(), projection.project.id);
+  if (snapshot === null) throw new Error("Two-offer projection should parse");
+  const mounted = await mountE8Tab({ state: "ready", snapshot }, () => ({ ok: true, message: "controlled selection route" }));
+  try {
+    expect(mounted.findButton("Review selected offer").disabled).toBe(false);
+    await act(async () => {
+      mounted.findButton("Review selected offer").click();
+    });
+    expect(mounted.container.textContent).toContain("DECISION REVIEW");
+    expect(mounted.container.textContent).toContain("Selection is not an order.");
+    const dialog = mounted.container.querySelector('.wb-selection-panel[role="dialog"]');
+    if (!(dialog instanceof mounted.container.ownerDocument.defaultView!.HTMLElement)) throw new Error("Selection dialog not found");
+    await act(async () => {
+      dialog.dispatchEvent(new mounted.container.ownerDocument.defaultView!.KeyboardEvent("keydown", { bubbles: true, key: "Escape" }));
+    });
+    expect(mounted.container.querySelector('[role="dialog"]')).toBeNull();
+    await act(async () => {
+      mounted.findButton("Ask about these quotes").click();
+    });
+    expect(mounted.container.textContent).toContain("Ask about this decision.");
+  } finally {
+    await mounted.cleanup();
+  }
+});
