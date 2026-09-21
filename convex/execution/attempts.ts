@@ -357,11 +357,15 @@ async function admitReconciliationRead(
   }
   const pricing = parseReconciliationPricingBasis(reservation.pricingBasis);
   const budget = await ctx.db.get(reservation.budgetId);
+  // ADR-0004: the org-wide `providerBudgets` row is one shared allowance
+  // ledger across branches, retries, and providers; its own basis label is
+  // not a per-reservation contract. The reservation's exact reconciliation
+  // basis is validated above, and the budget only must exist and belong to
+  // the operation organization.
   if (
     pricing === null ||
     budget === null ||
     budget.organizationId !== operation.organizationId ||
-    budget.pricingBasis !== reservation.pricingBasis ||
     reservation.ceilingMicroUsd < pricing.readCostMicroUsd
   ) {
     return { ok: false as const, code: "stale-pricing-basis", message: "reconciliation pricing basis is unavailable or stale" };
