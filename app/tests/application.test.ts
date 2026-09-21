@@ -37,7 +37,7 @@ describe("application foundation", () => {
     const workflow = await Bun.file(new URL("../../.github/workflows/application-ci.yml", import.meta.url)).text();
 
     expect(packageJson).toContain('"test:app": "bun test app/tests/application.test.ts app/tests/workbench.test.ts app/tests/convex-workbench-adapter.test.ts && bunx vitest run convex/models/jev.test.ts --environment edge-runtime"');
-    expect(workflow).toContain("- run: bun run test:app");
-    expect(workflow).not.toContain("- run: bun run test\n");
+    expect(packageJson).toContain('"test": "bun run test:repository && bun run test:proofs && bun run test:evals && bun run test:f1 && bun run test:browser && bun run test:app && bun test convex/communication/contracts.test.ts && bun run test:direct"');
+    expect(workflow).toContain("- run: bun run test\n");
   });
 });
