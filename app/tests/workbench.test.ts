@@ -1382,3 +1382,66 @@ test("disables every mutation control while reconnecting and resumes after a fre
     else actEnvironment.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment;
   }
 });
+
+// -- U1 narrow-viewport and nested-dialog visual recovery --------------------
+
+test("keeps the narrow workbench heading fluid and wrappable", async () => {
+  const css = await Bun.file(new URL("../styles.css", import.meta.url)).text();
+  const narrowBlock = css.slice(css.indexOf("@media (max-width: 480px)"));
+  expect(narrowBlock).toContain(".wb-page-heading h1");
+  const narrowHeading = narrowBlock.match(/\.wb-page-heading h1\s*\{[^}]*\}/);
+  expect(narrowHeading?.[0]).toContain("clamp(");
+  expect(narrowHeading?.[0]).toContain("overflow-wrap");
+  expect(narrowHeading?.[0]).not.toMatch(/font-size:\s*\d+(\.\d+)?rem\s*;/);
+  const baseHeading = css.match(/\.wb-page-heading h1\s*\{[^}]*\}/);
+  expect(baseHeading?.[0]).toContain("overflow-wrap");
+});
+
+test("makes all background content inert for the nested service dialog and restores exactly", async () => {
+  const snapshot = parseWorkbenchSnapshot(projectionWithEquipment({
+    assets: [assetFixture()],
+    assetsTruncated: false,
+  }), projection.project.id);
+  if (snapshot === null) throw new Error("E1 equipment projection should parse");
+  const mounted = await mountEquipmentTab({ state: "ready", snapshot }, () => ({ ok: false, message: "controlled test refusal" }));
+  try {
+    await mounted.clickTab("Equipment");
+    // A pre-existing background state the dialog must preserve exactly.
+    const overview = mounted.container.querySelector(".wb-overview-strip");
+    if (!(overview instanceof mounted.container.ownerDocument.defaultView!.HTMLElement)) throw new Error("Overview strip not found");
+    overview.setAttribute("inert", "");
+    overview.setAttribute("aria-hidden", "false");
+    const open = mounted.findButton("Open service case");
+    open.focus();
+    await act(async () => { open.click(); });
+    const dialog = mounted.container.querySelector('.wb-service-case-panel[role="dialog"]');
+    if (!(dialog instanceof mounted.container.ownerDocument.defaultView!.HTMLElement)) throw new Error("Service dialog not found");
+    const header = mounted.container.querySelector(".wb-header");
+    const banner = mounted.container.querySelector(".wb-demo-banner");
+    expect(header?.hasAttribute("inert")).toBe(true);
+    expect(header?.getAttribute("aria-hidden")).toBe("true");
+    expect(banner?.hasAttribute("inert")).toBe(true);
+    expect(banner?.getAttribute("aria-hidden")).toBe("true");
+    // The nested dialog observes the pre-existing state instead of overwriting it.
+    expect(overview.hasAttribute("inert")).toBe(true);
+    expect(overview.getAttribute("aria-hidden")).toBe("true");
+    // The dialog ancestor chain stays interactive and the dialog stays exposed.
+    expect(mounted.container.querySelector("#workbench-main")?.hasAttribute("inert")).toBe(false);
+    expect(dialog.getAttribute("aria-hidden")).toBeNull();
+    expect(dialog.contains(mounted.container.ownerDocument.activeElement)).toBe(true);
+
+    await act(async () => {
+      dialog.dispatchEvent(new mounted.container.ownerDocument.defaultView!.KeyboardEvent("keydown", { bubbles: true, key: "Escape" }));
+    });
+    expect(mounted.container.querySelector('[role="dialog"]')).toBeNull();
+    expect(header?.hasAttribute("inert")).toBe(false);
+    expect(header?.hasAttribute("aria-hidden")).toBe(false);
+    expect(banner?.hasAttribute("inert")).toBe(false);
+    // The pre-existing inert state restores exactly, including its odd value.
+    expect(overview.hasAttribute("inert")).toBe(true);
+    expect(overview.getAttribute("aria-hidden")).toBe("false");
+    expect(mounted.container.ownerDocument.activeElement).toBe(open);
+  } finally {
+    await mounted.cleanup();
+  }
+});
