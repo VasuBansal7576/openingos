@@ -2685,19 +2685,38 @@ describe("direct E10 usage metrics (P-22)", () => {
         currency: "EUR",
         entries: 2,
         byKind: { payment: 1, settledCost: 0, refund: 0, credit: 1 },
-        paymentsAndSettledMinorUnits: 100_00,
-        refundsAndCreditsMinorUnits: 20_00,
-        netMinorUnits: 80_00,
+        paymentsMinorUnits: 100_00,
+        refundsMinorUnits: 0,
+        netPaidMinorUnits: 100_00,
+        settledCostsMinorUnits: 0,
+        creditsMinorUnits: 20_00,
+        netSettledMinorUnits: -20_00,
+        linkedPairs: 0,
       },
       {
         currency: "USD",
         entries: 2,
         byKind: { payment: 1, settledCost: 1, refund: 0, credit: 0 },
-        paymentsAndSettledMinorUnits: 75_00,
-        refundsAndCreditsMinorUnits: 0,
-        netMinorUnits: 75_00,
+        paymentsMinorUnits: 50_00,
+        refundsMinorUnits: 0,
+        netPaidMinorUnits: 50_00,
+        settledCostsMinorUnits: 25_00,
+        creditsMinorUnits: 0,
+        netSettledMinorUnits: 25_00,
+        linkedPairs: 0,
       },
     ]);
+    // Paid cash and settled acquisition cost are never merged into one
+    // confirmed-spend metric: the combined USD payment-plus-settled total
+    // of 75_00 appears in no single spend field.
+    for (const bucket of result.spend.currencies) {
+      expect(bucket).not.toHaveProperty("paymentsAndSettledMinorUnits");
+      expect(bucket).not.toHaveProperty("refundsAndCreditsMinorUnits");
+      expect(bucket).not.toHaveProperty("netMinorUnits");
+      for (const value of Object.values(bucket)) {
+        expect(value).not.toBe(75_00);
+      }
+    }
     // The spend section exposes no cross-currency aggregate.
     expect(Object.keys(result.spend).sort()).toEqual([
       "currencies",
@@ -2826,7 +2845,9 @@ describe("direct E10 usage metrics (P-22)", () => {
       const now = Date.now();
       const MAX_SAFE = Number.MAX_SAFE_INTEGER;
       // Placed order with individually valid safe-integer cost entries
-      // whose EUR aggregate overflows the exact range.
+      // whose EUR paid-cash aggregate overflows the exact range. Both
+      // entries are payments so the overflow lands on the independent
+      // paid-cash state while settled cost stays exact.
       const orderId = await ctx.db.insert("orders", {
         organizationId: setup.orgId,
         projectId: setup.projectId,
@@ -2855,7 +2876,7 @@ describe("direct E10 usage metrics (P-22)", () => {
         organizationId: setup.orgId,
         projectId: setup.projectId,
         orderId,
-        kind: "settledCost",
+        kind: "payment",
         amount: { currency: "EUR", minorUnits: 1 },
         idempotencyKey: "ce-metrics-overflow-eur-2",
         recordedBy: OWNER_A.tokenIdentifier,
@@ -2991,24 +3012,34 @@ describe("direct E10 usage metrics (P-22)", () => {
     });
     expect(result.attempts.observedElapsed.attemptsWithSaneInterval).toBe(2);
 
-    // Per-currency spend: EUR overflows and its net is unavailable with
-    // it; USD stays an exact plain number. Currency separation holds.
+    // Per-currency spend: the EUR paid-cash total overflows and only
+    // its net is unavailable with it, while the settled-cost state stays
+    // an exact plain number; USD stays exact throughout. Currency and
+    // financial-state separation both hold.
     const eur = result.spend.currencies.find((bucket) => bucket.currency === "EUR");
     const usd = result.spend.currencies.find((bucket) => bucket.currency === "USD");
     expect(eur).toBeDefined();
     expect(usd).toBeDefined();
     if (!eur || !usd) throw new Error("currency buckets missing");
-    expect(eur.paymentsAndSettledMinorUnits).toEqual({
+    expect(eur.paymentsMinorUnits).toEqual({
       unavailable: "overflow",
       reason: expect.stringContaining("overflow"),
     });
-    expect(eur.refundsAndCreditsMinorUnits).toBe(0);
-    expect(eur.netMinorUnits).toEqual({
+    expect(eur.refundsMinorUnits).toBe(0);
+    expect(eur.netPaidMinorUnits).toEqual({
       unavailable: "overflow",
       reason: expect.stringContaining("overflow"),
     });
-    expect(usd.paymentsAndSettledMinorUnits).toBe(5);
-    expect(usd.netMinorUnits).toBe(5);
+    expect(eur.settledCostsMinorUnits).toBe(0);
+    expect(eur.creditsMinorUnits).toBe(0);
+    expect(eur.netSettledMinorUnits).toBe(0);
+    expect(eur.linkedPairs).toBe(0);
+    expect(usd.paymentsMinorUnits).toBe(5);
+    expect(usd.refundsMinorUnits).toBe(0);
+    expect(usd.netPaidMinorUnits).toBe(5);
+    expect(usd.settledCostsMinorUnits).toBe(0);
+    expect(usd.creditsMinorUnits).toBe(0);
+    expect(usd.netSettledMinorUnits).toBe(0);
 
     // No unsafe numeric value is reported anywhere in the measured-total
     // fields of the response.
@@ -3019,7 +3050,7 @@ describe("direct E10 usage metrics (P-22)", () => {
           const childPath = path === "" ? key : `${path}.${key}`;
           if (
             typeof child === "number" &&
-            /reservedMicroUsd|spentMicroUsd|unresolvedMicroUsd|paymentsAndSettledMinorUnits|refundsAndCreditsMinorUnits|netMinorUnits|totalObservedElapsedMs$/.test(
+            /reservedMicroUsd|spentMicroUsd|unresolvedMicroUsd|paymentsMinorUnits|refundsMinorUnits|netPaidMinorUnits|settledCostsMinorUnits|creditsMinorUnits|netSettledMinorUnits|totalObservedElapsedMs$/.test(
               childPath,
             )
           ) {
