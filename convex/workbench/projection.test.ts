@@ -843,6 +843,7 @@ async function insertQuote(
     readonly supersedes?: string;
     readonly createdAt: number;
     readonly organizationId?: Id<"organizations">;
+    readonly currency?: string;
     readonly lines?: readonly QuoteLineRow[];
     readonly charges?: readonly QuoteChargeRow[];
     readonly taxBasis?: QuoteTaxBasisRow;
@@ -857,12 +858,12 @@ async function insertQuote(
       vendorId: graph.vendorId,
       version: options.version,
       contentHash: options.contentHash,
-      currency: "EUR",
+      currency: options.currency ?? "EUR",
       lines: [...(options.lines ?? [{
         lineId: "machine",
         description: "Machine",
         quantity: "1",
-        unitPrice: { currency: "EUR", minorUnits: 750000 },
+        unitPrice: { currency: options.currency ?? "EUR", minorUnits: 750000 },
         evidenceRefs: [],
       }])],
       charges: [...(options.charges ?? [])],
@@ -1410,5 +1411,217 @@ describe("E8 changed-term impact and substitute projection", () => {
     expect(result.substitutes).toEqual([]);
     expect(result.impactsTruncated).toBe(false);
     expect(result.substitutesTruncated).toBe(false);
+  });
+});
+
+describe("F2 authoritative pairwise comparison verdicts", () => {
+  async function setupCompetingCandidates(
+    t: ReturnType<typeof convexTest>,
+    project: { organizationId: Id<"organizations">; projectId: Id<"projects"> },
+    suffix: string,
+  ) {
+    const asOwner = t.withIdentity(OWNER);
+    const requirement = await asOwner.mutation(createRequirementRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      key: `competing-${suffix}`,
+      title: `Competing offer ${suffix}`,
+      category: "coffee",
+      quantity: "1",
+      unit: "piece",
+      priority: "P0",
+    });
+    if (!requirement.ok) throw new Error(`requirement setup failed: ${JSON.stringify(requirement)}`);
+    const candidates: { candidateId: Id<"candidates">; vendorId: Id<"vendors"> }[] = [];
+    for (const name of ["alpha", "beta"]) {
+      const vendor = await asOwner.mutation(recordVendorRef, {
+        organizationId: project.organizationId,
+        name: `Vendor ${suffix}-${name}`,
+        regions: ["NL"],
+        serviceCoverage: "Netherlands",
+      });
+      if (!vendor.ok) throw new Error(`vendor setup failed: ${JSON.stringify(vendor)}`);
+      const candidate = await asOwner.mutation(recordCandidateRef, {
+        organizationId: project.organizationId,
+        projectId: project.projectId,
+        requirementId: requirement.requirementId,
+        vendorId: vendor.vendorId,
+        productModel: `Model ${suffix}-${name}`,
+        variant: "220V",
+        conversationState: "quoteReceived",
+      });
+      if (!candidate.ok) throw new Error(`candidate setup failed: ${JSON.stringify(candidate)}`);
+      candidates.push({ candidateId: candidate.candidateId, vendorId: vendor.vendorId });
+    }
+    return { requirementId: requirement.requirementId, candidates };
+  }
+
+  const scopeFor = (requirementId: string, items: readonly { readonly itemId: string; readonly lineId: string; readonly requiredQuantity: string }[]) => ({
+    requirementId,
+    scopeId: "scope-f2",
+    items: items.map((item) => ({ ...item, unit: "piece" })),
+  });
+  const singleLine = (currency: string, minorUnits: number) => [
+    {
+      lineId: "machine",
+      description: "Machine",
+      quantity: "1",
+      unitPrice: { currency, minorUnits },
+      evidenceRefs: [],
+    },
+  ];
+  const inclusiveBasis = (currency: string) =>
+    currency === "EUR"
+      ? ({ kind: "inclusive", basisId: "NL-EUR-INCLUSIVE", evidenceRefs: [] } as const)
+      : ({ kind: "inclusive", basisId: "US-USD-INCLUSIVE", evidenceRefs: [] } as const);
+
+  async function comparisonPairFor(
+    t: ReturnType<typeof convexTest>,
+    project: { organizationId: Id<"organizations">; projectId: Id<"projects"> },
+    options: {
+      readonly alpha: {
+        readonly currency: string;
+        readonly minorUnits: number;
+        readonly taxBasis?: QuoteTaxBasisRow;
+        readonly lines?: readonly QuoteLineRow[];
+        readonly scopeItems?: readonly { readonly itemId: string; readonly lineId: string; readonly requiredQuantity: string }[];
+      };
+      readonly beta: {
+        readonly currency: string;
+        readonly minorUnits: number;
+        readonly taxBasis?: QuoteTaxBasisRow;
+        readonly lines?: readonly QuoteLineRow[];
+        readonly scopeItems?: readonly { readonly itemId: string; readonly lineId: string; readonly requiredQuantity: string }[];
+      };
+    },
+  ) {
+    const graph = await setupCompetingCandidates(t, project, "f2");
+    const [alpha, beta] = graph.candidates;
+    if (alpha === undefined || beta === undefined) throw new Error("candidate setup failed");
+    await insertQuote(t, project, { requirementId: graph.requirementId, vendorId: alpha.vendorId }, {
+      version: "v1",
+      contentHash: "f2-hash-alpha",
+      createdAt: 100,
+      currency: options.alpha.currency,
+      lines: options.alpha.lines ?? singleLine(options.alpha.currency, options.alpha.minorUnits),
+      taxBasis: options.alpha.taxBasis ?? inclusiveBasis(options.alpha.currency),
+      comparisonScope: scopeFor(graph.requirementId, options.alpha.scopeItems ?? [
+        { itemId: "item-f2", lineId: "machine", requiredQuantity: "1" },
+      ]),
+    });
+    await insertQuote(t, project, { requirementId: graph.requirementId, vendorId: beta.vendorId }, {
+      version: "v1",
+      contentHash: "f2-hash-beta",
+      createdAt: 110,
+      currency: options.beta.currency,
+      lines: options.beta.lines ?? singleLine(options.beta.currency, options.beta.minorUnits),
+      taxBasis: options.beta.taxBasis ?? inclusiveBasis(options.beta.currency),
+      comparisonScope: scopeFor(graph.requirementId, options.beta.scopeItems ?? [
+        { itemId: "item-f2", lineId: "machine", requiredQuantity: "1" },
+      ]),
+    });
+    const result = await t.withIdentity(OWNER).query(getProjectionRef, { projectId: project.projectId });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("projection denied");
+    const alphaOffer = result.candidates.find((candidate) => candidate.id === alpha.candidateId);
+    const betaOffer = result.candidates.find((candidate) => candidate.id === beta.candidateId);
+    if (alphaOffer === undefined || betaOffer === undefined) throw new Error("offers missing from projection");
+    return { alphaOffer, betaOffer };
+  }
+
+  test("mixed currencies stay incomparable with the machine reason and both offers stay visible", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, OWNER, "f2-currency");
+    const { alphaOffer, betaOffer } = await comparisonPairFor(t, project, {
+      alpha: { currency: "USD", minorUnits: 795049 },
+      beta: { currency: "EUR", minorUnits: 850000 },
+    });
+    expect(alphaOffer.latestValidQuote).not.toBeNull();
+    expect(betaOffer.latestValidQuote).not.toBeNull();
+    const verdict = alphaOffer.comparisons.find((entry) => entry.againstCandidateId === betaOffer.id);
+    expect(verdict).toBeDefined();
+    expect(verdict?.status).toBe("incompatible");
+    expect(verdict?.reason).toBe("mixed-currency-requires-accepted-conversion-basis");
+    expect(verdict?.differenceMinorUnits).toBeNull();
+    expect(verdict?.cheaper).toBeNull();
+    expect(verdict?.estimatedDeltaMinorUnits).toBeNull();
+    const mirror = betaOffer.comparisons.find((entry) => entry.againstCandidateId === alphaOffer.id);
+    expect(mirror?.status).toBe("incompatible");
+    expect(mirror?.reason).toBe("mixed-currency-requires-accepted-conversion-basis");
+  });
+
+  test("inclusive versus exclusive tax bases stay incompatible with the machine reason", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, OWNER, "f2-tax");
+    const { alphaOffer, betaOffer } = await comparisonPairFor(t, project, {
+      alpha: { currency: "EUR", minorUnits: 750000, taxBasis: { kind: "inclusive", basisId: "NL-EUR-INCLUSIVE", evidenceRefs: [] } },
+      beta: { currency: "EUR", minorUnits: 850000, taxBasis: { kind: "exclusive", basisId: "DE-EUR-EXCLUSIVE", evidenceRefs: [] } },
+    });
+    const verdict = alphaOffer.comparisons.find((entry) => entry.againstCandidateId === betaOffer.id);
+    expect(verdict?.status).toBe("incompatible");
+    expect(verdict?.reason).toBe("tax bases are not compatible");
+    expect(verdict?.differenceMinorUnits).toBeNull();
+  });
+
+  test("two required units versus one stays incompatible with the scope reason", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, OWNER, "f2-scope");
+    const { alphaOffer, betaOffer } = await comparisonPairFor(t, project, {
+      alpha: {
+        currency: "EUR",
+        minorUnits: 750000,
+        lines: [
+          { lineId: "machine-a", description: "Machine A", quantity: "1", unitPrice: { currency: "EUR", minorUnits: 500000 }, evidenceRefs: [] },
+          { lineId: "machine-b", description: "Machine B", quantity: "1", unitPrice: { currency: "EUR", minorUnits: 250000 }, evidenceRefs: [] },
+        ],
+        scopeItems: [
+          { itemId: "item-a", lineId: "machine-a", requiredQuantity: "1" },
+          { itemId: "item-b", lineId: "machine-b", requiredQuantity: "1" },
+        ],
+      },
+      beta: { currency: "EUR", minorUnits: 750000 },
+    });
+    expect(alphaOffer.latestValidQuote?.comparisonScope?.items).toHaveLength(2);
+    expect(betaOffer.latestValidQuote?.comparisonScope?.items).toHaveLength(1);
+    const verdict = alphaOffer.comparisons.find((entry) => entry.againstCandidateId === betaOffer.id);
+    expect(verdict?.status).toBe("incompatible");
+    expect(verdict?.reason).toContain("comparison scopes are not compatible");
+    expect(verdict?.differenceMinorUnits).toBeNull();
+    expect(verdict?.cheaper).toBeNull();
+  });
+
+  test("an equivalent pair is comparable with the exact 54951 minor-unit difference", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, OWNER, "f2-comparable");
+    const { alphaOffer, betaOffer } = await comparisonPairFor(t, project, {
+      alpha: { currency: "EUR", minorUnits: 795049 },
+      beta: { currency: "EUR", minorUnits: 850000 },
+    });
+    const alphaQuote = alphaOffer.latestValidQuote;
+    const betaQuote = betaOffer.latestValidQuote;
+    expect(alphaQuote).not.toBeNull();
+    expect(betaQuote).not.toBeNull();
+    // Exact minor units are preserved without rounding, with the native
+    // currency carried on the total.
+    expect(alphaQuote?.totalMinorUnits).toBe(795049);
+    expect(alphaQuote?.total).toEqual({ currency: "EUR", minorUnits: 795049 });
+    expect(betaQuote?.total).toEqual({ currency: "EUR", minorUnits: 850000 });
+    // Tax-basis identity and the complete recorded comparison scope are
+    // retained by the projection.
+    expect(alphaQuote?.taxBasis).toEqual({ kind: "inclusive", basisId: "NL-EUR-INCLUSIVE" });
+    expect(alphaQuote?.comparisonScope?.scopeId).toBe("scope-f2");
+    expect(alphaQuote?.comparisonScope?.items).toEqual([
+      { itemId: "item-f2", lineId: "machine", unit: "piece", requiredQuantity: "1" },
+    ]);
+    const verdict = alphaOffer.comparisons.find((entry) => entry.againstCandidateId === betaOffer.id);
+    expect(verdict?.status).toBe("comparable");
+    expect(verdict?.reason).toBe("equivalent-scope");
+    expect(verdict?.differenceMinorUnits).toBe(54951);
+    expect(verdict?.cheaper).toBe("self");
+    expect(verdict?.estimatedDeltaMinorUnits).toBeNull();
+    const mirror = betaOffer.comparisons.find((entry) => entry.againstCandidateId === alphaOffer.id);
+    expect(mirror?.status).toBe("comparable");
+    expect(mirror?.differenceMinorUnits).toBe(54951);
+    expect(mirror?.cheaper).toBe("other");
   });
 });
