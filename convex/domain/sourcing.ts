@@ -1492,6 +1492,22 @@ export const openNegotiation = f1Mutation({
         return { ok: false as const, code: "invalid-payload", message: "negotiation target money is invalid" };
       }
     }
+    // The mandate-approved conversation identity is read server-side from
+    // the live conversation row at approval: the exact approved version AND
+    // the exact approved state. These are pins, not mirrors: raw inbound
+    // callback ingestion never advances them, so a reply recorded after
+    // approval leaves the live conversation ahead of the pins and every
+    // dependent claim fails closed until an explicit reply-incorporation
+    // transition exists.
+    let approvedConversationVersion: number | undefined;
+    let approvedConversationState: "draft" | "queued" | "awaitingReply" | "replyReceived" | "closed" | "cancelled" | undefined;
+    if (quote.conversationId !== undefined) {
+      const boundConversation = await ctx.db.get(quote.conversationId);
+      if (boundConversation !== null) {
+        approvedConversationVersion = boundConversation.version;
+        approvedConversationState = boundConversation.state;
+      }
+    }
     const negotiationId = await ctx.db.insert("negotiations", {
       organizationId: args.organizationId,
       projectId: args.projectId,
@@ -1499,6 +1515,8 @@ export const openNegotiation = f1Mutation({
       quoteVersion: quote.version,
       currency: quote.currency,
       ...(quote.conversationId === undefined ? {} : { conversationId: quote.conversationId }),
+      ...(approvedConversationVersion === undefined ? {} : { conversationVersion: approvedConversationVersion }),
+      ...(approvedConversationState === undefined ? {} : { conversationState: approvedConversationState }),
       mandateHash: args.mandateHash,
       ...(args.targetMinorUnits === undefined ? {} : { targetMinorUnits: args.targetMinorUnits }),
       roundLimit: args.roundLimit,
