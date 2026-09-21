@@ -7,6 +7,7 @@ import { ConvexReactClient, type Watch } from "convex/react";
 import App from "../App";
 import { statusFromConnection, type BackendStatus } from "../backend-state";
 import { AdapterAwareApp, mountRootApplication, RootApplication } from "../main";
+import type { WorkbenchIntakeInput } from "../workbench-state";
 
 function renderPath(backendStatus: BackendStatus): string {
   return renderToStaticMarkup(createElement(App, { backendStatus }));
@@ -1285,6 +1286,256 @@ test("an older discovery success cannot re-enable creation after disconnect", as
     await harness.clickDemo();
     expect(harness.container.textContent).toContain("The sample demo is not available in this build.");
     expect(harness.sampleCalls).toHaveLength(0);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+type CreationResult = {
+  readonly ok: boolean;
+  readonly projectId?: string;
+  readonly message?: string;
+};
+
+async function waitForQueueLength(queue: readonly unknown[], length: number, timeoutMs = 1_500): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (queue.length < length && Date.now() < deadline) {
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+  }
+  expect(queue.length).toBeGreaterThanOrEqual(length);
+}
+
+async function mountCreationEpochHarness() {
+  const dom = new HappyWindow({ url: "https://openingos.test/" });
+  const previousWindow = globalThis.window;
+  const previousDocument = globalThis.document;
+  const previousNavigator = globalThis.navigator;
+  const actEnvironment = globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean };
+  const previousActEnvironment = actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+  const browserGlobals = globalThis as unknown as { window: unknown; document: unknown; navigator: unknown };
+  browserGlobals.window = dom as unknown as globalThis.Window;
+  browserGlobals.document = dom.document as unknown as globalThis.Document;
+  browserGlobals.navigator = dom.navigator as unknown as globalThis.Navigator;
+  actEnvironment.IS_REACT_ACT_ENVIRONMENT = true;
+
+  const discoverQueue: Deferred<string | null>[] = [];
+  const sampleQueue: Deferred<CreationResult>[] = [];
+  const intakeQueue: Deferred<CreationResult>[] = [];
+  const sampleCalls: { idempotencyKey: string }[] = [];
+  const intakeCalls: WorkbenchIntakeInput[] = [];
+  const loadCalls: string[] = [];
+
+  const adapter = {
+    load: async (projectId: string) => {
+      loadCalls.push(projectId);
+      return null;
+    },
+    subscribe: () => () => {},
+    act: async () => ({ ok: true }),
+    discoverProject: (): Promise<string | null> => {
+      const gate = deferred<string | null>();
+      discoverQueue.push(gate);
+      return gate.promise;
+    },
+    createSample: (input: { idempotencyKey: string }): Promise<CreationResult> => {
+      sampleCalls.push(input);
+      const gate = deferred<CreationResult>();
+      sampleQueue.push(gate);
+      return gate.promise;
+    },
+    createIntake: (input: WorkbenchIntakeInput): Promise<CreationResult> => {
+      intakeCalls.push(input);
+      const gate = deferred<CreationResult>();
+      intakeQueue.push(gate);
+      return gate.promise;
+    },
+  };
+
+  const happyContainer = dom.document.createElement("div");
+  dom.document.body.append(happyContainer);
+  const container = happyContainer as unknown as globalThis.Element;
+  const root = createRoot(container);
+  const renderStatus = async (backendStatus: Exclude<BackendStatus, "unconfigured">) => {
+    await act(async () => {
+      root.render(createElement(AdapterAwareApp, {
+        backendStatus,
+        onRetry: () => undefined,
+        workbenchAdapter: adapter,
+      }));
+    });
+  };
+  const cleanup = async () => {
+    await act(async () => {
+      root.unmount();
+    });
+    dom.close();
+    browserGlobals.window = previousWindow;
+    browserGlobals.document = previousDocument;
+    browserGlobals.navigator = previousNavigator;
+    if (previousActEnvironment === undefined) delete actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+    else actEnvironment.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment;
+  };
+  const clickDemo = async () => {
+    const button = Array.from(container.querySelectorAll("button")).find((candidate) =>
+      candidate.textContent?.includes("Try the Northside"),
+    );
+    if (button === undefined) throw new Error("Demo button not found");
+    await act(async () => {
+      (button as unknown as HTMLButtonElement).click();
+    });
+  };
+  const clickButton = async (label: string) => {
+    const button = Array.from(container.querySelectorAll("button")).find((candidate) =>
+      candidate.textContent?.includes(label),
+    );
+    if (button === undefined) throw new Error(`Button not found: ${label}`);
+    await act(async () => {
+      (button as unknown as HTMLButtonElement).click();
+    });
+  };
+  const submitIntake = async (projectName: string, region: string) => {
+    const nameInput = container.querySelector('input[name="projectName"]') as unknown as HTMLInputElement | null;
+    const regionInput = container.querySelector('input[name="region"]') as unknown as HTMLInputElement | null;
+    if (nameInput === null || regionInput === null) throw new Error("Intake form inputs not found");
+    nameInput.value = projectName;
+    regionInput.value = region;
+    const form = nameInput.closest("form");
+    if (form === null) throw new Error("Intake form not found");
+    await act(async () => {
+      form.dispatchEvent(
+        new dom.window.Event("submit", { bubbles: true, cancelable: true }) as unknown as globalThis.Event,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+  };
+  return { container, renderStatus, cleanup, clickDemo, clickButton, submitIntake, discoverQueue, sampleQueue, intakeQueue, sampleCalls, intakeCalls, loadCalls };
+}
+
+test("pending sample creation resolving after reconnect does not load the stale project", async () => {
+  const harness = await mountCreationEpochHarness();
+  try {
+    await harness.renderStatus("connected");
+    await waitForQueueLength(harness.discoverQueue, 1);
+    await act(async () => {
+      harness.discoverQueue[0]?.resolve(null);
+      await harness.discoverQueue[0]?.promise;
+    });
+    await waitForText(harness.container, "NO AUTHORIZED PROJECT");
+
+    await harness.clickDemo();
+    await waitForQueueLength(harness.sampleQueue, 1);
+    expect(harness.sampleCalls).toHaveLength(1);
+    const dispatchKey = harness.sampleCalls[0]?.idempotencyKey;
+    expect(dispatchKey?.trim().length).toBeGreaterThan(0);
+
+    // Disconnect and reconnect while the sample mutation is still pending.
+    // The reconnect rolls the connection/auth epoch and dispatches a fresh
+    // discovery that stays pending.
+    await harness.renderStatus("reconnecting");
+    await waitForText(harness.container, "CONNECTION INTERRUPTED");
+    await harness.renderStatus("connected");
+    await waitForQueueLength(harness.discoverQueue, 2);
+
+    // Creation stays blocked while the fresh discovery is pending.
+    await harness.clickDemo();
+    expect(harness.container.textContent).toContain("The sample demo is not available in this build.");
+    expect(harness.sampleCalls).toHaveLength(1);
+
+    // The stale epoch-0 completion resolves after the reconnect: it must
+    // not adopt or load the old project (P-17, D-06, D-14).
+    await act(async () => {
+      harness.sampleQueue[0]?.resolve({ ok: true, projectId: "project-sample-stale" });
+      await harness.sampleQueue[0]?.promise;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+    expect(harness.loadCalls).not.toContain("project-sample-stale");
+    expect(harness.container.textContent).not.toContain("project-sample-stale");
+    expect(harness.container.textContent).toContain("could not be loaded in this session");
+
+    // Fresh discovery confirms the new epoch. The honest error offers a
+    // retry that reuses the same idempotency key, so the duplicate
+    // submission guard survives the epoch fence.
+    await act(async () => {
+      harness.discoverQueue[1]?.resolve(null);
+      await harness.discoverQueue[1]?.promise;
+    });
+    await waitForText(harness.container, "NO AUTHORIZED PROJECT");
+    await harness.clickButton("Retry sample creation");
+    await waitForQueueLength(harness.sampleQueue, 2);
+    expect(harness.sampleCalls).toHaveLength(2);
+    expect(harness.sampleCalls[1]?.idempotencyKey).toBe(dispatchKey);
+
+    // A fresh current-epoch success still loads its project.
+    await act(async () => {
+      harness.sampleQueue[1]?.resolve({ ok: true, projectId: "project-sample-fresh" });
+      await harness.sampleQueue[1]?.promise;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+    expect(harness.loadCalls).toContain("project-sample-fresh");
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("pending intake creation resolving after reconnect does not load the stale project", async () => {
+  const harness = await mountCreationEpochHarness();
+  try {
+    await harness.renderStatus("connected");
+    await waitForQueueLength(harness.discoverQueue, 1);
+    await act(async () => {
+      harness.discoverQueue[0]?.resolve(null);
+      await harness.discoverQueue[0]?.promise;
+    });
+    await waitForText(harness.container, "NO AUTHORIZED PROJECT");
+    await waitForText(harness.container, "Open a workspace");
+
+    await harness.submitIntake("Harbor expansion", "Amsterdam, Netherlands");
+    await waitForQueueLength(harness.intakeQueue, 1);
+    expect(harness.intakeCalls).toHaveLength(1);
+    expect(harness.intakeCalls[0]?.idempotencyKey.trim().length).toBeGreaterThan(0);
+
+    // Disconnect and reconnect while the intake mutation is still pending.
+    // The reconnect rolls the connection/auth epoch and dispatches a fresh
+    // discovery that stays pending.
+    await harness.renderStatus("reconnecting");
+    await waitForText(harness.container, "CONNECTION INTERRUPTED");
+    await harness.renderStatus("connected");
+    await waitForQueueLength(harness.discoverQueue, 2);
+
+    // While the fresh discovery is pending, the intake form is not offered
+    // and no second mutation is sent.
+    expect(harness.container.textContent).not.toContain("Open a workspace");
+    expect(harness.intakeCalls).toHaveLength(1);
+
+    // The stale epoch-0 completion resolves after the reconnect: it must
+    // not adopt or load the old project (P-17, D-06, D-14).
+    await act(async () => {
+      harness.intakeQueue[0]?.resolve({ ok: true, projectId: "project-intake-stale" });
+      await harness.intakeQueue[0]?.promise;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+    expect(harness.loadCalls).not.toContain("project-intake-stale");
+    expect(harness.container.textContent).not.toContain("project-intake-stale");
+    expect(harness.container.textContent).toContain("could not be loaded in this session");
+
+    // Fresh discovery confirms the new epoch and restores the intake form.
+    // A fresh current-epoch intake success still loads its project.
+    await act(async () => {
+      harness.discoverQueue[1]?.resolve(null);
+      await harness.discoverQueue[1]?.promise;
+    });
+    await waitForText(harness.container, "Open a workspace");
+    await harness.submitIntake("Harbor expansion", "Amsterdam, Netherlands");
+    await waitForQueueLength(harness.intakeQueue, 2);
+    expect(harness.intakeCalls).toHaveLength(2);
+    await act(async () => {
+      harness.intakeQueue[1]?.resolve({ ok: true, projectId: "project-intake-fresh" });
+      await harness.intakeQueue[1]?.promise;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+    expect(harness.loadCalls).toContain("project-intake-fresh");
   } finally {
     await harness.cleanup();
   }
