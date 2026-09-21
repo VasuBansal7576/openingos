@@ -1318,13 +1318,30 @@ describe("E5 substitute proposals", () => {
       decision: "approved",
     });
     expect(becameSelected).toMatchObject({ ok: false, code: "stale-proposal-basis" });
-    const approvalCount = await t.run(async (ctx) => {
+    const noSelectionView = await t.withIdentity(OWNER).query(getSubstituteProposalRef, {
+      organizationId: noSelectionProject.organizationId,
+      projectId: noSelectionProject.projectId,
+      proposalId: noSelectionProposal.proposalId,
+    });
+    if (!noSelectionView.ok) throw new Error("no-selection view failed");
+    expect(noSelectionView.proposal.state).toBe("pending");
+    // Both drifted approvals must have written nothing: one explicit
+    // zero-approval assertion per project, each with its correct id.
+    const driftProjectApprovalCount = await t.run(async (ctx) => {
       const rows = await ctx.db
         .query("approvals")
         .withIndex("by_project", (q) => q.eq("projectId", project.projectId))
         .collect();
       return rows.length;
     });
-    expect(approvalCount).toBe(0);
+    expect(driftProjectApprovalCount).toBe(0);
+    const noSelectionApprovalCount = await t.run(async (ctx) => {
+      const rows = await ctx.db
+        .query("approvals")
+        .withIndex("by_project", (q) => q.eq("projectId", noSelectionProject.projectId))
+        .collect();
+      return rows.length;
+    });
+    expect(noSelectionApprovalCount).toBe(0);
   });
 });
