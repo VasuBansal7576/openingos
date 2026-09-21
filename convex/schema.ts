@@ -887,15 +887,6 @@ export default defineSchema({
       "by_provider_environment_and_provider_thread_and_inbox",
       ["provider", "environment", "providerThreadId", "providerInboxId"],
     )
-    // Retained pre-binding replies query their exact waiting set through
-    // this key (Greptile r4058523015 repair). Patching a replayed row to
-    // observedSuccess removes it from the waiting set, so the next bounded
-    // read advances past completed rows without sampling a fixed prefix and
-    // without deleting the raw event record or its application outcome.
-    .index(
-      "by_provider_environment_and_thread_inbox_and_state",
-      ["provider", "environment", "providerThreadId", "providerInboxId", "applicationState"],
-    )
     // Fair replay rotation: equality on the waiting set plus ascending
     // order over the last evaluation time, so each bounded take returns
     // the least-recently-attempted waiting rows first.

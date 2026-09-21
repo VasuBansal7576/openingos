@@ -1003,27 +1003,12 @@ async function replayWaitingForThread(
   let replayed = 0;
   let stillWaiting = 0;
   let ingests = 0;
-  // Monotonic attempt ordering: the stamp strictly exceeds both the wall
-  // clock and the highest waiting attempt value already stored, so patched
-  // rows always sort behind every row evaluated earlier — even when the
-  // clock is frozen. Progress never depends on time advancing.
-  const highest = await ctx.db
-    .query("processedEvents")
-    .withIndex("by_provider_environment_and_thread_inbox_state_and_attempt", (q) =>
-      q
-        .eq("provider", "agentmail-inbound")
-        .eq("environment", "live")
-        .eq("providerThreadId", threadId)
-        .eq("providerInboxId", inboxId)
-        .eq("applicationState", "outcomeUnknown"),
-    )
-    .order("desc")
-    .take(1);
-  const highestValue = highest[0]?.replayLastAttemptAt;
-  const now = Date.now();
-  const stamp = typeof highestValue === "number" && Number.isSafeInteger(highestValue) && highestValue >= now
-    ? highestValue + 1
-    : now;
+  // A single current-attempt stamp is enough for rotation: rows left
+  // untouched by this bounded read keep their absent/older value and sort
+  // ahead on the next trigger. Equal stamps are harmless because the exact
+  // index has a stable document tie-breaker; progress comes from moving the
+  // evaluated rows behind every unseen row, not from wall-clock precision.
+  const stamp = Date.now();
   for (const row of rows.slice(0, WAITING_REPLAY_LIMIT)) {
     const stored = parseWaitingSnapshot(parseObject(row.outcome));
     if (

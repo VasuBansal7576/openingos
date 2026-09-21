@@ -449,7 +449,6 @@ function decodeBasicEntities(value: string): string {
     .replace(/&amp;/gi, "&");
 }
 
-const MAILBOX_PATTERN = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
 // Candidate radius around each `@`: the pattern backtracks quadratically
 // on long runs without a nearby match, so matching runs only inside a
 // bounded window anchored at a real `@`. The radius exceeds any
@@ -458,30 +457,104 @@ const MAILBOX_PATTERN = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
 const MAILBOX_SCAN_RADIUS = 512;
 
 function redactMailboxAddresses(value: string): string {
-  let at = value.indexOf("@");
-  if (at === -1) return value;
+  if (value.indexOf("@") === -1) return value;
+
+  const isAsciiLetter = (character: string): boolean => {
+    const code = character.charCodeAt(0);
+    return (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
+  };
+  const isLocalCharacter = (character: string): boolean => {
+    const code = character.charCodeAt(0);
+    return (
+      (code >= 48 && code <= 57) ||
+      (code >= 65 && code <= 90) ||
+      (code >= 97 && code <= 122) ||
+      character === "." ||
+      character === "_" ||
+      character === "%" ||
+      character === "+" ||
+      character === "-"
+    );
+  };
+  const isDomainCharacter = (character: string): boolean => {
+    const code = character.charCodeAt(0);
+    return (
+      (code >= 48 && code <= 57) ||
+      (code >= 65 && code <= 90) ||
+      (code >= 97 && code <= 122) ||
+      character === "." ||
+      character === "-"
+    );
+  };
+
   interface Span {
     readonly start: number;
     readonly end: number;
   }
   const spans: Span[] = [];
-  let acceptedEnd = 0;
-  while (at !== -1) {
-    if (at >= acceptedEnd) {
-      const candidate = value.slice(Math.max(0, at - MAILBOX_SCAN_RADIUS), at + MAILBOX_SCAN_RADIUS + 1);
-      MAILBOX_PATTERN.lastIndex = 0;
-      let match: RegExpExecArray | null;
-      while ((match = MAILBOX_PATTERN.exec(candidate)) !== null) {
-        const start = Math.max(0, at - MAILBOX_SCAN_RADIUS) + match.index;
-        if (start <= at && at < start + match[0].length) {
-          spans.push({ start, end: start + match[0].length });
-          acceptedEnd = Math.max(acceptedEnd, start + match[0].length);
-          break;
-        }
-      }
+  let localRunStart = 0;
+  let index = 0;
+  while (index < value.length) {
+    const character = value[index] ?? "";
+    if (isLocalCharacter(character)) {
+      if (index === 0 || !isLocalCharacter(value[index - 1] ?? "")) localRunStart = index;
+      index += 1;
+      continue;
     }
-    at = value.indexOf("@", at + 1);
+    if (character !== "@") {
+      localRunStart = index + 1;
+      index += 1;
+      continue;
+    }
+
+    if (localRunStart < index) {
+      const domainStart = index + 1;
+      const domainLimit = Math.min(value.length, domainStart + MAILBOX_SCAN_RADIUS);
+      let domainEnd = domainStart;
+      let activeDot = -1;
+      let suffixLength = 0;
+      let bestEnd = -1;
+      // The domain scan is bounded and consumes each candidate run once.
+      // A rightmost dot followed by two or more letters matches the final
+      // `\\.[A-Z]{2,}` portion of the old contract without regex backtracking.
+      while (domainEnd < domainLimit && isDomainCharacter(value[domainEnd] ?? "")) {
+        const domainCharacter = value[domainEnd] ?? "";
+        if (domainCharacter === ".") {
+          activeDot = domainEnd > domainStart ? domainEnd : -1;
+          suffixLength = 0;
+        } else if (activeDot !== -1 && isAsciiLetter(domainCharacter)) {
+          suffixLength += 1;
+          if (suffixLength >= 2) bestEnd = domainEnd + 1;
+        } else {
+          activeDot = -1;
+          suffixLength = 0;
+        }
+        domainEnd += 1;
+      }
+
+      if (bestEnd !== -1) {
+        spans.push({
+          start: Math.max(localRunStart, index - MAILBOX_SCAN_RADIUS),
+          end: bestEnd,
+        });
+        // Any remaining domain characters are local-part characters too, so
+        // a later `@` can still form a match after this redaction span.
+        localRunStart = bestEnd;
+      } else {
+        // Preserve a possible local run before a following `@` when this
+        // candidate was malformed, while letting a delimiter reset it.
+        localRunStart = domainEnd < value.length && value[domainEnd] === "@" ? domainStart : domainEnd;
+      }
+      // No domain character contains `@`, so skipping the scanned run keeps
+      // the whole function linear even when the input contains many `@`s.
+      index = domainEnd;
+      continue;
+    }
+
+    localRunStart = index + 1;
+    index += 1;
   }
+
   if (spans.length === 0) return value;
   let out = "";
   let cursor = 0;

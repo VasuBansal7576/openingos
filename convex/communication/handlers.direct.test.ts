@@ -2222,6 +2222,9 @@ describe("C1 Greptile P1 replay/scale repairs (r4058523015/r4058523016/r40585230
     });
     // Finite prefix fails closed temporarily while migration is scheduled.
     expect(early).toMatchObject({ ok: true, state: "waitingForBinding" });
+    // This is the live callback path: the scheduled migration consumes its
+    // one paginate, then its nested replay uses the bounded take queue. A
+    // second paginate in the same callback execution would fail this drain.
     await f.t.finishAllScheduledFunctions(() => {});
     const identities = await threadIdentityRows(f, "kick-thread");
     expect(identities).toHaveLength(1);
@@ -2925,11 +2928,13 @@ describe("C1 Greptile P1 replay/scale repairs (r4058523015/r4058523016/r40585230
 
   test("blocked prefix rows do not hide a later valid reply", async () => {
     const f = await fixture();
-    // Eight permanently unprocessable rows: malformed outcomes that are
+    // More than two bounded prefixes of permanently unprocessable rows:
+    // malformed outcomes that are
     // neither snapshots nor oversized markers, stuck as outcomeUnknown.
+    const blockedCount = 17;
     await f.t.run(async (ctx) => {
       const now = Date.now();
-      for (let index = 0; index < 8; index += 1) {
+      for (let index = 0; index < blockedCount; index += 1) {
         const messageId = `blocked-${index}`;
         await ctx.db.insert("processedEvents", {
           provider: "agentmail-inbound",
@@ -2960,15 +2965,30 @@ describe("C1 Greptile P1 replay/scale repairs (r4058523015/r4058523016/r40585230
       inboxId: "owner-inbox",
     });
     expect(bound).toMatchObject({ ok: true });
-    // The bind-time trigger pages the blocked prefix; the next trigger
-    // rotates past it (untouched rows sort first) and applies the valid reply.
+    // The bind-time trigger evaluates one bounded prefix, and the first
+    // explicit trigger evaluates the second. The next trigger reaches the
+    // valid reply even though two blocked prefixes remain unresolved.
+    const firstRotated = await f.t.mutation(replayRef, { threadId: "blocked-thread", inboxId: "owner-inbox" });
+    expect(firstRotated).toMatchObject({ ok: true, replayed: 0 });
     const replayed = await f.t.mutation(replayRef, { threadId: "blocked-thread", inboxId: "owner-inbox" });
-    expect(replayed).toEqual({ ok: true, replayed: 1, stillWaiting: 8 });
+    expect(replayed).toMatchObject({ ok: true, replayed: 1 });
     expect(await projectEvidenceRows(f)).toHaveLength(1);
-    const drained = await f.t.mutation(replayRef, { threadId: "blocked-thread", inboxId: "owner-inbox" });
-    // The valid work is done; the eight blocked rows honestly remain
-    // waiting (never applied, never relabeled as success, never deleted).
-    expect(drained).toEqual({ ok: true, replayed: 0, stillWaiting: 8 });
+    // The valid work is done; all blocked rows honestly remain waiting
+    // (never applied, never relabeled as success, never deleted).
+    const waiting = await f.t.run(async (ctx) =>
+      await ctx.db
+        .query("processedEvents")
+        .withIndex("by_provider_environment_and_thread_inbox_state_and_attempt", (q) =>
+          q
+            .eq("provider", "agentmail-inbound")
+            .eq("environment", "live")
+            .eq("providerThreadId", "blocked-thread")
+            .eq("providerInboxId", "owner-inbox")
+            .eq("applicationState", "outcomeUnknown"),
+        )
+        .take(blockedCount + 1),
+    );
+    expect(waiting).toHaveLength(blockedCount);
     // Blocked rows keep their honest unknown state: never applied, never
     // relabeled as success, never deleted.
     const blocked = await f.t.run(async (ctx) =>
@@ -3000,7 +3020,7 @@ describe("C1 Greptile P1 replay/scale repairs (r4058523015/r4058523016/r40585230
     return rows.map((row) => row.replayLastAttemptAt);
   }
 
-  test("replay ordering advances strictly under a frozen clock", async () => {
+  test("replay ordering reaches unseen replies under a frozen clock", async () => {
     const f = await fixture();
     await f.t.run(async (ctx) => {
       const now = Date.now();
@@ -3045,18 +3065,18 @@ describe("C1 Greptile P1 replay/scale repairs (r4058523015/r4058523016/r40585230
       const second = await f.t.mutation(replayRef, { threadId: "frozen-thread", inboxId: "owner-inbox" });
       expect(second).toMatchObject({ ok: true, replayed: 1 });
       expect(await projectEvidenceRows(f)).toHaveLength(1);
-      // New evaluations sort provably after the previous peak even though
-      // the clock never moved.
+      // The unseen reply sorts ahead of the evaluated rows even though the
+      // clock never moved, so rotation does not depend on timestamp changes.
       const secondStamps = await waitingAttemptStamps(f, "frozen-thread");
       const definedSecond = secondStamps.filter((stamp): stamp is number => typeof stamp === "number");
-      expect(Math.max(...definedSecond)).toBeGreaterThan(peakBound);
-      const peakSecond = Math.max(...definedSecond);
+      expect(definedSecond).toHaveLength(8);
+      expect(Math.max(...definedSecond)).toBeGreaterThanOrEqual(peakBound);
       const third = await f.t.mutation(replayRef, { threadId: "frozen-thread", inboxId: "owner-inbox" });
-      expect(third).toMatchObject({ ok: true, replayed: 0 });
+      expect(third).toMatchObject({ ok: true, replayed: 0, stillWaiting: 8 });
       const thirdStamps = await waitingAttemptStamps(f, "frozen-thread");
       const definedThird = thirdStamps.filter((stamp): stamp is number => typeof stamp === "number");
       expect(definedThird).toHaveLength(8);
-      expect(Math.max(...definedThird)).toBeGreaterThan(peakSecond);
+      expect(Math.max(...definedThird)).toBeGreaterThanOrEqual(Math.max(...definedSecond));
     } finally {
       vi.useRealTimers();
     }
