@@ -1338,13 +1338,14 @@ export const attemptFence = f1InternalQuery({
     if (reservation.pricingBasis !== pricing.policy.reservationPricingBasis) {
       return { ok: false as const, code: "stale-pricing-basis", message: "OpenAI reservation pricing policy is stale" };
     }
+    // ADR-0004: the org-wide `providerBudgets` row is one shared allowance
+    // ledger across branches, retries, and providers. Its own basis label is
+    // not a per-model contract; the reservation above binds this operation to
+    // the exact OpenAI pricing basis. The budget only must exist and belong to
+    // the operation organization.
     const budget = await ctx.db.get(reservation.budgetId);
-    if (
-      budget === null ||
-      budget.organizationId !== operation.organizationId ||
-      budget.pricingBasis !== pricing.policy.reservationPricingBasis
-    ) {
-      return { ok: false as const, code: "stale-pricing-basis", message: "operation allowance pricing policy is stale" };
+    if (budget === null || budget.organizationId !== operation.organizationId) {
+      return { ok: false as const, code: "allowance-exhausted", message: "operation allowance budget is unavailable" };
     }
     return { ok: true as const };
   },
