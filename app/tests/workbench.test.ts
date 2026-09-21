@@ -154,6 +154,21 @@ test("does not claim project-wide readiness from a truncated requirement page", 
   expect(html).not.toContain("P0 blockers stay visible");
 });
 
+test("does not display an equal-count readiness percentage without an authoritative result", () => {
+  const snapshot = parseWorkbenchSnapshot({
+    ...projection,
+    requirements: [{ ...projection.requirements[0]!, fulfillment: "commissioned", state: "fulfilled" }],
+  }, projection.project.id);
+  if (snapshot === null) throw new Error("Completed W1 projection should parse");
+
+  const html = renderToStaticMarkup(createElement(WorkbenchView, {
+    loadState: { state: "ready", snapshot },
+  }));
+  expect(html).toContain("Not assessed");
+  expect(html).toContain("authoritative result not supplied");
+  expect(html).not.toContain("100%");
+});
+
 test("keeps a connected app honest when no projection is available", () => {
   const html = renderToStaticMarkup(createElement(App, {
     backendStatus: "connected",
@@ -943,6 +958,70 @@ test("contains service dialog focus, cycles first and last controls, handles Esc
     });
     expect(mounted.container.querySelector('[role="dialog"]')).toBeNull();
     expect(mounted.container.ownerDocument.activeElement).toBe(open);
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("gives assistant, evidence, and selection dialogs the shared modal keyboard contract", async () => {
+  const snapshot = parseWorkbenchSnapshot(projection, projection.project.id);
+  if (snapshot === null) throw new Error("W1 projection should parse");
+  const mounted = await mountEquipmentTab({ state: "ready", snapshot }, () => ({ ok: false, message: "controlled test refusal" }));
+  const document = mounted.container.ownerDocument;
+  const keyboardEvent = (key: string, shiftKey = false) => new document.defaultView!.KeyboardEvent("keydown", { bubbles: true, key, shiftKey });
+  const modalControls = (dialog: Element): HTMLElement[] => Array.from(dialog.querySelectorAll<HTMLElement>("button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled])"));
+  const exerciseModal = async (opener: HTMLButtonElement, disabledButtonLabel?: string): Promise<void> => {
+    opener.focus();
+    await act(async () => { opener.click(); });
+    const dialog = mounted.container.querySelector('[role="dialog"]');
+    if (!(dialog instanceof document.defaultView!.HTMLElement)) throw new Error("Modal dialog not found");
+    const controls = modalControls(dialog);
+    const first = controls[0];
+    const last = controls[controls.length - 1];
+    if (first === undefined || last === undefined) throw new Error("Modal controls not found");
+    expect(document.activeElement).toBe(first);
+    expect(mounted.container.querySelector(".wb-header")?.hasAttribute("inert")).toBe(true);
+    expect(mounted.container.querySelector(".wb-header")?.getAttribute("aria-hidden")).toBe("true");
+    if (disabledButtonLabel !== undefined) {
+      const disabledButton = Array.from(dialog.querySelectorAll("button")).find((button) => button.textContent?.includes(disabledButtonLabel));
+      if (!(disabledButton instanceof document.defaultView!.HTMLButtonElement)) throw new Error(`${disabledButtonLabel} button not found`);
+      expect(disabledButton.disabled).toBe(true);
+    }
+
+    last.focus();
+    last.dispatchEvent(keyboardEvent("Tab"));
+    expect(document.activeElement).toBe(first);
+    first.focus();
+    first.dispatchEvent(keyboardEvent("Tab", true));
+    expect(document.activeElement).toBe(last);
+
+    const background = mounted.findButton("Project");
+    background.focus();
+    background.dispatchEvent(new document.defaultView!.Event("focusin", { bubbles: true }));
+    expect(document.activeElement).toBe(first);
+
+    await act(async () => {
+      dialog.dispatchEvent(keyboardEvent("Escape"));
+    });
+    expect(mounted.container.querySelector('[role="dialog"]')).toBeNull();
+    expect(document.activeElement).toBe(opener);
+    expect(mounted.container.querySelector(".wb-header")?.hasAttribute("inert")).toBe(false);
+    expect(mounted.container.querySelector(".wb-header")?.hasAttribute("aria-hidden")).toBe(false);
+  };
+
+  try {
+    const assistant = mounted.container.querySelector('button[aria-label="Open project assistant"]');
+    if (!(assistant instanceof document.defaultView!.HTMLButtonElement)) throw new Error("Assistant opener not found");
+    await exerciseModal(assistant as unknown as HTMLButtonElement);
+
+    await mounted.clickTab("Suppliers");
+    const evidence = mounted.container.querySelector('button[aria-label="Open evidence for Harbor Equipment"]');
+    if (!(evidence instanceof document.defaultView!.HTMLButtonElement)) throw new Error("Evidence opener not found");
+    await exerciseModal(evidence as unknown as HTMLButtonElement);
+
+    await mounted.clickTab("Project");
+    const review = mounted.findButton("Review quote");
+    await exerciseModal(review, "Select exact quote");
   } finally {
     await mounted.cleanup();
   }

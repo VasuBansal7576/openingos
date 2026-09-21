@@ -107,6 +107,87 @@ function focusableElements(container: HTMLElement): HTMLElement[] {
   });
 }
 
+type ModalElementRef = { readonly current: HTMLElement | null };
+
+/**
+ * Shared modal contract for every workbench overlay.  The overlay is a child
+ * of the workbench root, so its siblings can be made inert without hiding the
+ * dialog itself from assistive technology.
+ */
+function useModalAccessibility(dialogRef: ModalElementRef, onClose: () => void, closeDisabled = false): void {
+  const onCloseRef = useRef(onClose);
+  const closeDisabledRef = useRef(closeDisabled);
+  onCloseRef.current = onClose;
+  closeDisabledRef.current = closeDisabled;
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (dialog === null || typeof document === "undefined") return;
+    const previousActiveElement = document.activeElement as HTMLElement | null;
+    const modalRoot = dialog.closest<HTMLElement>(".wb-overlay");
+    const backgroundElements = modalRoot?.parentElement === null || modalRoot?.parentElement === undefined
+      ? []
+      : Array.from(modalRoot.parentElement.children)
+        .map((element) => element as HTMLElement)
+        .filter((element) => element !== modalRoot);
+    const previousBackgroundState = backgroundElements.map((element) => ({
+      element,
+      hadInert: element.hasAttribute("inert"),
+      ariaHidden: element.getAttribute("aria-hidden"),
+    }));
+    for (const element of backgroundElements) {
+      element.setAttribute("inert", "");
+      element.setAttribute("aria-hidden", "true");
+    }
+
+    const focusFirst = (): void => {
+      const first = focusableElements(dialog)[0];
+      (first ?? dialog).focus();
+    };
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") {
+        if (!closeDisabledRef.current) {
+          event.preventDefault();
+          onCloseRef.current();
+        }
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const elements = focusableElements(dialog);
+      if (elements.length === 0) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+      const first = elements[0]!;
+      const last = elements[elements.length - 1]!;
+      const active = document.activeElement;
+      if (event.shiftKey ? active === first || !dialog.contains(active) : active === last || !dialog.contains(active)) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+      }
+    };
+    const onFocusIn = (event: FocusEvent): void => {
+      const target = event.target;
+      if (target === null || !dialog.contains(target as HTMLElement)) focusFirst();
+    };
+
+    dialog.addEventListener("keydown", onKeyDown);
+    document.addEventListener("focusin", onFocusIn);
+    focusFirst();
+    return () => {
+      dialog.removeEventListener("keydown", onKeyDown);
+      document.removeEventListener("focusin", onFocusIn);
+      for (const { element, hadInert, ariaHidden } of previousBackgroundState) {
+        if (!hadInert) element.removeAttribute("inert");
+        if (ariaHidden === null) element.removeAttribute("aria-hidden");
+        else element.setAttribute("aria-hidden", ariaHidden);
+      }
+      previousActiveElement?.focus();
+    };
+  }, [dialogRef]);
+}
+
 function StatusDot({ state }: { readonly state: DeliveryState }) {
   return <span className={`wb-status-dot wb-status-${state}`} aria-hidden="true" />;
 }
@@ -195,15 +276,16 @@ function OverviewStrip({ snapshot }: { readonly snapshot: WorkbenchSnapshot }) {
   const budget = snapshot.project.budgetMinorUnits;
   const forecast = snapshot.selectedForecastMinorUnits;
   const requirementsTruncated = snapshot.truncation.requirements;
-  const readiness = requirementsTruncated
-    ? null
+  const readinessLabel = requirementsTruncated ? "Unavailable" : "Not assessed";
+  const readinessDescription = requirementsTruncated
+    ? `Showing ${snapshot.requirements.length} visible requirement${snapshot.requirements.length === 1 ? "" : "s"} · complete project scope unavailable`
     : snapshot.requirements.length === 0
-      ? null
-      : Math.round((snapshot.requirements.filter((requirement) => requirement.fulfillment === "commissioned").length / snapshot.requirements.length) * 100);
+      ? "No requirements in scope"
+      : `${snapshot.requirements.length} requirement${snapshot.requirements.length === 1 ? "" : "s"} · authoritative result not supplied`;
   return (
     <>
       <section className="wb-overview-strip" aria-label="Project financial overview">
-        <div className="wb-overview-intro"><span className="wb-eyebrow">PROCUREMENT READINESS</span><strong>{requirementsTruncated ? "Unavailable" : readiness === null ? "Not assessed" : `${readiness}%`}</strong><span>{requirementsTruncated ? `Showing ${snapshot.requirements.length} visible requirement${snapshot.requirements.length === 1 ? "" : "s"} · complete project scope unavailable` : snapshot.requirements.length === 0 ? "No requirements in scope" : `${snapshot.requirements.length} requirement${snapshot.requirements.length === 1 ? "" : "s"} · P0 blockers stay visible`}</span></div>
+        <div className="wb-overview-intro"><span className="wb-eyebrow">PROCUREMENT READINESS</span><strong>{readinessLabel}</strong><span>{readinessDescription}</span></div>
       <div className="wb-metric"><span>Approved budget</span><strong>{formatMoney(budget, snapshot.project.currency)}</strong><small>Planning allocation</small></div>
       <div className="wb-metric"><span>Selected forecast</span><strong>{formatMoney(forecast, snapshot.project.currency)}</strong><small>Expected, not yet ordered</small></div>
       <div className="wb-metric"><span>Committed</span><strong>{formatMoney(snapshot.committedMinorUnits, snapshot.project.currency)}</strong><small>Recorded orders only</small></div>
@@ -261,6 +343,9 @@ function ActivityList({ items, compact = false }: { readonly items: readonly Wor
 function AssistantRail({ snapshot, onClose }: { readonly snapshot: WorkbenchSnapshot; readonly onClose: () => void }) {
   const [question, setQuestion] = useState("");
   const [asked, setAsked] = useState<string[]>([]);
+  const dialogRef = useRef<HTMLElement | null>(null);
+  const idPrefix = useId().replace(/:/g, "");
+  const titleId = `${idPrefix}-assistant-title`;
   const prompts = ["Why is the complete total unknown?", "What still needs fit confirmation?", "Which terms are owner-authored?"];
   const submit = (value: string) => {
     const trimmed = value.trim();
@@ -268,11 +353,16 @@ function AssistantRail({ snapshot, onClose }: { readonly snapshot: WorkbenchSnap
     setAsked((current) => [...current, trimmed]);
     setQuestion("");
   };
-  return <div className="wb-overlay"><section className="wb-assistant-panel" role="dialog" aria-modal="true" aria-labelledby="assistant-title"><div className="wb-panel-head"><div><span className="wb-eyebrow">CONTEXTUAL ASSISTANT</span><h2 id="assistant-title">Ask about this decision.</h2></div><button className="wb-icon-button" type="button" onClick={onClose} aria-label="Close assistant"><Icon name="close" size={18} /></button></div><p className="wb-assistant-copy">Answers must use the current project, selected rows and supporting evidence. This panel cannot authorize a send or an order.</p><div className="wb-prompt-grid">{prompts.map((prompt) => <button key={prompt} type="button" onClick={() => submit(prompt)}>{prompt}<Icon name="arrow" size={13} /></button>)}</div><div className="wb-asked" aria-live="polite">{asked.map((item, index) => <div key={`${item}-${index}`}><p className="wb-question">{item}</p><div className="wb-answer"><Pill>{snapshot.provenance.mode === "live" ? "Current project evidence" : "Evidence available, model answer pending"}</Pill><p>{snapshot.provenance.mode === "live" ? "The authorized answer route is not represented in this projection. Review the cited quote and evidence before taking action." : "This project has not supplied a verified live model answer. The UI keeps the question open instead of inventing one."}</p></div></div>)}</div><form className="wb-assistant-input" onSubmit={(event) => { event.preventDefault(); submit(question); }}><label className="wb-visually-hidden" htmlFor="wb-assistant-question">Ask about this project</label><input id="wb-assistant-question" value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="Ask about suppliers, quotes or fit…" maxLength={500} /><button type="submit" disabled={!question.trim()} aria-label="Ask question"><Icon name="arrow" size={17} /></button></form><p className="wb-micro"><Icon name="lock" size={12} /> Server authority remains separate from assistant suggestions.</p></section></div>;
+  useModalAccessibility(dialogRef, onClose);
+  return <div className="wb-overlay"><section className="wb-assistant-panel" role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1} ref={dialogRef}><div className="wb-panel-head"><div><span className="wb-eyebrow">CONTEXTUAL ASSISTANT</span><h2 id={titleId}>Ask about this decision.</h2></div><button className="wb-icon-button" type="button" onClick={onClose} aria-label="Close assistant"><Icon name="close" size={18} /></button></div><p className="wb-assistant-copy">Answers must use the current project, selected rows and supporting evidence. This panel cannot authorize a send or an order.</p><div className="wb-prompt-grid">{prompts.map((prompt) => <button key={prompt} type="button" onClick={() => submit(prompt)}>{prompt}<Icon name="arrow" size={13} /></button>)}</div><div className="wb-asked" aria-live="polite">{asked.map((item, index) => <div key={`${item}-${index}`}><p className="wb-question">{item}</p><div className="wb-answer"><Pill>{snapshot.provenance.mode === "live" ? "Current project evidence" : "Evidence available, model answer pending"}</Pill><p>{snapshot.provenance.mode === "live" ? "The authorized answer route is not represented in this projection. Review the cited quote and evidence before taking action." : "This project has not supplied a verified live model answer. The UI keeps the question open instead of inventing one."}</p></div></div>)}</div><form className="wb-assistant-input" onSubmit={(event) => { event.preventDefault(); submit(question); }}><label className="wb-visually-hidden" htmlFor={`${idPrefix}-assistant-question`}>Ask about this project</label><input id={`${idPrefix}-assistant-question`} value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="Ask about suppliers, quotes or fit…" maxLength={500} /><button type="submit" disabled={!question.trim()} aria-label="Ask question"><Icon name="arrow" size={17} /></button></form><p className="wb-micro"><Icon name="lock" size={12} /> Server authority remains separate from assistant suggestions.</p></section></div>;
 }
 
 function EvidencePanel({ evidence, onClose }: { readonly evidence: WorkbenchEvidence; readonly onClose: () => void }) {
-  return <div className="wb-overlay"><section className="wb-evidence-panel" role="dialog" aria-modal="true" aria-labelledby="evidence-title"><div className="wb-panel-head"><div><span className="wb-eyebrow">SOURCE RECORD</span><h2 id="evidence-title">{evidence.label}</h2></div><button className="wb-icon-button" type="button" onClick={onClose} aria-label="Close evidence"><Icon name="close" size={18} /></button></div><div className="wb-document"><div className="wb-document-head"><span>{evidence.sourceKind}</span><ProvenancePill mode={evidence.executionMode} /></div><div className="wb-document-row"><span>Verification</span><strong>{formatStateLabel(evidence.verification)}</strong></div><div className="wb-document-row"><span>Freshness</span><strong>{formatStateLabel(evidence.freshness)}</strong></div><div className="wb-document-row"><span>Counterparty</span><strong>{evidence.counterpartyRole === "ownerStandIn" ? "Owner stand-in · controlled" : formatStateLabel(evidence.counterpartyRole)}</strong></div><div className="wb-document-watermark">PUBLIC PROJECTION · PRIVATE HEADERS REDACTED</div></div><p className="wb-micro">{evidence.sourceUrl ? "The source link is available through the authorized evidence record." : "No public source URL was included in this projection."} Raw headers, mailbox addresses and provider IDs are never shown in the workbench.</p></section></div>;
+  const dialogRef = useRef<HTMLElement | null>(null);
+  const idPrefix = useId().replace(/:/g, "");
+  const titleId = `${idPrefix}-evidence-title`;
+  useModalAccessibility(dialogRef, onClose);
+  return <div className="wb-overlay"><section className="wb-evidence-panel" role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1} ref={dialogRef}><div className="wb-panel-head"><div><span className="wb-eyebrow">SOURCE RECORD</span><h2 id={titleId}>{evidence.label}</h2></div><button className="wb-icon-button" type="button" onClick={onClose} aria-label="Close evidence"><Icon name="close" size={18} /></button></div><div className="wb-document"><div className="wb-document-head"><span>{evidence.sourceKind}</span><ProvenancePill mode={evidence.executionMode} /></div><div className="wb-document-row"><span>Verification</span><strong>{formatStateLabel(evidence.verification)}</strong></div><div className="wb-document-row"><span>Freshness</span><strong>{formatStateLabel(evidence.freshness)}</strong></div><div className="wb-document-row"><span>Counterparty</span><strong>{evidence.counterpartyRole === "ownerStandIn" ? "Owner stand-in · controlled" : formatStateLabel(evidence.counterpartyRole)}</strong></div><div className="wb-document-watermark">PUBLIC PROJECTION · PRIVATE HEADERS REDACTED</div></div><p className="wb-micro">{evidence.sourceUrl ? "The source link is available through the authorized evidence record." : "No public source URL was included in this projection."} Raw headers, mailbox addresses and provider IDs are never shown in the workbench.</p></section></div>;
 }
 
 function SelectionPanel({ offer, snapshot, onClose, onAction, onMessage }: { readonly offer: WorkbenchOffer; readonly snapshot: WorkbenchSnapshot; readonly onClose: () => void; readonly onAction?: WorkbenchViewProps["onAction"]; readonly onMessage: (message: string) => void }) {
@@ -280,6 +370,10 @@ function SelectionPanel({ offer, snapshot, onClose, onAction, onMessage }: { rea
   const vendorName = offer.vendor?.name ?? "Vendor unavailable";
   const vendorRegions = offer.vendor?.regions.join(", ") || "Service region unknown";
   const canSelect = snapshot.access.capabilities.canApprove === true && offer.vendor !== null && offer.compatibility === "pass" && quote !== null && quote.comparableTotalMinorUnits !== null && quote.superseded === false;
+  const dialogRef = useRef<HTMLElement | null>(null);
+  const idPrefix = useId().replace(/:/g, "");
+  const titleId = `${idPrefix}-selection-title`;
+  useModalAccessibility(dialogRef, onClose);
   const choose = async () => {
     if (!canSelect || !quote || !onAction) {
       onMessage("Selection waits for an authorized server action and a complete compatible quote.");
@@ -289,7 +383,7 @@ function SelectionPanel({ offer, snapshot, onClose, onAction, onMessage }: { rea
     onMessage(result.ok ? "Selection request recorded by the server." : result.message ?? "Selection was not recorded.");
     if (result.ok) onClose();
   };
-  return <div className="wb-overlay"><section className="wb-selection-panel" role="dialog" aria-modal="true" aria-labelledby="selection-title"><div className="wb-panel-head"><div><span className="wb-eyebrow">DECISION REVIEW</span><h2 id="selection-title">{vendorName} · quote v{quote?.version ?? "unknown"}</h2></div><button className="wb-icon-button" type="button" onClick={onClose} aria-label="Close decision review"><Icon name="close" size={18} /></button></div><div className="wb-selection-content"><div className="wb-selection-brand"><span className="wb-vendor-monogram large">{vendorName.slice(0, 1).toUpperCase()}</span><div><h3>{offer.productModel}</h3><p>{offer.variant} · {vendorRegions}</p></div><ProvenancePill mode={offer.provenance} ownerAuthoredTerms={offer.ownerAuthoredTerms} /></div><QuoteSummary quote={quote} currency={snapshot.project.currency} /><div className="wb-decision-explanation"><Icon name="shield" size={19} /><div><strong>Selection is not an order.</strong><p>This exact quote would change the selected forecast only. It does not create a commitment, place an order or take payment.</p></div></div>{snapshot.access.capabilities.canApprove === null ? <div className="wb-inline-warning"><Icon name="lock" size={16} /> Approval authority is not represented in this projection.</div> : snapshot.access.capabilities.canApprove === false ? <div className="wb-inline-warning"><Icon name="lock" size={16} /> Your role cannot approve this decision. An authorized approver must review it.</div> : null}{quote?.superseded === true ? <div className="wb-inline-warning"><Icon name="warning" size={16} /> This quote version is superseded. Refresh the projection before approving.</div> : quote?.superseded === null ? <div className="wb-inline-warning"><Icon name="warning" size={16} /> Quote successor status is not represented in this projection. The server must project authoritative successor state before selection can proceed.</div> : null}{quote?.comparableTotalMinorUnits === null ? <div className="wb-inline-warning"><Icon name="warning" size={16} /> Comparable total is not represented in this projection. Selection stays blocked until the server supplies an authoritative total.</div> : null}<ActionButton disabled={!onAction || !canSelect} onClick={() => { void choose(); }} title={!onAction ? "No server action is attached" : !canSelect ? "A complete, compatible, current quote and authorized capability are required" : undefined}>Select exact quote <Icon name="check" size={16} /></ActionButton><p className="wb-micro">No order will be placed. No payment will be taken.</p></div></section></div>;
+  return <div className="wb-overlay"><section className="wb-selection-panel" role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1} ref={dialogRef}><div className="wb-panel-head"><div><span className="wb-eyebrow">DECISION REVIEW</span><h2 id={titleId}>{vendorName} · quote v{quote?.version ?? "unknown"}</h2></div><button className="wb-icon-button" type="button" onClick={onClose} aria-label="Close decision review"><Icon name="close" size={18} /></button></div><div className="wb-selection-content"><div className="wb-selection-brand"><span className="wb-vendor-monogram large">{vendorName.slice(0, 1).toUpperCase()}</span><div><h3>{offer.productModel}</h3><p>{offer.variant} · {vendorRegions}</p></div><ProvenancePill mode={offer.provenance} ownerAuthoredTerms={offer.ownerAuthoredTerms} /></div><QuoteSummary quote={quote} currency={snapshot.project.currency} /><div className="wb-decision-explanation"><Icon name="shield" size={19} /><div><strong>Selection is not an order.</strong><p>This exact quote would change the selected forecast only. It does not create a commitment, place an order or take payment.</p></div></div>{snapshot.access.capabilities.canApprove === null ? <div className="wb-inline-warning"><Icon name="lock" size={16} /> Approval authority is not represented in this projection.</div> : snapshot.access.capabilities.canApprove === false ? <div className="wb-inline-warning"><Icon name="lock" size={16} /> Your role cannot approve this decision. An authorized approver must review it.</div> : null}{quote?.superseded === true ? <div className="wb-inline-warning"><Icon name="warning" size={16} /> This quote version is superseded. Refresh the projection before approving.</div> : quote?.superseded === null ? <div className="wb-inline-warning"><Icon name="warning" size={16} /> Quote successor status is not represented in this projection. The server must project authoritative successor state before selection can proceed.</div> : null}{quote?.comparableTotalMinorUnits === null ? <div className="wb-inline-warning"><Icon name="warning" size={16} /> Comparable total is not represented in this projection. Selection stays blocked until the server supplies an authoritative total.</div> : null}<ActionButton disabled={!onAction || !canSelect} onClick={() => { void choose(); }} title={!onAction ? "No server action is attached" : !canSelect ? "A complete, compatible, current quote and authorized capability are required" : undefined}>Select exact quote <Icon name="check" size={16} /></ActionButton><p className="wb-micro">No order will be placed. No payment will be taken.</p></div></section></div>;
 }
 
 function ProjectView({ snapshot, onReview, onAction, onLoadMore, onTabChange, onMessage }: { readonly snapshot: WorkbenchSnapshot; readonly onReview: (offer: WorkbenchOffer) => void; readonly onAction?: WorkbenchViewProps["onAction"]; readonly onLoadMore?: (() => void) | undefined; readonly onTabChange: (tab: Tab) => void; readonly onMessage: (message: string) => void }) {
@@ -401,9 +495,6 @@ function ServiceCaseDialog({
   const [submittedFingerprint, setSubmittedFingerprint] = useState<string | null>(null);
   const dialogRef = useRef<HTMLElement | null>(null);
   const submittingRef = useRef(false);
-  const pendingRef = useRef(false);
-  const onCloseRef = useRef(onClose);
-  const previousActiveElement = useRef<HTMLElement | null>(null);
   const idPrefix = useId().replace(/:/g, "");
   const titleId = `${idPrefix}-service-case-title`;
   const descriptionId = `${idPrefix}-service-case-description`;
@@ -412,53 +503,7 @@ function ServiceCaseDialog({
   const countId = `${idPrefix}-service-case-count`;
   const errorId = `${idPrefix}-service-case-error`;
 
-  pendingRef.current = pending;
-  onCloseRef.current = onClose;
-
-  useEffect(() => {
-    const dialog = dialogRef.current;
-    if (dialog === null || typeof document === "undefined") return;
-    previousActiveElement.current = document.activeElement as HTMLElement | null;
-    const focusFirst = (): void => {
-      const first = focusableElements(dialog)[0];
-      (first ?? dialog).focus();
-    };
-    const onKeyDown = (event: KeyboardEvent): void => {
-      if (event.key === "Escape") {
-        if (!pendingRef.current) {
-          event.preventDefault();
-          onCloseRef.current();
-        }
-        return;
-      }
-      if (event.key !== "Tab") return;
-      const elements = focusableElements(dialog);
-      if (elements.length === 0) {
-        event.preventDefault();
-        dialog.focus();
-        return;
-      }
-      const first = elements[0]!;
-      const last = elements[elements.length - 1]!;
-      const active = document.activeElement;
-      if (event.shiftKey ? active === first || !dialog.contains(active) : active === last || !dialog.contains(active)) {
-        event.preventDefault();
-        (event.shiftKey ? last : first).focus();
-      }
-    };
-    const onFocusIn = (event: FocusEvent): void => {
-      const target = event.target;
-      if (target === null || !dialog.contains(target as HTMLElement)) focusFirst();
-    };
-    dialog.addEventListener("keydown", onKeyDown);
-    document.addEventListener("focusin", onFocusIn);
-    focusFirst();
-    return () => {
-      dialog.removeEventListener("keydown", onKeyDown);
-      document.removeEventListener("focusin", onFocusIn);
-      previousActiveElement.current?.focus();
-    };
-  }, []);
+  useModalAccessibility(dialogRef, onClose, pending);
 
   const fingerprintFor = (nextUrgency: ServiceCaseUrgency, nextSummary: string) => `${nextUrgency}\u0000${nextSummary.trim()}`;
   const updateUrgency = (nextUrgency: ServiceCaseUrgency) => {

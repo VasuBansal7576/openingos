@@ -122,6 +122,13 @@ export interface ConvexWorkbenchAdapter extends WorkbenchServerAdapter {
 
 type WorkbenchWatch = Watch<unknown>;
 
+type CachedProjection = {
+  readonly raw: unknown;
+  readonly generation: number;
+};
+
+type MutationSettlement = "success" | "denied" | "uncertain";
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
@@ -249,7 +256,7 @@ function noop(): void {}
 export function createConvexWorkbenchAdapter(client: ConvexWorkbenchClient): ConvexWorkbenchAdapter {
   let disposed = false;
   const subscriptions = new Set<() => void>();
-  const projectionCache = new Map<string, { readonly raw: unknown }>();
+  const projectionCache = new Map<string, CachedProjection>();
   const readVersions = new Map<string, number>();
   const inFlightMutations = new Set<string>();
 
@@ -292,9 +299,40 @@ export function createConvexWorkbenchAdapter(client: ConvexWorkbenchClient): Con
     return key;
   };
 
-  const finishMutation = (projectId: string, key: string): void => {
-    inFlightMutations.delete(key);
-    invalidateProjection(projectId);
+  const mutationSettlement = (value: unknown): MutationSettlement => {
+    if (isRecord(value) && value.ok === false) return "denied";
+    if (isRecord(value) && value.ok === true) return "success";
+    return "uncertain";
+  };
+
+  const hasNewerValidatedProjection = (projectId: string, mutationGeneration: number): boolean => {
+    const cached = projectionCache.get(projectId);
+    if (cached === undefined || cached.generation <= mutationGeneration) return false;
+    return parseWorkbenchSnapshot(cached.raw, projectId) !== null;
+  };
+
+  const finishMutation = async (
+    projectId: string,
+    key: string,
+    mutationGeneration: number,
+    settlement: MutationSettlement,
+  ): Promise<void> => {
+    try {
+      // An explicit server denial is a no-write result. Keep the validated
+      // basis so a user can correct and retry without being stranded behind a
+      // false "current projection required" error.
+      if (settlement !== "denied" && !hasNewerValidatedProjection(projectId, mutationGeneration)) {
+        // A mutation may commit before its watch emits. Refresh only in that
+        // case; load() preserves a watch value that arrives while the query is
+        // in flight through the same generation fence.
+        await load(projectId);
+      }
+    } catch {
+      // load() invalidates a basis when recovery cannot produce a validated
+      // projection. The action result remains the server mutation result.
+    } finally {
+      inFlightMutations.delete(key);
+    }
   };
 
   const readCachedSnapshot = (projectId: string) => {
@@ -363,7 +401,7 @@ export function createConvexWorkbenchAdapter(client: ConvexWorkbenchClient): Con
       invalidateProjection(projectId);
       return null;
     }
-    projectionCache.set(projectId, { raw: result });
+    projectionCache.set(projectId, { raw: result, generation: version });
     return result;
   };
 
@@ -406,8 +444,8 @@ export function createConvexWorkbenchAdapter(client: ConvexWorkbenchClient): Con
         // A watch emission is newer than every in-flight query started before
         // it. Advance the same per-project fence before caching so a late
         // query cannot regress this mutation basis.
-        nextReadVersion(projectId);
-        projectionCache.set(projectId, { raw: result });
+        const generation = nextReadVersion(projectId);
+        projectionCache.set(projectId, { raw: result, generation });
         onSnapshot(result);
       } catch (error) {
         reportError(error);
@@ -489,15 +527,18 @@ export function createConvexWorkbenchAdapter(client: ConvexWorkbenchClient): Con
       };
       const mutationKey = claimMutation(projectId, action);
       if (mutationKey === null) return { ok: false, message: ACTION_ALREADY_IN_FLIGHT };
+      const mutationGeneration = readVersions.get(projectId) ?? 0;
+      let settlement: MutationSettlement = "uncertain";
       try {
         const result = await client.mutation(recordSelectionReference, args);
+        settlement = mutationSettlement(result);
         const failure = mutationFailure(result, "The server did not record this selection.");
         if (failure !== null) return failure;
         return { ok: true, message: "Selection recorded by the server; no order was placed." };
       } catch (error) {
         return { ok: false, message: error instanceof Error ? error.message : "The server did not record this selection." };
       } finally {
-        finishMutation(projectId, mutationKey);
+        await finishMutation(projectId, mutationKey, mutationGeneration, settlement);
       }
     }
 
@@ -514,15 +555,18 @@ export function createConvexWorkbenchAdapter(client: ConvexWorkbenchClient): Con
       };
       const mutationKey = claimMutation(projectId, action);
       if (mutationKey === null) return { ok: false, message: ACTION_ALREADY_IN_FLIGHT };
+      const mutationGeneration = readVersions.get(projectId) ?? 0;
+      let settlement: MutationSettlement = "uncertain";
       try {
         const result = await client.mutation(decideApprovalReference, args);
+        settlement = mutationSettlement(result);
         const failure = mutationFailure(result, "The server did not decide this approval.");
         if (failure !== null) return failure;
         return { ok: true, message: "Approval recorded by the server." };
       } catch (error) {
         return { ok: false, message: error instanceof Error ? error.message : "The server did not decide this approval." };
       } finally {
-        finishMutation(projectId, mutationKey);
+        await finishMutation(projectId, mutationKey, mutationGeneration, settlement);
       }
     }
 
@@ -554,8 +598,11 @@ export function createConvexWorkbenchAdapter(client: ConvexWorkbenchClient): Con
       };
       const mutationKey = claimMutation(projectId, action);
       if (mutationKey === null) return { ok: false, message: ACTION_ALREADY_IN_FLIGHT };
+      const mutationGeneration = readVersions.get(projectId) ?? 0;
+      let settlement: MutationSettlement = "uncertain";
       try {
         const result = await client.mutation(openServiceCaseReference, args);
+        settlement = mutationSettlement(result);
         const failure = mutationFailure(result, "The server did not record this service case.");
         if (failure !== null) return failure;
         if (!isRecord(result) || requiredString(result.caseId) === null || typeof result.deduplicated !== "boolean") {
@@ -570,7 +617,7 @@ export function createConvexWorkbenchAdapter(client: ConvexWorkbenchClient): Con
       } catch (error) {
         return { ok: false, message: error instanceof Error ? error.message : "The server did not record this service case." };
       } finally {
-        finishMutation(projectId, mutationKey);
+        await finishMutation(projectId, mutationKey, mutationGeneration, settlement);
       }
     }
 
@@ -585,8 +632,11 @@ export function createConvexWorkbenchAdapter(client: ConvexWorkbenchClient): Con
       };
       const mutationKey = claimMutation(projectId, action);
       if (mutationKey === null) return { ok: false, message: ACTION_ALREADY_IN_FLIGHT };
+      const mutationGeneration = readVersions.get(projectId) ?? 0;
+      let settlement: MutationSettlement = "uncertain";
       try {
         const result = await client.mutation(cancelJobReference, args);
+        settlement = mutationSettlement(result);
         const failure = mutationFailure(result, "The server did not accept this cancellation.");
         if (failure !== null) return failure;
         if (!isRecord(result) || (result.state !== "cancelling" && result.state !== "cancelled")) {
@@ -596,7 +646,7 @@ export function createConvexWorkbenchAdapter(client: ConvexWorkbenchClient): Con
       } catch (error) {
         return { ok: false, message: error instanceof Error ? error.message : "The server did not accept this cancellation." };
       } finally {
-        finishMutation(projectId, mutationKey);
+        await finishMutation(projectId, mutationKey, mutationGeneration, settlement);
       }
     }
 
@@ -634,8 +684,11 @@ export function createConvexWorkbenchAdapter(client: ConvexWorkbenchClient): Con
       };
       const mutationKey = claimMutation(projectId, action);
       if (mutationKey === null) return { ok: false, message: ACTION_ALREADY_IN_FLIGHT };
+      const mutationGeneration = readVersions.get(projectId) ?? 0;
+      let settlement: MutationSettlement = "uncertain";
       try {
         const result = await client.mutation(startJobReference, args);
+        settlement = mutationSettlement(result);
         const failure = mutationFailure(result, "The server did not queue research.");
         if (failure !== null) return failure;
         if (!isRecord(result) || result.state !== "queued") {
@@ -645,7 +698,7 @@ export function createConvexWorkbenchAdapter(client: ConvexWorkbenchClient): Con
       } catch (error) {
         return { ok: false, message: error instanceof Error ? error.message : "The server did not queue research." };
       } finally {
-        finishMutation(projectId, mutationKey);
+        await finishMutation(projectId, mutationKey, mutationGeneration, settlement);
       }
     }
 

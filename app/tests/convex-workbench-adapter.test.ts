@@ -356,7 +356,7 @@ test("keeps unsupported actions explicitly unavailable without querying or sendi
   expect(watchArgs).toHaveLength(0);
 });
 
-test("records the exact selection payload and invalidates the basis after a mutation attempt", async () => {
+test("records the exact selection payload and refreshes the basis after a mutation", async () => {
   const calls: MutationCall[] = [];
   const controls = controlledWatch(() => actionProjection());
   const adapter = createConvexWorkbenchAdapter(actionClient(
@@ -385,14 +385,14 @@ test("records the exact selection payload and invalidates the basis after a muta
   });
 
   await expect(adapter.act({ type: "selectOffer", projectId: "project-1", offerId: "candidate-1", quoteId: "quote-1", quoteVersion: "v1" })).resolves.toEqual({
-    ok: false,
-    message: "This action requires a current validated project projection. Nothing was sent.",
+    ok: true,
+    message: "Selection recorded by the server; no order was placed.",
   });
-  expect(calls).toHaveLength(1);
+  expect(calls).toHaveLength(2);
 
   await adapter.load("project-1");
   await adapter.act({ type: "selectOffer", projectId: "project-1", offerId: "candidate-1", quoteId: "quote-1", quoteVersion: "v1" });
-  expect(calls).toHaveLength(2);
+  expect(calls).toHaveLength(3);
 });
 
 test("approves only a normalized pending approval and surfaces server denial text", async () => {
@@ -440,10 +440,10 @@ test("cancels only a projected cancellable job", async () => {
   expect(calls[0]?.args).toEqual({ jobId: "job-1", reason: "Cancelled from the purchasing workbench" });
 
   await expect(adapter.act({ type: "cancelJob", projectId: "project-1", jobId: "job-1" })).resolves.toEqual({
-    ok: false,
-    message: "This action requires a current validated project projection. Nothing was sent.",
+    ok: true,
+    message: "Cancellation queued by the server.",
   });
-  expect(calls).toHaveLength(1);
+  expect(calls).toHaveLength(2);
 });
 
 test("starts only one supported purchasing research brief and reports queued backend state", async () => {
@@ -512,8 +512,74 @@ test("fences concurrent research calls before the first mutation resolves", asyn
   });
   resolveMutation?.({ ok: true, jobId: "job-2", state: "queued", supportedSegment: "research suppliers", refusedSegments: [] });
   await expect(first).resolves.toEqual({ ok: true, message: "Research queued by the server; provider outcome is still pending." });
-  await expect(adapter.act(action)).resolves.toMatchObject({ ok: false });
-  expect(calls).toHaveLength(1);
+  await expect(adapter.act(action)).resolves.toMatchObject({ ok: true });
+  expect(calls).toHaveLength(2);
+});
+
+test("keeps a newer watched projection when a mutation resolves later", async () => {
+  let current: unknown = actionProjection("project-1", 4);
+  const controls = controlledWatch(() => current);
+  const queries: unknown[] = [];
+  const calls: MutationCall[] = [];
+  let resolveMutation: ((value: unknown) => void) | undefined;
+  const pendingMutation = new Promise<unknown>((resolve) => { resolveMutation = resolve; });
+  const adapter = createConvexWorkbenchAdapter({
+    query: async () => {
+      queries.push(current);
+      return current;
+    },
+    watchQuery: () => controls.watch,
+    mutation: async (reference: unknown, args: unknown) => {
+      calls.push({ reference, args });
+      return calls.length === 1
+        ? pendingMutation
+        : { ok: true, selectionId: `selection-${calls.length}`, deduplicated: false };
+    },
+  } as unknown as ConvexWorkbenchClient);
+
+  await adapter.load("project-1");
+  const unsubscribe = adapter.subscribe?.("project-1", () => {}, () => {});
+  const first = adapter.act({ type: "selectOffer", projectId: "project-1", offerId: "candidate-1", quoteId: "quote-1", quoteVersion: "v1" });
+
+  current = actionProjection("project-1", 5);
+  controls.emit();
+  resolveMutation?.({ ok: true, selectionId: "selection-1", deduplicated: false });
+  await expect(first).resolves.toMatchObject({ ok: true });
+
+  // The watch already supplied the newer mutation basis, so completion must
+  // not erase it or dispatch a redundant head query.
+  expect(queries).toHaveLength(1);
+
+  await expect(adapter.act({ type: "selectOffer", projectId: "project-1", offerId: "candidate-1", quoteId: "quote-1", quoteVersion: "v1" })).resolves.toMatchObject({ ok: true });
+  expect(calls[1]?.args).toMatchObject({ requirementVersion: 5 });
+  unsubscribe?.();
+});
+
+test("refetches after a successful mutation when no newer watch exists", async () => {
+  const responses: unknown[] = [actionProjection("project-1", 4), actionProjection("project-1", 5)];
+  const queries: unknown[] = [];
+  const calls: MutationCall[] = [];
+  const controls = controlledWatch(() => responses[responses.length - 1]);
+  const adapter = createConvexWorkbenchAdapter({
+    query: async () => {
+      queries.push(responses[0]);
+      return responses.shift() ?? null;
+    },
+    watchQuery: () => controls.watch,
+    mutation: async (reference: unknown, args: unknown) => {
+      calls.push({ reference, args });
+      return { ok: true, selectionId: "selection-1", deduplicated: false };
+    },
+  } as unknown as ConvexWorkbenchClient);
+
+  await adapter.load("project-1");
+  await expect(adapter.act({ type: "selectOffer", projectId: "project-1", offerId: "candidate-1", quoteId: "quote-1", quoteVersion: "v1" })).resolves.toMatchObject({ ok: true });
+  expect(queries).toHaveLength(2);
+
+  // The post-mutation refetch is the basis for the next action when no watch
+  // emission arrived during the mutation.
+  await expect(adapter.act({ type: "selectOffer", projectId: "project-1", offerId: "candidate-1", quoteId: "quote-1", quoteVersion: "v1" })).resolves.toMatchObject({ ok: true });
+  expect(calls[1]?.args).toMatchObject({ requirementVersion: 5 });
 });
 
 test("rejects missing, stale, cross-project, and malformed action inputs without mutation", async () => {
@@ -719,19 +785,18 @@ test("opens a current projected service case with exact authority and idempotenc
     idempotencyKey: "case-key-1",
   });
 
-  // Every attempted mutation invalidates the basis, including denial. A
-  // repeated click cannot send again until fresh server state arrives.
+  // An explicit server denial is no-write, so the validated basis remains
+  // available for a corrected or retried action without a forced reload.
   await expect(adapter.act(action)).resolves.toMatchObject({ ok: false });
-  expect(calls).toHaveLength(1);
+  expect(calls).toHaveLength(2);
 
-  await adapter.load("project-1");
   mutationResult = { ok: true, caseId: "case-e1-1", deduplicated: true };
   await expect(adapter.act(action)).resolves.toEqual({
     ok: true,
     message: "Service case already recorded by the server; this submission was deduplicated.",
   });
-  expect(calls).toHaveLength(2);
-  expect(calls[1]?.args).toEqual(calls[0]?.args);
+  expect(calls).toHaveLength(3);
+  expect(calls[2]?.args).toEqual(calls[0]?.args);
 });
 
 test("rejects viewer, missing, stale, and cross-project service-case inputs without mutation", async () => {
