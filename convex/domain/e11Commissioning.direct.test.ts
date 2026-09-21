@@ -791,6 +791,57 @@ describe("E11 service outcomes are explicit, bounded, idempotent, and stable", (
     });
   });
 
+  test("terminal targets without any outcome fail closed with no writes", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, "required");
+    const caseId = await setupCase(t, project, "required");
+    const asOwner = t.withIdentity(OWNER);
+    const base = {
+      organizationId: project.orgId,
+      projectId: project.projectId,
+      caseId,
+    };
+    // Neither resolution nor closure may land outcome-less: the defect
+    // is denied before the no-op return or patch, and nothing writes.
+    for (const state of ["resolved", "closed"] as const) {
+      const denied = await asOwner.mutation(updateServiceCaseRef, { ...base, state });
+      expect(denied.ok).toBe(false);
+      if (!denied.ok) {
+        expect(denied.code).toBe("invalid-payload");
+        expect(denied.message).toContain("outcome required");
+      }
+    }
+    const untouched = await t.run((ctx) => ctx.db.get(caseId));
+    expect(untouched?.state).toBe("open");
+    expect(untouched).not.toHaveProperty("outcome");
+    // An explicit outcome resolves; closing carries the immutable
+    // stored outcome forward; identical terminal replays stay idempotent
+    // with or without restating it.
+    expect(
+      await asOwner.mutation(updateServiceCaseRef, {
+        ...base,
+        state: "resolved",
+        outcome: "replaced heating element",
+      }),
+    ).toEqual({ ok: true });
+    expect(await asOwner.mutation(updateServiceCaseRef, { ...base, state: "closed" })).toEqual({
+      ok: true,
+    });
+    expect(await asOwner.mutation(updateServiceCaseRef, { ...base, state: "closed" })).toEqual({
+      ok: true,
+    });
+    expect(
+      await asOwner.mutation(updateServiceCaseRef, {
+        ...base,
+        state: "closed",
+        outcome: "replaced heating element",
+      }),
+    ).toEqual({ ok: true });
+    const stored = await t.run((ctx) => ctx.db.get(caseId));
+    expect(stored?.state).toBe("closed");
+    expect(stored?.outcome).toBe("replaced heating element");
+  });
+
   test("blank and overlong outcomes fail with stable denials", async () => {
     const t = convexTest(schema, modules);
     const project = await setupProject(t, "bounds");
