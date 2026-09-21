@@ -195,6 +195,94 @@ async function sha256Hex(text: string): Promise<string> {
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
+async function acceptRequirement(
+  t: ReturnType<typeof convexTest>,
+  project: { organizationId: Id<"organizations">; projectId: Id<"projects"> },
+  requirementId: Id<"requirements">,
+  key: string,
+  acceptedQuantity = "1",
+) {
+  const asOwner = t.withIdentity(OWNER);
+  const vendor = await asOwner.mutation(recordVendorRef, {
+    organizationId: project.organizationId,
+    name: `Controlled supplier ${key}`,
+    regions: ["NL"],
+  });
+  if (!vendor.ok) throw new Error(`vendor setup failed for ${key}`);
+  const candidate = await asOwner.mutation(recordCandidateRef, {
+    organizationId: project.organizationId,
+    projectId: project.projectId,
+    requirementId,
+    vendorId: vendor.vendorId,
+    productModel: `Model ${key}`,
+    variant: "220V",
+    conversationState: "draft",
+  });
+  if (!candidate.ok) throw new Error(`candidate setup failed for ${key}`);
+  const quote = await asOwner.mutation(recordQuoteRef, {
+    organizationId: project.organizationId,
+    projectId: project.projectId,
+    version: `quote-${key}`,
+    currency: "EUR",
+    lines: [{
+      lineId: `line-${key}`,
+      description: `Item ${key}`,
+      quantity: acceptedQuantity,
+      unitPrice: { currency: "EUR", minorUnits: 1_000 },
+      evidenceRefs: [],
+    }],
+    charges: [],
+    taxBasis: { kind: "inclusive", basisId: `controlled-${key}`, evidenceRefs: [] },
+    comparisonScope: {
+      requirementId: key,
+      scopeId: `scope-${key}`,
+      items: [{
+        itemId: `item-${key}`,
+        lineId: `line-${key}`,
+        unit: "piece",
+        requiredQuantity: acceptedQuantity,
+      }],
+    },
+    evidenceRefs: [],
+    requirementId,
+    vendorId: vendor.vendorId,
+  });
+  if (!quote.ok) throw new Error(`quote setup failed for ${key}`);
+  const selection = await asOwner.mutation(recordSelectionRef, {
+    organizationId: project.organizationId,
+    projectId: project.projectId,
+    requirementId,
+    candidateId: candidate.candidateId,
+    quoteId: quote.quoteId,
+    quoteVersion: `quote-${key}`,
+    selectionLines: [{ quoteLineId: `line-${key}`, quantity: acceptedQuantity, unit: "piece" }],
+    idempotencyKey: `selection-${key}`,
+    requirementVersion: 1,
+  });
+  if (!selection.ok) throw new Error(`selection setup failed for ${key}`);
+  const order = await asOwner.mutation(recordOrderRef, {
+    organizationId: project.organizationId,
+    projectId: project.projectId,
+    selectionId: selection.selectionId,
+    idempotencyKey: `order-${key}`,
+    orderLines: [{ quoteLineId: `line-${key}`, quantity: acceptedQuantity, unit: "piece" }],
+  });
+  if (!order.ok) throw new Error(`order setup failed for ${key}`);
+  const accepted = await asOwner.mutation(appendOrderEventRef, {
+    organizationId: project.organizationId,
+    projectId: project.projectId,
+    orderId: order.orderId,
+    kind: "acceptance",
+    acceptanceLines: [{
+      quoteLineId: `line-${key}`,
+      acceptedQuantity,
+      unit: "piece",
+    }],
+    idempotencyKey: `acceptance-${key}`,
+  });
+  if (!accepted.ok) throw new Error(`acceptance setup failed for ${key}`);
+}
+
 describe("E2 requirement revisions", () => {
   test("viewer and cross-project calls are denied", async () => {
     const t = convexTest(schema, modules);
@@ -452,10 +540,8 @@ describe("E2 procurement readiness", () => {
     const p0 = await createRequirement(t, project, "p0", { priority: "P0", requiredMilestone: "delivered" });
     const p1 = await createRequirement(t, project, "p1", { priority: "P1", requiredMilestone: "delivered" });
     const p2 = await createRequirement(t, project, "p2", { priority: "P2", requiredMilestone: "delivered" });
-    await t.run(async (ctx) => {
-      await ctx.db.patch(p1, { fulfillment: "delivered" });
-      await ctx.db.patch(p2, { fulfillment: "delivered" });
-    });
+    await acceptRequirement(t, project, p1, "weighted-p1");
+    await acceptRequirement(t, project, p2, "weighted-p2");
     const result = await t.withIdentity(OWNER).query(getReadinessRef, {
       organizationId: project.organizationId,
       projectId: project.projectId,
@@ -574,10 +660,8 @@ describe("E2 procurement readiness", () => {
     const project = await setupProject(t, OWNER, "dependency");
     const target = await createRequirement(t, project, "target", { priority: "P0", requiredMilestone: "delivered" });
     const prerequisite = await createRequirement(t, project, "prerequisite", { priority: "P1", requiredMilestone: "delivered" });
-    await t.run(async (ctx) => {
-      await ctx.db.patch(target, { fulfillment: "delivered" });
-      await ctx.db.patch(prerequisite, { fulfillment: "delivered" });
-    });
+    await acceptRequirement(t, project, target, "dependency-target");
+    await acceptRequirement(t, project, prerequisite, "dependency-prerequisite");
     const dependency = await t.withIdentity(OWNER).mutation(addDependencyRef, {
       organizationId: project.organizationId,
       projectId: project.projectId,

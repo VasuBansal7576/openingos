@@ -1253,10 +1253,7 @@ export const getReadiness = f1Query({
     const readinessRequirements = activeRequirements.map((row) => {
       const required = requiredById.get(row._id);
       if (required === undefined) throw new Error("readiness quantity invariant violated");
-      let fulfilled = acceptedByRequirement.get(row._id) ?? decimalZero();
-      if (acceptedByRequirement.has(row._id) === false && fulfillmentRank(row.fulfillment) >= 1) {
-        fulfilled = required;
-      }
+      const fulfilled = acceptedByRequirement.get(row._id) ?? decimalZero();
       const milestone = row.requiredMilestone ?? "delivered";
       const milestoneRank = MILESTONE_RANK[milestone];
       const observedMilestone = Math.max(
