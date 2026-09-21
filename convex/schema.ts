@@ -768,9 +768,16 @@ export default defineSchema({
     // -> operation and revalidated at each protected boundary. Missing
     // authority on legacy rows fails closed before new work is created.
     workflowAuthority: v.optional(workflowAuthorityValidator),
+    // E3 automatic-start idempotency: a client-supplied bounded key that
+    // binds one logical automatic research start to exactly one grant+job.
+    // Optional so legacy rows remain readable; new automatic starts with a
+    // key populate it. Scoped by the compound project index below so a key
+    // never replays across projects.
+    startIdempotencyKey: v.optional(v.string()),
   })
     .index("by_project", ["projectId"])
-    .index("by_grant", ["grantId"]),
+    .index("by_grant", ["grantId"])
+    .index("by_project_and_start_key", ["projectId", "startIdempotencyKey"]),
 
   operations: defineTable({
     organizationId: v.id("organizations"),

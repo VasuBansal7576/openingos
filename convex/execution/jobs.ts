@@ -79,6 +79,20 @@ const jobViewValidator = v.object({
 const CANCELLATION_PAGE_SIZE = 16;
 const CANCELLATION_UNRESOLVED_SAMPLE_LIMIT = 16;
 
+// E3 server-side automatic-start idempotency: a stable bounded client key
+// binds one logical automatic research start to exactly one automatic grant
+// and one queued job. Client-side pending state is insufficient because two
+// separate clients (or two concurrent calls) never share it. The key is
+// validated before any write, scoped by the compound project index on jobs,
+// and replay compares the server-derived material fingerprint (project,
+// operation, kind, requirement authority, normalized supported payload) —
+// never the raw display text alone.
+const START_IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9:_-]{8,128}$/;
+
+function validStartIdempotencyKey(key: string): boolean {
+  return START_IDEMPOTENCY_KEY_PATTERN.test(key);
+}
+
 // An omitted grant may only create the bounded automatic research/read
 // authority. Record-changing operations remain valid when the caller carries
 // an explicit, version-bound grant, but never receive authority from a free
@@ -530,6 +544,10 @@ async function processReconciliationPage(
  * no job; supplier-evidence instructions cannot expand capabilities.
  * Research jobs without an explicit grant receive a server-bound
  * no-spend grant so the job always carries a versioned authority.
+ * Automatic starts may carry a bounded `idempotencyKey`: exact replays
+ * return the original queued job with no second grant or effect, while the
+ * same key with a materially different project, operation, kind, requirement
+ * authority, or normalized supported payload fails closed.
  */
 export const start = f1Mutation({
   args: {
@@ -539,6 +557,7 @@ export const start = f1Mutation({
     operationId: v.optional(v.string()),
     kind: v.optional(jobKindValidator),
     grantId: v.optional(v.id("grants")),
+    idempotencyKey: v.optional(v.string()),
   },
   returns: v.union(
     startedJobResultValidator,
@@ -552,6 +571,17 @@ export const start = f1Mutation({
     const now = Date.now();
     if (containsInstructionOverride(args.text)) {
       return { ok: false as const, code: "prompt-injection-denied", message: "supplier evidence cannot expand capabilities" };
+    }
+
+    // E3: validate the bounded idempotency key before any write. Supplied
+    // grants keep their exact existing behavior, so a key combined with an
+    // explicit grant fails closed rather than changing that path.
+    const startKey = args.idempotencyKey;
+    if (startKey !== undefined && !validStartIdempotencyKey(startKey)) {
+      return { ok: false as const, code: "invalid-payload", message: "idempotencyKey must be 8-128 chars of A-Za-z0-9:_-" };
+    }
+    if (startKey !== undefined && args.grantId !== undefined) {
+      return { ok: false as const, code: "invalid-payload", message: "idempotency keys are automatic-start only" };
     }
 
     // Resolve the supplied grant before building context. A caller cannot
@@ -882,11 +912,59 @@ export const start = f1Mutation({
       if (!automaticPayload.ok) {
         return { ok: false as const, code: "unrelated-refusal", message: automaticPayload.reason ?? "research payload is not supported" };
       }
+      const autoCanonical = canonicalJson(autoPayload);
+      // E3: exact replay returns the original job with no second grant or
+      // effect. The lookup is one bounded compound-index read scoped to this
+      // project, so a key from another project never replays here and leaks
+      // nothing. A stored row with a materially different operation, kind,
+      // requirement authority, or normalized supported payload conflicts
+      // instead of replaying. Authorization already passed above, so this
+      // probe cannot become a cross-project existence oracle.
+      if (startKey !== undefined) {
+        const priorRows = await ctx.db
+          .query("jobs")
+          .withIndex("by_project_and_start_key", (q) =>
+            q.eq("projectId", args.projectId).eq("startIdempotencyKey", startKey),
+          )
+          .take(2);
+        if (priorRows.length > 1) {
+          return { ok: false as const, code: "duplicate-conflict", message: "idempotency key maps to multiple jobs" };
+        }
+        const prior = priorRows[0];
+        if (prior !== undefined) {
+          const priorAuthority = prior.workflowAuthority;
+          const authorityMatches =
+            priorAuthority !== undefined &&
+            priorAuthority.operationId === operationId &&
+            canonicalJson(priorAuthority) === canonicalJson(grantAuthority);
+          const priorGrant = await ctx.db.get(prior.grantId);
+          const payloadMatches =
+            priorGrant !== null &&
+            priorGrant.organizationId === args.organizationId &&
+            priorGrant.projectId === args.projectId &&
+            priorGrant.canonicalPayload === autoCanonical;
+          if (
+            prior.organizationId !== args.organizationId ||
+            prior.projectId !== args.projectId ||
+            prior.kind !== kind ||
+            !authorityMatches ||
+            !payloadMatches
+          ) {
+            return { ok: false as const, code: "duplicate-conflict", message: "idempotency key was used with a different start" };
+          }
+          return {
+            ok: true as const,
+            jobId: prior._id,
+            state: prior.state,
+            supportedSegment: supportedClassification.supportedSegment,
+            refusedSegments: [...supportedClassification.refusedSegments],
+          };
+        }
+      }
       const recipient = await ctx.db
         .query("recipientConfigs")
         .withIndex("by_active", (q) => q.eq("active", true))
         .unique();
-      const autoCanonical = canonicalJson(autoPayload);
       grantId = await ctx.db.insert("grants", {
         organizationId: args.organizationId,
         projectId: args.projectId,
@@ -940,6 +1018,9 @@ export const start = f1Mutation({
       inputVersions,
       createdAt: now,
       updatedAt: now,
+      ...(startKey !== undefined && grantId !== args.grantId
+        ? { startIdempotencyKey: startKey }
+        : {}),
     });
     return {
       ok: true as const,
