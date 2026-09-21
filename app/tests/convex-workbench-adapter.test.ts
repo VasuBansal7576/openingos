@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import type { Watch } from "convex/react";
+import { getFunctionName, type FunctionReference } from "convex/server";
 import {
   createConvexWorkbenchAdapter,
   type ConvexWorkbenchClient,
@@ -115,11 +116,13 @@ function controlledWatch(read: () => unknown): {
 
 test("wires the bounded project discovery query and validates a W1 projection load", async () => {
   const queryArgs: unknown[] = [];
+  const queryReferences: FunctionReference<"query">[] = [];
   const watchArgs: unknown[] = [];
   const controls = controlledWatch(() => projection());
   const responses: unknown[] = [accessibleProjects(), projection()];
   const client = {
-    query: async (_reference: unknown, args: unknown) => {
+    query: async (reference: FunctionReference<"query">, args: unknown) => {
+      queryReferences.push(reference);
       queryArgs.push(args);
       return responses.shift() ?? null;
     },
@@ -136,6 +139,10 @@ test("wires the bounded project discovery query and validates a W1 projection lo
   const loaded = await adapter.load("project-1");
   expect(loaded).toEqual(projection());
   expect(queryArgs[1]).toEqual({ projectId: "project-1", limit: 12 });
+  expect(queryReferences.map((reference) => getFunctionName(reference))).toEqual([
+    "workbench/projection:listAccessibleProjects",
+    "workbench/projection:getProjection",
+  ]);
   expect(watchArgs).toHaveLength(0);
 });
 

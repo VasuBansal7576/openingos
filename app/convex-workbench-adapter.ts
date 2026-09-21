@@ -1,5 +1,6 @@
 import type { ConvexReactClient, Watch } from "convex/react";
-import { makeFunctionReference } from "convex/server";
+import type { FunctionReference } from "convex/server";
+import { api } from "../convex/_generated/api";
 import type { Id } from "../convex/_generated/dataModel";
 import {
   parseWorkbenchSnapshot,
@@ -8,12 +9,6 @@ import {
   type WorkbenchServerAdapter,
 } from "./workbench-state";
 
-/**
- * These references intentionally stay local until the generated API contains
- * the W1 module on the integration branch. The argument types mirror the
- * accepted `workbench/projection` validators, while projection values remain
- * unknown until the exact UI boundary parser validates them.
- */
 export type W1ListAccessibleProjectsArgs = Record<string, unknown> & {
   readonly cursor?: string;
   readonly limit?: number;
@@ -25,17 +20,27 @@ export type W1GetProjectionArgs = Record<string, unknown> & {
   readonly limit?: number;
 };
 
-const listAccessibleProjectsReference = makeFunctionReference<
-  "query",
-  W1ListAccessibleProjectsArgs,
-  unknown
->("workbench/projection:listAccessibleProjects");
+type W1PublicApi = {
+  readonly "workbench/projection": {
+    readonly listAccessibleProjects: FunctionReference<
+      "query",
+      "public",
+      W1ListAccessibleProjectsArgs,
+      unknown
+    >;
+    readonly getProjection: FunctionReference<"query", "public", W1GetProjectionArgs, unknown>;
+  };
+};
 
-const getProjectionReference = makeFunctionReference<
-  "query",
-  W1GetProjectionArgs,
-  unknown
->("workbench/projection:getProjection");
+/**
+ * Convex's checked-in API declaration predates W1 because this checkout has no
+ * configured deployment for codegen. The generated runtime proxy still owns
+ * function routing; this narrow declaration records the two public validators
+ * consumed here until deployment-backed codegen refreshes the declaration.
+ */
+const workbenchApi = (api as unknown as W1PublicApi)["workbench/projection"];
+const listAccessibleProjectsReference = workbenchApi.listAccessibleProjects;
+const getProjectionReference = workbenchApi.getProjection;
 
 const WORKBENCH_PROJECTION_LIMIT = 12;
 const PROJECT_DISCOVERY_LIMIT = 1;
