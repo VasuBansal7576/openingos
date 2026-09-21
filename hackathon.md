@@ -593,3 +593,21 @@ All three repair branches were pushed, integrated and independently rerun before
 This checkpoint is controlled evidence only.
 No live provider call, owner-mailbox exchange, hosted Convex deployment, public site, genuine supplier reply, purchase, realized saving or commercial outcome was observed.
 PR #14 still requires latest-head GitHub CI and a fresh separate GPT-6 Astra verdict on the same fixed commit before merge.
+
+### 2026-09-22 - accepted-reply and reconnect-race repair checkpoint
+
+A later separate GPT-6 Astra review of exact PR #14 head `952d091` rejected two remaining defects.
+An accepted inbound reply longer than the bounded model context could lose a trailing final-offer or stop instruction, and a sample or intake request started before disconnect could load its stale project after a new authenticated connection was established.
+
+Local combined checkpoint `7ebca8b` repairs both defects.
+Negotiation processing now measures the complete mailbox-redacted accepted reply before slicing, records an explicit oversized state, and refuses model, draft and send effects until a newer bounded accepted marker supersedes it.
+Application creation now binds sample and intake completions to the dispatch connection epoch and adapter identity, so disconnect and reconnect invalidates the old completion while a fresh current-epoch attempt may still succeed.
+
+Focused coordinator reruns pass 23 user-path tests with 218 assertions, 87 negotiation-orchestrator tests, both strict TypeScript checks and the production build.
+The complete local `bun run test` command also exits successfully, including all 24 direct Vitest files and 572 direct Convex tests.
+The two OpenCode Muse Spark 1.3 Free high workers pushed their exact repair branches before their clean E27 and E28 worktrees were removed through Orca.
+The OpenCode Go subscription endpoint returned insufficient account funds before either assigned task could start, so no result is attributed to that provider path and the free Muse model was used without a broad permission grant.
+
+This checkpoint is controlled evidence only.
+No hosted Convex deployment, live provider call, owner-mailbox exchange, genuine supplier response, public origin, purchase, realized saving or commercial outcome was observed.
+PR #14 still requires a pushed exact-head GitHub CI pass and a fresh separate GPT-6 Astra acceptance on the same commit before merge.
