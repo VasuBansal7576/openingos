@@ -178,12 +178,16 @@ test("keeps a connected app honest when no projection is available", () => {
     backendStatus: "connected",
     workbench: { state: "empty", message: "No authorized project projection is available yet." },
   }));
-  expect(html).toContain("Waiting for an authorized project.");
+  expect(html).toContain("NO AUTHORIZED PROJECT");
+  expect(html).toContain("No authorized project projection is available yet.");
   expect(html).toContain("No vendors, quotes or provider outcomes are shown");
-  expect(html).toContain("Everything on the table.");
-  expect(html).toContain("wb-connection-paper");
+  expect(html).toContain("Less chasing.");
+  expect(html).toContain("Try the Northside");
+  expect(html).toContain("Start your own brief");
+  expect(html).toContain("wb-landing-status");
   expect(html).not.toContain("wb-connected-empty");
   expect(html).not.toContain("Harbor Equipment");
+  expect(html).not.toContain("OpeningOS is ready to connect");
 });
 
 test("rejects malformed, cross-project, and private W1 projection payloads", () => {
@@ -1819,6 +1823,231 @@ test("bench actions open the real review dialog and assistant rail", async () =>
       mounted.findButton("Ask about these quotes").click();
     });
     expect(mounted.container.textContent).toContain("Ask about this decision.");
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+// -- F4 projected evidence source -------------------------------------------
+
+async function mountProjectView(
+  loadState: Parameters<typeof WorkbenchView>[0]["loadState"],
+): Promise<{
+  readonly container: HTMLElement;
+  readonly dom: HappyWindow;
+  readonly cleanup: () => Promise<void>;
+}> {
+  const dom = new HappyWindow({ url: "https://openingos.test/" });
+  const previousWindow = globalThis.window;
+  const previousDocument = globalThis.document;
+  const previousNavigator = globalThis.navigator;
+  const actEnvironment = globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean };
+  const previousActEnvironment = actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+  const browserGlobals = globalThis as unknown as { window: unknown; document: unknown; navigator: unknown };
+  browserGlobals.window = dom as unknown as globalThis.Window;
+  browserGlobals.document = dom.document as unknown as globalThis.Document;
+  browserGlobals.navigator = dom.navigator as unknown as globalThis.Navigator;
+  actEnvironment.IS_REACT_ACT_ENVIRONMENT = true;
+  const happyElement = dom.document.createElement("div");
+  dom.document.body.append(happyElement);
+  const container = happyElement as unknown as HTMLElement;
+  const root = createRoot(container as unknown as globalThis.Element);
+  await act(async () => {
+    root.render(createElement(WorkbenchView, { loadState }));
+  });
+  return {
+    container,
+    dom,
+    cleanup: async () => {
+      await act(async () => {
+        root.unmount();
+      });
+      browserGlobals.window = previousWindow;
+      browserGlobals.document = previousDocument;
+      browserGlobals.navigator = previousNavigator;
+      if (previousActEnvironment === undefined) delete actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+      else actEnvironment.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment;
+    },
+  };
+}
+
+function projectionWithEvidenceSource(sourceUrl: string | undefined): Record<string, unknown> {
+  const base = projection as unknown as Record<string, unknown>;
+  const candidates = base.candidates as readonly Record<string, unknown>[];
+  const candidate = candidates[0]!;
+  const evidence = candidate.evidence as readonly Record<string, unknown>[];
+  return {
+    ...base,
+    candidates: [{
+      ...candidate,
+      evidence: [{ ...evidence[0]!, ...(sourceUrl === undefined ? {} : { sourceUrl }) }],
+    }],
+  };
+}
+
+test("view original opens the validated projected source URL without private material", async () => {
+  const snapshot = parseWorkbenchSnapshot(projectionWithEvidenceSource("https://supplier.example.test/quote.pdf"), projection.project.id);
+  if (snapshot === null) throw new Error("Evidence projection should parse");
+  const mounted = await mountProjectView({ state: "ready", snapshot });
+  try {
+    const opener = mounted.container.querySelector(".wb-paper-source");
+    if (!(opener instanceof mounted.dom.window.HTMLButtonElement)) throw new Error("View original button not found");
+    await act(async () => {
+      (opener as unknown as HTMLButtonElement).click();
+    });
+    const dialog = mounted.container.querySelector('.wb-evidence-panel[role="dialog"]');
+    expect(dialog).not.toBeNull();
+    const link = mounted.container.querySelector('.wb-evidence-panel a[href="https://supplier.example.test/quote.pdf"]');
+    if (!(link instanceof mounted.dom.window.HTMLAnchorElement)) throw new Error("Projected source link not found");
+    expect((link as unknown as HTMLAnchorElement).target).toBe("_blank");
+    expect(mounted.container.textContent).toContain("PRIVATE HEADERS REDACTED");
+    expect(mounted.container.textContent).not.toContain("providerId");
+    expect(mounted.container.textContent).not.toContain("rawHeaders");
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("evidence without a projected source URL stays a truthful unavailable state", async () => {
+  const snapshot = parseWorkbenchSnapshot(projectionWithEvidenceSource(undefined), projection.project.id);
+  if (snapshot === null) throw new Error("Evidence projection should parse");
+  const mounted = await mountProjectView({ state: "ready", snapshot });
+  try {
+    const opener = mounted.container.querySelector(".wb-paper-source");
+    if (!(opener instanceof mounted.dom.window.HTMLButtonElement)) throw new Error("View original button not found");
+    await act(async () => {
+      (opener as unknown as HTMLButtonElement).click();
+    });
+    expect(mounted.container.textContent).toContain("No public source URL was included in this projection.");
+    expect(mounted.container.querySelector('.wb-evidence-panel a[href]')).toBeNull();
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+// -- F7 unsafe intake budget -------------------------------------------------
+
+async function mountIntakeView(
+  onIntake: (input: import("../workbench-state").WorkbenchIntakeInput) => Promise<import("../workbench-state").WorkbenchIntakeResult>,
+): Promise<{
+  readonly container: HTMLElement;
+  readonly dom: HappyWindow;
+  readonly cleanup: () => Promise<void>;
+}> {
+  const { WorkbenchIntakeView } = await import("../Workbench");
+  const dom = new HappyWindow({ url: "https://openingos.test/" });
+  const previousWindow = globalThis.window;
+  const previousDocument = globalThis.document;
+  const previousNavigator = globalThis.navigator;
+  const actEnvironment = globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean };
+  const previousActEnvironment = actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+  const browserGlobals = globalThis as unknown as { window: unknown; document: unknown; navigator: unknown };
+  browserGlobals.window = dom as unknown as globalThis.Window;
+  browserGlobals.document = dom.document as unknown as globalThis.Document;
+  browserGlobals.navigator = dom.navigator as unknown as globalThis.Navigator;
+  actEnvironment.IS_REACT_ACT_ENVIRONMENT = true;
+  const happyElement = dom.document.createElement("div");
+  dom.document.body.append(happyElement);
+  const container = happyElement as unknown as HTMLElement;
+  const root = createRoot(container as unknown as globalThis.Element);
+  await act(async () => {
+    root.render(createElement(WorkbenchIntakeView, { onIntake }));
+  });
+  return {
+    container,
+    dom,
+    cleanup: async () => {
+      await act(async () => {
+        root.unmount();
+      });
+      browserGlobals.window = previousWindow;
+      browserGlobals.document = previousDocument;
+      browserGlobals.navigator = previousNavigator;
+      if (previousActEnvironment === undefined) delete actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+      else actEnvironment.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment;
+    },
+  };
+}
+
+async function submitIntakeBudget(
+  container: HTMLElement,
+  dom: HappyWindow,
+  values: { readonly projectName: string; readonly region: string; readonly budget: string },
+): Promise<void> {
+  const set = (name: string, value: string) => {
+    const control = container.querySelector(`[name="${name}"]`);
+    if (!(control instanceof dom.window.HTMLInputElement)) throw new Error(`Control not found: ${name}`);
+    (control as unknown as HTMLInputElement).value = value;
+  };
+  set("projectName", values.projectName);
+  set("region", values.region);
+  set("budget", values.budget);
+  const button = Array.from(container.querySelectorAll("button")).find((candidate) =>
+    candidate.textContent?.includes("Create workspace"),
+  );
+  if (!(button instanceof dom.window.HTMLButtonElement)) throw new Error("Submit button not found");
+  await act(async () => {
+    (button as unknown as HTMLButtonElement).click();
+  });
+}
+
+test("an unsafe intake budget shows an error, retains input, and never reaches intake", async () => {
+  const seen: unknown[] = [];
+  const mounted = await mountIntakeView(async (input) => {
+    seen.push(input);
+    return { ok: true, projectId: "project-unsafe" };
+  });
+  try {
+    await submitIntakeBudget(mounted.container, mounted.dom, {
+      projectName: "Northside café",
+      region: "Amsterdam",
+      budget: "99999999999999999.99",
+    });
+    expect(seen).toHaveLength(0);
+    expect(mounted.container.textContent).toContain("too large to record safely");
+    const budget = mounted.container.querySelector('[name="budget"]') as unknown as HTMLInputElement;
+    expect(budget.value).toBe("99999999999999999.99");
+    const project = mounted.container.querySelector('[name="projectName"]') as unknown as HTMLInputElement;
+    expect(project.value).toBe("Northside café");
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("an over-precision intake budget is rejected before the intake route", async () => {
+  const seen: unknown[] = [];
+  const mounted = await mountIntakeView(async (input) => {
+    seen.push(input);
+    return { ok: true, projectId: "project-precision" };
+  });
+  try {
+    await submitIntakeBudget(mounted.container, mounted.dom, {
+      projectName: "Northside café",
+      region: "Amsterdam",
+      budget: "45000.555",
+    });
+    expect(seen).toHaveLength(0);
+    expect(mounted.container.textContent).toContain("whole euros and cents");
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("a valid intake budget still reaches the intake route in minor units", async () => {
+  const seen: import("../workbench-state").WorkbenchIntakeInput[] = [];
+  const mounted = await mountIntakeView(async (input) => {
+    seen.push(input);
+    return { ok: true, projectId: "project-valid" };
+  });
+  try {
+    await submitIntakeBudget(mounted.container, mounted.dom, {
+      projectName: "Northside café",
+      region: "Amsterdam",
+      budget: "45000.50",
+    });
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({ budgetMinorUnits: 4500050 });
+    expect(mounted.container.textContent).toContain("Workspace created. Loading the persisted project.");
   } finally {
     await mounted.cleanup();
   }

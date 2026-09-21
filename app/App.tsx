@@ -1,5 +1,6 @@
 import type { BackendStatus } from "./backend-state";
-import WorkbenchView, { WorkbenchUnavailableView, type WorkbenchViewProps } from "./Workbench";
+import LandingView from "./Landing";
+import WorkbenchView, { type WorkbenchViewProps } from "./Workbench";
 import type { WorkbenchLoadState } from "./workbench-state";
 
 export interface AppProps extends Pick<WorkbenchViewProps, "onAction" | "onLoadMore" | "onIntake"> {
@@ -8,75 +9,26 @@ export interface AppProps extends Pick<WorkbenchViewProps, "onAction" | "onLoadM
   readonly workbench?: WorkbenchLoadState | undefined;
 }
 
-type StatusCopy = {
-  eyebrow: string;
-  title: string;
-  message: string;
-  tone: "neutral" | "pending" | "success" | "warning" | "error";
-  action?: string;
-};
-
-function statusCopy(status: BackendStatus): StatusCopy {
-  switch (status) {
-    case "unconfigured":
-      return {
-        eyebrow: "BACKEND NOT CONFIGURED",
-        title: "OpeningOS is ready to connect.",
-        message: "Add a Convex deployment URL before starting application work. No provider calls or customer data are available in this state.",
-        tone: "neutral",
-      };
-    case "configured-unverified":
-      return {
-        eyebrow: "BACKEND CONFIGURED / UNVERIFIED",
-        title: "Waiting for the first backend response.",
-        message: "A Convex URL is configured, but this browser has not observed a connection or identity result yet. Application readiness is not claimed.",
-        tone: "pending",
-      };
-    case "authenticating":
-      return {
-        eyebrow: "AUTHENTICATING",
-        title: "Connecting your workspace.",
-        message: "The Convex connection is responding while authentication is still being established. Your workflow will appear after the current identity is known.",
-        tone: "pending",
-      };
-    case "connected":
-      return {
-        eyebrow: "BACKEND CONNECTED",
-        title: "Waiting for the project projection.",
-        message: "Convex has reported a live connection, but no authorized project projection is attached to this browser yet. No vendors, quotes or provider outcomes are shown.",
-        tone: "pending",
-      };
-    case "reconnecting":
-      return {
-        eyebrow: "CONNECTION INTERRUPTED",
-        title: "Reconnecting to OpeningOS.",
-        message: "The last backend connection was lost. Completed work remains on the server; new actions wait until the connection is observed again.",
-        tone: "warning",
-        action: "Retry connection",
-      };
-    case "unavailable":
-      return {
-        eyebrow: "BACKEND UNAVAILABLE",
-        title: "The configured deployment did not respond.",
-        message: "OpeningOS cannot verify this backend right now. No provider action or live outcome is reported; retry when the deployment is reachable.",
-        tone: "error",
-        action: "Retry connection",
-      };
-  }
-}
-
-function WorkbenchConnectionStatus({ status, onRetry }: { readonly status: BackendStatus; readonly onRetry?: (() => void) | undefined }) {
-  const copy = statusCopy(status);
-  return <WorkbenchUnavailableView {...copy} onRetry={copy.action !== undefined ? onRetry : undefined} />;
-}
-
+/**
+ * Public entry routing for the purchasing workbench.
+ *
+ * A live connected projection renders the full workbench directly so
+ * returning users enter their current project and due decisions. Every other
+ * backend lifecycle state renders the public purchasing-workbench landing:
+ * static landing content needs no configured backend, and the backend status
+ * stays a compact integrated notice that never replaces the whole design and
+ * never implies a live connection.
+ */
 export default function App({ backendStatus = "unconfigured", onRetry, workbench, onAction, onLoadMore, onIntake }: AppProps) {
   if (workbench !== undefined && (backendStatus === "connected" || backendStatus === "reconnecting")) {
     // Intake is offered only on a live connected empty state through the
-    // real adapter route. Every unconfigured, unverified, authenticating,
-    // or unavailable state stays honest and offers no mutation.
+    // real adapter route, rendered inside the landing below. Ready and
+    // last-known projections render the full workbench directly.
     const connectedIntake = workbench.state === "empty" && backendStatus === "connected" ? onIntake : undefined;
-    return <WorkbenchView loadState={workbench} onRetry={onRetry} onAction={onAction} onLoadMore={onLoadMore} onIntake={connectedIntake} />;
+    if (workbench.state === "ready" || workbench.state === "reconnecting" || "lastKnown" in workbench) {
+      return <WorkbenchView loadState={workbench} onRetry={onRetry} onAction={onAction} onLoadMore={onLoadMore} onIntake={connectedIntake} />;
+    }
+    return <LandingView backendStatus={backendStatus} onRetry={onRetry} workbench={workbench} onIntake={connectedIntake} />;
   }
-  return <WorkbenchConnectionStatus status={backendStatus} onRetry={onRetry} />;
+  return <LandingView backendStatus={backendStatus} onRetry={onRetry} workbench={workbench} onIntake={undefined} />;
 }

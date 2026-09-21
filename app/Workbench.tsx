@@ -437,7 +437,7 @@ function EvidencePanel({ evidence, onClose }: { readonly evidence: WorkbenchEvid
   const idPrefix = useId().replace(/:/g, "");
   const titleId = `${idPrefix}-evidence-title`;
   useModalAccessibility(dialogRef, onClose);
-  return <div className="wb-overlay"><section className="wb-evidence-panel" role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1} ref={dialogRef}><div className="wb-panel-head"><div><span className="wb-eyebrow">SOURCE RECORD</span><h2 id={titleId}>{evidence.label}</h2></div><button className="wb-icon-button" type="button" onClick={onClose} aria-label="Close evidence"><Icon name="close" size={18} /></button></div><div className="wb-document"><div className="wb-document-head"><span>{evidence.sourceKind}</span><ProvenancePill mode={evidence.executionMode} /></div><div className="wb-document-row"><span>Verification</span><strong>{formatStateLabel(evidence.verification)}</strong></div><div className="wb-document-row"><span>Freshness</span><strong>{formatStateLabel(evidence.freshness)}</strong></div><div className="wb-document-row"><span>Counterparty</span><strong>{evidence.counterpartyRole === "ownerStandIn" ? "Owner stand-in · controlled" : formatStateLabel(evidence.counterpartyRole)}</strong></div><div className="wb-document-watermark">PUBLIC PROJECTION · PRIVATE HEADERS REDACTED</div></div><p className="wb-micro">{evidence.sourceUrl ? "The source link is available through the authorized evidence record." : "No public source URL was included in this projection."} Raw headers, mailbox addresses and provider IDs are never shown in the workbench.</p></section></div>;
+  return <div className="wb-overlay"><section className="wb-evidence-panel" role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1} ref={dialogRef}><div className="wb-panel-head"><div><span className="wb-eyebrow">SOURCE RECORD</span><h2 id={titleId}>{evidence.label}</h2></div><button className="wb-icon-button" type="button" onClick={onClose} aria-label="Close evidence"><Icon name="close" size={18} /></button></div><div className="wb-document"><div className="wb-document-head"><span>{evidence.sourceKind}</span><ProvenancePill mode={evidence.executionMode} /></div><div className="wb-document-row"><span>Verification</span><strong>{formatStateLabel(evidence.verification)}</strong></div><div className="wb-document-row"><span>Freshness</span><strong>{formatStateLabel(evidence.freshness)}</strong></div><div className="wb-document-row"><span>Counterparty</span><strong>{evidence.counterpartyRole === "ownerStandIn" ? "Owner stand-in · controlled" : formatStateLabel(evidence.counterpartyRole)}</strong></div><div className="wb-document-watermark">PUBLIC PROJECTION · PRIVATE HEADERS REDACTED</div></div>{evidence.sourceUrl !== null ? <p className="wb-evidence-source"><a className="wb-paper-source" href={evidence.sourceUrl} target="_blank" rel="noreferrer">Original quote document · Open original</a></p> : <p className="wb-micro" role="status">No public source URL was included in this projection. The record above is the complete projected evidence.</p>}<p className="wb-micro">Raw headers, mailbox addresses and provider IDs are never shown in the workbench.</p></section></div>;
 }
 
 function SelectionPanel({ offer, snapshot, onClose, onAction, onMessage }: { readonly offer: WorkbenchOffer; readonly snapshot: WorkbenchSnapshot; readonly onClose: () => void; readonly onAction?: WorkbenchViewProps["onAction"]; readonly onMessage: (message: string) => void }) {
@@ -989,7 +989,7 @@ function readIntakeForm(form: HTMLFormElement | null): IntakeFormValues {
   };
 }
 
-export function WorkbenchIntakeView({ onIntake }: { readonly onIntake: WorkbenchIntakeHandler }) {
+export function WorkbenchIntakeView({ onIntake, onBack }: { readonly onIntake: WorkbenchIntakeHandler; readonly onBack?: (() => void) | undefined }) {
   const [mode, setMode] = useState<WorkbenchIntakeMode>("opening");
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -1027,8 +1027,17 @@ export function WorkbenchIntakeView({ onIntake }: { readonly onIntake: Workbench
     if (values.currency.trim().length > 0 && !/^[A-Za-z]{3}$/.test(values.currency.trim())) {
       return "Use a three-letter reporting currency such as EUR.";
     }
-    if (values.budget.trim().length > 0 && !/^\d+(?:\.\d{1,2})?$/.test(values.budget.trim())) {
-      return "Enter the budget as whole euros and cents, for example 45000 or 45000.50.";
+    if (values.budget.trim().length > 0) {
+      if (!/^\d+(?:\.\d{1,2})?$/.test(values.budget.trim())) {
+        return "Enter the budget as whole euros and cents, for example 45000 or 45000.50.";
+      }
+      // Over-precision is rejected by the pattern above; an unsafe integer
+      // (magnitude beyond the safe minor-unit range) must also fail closed
+      // here so the submission below can never silently omit it.
+      const budgetMinorUnits = Math.round(Number.parseFloat(values.budget.trim()) * 100);
+      if (!Number.isSafeInteger(budgetMinorUnits) || budgetMinorUnits < 0) {
+        return "That budget is too large to record safely. Enter a smaller amount.";
+      }
     }
     if (values.needBy.trim().length > 0 && Number.isNaN(Date.parse(values.needBy))) {
       return "Enter a valid needed-by date or leave it empty.";
@@ -1081,6 +1090,12 @@ export function WorkbenchIntakeView({ onIntake }: { readonly onIntake: Workbench
       const budgetMinorUnits = values.budget.trim().length === 0
         ? undefined
         : Math.round(Number.parseFloat(values.budget.trim()) * 100);
+      if (budgetMinorUnits !== undefined && (!Number.isSafeInteger(budgetMinorUnits) || budgetMinorUnits < 0)) {
+        // Fail closed: an unsafe or over-precision budget keeps the entered
+        // values in place and never reaches the intake route with an omission.
+        setError("That budget is too large to record safely. Enter a smaller amount.");
+        return;
+      }
       const needByAt = values.needBy.trim().length === 0 ? undefined : Date.parse(values.needBy);
       const workspaceKind = values.workspaceKind === "guest" ? "guest" as const : "private" as const;
       const urgency = values.urgency === "urgent" || values.urgency === "high" || values.urgency === "low"
@@ -1093,9 +1108,7 @@ export function WorkbenchIntakeView({ onIntake }: { readonly onIntake: Workbench
         ...(values.region.trim().length === 0 ? {} : { region: values.region.trim() }),
         ...(trimmedCurrency.length === 0 ? {} : { currency: trimmedCurrency.toUpperCase() }),
         ...(needByAt === undefined || Number.isNaN(needByAt) ? {} : { needByAt }),
-        ...(budgetMinorUnits === undefined || !Number.isSafeInteger(budgetMinorUnits) || budgetMinorUnits < 0
-          ? {}
-          : { budgetMinorUnits }),
+        ...(budgetMinorUnits === undefined ? {} : { budgetMinorUnits }),
         ...(values.detailTitle.trim().length === 0 ? {} : { detailTitle: values.detailTitle.trim() }),
         ...(values.detailCategory.trim().length === 0 ? {} : { detailCategory: values.detailCategory.trim() }),
         ...(values.detailSummary.trim().length === 0 ? {} : { detailSummary: values.detailSummary.trim() }),
@@ -1123,6 +1136,11 @@ export function WorkbenchIntakeView({ onIntake }: { readonly onIntake: Workbench
     <div className="wb-app wb-connection-app">
       <Header activeTab="project" project={{ name: "New project intake", region: null, currency: null }} onTabChange={() => undefined} onOpenAssistant={() => undefined} disabled />
       <main id="workbench-main" className="wb-page wb-intake-page" tabIndex={-1}>
+        {onBack !== undefined ? (
+          <div className="wb-intake-back">
+            <button type="button" className="wb-text-button" onClick={onBack}>&larr; Back to the landing</button>
+          </div>
+        ) : null}
         <PageHeading
           eyebrow="OPENINGOS / NEW PROJECT INTAKE"
           title="Start with the job at hand."

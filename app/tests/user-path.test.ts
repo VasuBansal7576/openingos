@@ -381,3 +381,146 @@ test("automatically wires the default adapter and discovers the first authorized
     else actEnvironment.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment;
   }
 });
+
+async function mountLanding(
+  props: Parameters<typeof App>[0],
+): Promise<{
+  readonly container: Element;
+  readonly dom: HappyWindow;
+  readonly cleanup: () => Promise<void>;
+  readonly clickButton: (label: string) => Promise<void>;
+  readonly pressEscape: () => Promise<void>;
+}> {
+  const dom = new HappyWindow({ url: "https://openingos.test/" });
+  const previousWindow = globalThis.window;
+  const previousDocument = globalThis.document;
+  const previousNavigator = globalThis.navigator;
+  const actEnvironment = globalThis as typeof globalThis & {
+    IS_REACT_ACT_ENVIRONMENT?: boolean;
+  };
+  const previousActEnvironment = actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+  const browserGlobals = globalThis as unknown as { window: unknown; document: unknown; navigator: unknown };
+  browserGlobals.window = dom as unknown as globalThis.Window;
+  browserGlobals.document = dom.document as unknown as globalThis.Document;
+  browserGlobals.navigator = dom.navigator as unknown as globalThis.Navigator;
+  actEnvironment.IS_REACT_ACT_ENVIRONMENT = true;
+  const happyContainer = dom.document.createElement("div");
+  dom.document.body.append(happyContainer);
+  const container = happyContainer as unknown as globalThis.Element;
+  const { createRoot } = await import("react-dom/client");
+  const root = createRoot(container);
+  await act(async () => {
+    root.render(createElement(App, props));
+  });
+  const findButton = (label: string): HTMLButtonElement => {
+    const button = Array.from(container.querySelectorAll("button")).find((candidate) =>
+      candidate.textContent?.includes(label),
+    );
+    if (!(button instanceof dom.window.HTMLButtonElement)) throw new Error(`Button not found: ${label}`);
+    return button as unknown as HTMLButtonElement;
+  };
+  return {
+    container: container as unknown as Element,
+    dom,
+    cleanup: async () => {
+      await act(async () => {
+        root.unmount();
+      });
+      dom.close();
+      browserGlobals.window = previousWindow;
+      browserGlobals.document = previousDocument;
+      browserGlobals.navigator = previousNavigator;
+      if (previousActEnvironment === undefined) delete actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+      else actEnvironment.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment;
+    },
+    clickButton: async (label: string) => {
+      await act(async () => {
+        findButton(label).click();
+      });
+    },
+    pressEscape: async () => {
+      await act(async () => {
+        container.dispatchEvent(
+          new dom.window.KeyboardEvent("keydown", { bubbles: true, key: "Escape" }) as unknown as globalThis.KeyboardEvent,
+        );
+      });
+    },
+  };
+}
+
+test("unconfigured demo entry stays an unavailable state naming the missing backend contract", async () => {
+  const mounted = await mountLanding({ backendStatus: "unconfigured" });
+  try {
+    expect(mounted.container.textContent).toContain("Less chasing.");
+    await mounted.clickButton("Try the Northside");
+    expect(mounted.container.textContent).toContain("The sample demo is not available in this build.");
+    expect(mounted.container.textContent).toContain("Missing backend contract");
+    expect(mounted.container.textContent).toContain("domain/intake:createWorkspace");
+    expect(mounted.container.textContent).not.toContain("Harbor Equipment");
+    await mounted.pressEscape();
+    expect(mounted.container.textContent).not.toContain("The sample demo is not available in this build.");
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("unconfigured brief entry explains the backend requirement without creating anything", async () => {
+  const mounted = await mountLanding({ backendStatus: "unconfigured" });
+  try {
+    await mounted.clickButton("Start your own brief");
+    expect(mounted.container.textContent).toContain("Connect a backend to open a real workspace.");
+    expect(mounted.container.textContent).toContain("No Convex deployment URL is configured");
+    expect(mounted.container.textContent).not.toContain("Create workspace");
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("connected landing embeds the real intake flow while the demo stays unavailable", async () => {
+  const seen: unknown[] = [];
+  const mounted = await mountLanding({
+    backendStatus: "connected",
+    workbench: { state: "empty", message: "No authorized project projection is available yet." },
+    onIntake: async (input) => {
+      seen.push(input);
+      return { ok: true, projectId: "project-landing" };
+    },
+  });
+  try {
+    expect(mounted.container.textContent).toContain("Less chasing.");
+    expect(mounted.container.textContent).toContain("Open a workspace");
+    await mounted.clickButton("Try the Northside");
+    expect(mounted.container.textContent).toContain("The sample demo is not available in this build.");
+    expect(seen).toHaveLength(0);
+    await mounted.clickButton("Start your own brief instead");
+    expect(mounted.container.textContent).toContain("Open a workspace");
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("landing keeps keyboard entry points, skip link, and status retry", async () => {
+  const mounted = await mountLanding({ backendStatus: "unavailable", onRetry: () => undefined });
+  try {
+    const buttons = Array.from(mounted.container.querySelectorAll("button"));
+    expect(buttons.length).toBeGreaterThan(0);
+    for (const button of buttons) {
+      expect(button.tagName).toBe("BUTTON");
+    }
+    expect(mounted.container.querySelector(".wb-skip-link")?.textContent).toContain("Skip to content");
+    expect(mounted.container.querySelector("main#workbench-main")).not.toBeNull();
+    expect(mounted.container.querySelector("nav[aria-label]")).not.toBeNull();
+    const retry = Array.from(mounted.container.querySelectorAll("button")).find((candidate) =>
+      candidate.textContent?.includes("Retry connection"),
+    );
+    expect(retry).not.toBeUndefined();
+    const demo = Array.from(mounted.container.querySelectorAll("button")).find((candidate) =>
+      candidate.textContent?.includes("Try the Northside"),
+    );
+    if (demo === undefined) throw new Error("Demo button not found");
+    demo.focus();
+    expect((mounted.dom.document.activeElement as unknown) === (demo as unknown)).toBe(true);
+  } finally {
+    await mounted.cleanup();
+  }
+});
