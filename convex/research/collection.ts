@@ -34,7 +34,7 @@ import { components } from "../models/components.js";
 import type { ComponentApi } from "@firecrawl/firecrawl-convex/_generated/component.js";
 import { canonicalJson, requestKey } from "../shared/hashing.js";
 import { provenanceLabel } from "../shared/provenance.js";
-import { MAX_OPERATIONS_PER_GRANT, MAX_OPERATIONS_PER_JOB } from "../shared/scope.js";
+import { MAX_OPERATIONS_PER_JOB } from "../shared/scope.js";
 import {
   compareResultValidator,
   classifyFirecrawlError,
@@ -384,78 +384,115 @@ function collectionTargetsEqual(first: CollectionTarget, second: CollectionTarge
   return first.mode === second.mode && (first.sourceUrl ?? undefined) === (second.sourceUrl ?? undefined);
 }
 
-/**
- * Maximum project grants examined by the cross-grant request fence below.
- * Grants are approver-issued, so a caller holding one valid grant cannot
- * inflate this list to push another grant's request out of the scan window.
- */
-const MAX_PROJECT_GRANTS_SCANNED = 32;
-
 interface ProjectRequestSibling {
   readonly operationId: Id<"operations">;
   readonly jobId: Id<"jobs">;
   readonly normalizedPayload: string;
+  readonly state: string;
   readonly binding: CollectionTarget | undefined;
+}
+
+const COLLECTION_OPERATION_KIND = "research.collect";
+
+/**
+ * Collection requests use a project-scoped exact key. The generic operation
+ * key is organization-scoped, which is correct for most operations but would
+ * incorrectly couple two projects that reuse a client request ID. Keeping
+ * the project in this opaque key lets one indexed lookup enforce both
+ * cross-grant idempotency and cross-project isolation.
+ */
+function collectionRequestKey(
+  organizationId: Id<"organizations">,
+  projectId: Id<"projects">,
+  clientRequestId: string,
+): string {
+  return requestKey(`${organizationId}|${projectId}`, COLLECTION_OPERATION_KIND, clientRequestId);
+}
+
+function legacyCollectionRequestKey(organizationId: Id<"organizations">, requestId: string): string {
+  return requestKey(organizationId, COLLECTION_OPERATION_KIND, requestId);
+}
+
+/**
+ * `operations.create` derives its index key from the request ID it receives.
+ * Use a project-bound temporary ID during that generic admission, then
+ * replace it with the server-owned bound request ID and collection key in
+ * this mutation. This preserves the target binding in `requestId` while the
+ * exact project/client key remains independent of mode and source URL.
+ */
+function collectionCreationRequestId(projectId: Id<"projects">, boundRequestId: string): string {
+  return `${projectId}|${boundRequestId}`;
+}
+
+function collectionTargetMatches(
+  binding: CollectionTarget | undefined,
+  requestedTarget: CollectionTarget,
+): boolean {
+  // Rows written before F03 had no target binding. Those rows represented the
+  // original default search operation; treating them as search keeps the
+  // controlled fixture state readable while a changed mode/source conflicts.
+  return collectionTargetsEqual(binding ?? { mode: "search" }, requestedTarget);
 }
 
 /**
  * Cross-grant request lookup for one logical project/client request ID.
  *
- * The bound `by_requestKey` identity folds the collection target into the
- * key, so a changed target misses that exact lookup by design. This helper
- * finds the original operation under any grant of the same project instead,
- * so presenting another valid grant with the same client request ID can
- * never mint a second job, reservation, or provider exposure.
- *
- * Every read is indexed and bounded: grants enumerate through
- * `by_project_and_status` and each grant's operations through `by_grant`.
- * A bound overflow fails closed before any job, reservation, or dispatch
- * side effect. Only rows in this organization, project, and operation kind
- * participate, so no cross-project request identity is disclosed or blocked.
+ * The primary probe is one exact project/client key, so grant rotation does
+ * not enumerate active, revoked, or expired grants. Two legacy probes keep
+ * the current controlled fixture rows and pre-fix bound keys readable while
+ * new rows converge on the project-scoped exact key. Every probe is an
+ * indexed, two-row maximum read and only rows belonging to this organization,
+ * project, and operation kind participate.
  */
 async function lookupProjectRequest(
   ctx: F1MutationCtx,
   organizationId: Id<"organizations">,
   projectId: Id<"projects">,
   clientRequestId: string,
+  requestedTarget: CollectionTarget,
 ): Promise<
   | { readonly ok: true; readonly sibling: ProjectRequestSibling | null }
   | { readonly ok: false; readonly code: "duplicate-conflict"; readonly message: string }
 > {
-  const unverifiable = {
-    ok: false as const,
-    code: "duplicate-conflict" as const,
-    message: "requestId could not be verified across project grants",
-  };
-  for (const status of ["active", "revoked", "expired"] as const) {
-    const projectGrants = await ctx.db
-      .query("grants")
-      .withIndex("by_project_and_status", (q) => q.eq("projectId", projectId).eq("status", status))
-      .take(MAX_PROJECT_GRANTS_SCANNED + 1);
-    if (projectGrants.length > MAX_PROJECT_GRANTS_SCANNED) return unverifiable;
-    for (const grant of projectGrants) {
-      if (grant.organizationId !== organizationId || grant.projectId !== projectId) continue;
-      const siblings = await ctx.db
-        .query("operations")
-        .withIndex("by_grant", (q) => q.eq("grantId", grant._id))
-        .take(MAX_OPERATIONS_PER_GRANT + 1);
-      if (siblings.length > MAX_OPERATIONS_PER_GRANT) return unverifiable;
-      for (const sibling of siblings) {
-        if (sibling.kind !== "research.collect") continue;
-        if (sibling.organizationId !== organizationId || sibling.projectId !== projectId) continue;
-        const decoded = decodeCollectionRequestId(sibling.requestId);
-        if (decoded.clientRequestId !== clientRequestId) continue;
-        return {
-          ok: true as const,
-          sibling: {
-            operationId: sibling._id,
-            jobId: sibling.jobId,
-            normalizedPayload: sibling.normalizedPayload,
-            binding: decoded.binding,
-          },
-        };
-      }
+  const boundRequestId = encodeCollectionRequestId(clientRequestId, requestedTarget);
+  const keys = [
+    collectionRequestKey(organizationId, projectId, clientRequestId),
+    legacyCollectionRequestKey(organizationId, clientRequestId),
+    legacyCollectionRequestKey(organizationId, boundRequestId),
+  ];
+  for (const key of [...new Set(keys)]) {
+    const rows = await ctx.db
+      .query("operations")
+      .withIndex("by_requestKey", (q) => q.eq("requestKey", key))
+      .take(2);
+    if (rows.length > 1) {
+      return {
+        ok: false as const,
+        code: "duplicate-conflict" as const,
+        message: "requestId maps to multiple collection operations",
+      };
     }
+    const sibling = rows[0];
+    if (
+      sibling === undefined ||
+      sibling.organizationId !== organizationId ||
+      sibling.projectId !== projectId ||
+      sibling.kind !== COLLECTION_OPERATION_KIND
+    ) {
+      continue;
+    }
+    const decoded = decodeCollectionRequestId(sibling.requestId);
+    if (decoded.clientRequestId !== clientRequestId) continue;
+    return {
+      ok: true as const,
+      sibling: {
+        operationId: sibling._id,
+        jobId: sibling.jobId,
+        normalizedPayload: sibling.normalizedPayload,
+        state: sibling.state,
+        binding: decoded.binding,
+      },
+    };
   }
   return { ok: true as const, sibling: null };
 }
@@ -1174,24 +1211,20 @@ export const requestResearchWithoutGrant = f1Mutation({
       }
     }
     const operationPayload = canonicalResearchPayload(args.researchIntent);
-    // F03: the retry lookup covers both the bound request identity (same
-    // client requestId, mode, and sourceUrl) and legacy bare rows. A changed
-    // target misses both lookups and falls through to the allowance refusal
-    // below, never to a false success.
-    const boundKey = requestKey(
+    const requestedTarget = collectionTargetOf(args.mode, args.sourceUrl, targetCheck.effectiveMode);
+    const existingLookup = await lookupProjectRequest(
+      ctx,
       project.organizationId,
-      "research.collect",
-      encodeCollectionRequestId(args.requestId, collectionTargetOf(args.mode, args.sourceUrl, targetCheck.effectiveMode)),
+      project._id,
+      args.requestId,
+      requestedTarget,
     );
-    const bareKey = requestKey(project.organizationId, "research.collect", args.requestId);
-    const existing =
-      (await ctx.db.query("operations").withIndex("by_requestKey", (q) => q.eq("requestKey", boundKey)).unique()) ??
-      (await ctx.db.query("operations").withIndex("by_requestKey", (q) => q.eq("requestKey", bareKey)).unique());
+    if (!existingLookup.ok) return existingLookup;
+    const existing = existingLookup.sibling;
     if (existing !== null) {
       if (
-        existing.projectId !== project._id ||
-        existing.kind !== "research.collect" ||
-        existing.normalizedPayload !== operationPayload
+        existing.normalizedPayload !== operationPayload ||
+        !collectionTargetMatches(existing.binding, requestedTarget)
       ) {
         return { ok: false as const, code: "duplicate-conflict", message: "requestId reused with a different research payload" };
       }
@@ -1202,7 +1235,7 @@ export const requestResearchWithoutGrant = f1Mutation({
       return {
         ok: true as const,
         jobId: existing.jobId,
-        operationId: existing._id,
+        operationId: existing.operationId,
         state: existingJob.state,
         requestCount: existing.state === "observedSuccess" ? 1 : 0,
         incompleteCount: existing.state === "observedSuccess" ? 0 : 0,
@@ -1267,47 +1300,37 @@ export const requestGrantedResearch = f1Mutation({
       return { ok: false as const, code: "changed-draft", message: "research intent does not match the approved grant" };
     }
     // F03: the stored request identity binds the client requestId together
-    // with the effective collection target. An identical retry returns the
-    // existing operation; a same-key retry with another mode or source URL
-    // conflicts before any job, reservation, or dispatch side effect.
+    // with the effective collection target. The separate project-scoped
+    // request key makes this lookup exact across grant rotation while a
+    // changed mode or source URL still conflicts before any job, reservation,
+    // or dispatch side effect.
     const requestedTarget = collectionTargetOf(args.mode, args.sourceUrl, targetCheck.effectiveMode);
     const boundRequestId = encodeCollectionRequestId(args.requestId, requestedTarget);
-    const boundKey = requestKey(project.organizationId, "research.collect", boundRequestId);
-    const existing = await ctx.db.query("operations").withIndex("by_requestKey", (q) => q.eq("requestKey", boundKey)).unique();
-    if (existing !== null) {
-      if (existing.projectId !== project._id || existing.kind !== "research.collect" || existing.normalizedPayload !== operationPayload) {
-        return { ok: false as const, code: "duplicate-conflict", message: "requestId reused with a different research payload" };
-      }
-      const existingJob = await ctx.db.get(existing.jobId);
-      if (existingJob === null || existingJob.projectId !== project._id) {
-        return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
-      }
-      return { ok: true as const, jobId: existing.jobId, operationId: existing._id, state: existingJob.state, requestCount: 0, incompleteCount: 0, controlled: false };
-    }
-    // Cross-grant idempotency fence: the same logical project/client
-    // request ID returns its original operation (identical payload and
-    // collection target, including legacy rows without a stored binding)
-    // or conflicts (changed payload or target) under every grant of this
-    // project, before any job, reservation, or dispatch side effect.
-    const crossGrant = await lookupProjectRequest(ctx, project.organizationId, project._id, args.requestId);
+    const crossGrant = await lookupProjectRequest(
+      ctx,
+      project.organizationId,
+      project._id,
+      args.requestId,
+      requestedTarget,
+    );
     if (!crossGrant.ok) return crossGrant;
     const sibling = crossGrant.sibling;
     if (sibling !== null) {
-      if (
-        sibling.normalizedPayload === operationPayload &&
-        (sibling.binding === undefined || collectionTargetsEqual(sibling.binding, requestedTarget))
-      ) {
-        const siblingJob = await ctx.db.get(sibling.jobId);
-        if (
-          siblingJob === null ||
-          siblingJob.organizationId !== project.organizationId ||
-          siblingJob.projectId !== project._id
-        ) {
-          return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
-        }
-        return { ok: true as const, jobId: sibling.jobId, operationId: sibling.operationId, state: siblingJob.state, requestCount: 0, incompleteCount: 0, controlled: false };
+      if (sibling.normalizedPayload !== operationPayload) {
+        return { ok: false as const, code: "duplicate-conflict", message: "requestId reused with a different research payload" };
       }
-      return { ok: false as const, code: "duplicate-conflict", message: "requestId reused with a different research payload" };
+      if (!collectionTargetMatches(sibling.binding, requestedTarget)) {
+        return { ok: false as const, code: "duplicate-conflict", message: "requestId reused with a different research payload" };
+      }
+      const existingJob = await ctx.db.get(sibling.jobId);
+      if (
+        existingJob === null ||
+        existingJob.organizationId !== project.organizationId ||
+        existingJob.projectId !== project._id
+      ) {
+        return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
+      }
+      return { ok: true as const, jobId: sibling.jobId, operationId: sibling.operationId, state: existingJob.state, requestCount: 0, incompleteCount: 0, controlled: false };
     }
     const pausedJobs = await ctx.db.query("jobs").withIndex("by_project", (q) => q.eq("projectId", project._id)).take(MAX_PROJECT_RECORDS + 1);
     if (pausedJobs.length > MAX_PROJECT_RECORDS || pausedJobs.some((job) => job.state === "pausedBudget")) {
@@ -1349,8 +1372,8 @@ export const requestGrantedResearch = f1Mutation({
       jobId: started.jobId,
       organizationId: project.organizationId,
       projectId: project._id,
-      kind: "research.collect",
-      requestId: boundRequestId,
+      kind: COLLECTION_OPERATION_KIND,
+      requestId: collectionCreationRequestId(project._id, boundRequestId),
       payloadJson: operationPayload,
       grantId: args.grantId,
       reservationId: reserved.reservationId,
@@ -1359,6 +1382,10 @@ export const requestGrantedResearch = f1Mutation({
       await ctx.runMutation(cancelJobRef, { jobId: started.jobId, reason: "research operation could not be created" });
       return created;
     }
+    await ctx.db.patch(created.operationId, {
+      requestId: boundRequestId,
+      requestKey: collectionRequestKey(project.organizationId, project._id, args.requestId),
+    });
     await ctx.scheduler.runAfter(0, makeInternalActionRef<ExecuteArgs, ExecuteReturn>("research/collection:execute"), {
       operationId: created.operationId,
       identity,
@@ -1483,21 +1510,23 @@ export const recoverResearch = f1Mutation({
     });
     if (!reserved.ok) return reserved;
     const payload = operation.normalizedPayload;
-    const recoveryRequestId = encodeCollectionRequestId(
-      `${args.operationId}:recovery:${args.requestId}`,
-      recoveryTarget,
-    );
+    const recoveryClientRequestId = `${args.operationId}:recovery:${args.requestId}`;
+    const recoveryRequestId = encodeCollectionRequestId(recoveryClientRequestId, recoveryTarget);
     const created = await ctx.runMutation(createOperationRef, {
       jobId: job._id,
       organizationId: job.organizationId,
       projectId: job.projectId,
-      kind: "research.collect",
-      requestId: recoveryRequestId,
+      kind: COLLECTION_OPERATION_KIND,
+      requestId: collectionCreationRequestId(job.projectId, recoveryRequestId),
       payloadJson: payload,
       grantId: operation.grantId,
       reservationId: reserved.reservationId,
     });
     if (!created.ok) return created;
+    await ctx.db.patch(created.operationId, {
+      requestId: recoveryRequestId,
+      requestKey: collectionRequestKey(job.organizationId, job.projectId, recoveryClientRequestId),
+    });
     await ctx.scheduler.runAfter(0, makeInternalActionRef<ExecuteArgs, ExecuteReturn>("research/collection:execute"), {
       operationId: created.operationId,
       identity,

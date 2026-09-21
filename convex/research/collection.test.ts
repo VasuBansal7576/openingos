@@ -205,6 +205,60 @@ async function createFixture(t: TestConvex<typeof schema>, requestId = "r1-reque
   };
 }
 
+type RotatedGrantStatus = "active" | "revoked" | "expired";
+
+async function issueRotatedGrants(
+  t: TestConvex<typeof schema>,
+  fixture: Fixture,
+  status: RotatedGrantStatus,
+  count = 33,
+): Promise<Id<"grants">[]> {
+  const asOwner = t.withIdentity(OWNER);
+  const grantIds: Id<"grants">[] = [];
+  for (let index = 0; index < count; index += 1) {
+    const grant = await asOwner.mutation(issueGrantRef, {
+      organizationId: fixture.organizationId,
+      projectId: fixture.projectId,
+      operations: ["research.collect"],
+      communicationProfile: "ownerRoleplay",
+      recipientConfigVersion: 0,
+      inputVersions: { brief: "r1-v1" },
+      payloadJson: canonicalJson({ query: "Research suppliers for the espresso machine" }),
+      costCeilingMicroUsd: 250_000,
+      roundLimit: 8,
+      expiresAt: Date.now() + 60 * 60 * 1000 + index,
+    });
+    if (!grant.ok) throw new Error(`rotated grant setup failed: ${grant.message}`);
+    grantIds.push(grant.grantId);
+  }
+  if (status !== "active") {
+    await t.run(async (ctx) => {
+      for (const grantId of grantIds) {
+        await ctx.db.patch(grantId, status === "revoked"
+          ? { status: "revoked", revocationVersion: 2 }
+          : { status: "expired", expiresAt: Date.now() - 1 });
+      }
+    });
+  }
+  return grantIds;
+}
+
+async function countProjectEffects(
+  t: TestConvex<typeof schema>,
+  projectId: Id<"projects">,
+): Promise<{ jobs: number; operations: number; reservations: number }> {
+  return await t.run(async (ctx) => {
+    const jobs = await ctx.db.query("jobs").withIndex("by_project", (q) => q.eq("projectId", projectId)).take(128);
+    const operations = (await ctx.db.query("operations").take(128)).filter((row) => row.projectId === projectId);
+    const reservations = (
+      await Promise.all(
+        jobs.map((job) => ctx.db.query("reservations").withIndex("by_job", (q) => q.eq("jobId", job._id)).take(128)),
+      )
+    ).flat();
+    return { jobs: jobs.length, operations: operations.length, reservations: reservations.length };
+  });
+}
+
 function init(): TestConvex<typeof schema> {
   process.env.FIRECRAWL_API_KEY = "controlled-r1-key";
   const t = convexTest(schema, modules);
@@ -988,6 +1042,71 @@ describe("R1 collection-target binding (F03)", () => {
     expect(identical.operationId).toBe(first.operationId);
     expect(identical.jobId).toBe(first.jobId);
     expect(await countRows()).toEqual({ jobs: 2, firstGrantOps: 2, secondGrantOps: 0 });
+  });
+
+  async function assertGrantRotation(status: RotatedGrantStatus): Promise<void> {
+    const t = init();
+    const fixture = await createFixture(t, `rotation-fixture-${status}`);
+    const asOwner = t.withIdentity(OWNER);
+    await issueRotatedGrants(t, fixture, status);
+    const retryGrant = await asOwner.mutation(issueGrantRef, {
+      organizationId: fixture.organizationId,
+      projectId: fixture.projectId,
+      operations: ["research.collect"],
+      communicationProfile: "ownerRoleplay",
+      recipientConfigVersion: 0,
+      inputVersions: { brief: "r1-v1" },
+      payloadJson: canonicalJson({ query: INTENT }),
+      costCeilingMicroUsd: 250_000,
+      roundLimit: 8,
+      expiresAt: Date.now() + 60 * 60 * 1000,
+    });
+    if (!retryGrant.ok) throw new Error(`retry grant setup failed: ${retryGrant.message}`);
+
+    const requestId = `rotation-${status}`;
+    const first = await asOwner.mutation(requestGrantedResearchRef, {
+      projectId: fixture.projectId,
+      researchIntent: INTENT,
+      requestId,
+      grantId: fixture.grantId,
+      mode: "search",
+    });
+    expect(first.ok).toBe(true);
+    if (!first.ok || first.operationId === null) throw new Error(`fresh request failed after ${status} grant rotation`);
+    const afterFirst = await countProjectEffects(t, fixture.projectId);
+    expect(afterFirst).toEqual({ jobs: 2, operations: 2, reservations: 2 });
+
+    const changedTarget = await asOwner.mutation(requestGrantedResearchRef, {
+      projectId: fixture.projectId,
+      researchIntent: INTENT,
+      requestId,
+      grantId: retryGrant.grantId,
+      mode: "scrape",
+      sourceUrl: "https://supplier.example.test/rotation-changed",
+    });
+    expect(changedTarget).toMatchObject({ ok: false, code: "duplicate-conflict" });
+
+    const identical = await asOwner.mutation(requestGrantedResearchRef, {
+      projectId: fixture.projectId,
+      researchIntent: INTENT,
+      requestId,
+      grantId: retryGrant.grantId,
+      mode: "search",
+    });
+    expect(identical).toMatchObject({ ok: true, operationId: first.operationId, jobId: first.jobId });
+    expect(await countProjectEffects(t, fixture.projectId)).toEqual(afterFirst);
+  }
+
+  test("fresh request and cross-grant retry survive more than 32 active grants", async () => {
+    await assertGrantRotation("active");
+  });
+
+  test("fresh request and cross-grant retry survive more than 32 revoked grants", async () => {
+    await assertGrantRotation("revoked");
+  });
+
+  test("fresh request and cross-grant retry survive more than 32 expired grants", async () => {
+    await assertGrantRotation("expired");
   });
 
   test("same client requestId in another project is an independent request", async () => {
