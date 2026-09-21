@@ -1003,7 +1003,27 @@ async function replayWaitingForThread(
   let replayed = 0;
   let stillWaiting = 0;
   let ingests = 0;
+  // Monotonic attempt ordering: the stamp strictly exceeds both the wall
+  // clock and the highest waiting attempt value already stored, so patched
+  // rows always sort behind every row evaluated earlier — even when the
+  // clock is frozen. Progress never depends on time advancing.
+  const highest = await ctx.db
+    .query("processedEvents")
+    .withIndex("by_provider_environment_and_thread_inbox_state_and_attempt", (q) =>
+      q
+        .eq("provider", "agentmail-inbound")
+        .eq("environment", "live")
+        .eq("providerThreadId", threadId)
+        .eq("providerInboxId", inboxId)
+        .eq("applicationState", "outcomeUnknown"),
+    )
+    .order("desc")
+    .take(1);
+  const highestValue = highest[0]?.replayLastAttemptAt;
   const now = Date.now();
+  const stamp = typeof highestValue === "number" && Number.isSafeInteger(highestValue) && highestValue >= now
+    ? highestValue + 1
+    : now;
   for (const row of rows.slice(0, WAITING_REPLAY_LIMIT)) {
     const stored = parseWaitingSnapshot(parseObject(row.outcome));
     if (
@@ -1032,13 +1052,13 @@ async function replayWaitingForThread(
         });
       }
       stillWaiting += 1;
-      await ctx.db.patch(row._id, { replayLastAttemptAt: now });
+      await ctx.db.patch(row._id, { replayLastAttemptAt: stamp });
       continue;
     }
     const binding = await conversationForMessage(ctx, stored);
     if (binding === null || ingests >= WAITING_REPLAY_LIMIT) {
       stillWaiting += 1;
-      await ctx.db.patch(row._id, { replayLastAttemptAt: now });
+      await ctx.db.patch(row._id, { replayLastAttemptAt: stamp });
       continue;
     }
     const result = await ingestBoundMessage(
@@ -1055,7 +1075,7 @@ async function replayWaitingForThread(
     );
     if (!result.ok) {
       stillWaiting += 1;
-      await ctx.db.patch(row._id, { replayLastAttemptAt: now });
+      await ctx.db.patch(row._id, { replayLastAttemptAt: stamp });
       continue;
     }
     ingests += 1;
