@@ -1,0 +1,1214 @@
+/**
+ * UI-owned boundary for the project-scoped purchasing projection.
+ *
+ * The browser never receives recipient addresses, raw message headers, or
+ * provider credentials. The adapter accepts the exact redacted W1 result and
+ * this module transforms it into the deliberately smaller view model.
+ */
+
+export type ProvenanceMode = "controlled" | "recorded" | "live" | "fixture" | "mixed" | "unknown";
+
+export type DeliveryState = "queued" | "sent" | "delivered" | "unknown" | "partial" | "paused";
+
+/** Exact safe execution lifecycle states projected by the Convex workbench. */
+export type WorkbenchJobState =
+  | "queued"
+  | "running"
+  | "waitingForSupplier"
+  | "waitingForUser"
+  | "pausedBudget"
+  | "completed"
+  | "partial"
+  | "failed"
+  | "cancelling"
+  | "cancelled";
+
+export type WorkbenchLoadState =
+  | { readonly state: "loading"; readonly lastKnown?: WorkbenchSnapshot }
+  | { readonly state: "ready"; readonly snapshot: WorkbenchSnapshot }
+  | { readonly state: "empty"; readonly message: string }
+  | { readonly state: "error"; readonly message: string; readonly lastKnown?: WorkbenchSnapshot }
+  | { readonly state: "reconnecting"; readonly lastKnown?: WorkbenchSnapshot };
+
+export type WorkbenchRole = "viewer" | "contributor" | "approver" | "owner";
+
+export interface WorkbenchCapabilities {
+  readonly canResearch: boolean;
+  readonly canRecordEvidence: boolean;
+  readonly canRecordQuote: boolean;
+  readonly canCompare: boolean;
+  readonly canCommunicate: boolean;
+  readonly canClarify: boolean;
+  /** Server-authoritative approval capability. Absent means unrepresented authority (null). */
+  readonly canApprove: boolean | null;
+  /** Server-authoritative service-case capability. Missing/malformed values fail closed in the parser. */
+  readonly canOpenServiceCase: boolean;
+  readonly canRecordOrder: boolean | null;
+  readonly canResolveRisk: boolean | null;
+}
+
+export interface WorkbenchProject {
+  readonly id: string;
+  readonly organizationId: string;
+  readonly name: string;
+  readonly region: string | null;
+  readonly currency: string | null;
+  readonly budgetMinorUnits: number | null;
+  readonly needByAt: number | null;
+  readonly sampleKind?: "controlledSample" | null;
+  readonly sampleLabel?: string | null;
+}
+
+export interface WorkbenchAccess {
+  readonly role: WorkbenchRole;
+  readonly capabilities: WorkbenchCapabilities;
+}
+
+export interface WorkbenchRequirement {
+  readonly id: string;
+  readonly key: string;
+  readonly title: string;
+  readonly category: string;
+  readonly quantity: string;
+  readonly unit: string;
+  readonly priority: string;
+  readonly state: string;
+  readonly fulfillment: string;
+  readonly version: number;
+  readonly budgetMinorUnits: number | null;
+  readonly needByAt: number | null;
+}
+
+export type Compatibility = "pass" | "fail" | "unknown";
+
+export interface WorkbenchVendor {
+  readonly id: string;
+  readonly name: string;
+  readonly regions: readonly string[];
+  readonly serviceCoverage: string | null;
+}
+
+export type ChargeState = "known" | "included" | "estimated" | "unknown" | "notApplicable";
+
+export interface WorkbenchQuoteLine {
+  readonly lineId: string;
+  readonly description: string;
+  readonly quantity: string;
+  readonly unit: string | null;
+  readonly unitMinorUnits: number | null;
+  readonly evidenceIds: readonly string[];
+}
+
+export interface WorkbenchQuoteCharge {
+  readonly kind: string;
+  readonly state: ChargeState;
+  readonly minorUnits: number | null;
+  readonly currency: string;
+  readonly scope: string;
+  readonly evidenceIds: readonly string[];
+}
+
+/** Exact native money: no conversion is ever applied in the browser. */
+export interface WorkbenchMoney {
+  readonly currency: string;
+  readonly minorUnits: number;
+}
+
+/** Complete recorded comparison scope retained verbatim from the backend. */
+export interface WorkbenchComparisonScopeItem {
+  readonly itemId: string;
+  readonly lineId: string;
+  readonly unit: string;
+  readonly requiredQuantity: string;
+}
+
+export interface WorkbenchComparisonScope {
+  readonly requirementId: string;
+  readonly scopeId: string;
+  readonly items: readonly WorkbenchComparisonScopeItem[];
+}
+
+/**
+ * F2 machine statuses for an authoritative pairwise verdict. Only
+ * `comparable` verdicts may drive rank or delta in the UI; `incompatible`,
+ * `estimated`, and `incomplete` verdicts carry a truthful reason and must
+ * be shown as not rankable.
+ */
+export type WorkbenchComparisonStatus = "comparable" | "estimated" | "incompatible" | "incomplete";
+
+/** Authoritative backend verdict for one offer against one other offer. */
+export interface WorkbenchOfferComparison {
+  readonly againstOfferId: string;
+  readonly againstQuoteId: string | null;
+  readonly status: WorkbenchComparisonStatus;
+  readonly reason: string;
+  readonly differenceMinorUnits: number | null;
+  readonly cheaper: "self" | "other" | "equal" | null;
+  readonly estimatedDeltaMinorUnits: { readonly minimum: number; readonly maximum: number } | null;
+}
+
+export interface WorkbenchQuote {
+  readonly id: string;
+  readonly version: string;
+  readonly currency: string;
+  readonly lines: readonly WorkbenchQuoteLine[];
+  readonly charges: readonly WorkbenchQuoteCharge[];
+  readonly totalMinorUnits: number | null;
+  readonly comparableTotalMinorUnits: number | null;
+  /** Native-currency exact total; never a converted amount. */
+  readonly total: WorkbenchMoney | null;
+  /** Exact tax-basis identity, or null when the basis is unknown. */
+  readonly taxBasisId: string | null;
+  readonly comparisonScope: WorkbenchComparisonScope | null;
+  readonly validUntil: number | null;
+  readonly taxBasis: "inclusive" | "exclusive" | "unknown";
+  readonly superseded: boolean | null;
+}
+
+export interface WorkbenchEvidence {
+  readonly id: string;
+  readonly label: string;
+  readonly sourceKind: string;
+  readonly freshness: string;
+  readonly verification: string;
+  readonly executionMode: ProvenanceMode;
+  readonly counterpartyRole: string;
+  readonly origin: "internal" | "ownerImport" | null;
+  readonly sourceUrl: string | null;
+}
+
+export interface WorkbenchOffer {
+  readonly id: string;
+  readonly requirementId: string;
+  readonly vendor: WorkbenchVendor | null;
+  readonly productModel: string;
+  readonly variant: string;
+  readonly compatibility: Compatibility;
+  readonly conversationState: string;
+  readonly quote: WorkbenchQuote | null;
+  /**
+   * F2 authoritative pairwise verdicts from the backend. An offer with no
+   * verdict against another offer must never be ranked or differenced in
+   * the UI; only `status: "comparable"` verdicts carry a difference.
+   */
+  readonly comparisons: readonly WorkbenchOfferComparison[];
+  readonly evidence: readonly WorkbenchEvidence[];
+  readonly provenance: ProvenanceMode;
+  readonly ownerAuthoredTerms: boolean;
+  readonly recommendationNote: string | null;
+}
+
+export interface WorkbenchJob {
+  readonly id: string;
+  readonly kind: string;
+  readonly cancellable: boolean;
+  readonly state: WorkbenchJobState;
+  readonly delivery: DeliveryState;
+  readonly progress: number | null;
+  readonly attempts: number;
+  readonly updatedAt: number;
+  readonly failureCode: string | null;
+  readonly lastCheckedAt: number | null;
+  readonly summary: string | null;
+  readonly evidenceIds: readonly string[];
+}
+
+export interface WorkbenchDecision {
+  readonly id: string;
+  readonly type: string;
+  readonly state: string;
+  readonly requirementId: string | null;
+  readonly offerId: string | null;
+  readonly quoteId: string | null;
+  readonly quoteVersion: string | null;
+  /** Safe immutable approval basis metadata, never the canonical snapshot. */
+  readonly scope: string | null;
+  readonly snapshotHash: string | null;
+  readonly requestedAt: number;
+  readonly evidenceIds: readonly string[];
+  readonly summary: string | null;
+  readonly authorizationRequired: boolean | null;
+}
+
+export interface WorkbenchActivityItem {
+  readonly id: string;
+  readonly type: string;
+  readonly occurredAt: number;
+  readonly actorLabel: string | null;
+  readonly state: string;
+  readonly summary: string | null;
+  readonly evidenceIds: readonly string[];
+}
+
+export interface WorkbenchActivityPage {
+  readonly items: readonly WorkbenchActivityItem[];
+  readonly continueCursor: string | null;
+  readonly isDone: boolean;
+}
+
+export interface WorkbenchAssetDocument {
+  readonly kind: string;
+  readonly createdAt: number;
+}
+
+export interface WorkbenchServiceCase {
+  readonly id: string;
+  readonly urgency: string;
+  readonly summary: string;
+  readonly state: string;
+  readonly outcome: string | null;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+}
+
+export interface WorkbenchAsset {
+  readonly id: string;
+  readonly label: string;
+  readonly serial: string | null;
+  readonly constraints: string | null;
+  readonly purchaseProvenance: string | null;
+  readonly createdAt: number;
+  readonly documents: readonly WorkbenchAssetDocument[];
+  readonly documentsTruncated: boolean;
+  readonly serviceCases: readonly WorkbenchServiceCase[];
+  readonly serviceCasesTruncated: boolean;
+}
+
+/** E8 stored changed-term impact: reason and order impact only, never invented outcomes. */
+export interface WorkbenchImpact {
+  readonly id: string;
+  readonly requirementId: string;
+  readonly trigger: "quoteRevision" | "watchObservation";
+  readonly state: "recorded" | "unknown" | "incomplete";
+  readonly orderImpact: "none" | "selectionOnly" | "reviewRequired" | "unknown";
+  readonly reason: string;
+  readonly quoteVersion: string | null;
+  readonly predecessorQuoteVersion: string | null;
+  readonly watchResult: string | null;
+  readonly placedOrderCount: number;
+  readonly createdAt: number;
+}
+
+/** E8 substitute proposal: fresh approval required while pending and basis current. */
+export interface WorkbenchSubstitute {
+  readonly id: string;
+  readonly requirementId: string;
+  readonly assessmentId: string;
+  readonly proposedCandidateId: string;
+  readonly proposedQuoteId: string;
+  readonly proposedQuoteVersion: string;
+  readonly state: "pending" | "approved" | "rejected";
+  readonly reason: string;
+  readonly basisStale: boolean;
+  readonly basisReason: string;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+}
+
+export interface WorkbenchEquipment {
+  readonly assets: readonly WorkbenchAsset[];
+  readonly assetsTruncated: boolean;
+}
+
+export interface WorkbenchProvenance {
+  readonly mode: ProvenanceMode;
+  readonly label: string;
+  readonly ownerAuthoredTerms: boolean;
+}
+
+export interface WorkbenchSnapshot {
+  readonly project: WorkbenchProject;
+  readonly access: WorkbenchAccess;
+  readonly requirements: readonly WorkbenchRequirement[];
+  readonly offers: readonly WorkbenchOffer[];
+  readonly jobs: readonly WorkbenchJob[];
+  readonly decisions: readonly WorkbenchDecision[];
+  readonly activity: WorkbenchActivityPage;
+  readonly provenance: WorkbenchProvenance;
+  readonly equipment: WorkbenchEquipment;
+  readonly impacts: readonly WorkbenchImpact[];
+  readonly substitutes: readonly WorkbenchSubstitute[];
+  readonly selectedOfferId: string | null;
+  readonly selectedForecastMinorUnits: number | null;
+  readonly committedMinorUnits: number | null;
+  readonly paidMinorUnits: number | null;
+  readonly deliveredQuantityByRequirement: Readonly<Record<string, string | null>>;
+  readonly truncation: {
+    readonly requirements: boolean;
+    readonly offers: boolean;
+    readonly jobs: boolean;
+    readonly decisions: boolean;
+    readonly impacts: boolean;
+    readonly substitutes: boolean;
+    readonly equipment: boolean;
+  };
+}
+
+export type WorkbenchAction =
+  | { readonly type: "startResearch"; readonly projectId: string }
+  | { readonly type: "retryJob"; readonly projectId: string; readonly jobId: string }
+  | { readonly type: "cancelJob"; readonly projectId: string; readonly jobId: string }
+  | { readonly type: "selectOffer"; readonly projectId: string; readonly offerId: string; readonly quoteId: string; readonly quoteVersion: string }
+  | { readonly type: "approveDecision"; readonly projectId: string; readonly decisionId: string }
+  | { readonly type: "decideSubstituteProposal"; readonly projectId: string; readonly proposalId: string; readonly decision: "approved" | "rejected" }
+  | {
+      readonly type: "openServiceCase";
+      readonly projectId: string;
+      readonly assetId: string;
+      readonly urgency: "urgent" | "high" | "normal" | "low";
+      readonly summary: string;
+      readonly idempotencyKey: string;
+    }
+  | { readonly type: "openEvidence"; readonly projectId: string; readonly evidenceId: string };
+
+export interface WorkbenchActionResult {
+  readonly ok: boolean;
+  readonly message?: string;
+}
+
+/** P-01 intake modes: opening, quote comparison, or equipment case. */
+export type WorkbenchIntakeMode = "opening" | "quoteComparison" | "equipment";
+
+export type WorkbenchIntakeUrgency = "urgent" | "high" | "normal" | "low";
+
+export interface WorkbenchIntakeInput {
+  readonly mode: WorkbenchIntakeMode;
+  readonly projectName: string;
+  readonly workspaceKind: "guest" | "private";
+  readonly region?: string;
+  readonly currency?: string;
+  readonly needByAt?: number;
+  readonly budgetMinorUnits?: number;
+  readonly detailTitle?: string;
+  readonly detailCategory?: string;
+  readonly detailSummary?: string;
+  readonly urgency?: WorkbenchIntakeUrgency;
+  readonly idempotencyKey: string;
+}
+
+export interface WorkbenchIntakeResult {
+  readonly ok: boolean;
+  readonly projectId?: string;
+  readonly message?: string;
+}
+
+export interface WorkbenchSampleInput {
+  readonly idempotencyKey: string;
+}
+
+export interface WorkbenchSampleResult {
+  readonly ok: boolean;
+  readonly projectId?: string;
+  readonly message?: string;
+}
+
+export type WorkbenchSampleHandler = (input: WorkbenchSampleInput) => Promise<WorkbenchSampleResult>;
+
+export interface WorkbenchServerAdapter {
+  readonly load: (projectId: string, cursor?: string | null) => Promise<unknown>;
+  readonly subscribe?: (projectId: string, onSnapshot: (snapshot: unknown) => void, onError: (error: unknown) => void) => (() => void);
+  readonly act: (action: WorkbenchAction) => Promise<WorkbenchActionResult>;
+  readonly createIntake?: (input: WorkbenchIntakeInput) => Promise<WorkbenchIntakeResult>;
+  readonly createSample?: (input: WorkbenchSampleInput) => Promise<WorkbenchSampleResult>;
+}
+
+export function formatMoney(minorUnits: number | null, currency: string | null, unknownLabel = "Unknown"): string {
+  if (minorUnits === null || !Number.isFinite(minorUnits) || currency === null || currency.trim().length === 0) return unknownLabel;
+  try {
+    return new Intl.NumberFormat("en-GB", { style: "currency", currency, minimumFractionDigits: 0, maximumFractionDigits: 2 }).format(minorUnits / 100);
+  } catch {
+    return `${currency} ${(minorUnits / 100).toFixed(2).replace(/\.00$/, "")}`;
+  }
+}
+
+export function formatDate(timestamp: number | null): string {
+  if (timestamp === null || !Number.isFinite(timestamp)) return "Date unknown";
+  return new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "short", year: "numeric" }).format(timestamp);
+}
+
+export function provenanceLabel(mode: ProvenanceMode): string {
+  switch (mode) {
+    case "controlled":
+      return "Controlled evidence";
+    case "recorded":
+      return "Recorded owner exchange";
+    case "live":
+      return "Live provider result";
+    case "fixture":
+      return "Controlled fixture evidence";
+    case "mixed":
+      return "Mixed evidence provenance";
+    case "unknown":
+      return "Provenance unknown";
+  }
+}
+
+export function deliveryLabel(state: DeliveryState): string {
+  switch (state) {
+    case "queued":
+      return "Queued";
+    case "sent":
+      return "Sent, awaiting delivery receipt";
+    case "delivered":
+      return "Delivered";
+    case "unknown":
+      return "Outcome unknown";
+    case "partial":
+      return "Partially completed";
+    case "paused":
+      return "Paused for review";
+  }
+}
+
+export function formatStateLabel(value: string): string {
+  return value
+    .replace(/([a-z])([A-Z])/g, "$1 $2")
+    .replace(/[-_]/g, " ")
+    .replace(/^./, (character) => character.toUpperCase());
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function nullableNumber(value: unknown): number | null | undefined {
+  if (value === undefined || value === null) return null;
+  return isFiniteNumber(value) ? value : undefined;
+}
+
+function nullableString(value: unknown): string | null | undefined {
+  if (value === undefined || value === null) return null;
+  return typeof value === "string" ? value : undefined;
+}
+
+function requiredString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+function isOneOf<T extends string>(value: unknown, options: readonly T[]): value is T {
+  return options.some((option) => option === value);
+}
+
+function stringArray(value: unknown): readonly string[] | null {
+  if (!Array.isArray(value) || !value.every((entry) => typeof entry === "string")) return null;
+  return value;
+}
+
+function parseProvenanceMode(value: unknown): ProvenanceMode | null {
+  return isOneOf(value, ["controlled", "recorded", "live", "fixture", "mixed", "unknown"] as const) ? value : null;
+}
+
+function parseProjectionProvenance(value: unknown): WorkbenchProvenance | null {
+  if (!isRecord(value)) return null;
+  const mode = parseProvenanceMode(value.mode);
+  const label = requiredString(value.label);
+  if (mode === null || label === null || typeof value.ownerAuthoredTerms !== "boolean") return null;
+  return { mode, label, ownerAuthoredTerms: value.ownerAuthoredTerms };
+}
+
+function parseMoney(value: unknown): { readonly currency: string; readonly minorUnits: number } | null {
+  if (!isRecord(value)) return null;
+  const currency = requiredString(value.currency);
+  const minorUnits = value.minorUnits;
+  if (currency === null || !isFiniteNumber(minorUnits) || !Number.isSafeInteger(minorUnits)) return null;
+  return { currency, minorUnits };
+}
+
+function parseEvidence(value: unknown): WorkbenchEvidence | null {
+  if (!isRecord(value)) return null;
+  const id = requiredString(value.id);
+  const field = requiredString(value.field);
+  const sourceKind = requiredString(value.sourceKind);
+  const sourceUrl = nullableString(value.sourceUrl);
+  const executionMode = parseProvenanceMode(value.executionMode);
+  const counterpartyRole = requiredString(value.counterpartyRole);
+  if (id === null || field === null || sourceKind === null || sourceUrl === undefined || executionMode === null || counterpartyRole === null || !isFiniteNumber(value.capturedAt) || typeof value.verification !== "string" || typeof value.freshness !== "string") return null;
+  if (sourceUrl !== null && !sourceUrl.startsWith("https://")) return null;
+  const lastCheckedAt = nullableNumber(value.lastCheckedAt);
+  if (lastCheckedAt === undefined) return null;
+  return { id, label: field, sourceKind, freshness: value.freshness, verification: value.verification, executionMode, counterpartyRole, origin: null, sourceUrl };
+}
+
+function chargeScopeLabel(value: unknown): string | null {
+  if (!isRecord(value) || !isOneOf(value.kind, ["quote", "line", "allocated"] as const)) return null;
+  if (value.kind === "quote") return "quote";
+  const lineId = requiredString(value.lineId);
+  if (lineId === null) return null;
+  if (value.kind === "line") return `line:${lineId}`;
+  return isOneOf(value.method, ["fixed", "proportional"] as const) ? `allocated:${lineId}:${value.method}` : null;
+}
+
+function parseCharge(value: unknown, quoteCurrency: string): WorkbenchQuoteCharge | null {
+  if (!isRecord(value)) return null;
+  const kind = requiredString(value.label);
+  const chargeId = requiredString(value.chargeId);
+  const scope = chargeScopeLabel(value.scope);
+  if (kind === null || chargeId === null || scope === null || !isRecord(value.state)) return null;
+  const stateKind = value.state.kind;
+  if (!isOneOf(stateKind, ["known", "included", "estimated", "unknown", "notApplicable"] as const)) return null;
+  let minorUnits: number | null = null;
+  let currency = quoteCurrency;
+  if (stateKind === "known") {
+    const amount = parseMoney(value.state.amount);
+    if (amount === null || amount.currency !== quoteCurrency) return null;
+    minorUnits = amount.minorUnits;
+    currency = amount.currency;
+  } else if (stateKind === "included") {
+    if (requiredString(value.state.coveringId) === null) return null;
+  } else if (stateKind === "estimated") {
+    if (!isRecord(value.state.estimate) || !isOneOf(value.state.estimate.kind, ["point", "range"] as const)) return null;
+    if (value.state.estimate.kind === "point") {
+      const amount = parseMoney(value.state.estimate.amount);
+      if (amount === null || amount.currency !== quoteCurrency) return null;
+      minorUnits = amount.minorUnits;
+      currency = amount.currency;
+    } else {
+      const minimum = parseMoney(value.state.estimate.minimum);
+      const maximum = parseMoney(value.state.estimate.maximum);
+      if (minimum === null || maximum === null || minimum.currency !== maximum.currency || minimum.currency !== quoteCurrency) return null;
+      currency = minimum.currency;
+    }
+  } else if (stateKind === "unknown" || stateKind === "notApplicable") {
+    if (requiredString(value.state.reason) === null) return null;
+  }
+  return { kind, state: stateKind, minorUnits, currency, scope, evidenceIds: [] };
+}
+
+/**
+ * E4 authoritative totals: the wire field must be null or a non-negative
+ * safe integer. A present but non-safe-integer (float, NaN, string) or
+ * negative value is invalid money supplied by the backend and rejects the
+ * payload instead of being synthesized into null.
+ */
+function parseExactTotal(value: unknown): number | null | undefined {
+  if (value === null) return null;
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+/**
+ * F2 comparison-scope parser: the complete recorded scope must be retained
+ * verbatim. A malformed block rejects the payload; an absent block parses
+ * as null (no recorded scope), matching the backend's null emission.
+ */
+function parseComparisonScope(value: unknown): WorkbenchComparisonScope | null | undefined {
+  if (value === undefined || value === null) return null;
+  if (!isRecord(value)) return undefined;
+  const requirementId = requiredString(value.requirementId);
+  const scopeId = requiredString(value.scopeId);
+  if (requirementId === null || scopeId === null || !Array.isArray(value.items)) return undefined;
+  const items: WorkbenchComparisonScopeItem[] = [];
+  for (const entry of value.items) {
+    if (!isRecord(entry)) return undefined;
+    const itemId = requiredString(entry.itemId);
+    const lineId = requiredString(entry.lineId);
+    const unit = requiredString(entry.unit);
+    const requiredQuantity = requiredString(entry.requiredQuantity);
+    if (itemId === null || lineId === null || unit === null || requiredQuantity === null) return undefined;
+    items.push({ itemId, lineId, unit, requiredQuantity });
+  }
+  return { requirementId, scopeId, items };
+}
+
+/**
+ * F2 pairwise-verdict parser. Each verdict is a backend-authored fact, so
+ * the shape must be internally consistent or the payload fails closed:
+ * `comparable` requires an exact non-negative difference and a cheaper
+ * side, `estimated` requires the signed delta range, and the other
+ * statuses carry neither. A present but malformed verdict rejects the
+ * snapshot instead of being dropped.
+ *
+ * E18 finding 3 (parser half): a verdict may only bind to the displayed
+ * comparison contract when it names the compared quote, so `againstQuoteId`
+ * is required on every emitted verdict. Minor-unit delta ranges must be
+ * safe integers (no fractional minor units) and correctly ordered
+ * (minimum <= maximum; a reversed or negative-width range is rejected).
+ * An exact `equal` verdict must carry a zero difference, and a zero
+ * difference must be claimed as `equal` — anything else is ambiguous
+ * rank data and rejects the payload.
+ */
+function parseOfferComparison(value: unknown): WorkbenchOfferComparison | null {
+  if (!isRecord(value)) return null;
+  const againstOfferId = requiredString(value.againstCandidateId);
+  const againstQuoteId = requiredString(value.againstQuoteId);
+  const reason = requiredString(value.reason);
+  const status = isOneOf(value.status, ["comparable", "estimated", "incompatible", "incomplete"] as const)
+    ? value.status
+    : null;
+  if (againstOfferId === null || againstQuoteId === null || reason === null || status === null) return null;
+  const differenceMinorUnits = parseExactTotal(value.differenceMinorUnits);
+  if (differenceMinorUnits === undefined) return null;
+  const cheaper = value.cheaper === null || value.cheaper === undefined
+    ? null
+    : isOneOf(value.cheaper, ["self", "other", "equal"] as const)
+      ? value.cheaper
+      : undefined;
+  if (cheaper === undefined) return null;
+  let estimatedDeltaMinorUnits: { readonly minimum: number; readonly maximum: number } | null;
+  if (value.estimatedDeltaMinorUnits === undefined || value.estimatedDeltaMinorUnits === null) {
+    estimatedDeltaMinorUnits = null;
+  } else if (isRecord(value.estimatedDeltaMinorUnits)) {
+    const minimum = nullableNumber(value.estimatedDeltaMinorUnits.minimum);
+    const maximum = nullableNumber(value.estimatedDeltaMinorUnits.maximum);
+    if (minimum === null || minimum === undefined || maximum === null || maximum === undefined) return null;
+    if (!Number.isSafeInteger(minimum) || !Number.isSafeInteger(maximum) || minimum > maximum) return null;
+    estimatedDeltaMinorUnits = { minimum, maximum };
+  } else {
+    return null;
+  }
+  if (status === "comparable") {
+    if (differenceMinorUnits === null || cheaper === null || estimatedDeltaMinorUnits !== null) return null;
+    if (cheaper === "equal" ? differenceMinorUnits !== 0 : differenceMinorUnits === 0) return null;
+  } else if (status === "estimated") {
+    if (estimatedDeltaMinorUnits === null || differenceMinorUnits !== null || cheaper !== null) return null;
+  } else if (differenceMinorUnits !== null || cheaper !== null || estimatedDeltaMinorUnits !== null) {
+    return null;
+  }
+  return { againstOfferId, againstQuoteId, status, reason, differenceMinorUnits, cheaper, estimatedDeltaMinorUnits };
+}
+
+function parseQuote(value: unknown): WorkbenchQuote | null {
+  if (!isRecord(value)) return null;
+  const id = requiredString(value.id);
+  const version = requiredString(value.version);
+  const currency = requiredString(value.currency);
+  if (id === null || version === null || currency === null || !isFiniteNumber(value.createdAt) || !Array.isArray(value.lines) || !Array.isArray(value.charges) || !isRecord(value.taxBasis)) return null;
+  if (!isOneOf(value.taxBasis.kind, ["inclusive", "exclusive", "unknown"] as const)) return null;
+  const basisId = value.taxBasis.kind === "unknown" ? null : requiredString(value.taxBasis.basisId);
+  const reason = value.taxBasis.kind === "unknown" ? requiredString(value.taxBasis.reason) : null;
+  if (value.taxBasis.kind === "unknown" ? reason === null : basisId === null) return null;
+  if (value.currentness !== "current" || value.superseded !== false) return null;
+  const totalMinorUnits = parseExactTotal(value.totalMinorUnits);
+  const comparableTotalMinorUnits = parseExactTotal(value.comparableTotalMinorUnits);
+  if (totalMinorUnits === undefined || comparableTotalMinorUnits === undefined) return null;
+  // A comparable total must agree with the quote's own exact total. An
+  // exact total without a comparable total is allowed only as the
+  // complete-but-not-proven-comparable shape; any other relationship is
+  // an ambiguous payload and fails closed.
+  if (comparableTotalMinorUnits !== null && (totalMinorUnits === null || comparableTotalMinorUnits !== totalMinorUnits)) return null;
+  // F2 native money: the backend emits the exact total with its own
+  // currency. An absent block falls back to the proven quote currency
+  // with the exact scalar (no conversion is ever applied); a present
+  // block must agree exactly or the payload is ambiguous and fails
+  // closed.
+  const rawTotal = value.total;
+  let total: WorkbenchMoney | null;
+  if (rawTotal === undefined) {
+    total = totalMinorUnits === null ? null : { currency, minorUnits: totalMinorUnits };
+  } else if (rawTotal === null) {
+    if (totalMinorUnits !== null) return null;
+    total = null;
+  } else {
+    const money = parseMoney(rawTotal);
+    if (money === null || money.currency !== currency) return null;
+    if (totalMinorUnits === null || money.minorUnits !== totalMinorUnits) return null;
+    total = money;
+  }
+  // F2 tax-basis identity and comparison scope are retained, never
+  // discarded: the basis identity is already validated above, and a
+  // malformed scope block rejects the payload.
+  const comparisonScope = parseComparisonScope(value.comparisonScope);
+  if (comparisonScope === undefined) return null;
+  const lines: WorkbenchQuoteLine[] = [];
+  for (const entry of value.lines) {
+    if (!isRecord(entry)) return null;
+    const lineId = requiredString(entry.lineId);
+    const description = requiredString(entry.description);
+    const quantity = requiredString(entry.quantity);
+    const unit = nullableString(entry.unit);
+    const unitPrice = parseMoney(entry.unitPrice);
+    if (lineId === null || description === null || quantity === null || (unit === undefined && Object.prototype.hasOwnProperty.call(entry, "unit")) || unitPrice === null || unitPrice.currency !== currency) return null;
+    lines.push({ lineId, description, quantity, unit: unit ?? null, unitMinorUnits: unitPrice.minorUnits, evidenceIds: [] });
+  }
+  const charges: WorkbenchQuoteCharge[] = [];
+  for (const entry of value.charges) {
+    const parsed = parseCharge(entry, currency);
+    if (parsed === null) return null;
+    charges.push(parsed);
+  }
+  const provenance = parseProjectionProvenance(value.provenance);
+  if (provenance === null) return null;
+  return {
+    id,
+    version,
+    currency,
+    lines,
+    charges,
+    totalMinorUnits,
+    comparableTotalMinorUnits,
+    total,
+    taxBasisId: basisId,
+    comparisonScope,
+    validUntil: null,
+    taxBasis: value.taxBasis.kind,
+    superseded: false,
+  };
+}
+
+function parseVendor(value: unknown): WorkbenchVendor | null {
+  if (value === undefined) return null;
+  if (!isRecord(value)) return null;
+  const id = requiredString(value.id);
+  const name = requiredString(value.name);
+  const regions = stringArray(value.regions);
+  const serviceCoverage = nullableString(value.serviceCoverage);
+  if (id === null || name === null || regions === null || serviceCoverage === undefined) return null;
+  return { id, name, regions, serviceCoverage };
+}
+
+function parseOffer(value: unknown): WorkbenchOffer | null {
+  if (!isRecord(value)) return null;
+  const id = requiredString(value.id);
+  const requirementId = requiredString(value.requirementId);
+  const productModel = requiredString(value.productModel);
+  const variant = requiredString(value.variant);
+  const compatibility = value.compatibility === "pass" ? "pass" : value.compatibility === "fail" ? "fail" : value.compatibility === "unknown" ? "unknown" : null;
+  const conversationState = typeof value.conversationState === "string" ? value.conversationState : null;
+  const vendor = parseVendor(value.vendor);
+  const quote = value.latestValidQuote === null ? null : parseQuote(value.latestValidQuote);
+  // F2: authoritative pairwise verdicts are optional only for servers
+  // that predate the block (parsed as empty — the UI must then not rank
+  // anything); a present but malformed verdict rejects the payload.
+  let comparisons: WorkbenchOfferComparison[] | null;
+  if (value.comparisons === undefined) {
+    comparisons = [];
+  } else if (!Array.isArray(value.comparisons)) {
+    comparisons = null;
+  } else {
+    comparisons = [];
+    for (const entry of value.comparisons) {
+      const parsed = parseOfferComparison(entry);
+      if (parsed === null) {
+        comparisons = null;
+        break;
+      }
+      comparisons.push(parsed);
+    }
+  }
+  const evidence = Array.isArray(value.evidence) ? value.evidence.map(parseEvidence) : null;
+  const provenance = parseProjectionProvenance(value.provenance);
+  if (
+    id === null ||
+    requirementId === null ||
+    productModel === null ||
+    variant === null ||
+    compatibility === null ||
+    conversationState === null ||
+    comparisons === null ||
+    (vendor === null && value.vendor !== undefined) ||
+    (quote === null && value.latestValidQuote !== null) ||
+    evidence === null ||
+    evidence.some((entry) => entry === null) ||
+    provenance === null
+  ) return null;
+  return {
+    id,
+    requirementId,
+    vendor,
+    productModel,
+    variant,
+    compatibility,
+    conversationState,
+    quote,
+    comparisons,
+    evidence: evidence.filter((entry): entry is WorkbenchEvidence => entry !== null),
+    provenance: provenance.mode,
+    ownerAuthoredTerms: provenance.ownerAuthoredTerms,
+    recommendationNote: null,
+  };
+}
+
+function parseRequirement(value: unknown): WorkbenchRequirement | null {
+  if (!isRecord(value)) return null;
+  const id = requiredString(value.id);
+  const key = requiredString(value.key);
+  const title = requiredString(value.title);
+  const category = requiredString(value.category);
+  const quantity = requiredString(value.quantity);
+  const unit = requiredString(value.unit);
+  const budgetMinorUnits = nullableNumber(value.budgetMinorUnits);
+  const needByAt = nullableNumber(value.needByAt);
+  if (id === null || key === null || title === null || category === null || quantity === null || unit === null || typeof value.priority !== "string" || typeof value.state !== "string" || typeof value.fulfillment !== "string" || !isFiniteNumber(value.version) || budgetMinorUnits === undefined || needByAt === undefined) return null;
+  return { id, key, title, category, quantity, unit, priority: value.priority, state: value.state, fulfillment: value.fulfillment, version: value.version, budgetMinorUnits, needByAt };
+}
+
+function parseJob(value: unknown): WorkbenchJob | null {
+  if (!isRecord(value)) return null;
+  const id = requiredString(value.id);
+  const kind = typeof value.kind === "string" ? value.kind : null;
+  const cancellable = value.cancellable;
+  const state = isOneOf(value.state, ["queued", "running", "waitingForSupplier", "waitingForUser", "pausedBudget", "completed", "partial", "failed", "cancelling", "cancelled"] as const) ? value.state : null;
+  const status = isOneOf(value.status, ["queued", "sent", "delivered", "unknown", "partial", "paused"] as const) ? value.status : null;
+  const attempts = Array.isArray(value.attempts) ? value.attempts : null;
+  if (id === null || kind === null || typeof cancellable !== "boolean" || state === null || status === null || !isFiniteNumber(value.createdAt) || !isFiniteNumber(value.updatedAt) || !isFiniteNumber(value.grantVersion) || attempts === null) return null;
+  let lastCheckedAt: number | null = null;
+  for (const attempt of attempts) {
+    if (!isRecord(attempt) || typeof attempt.state !== "string" || !isFiniteNumber(attempt.createdAt)) return null;
+    const observedAt = nullableNumber(attempt.observedAt);
+    if (observedAt === undefined) return null;
+    if (observedAt !== null && (lastCheckedAt === null || observedAt > lastCheckedAt)) lastCheckedAt = observedAt;
+  }
+  return { id, kind, cancellable, state, delivery: status, progress: null, attempts: attempts.length, updatedAt: value.updatedAt, failureCode: null, lastCheckedAt, summary: null, evidenceIds: [] };
+}
+
+function optionalId(value: unknown): string | null | undefined {
+  if (value === undefined || value === null) return null;
+  return requiredString(value) ?? undefined;
+}
+
+function parseDecision(value: unknown): WorkbenchDecision | null {
+  if (!isRecord(value)) return null;
+  const id = requiredString(value.id);
+  const type = typeof value.kind === "string" ? value.kind : null;
+  const rawState = typeof value.state === "string" ? value.state : null;
+  const requirementId = optionalId(value.requirementId);
+  const offerId = optionalId(value.candidateId);
+  const quoteId = optionalId(value.quoteId);
+  const quoteVersion = nullableString(value.quoteVersion);
+  const scope = nullableString(value.scope);
+  const snapshotHash = nullableString(value.snapshotHash);
+  const decidedAt = nullableNumber(value.decidedAt);
+  if (id === null || type === null || rawState === null || requirementId === undefined || offerId === undefined || quoteId === undefined || quoteVersion === undefined || scope === undefined || snapshotHash === undefined || decidedAt === undefined || !isFiniteNumber(value.createdAt)) return null;
+  const state = type === "approval" && rawState === "pending" ? "requested" : rawState;
+  return { id, type, state, requirementId, offerId, quoteId, quoteVersion, scope, snapshotHash, requestedAt: value.createdAt, evidenceIds: [], summary: null, authorizationRequired: null };
+}
+
+function parseActivityItem(value: unknown): WorkbenchActivityItem | null {
+  if (!isRecord(value)) return null;
+  const id = requiredString(value.id);
+  const type = typeof value.kind === "string" ? value.kind : null;
+  if (id === null || type === null || !isFiniteNumber(value.createdAt)) return null;
+  return { id, type, occurredAt: value.createdAt, actorLabel: null, state: "unknown", summary: null, evidenceIds: [] };
+}
+
+const CONTROLLED_SAMPLE_KIND = "controlledSample" as const;
+const SAMPLE_LABEL_MAX_LENGTH = 200;
+
+function parseSampleMarker(value: Record<string, unknown>): { readonly sampleKind: "controlledSample" | null; readonly sampleLabel: string | null } | null {
+  const rawKind = value.sampleKind;
+  const rawLabel = value.sampleLabel;
+  if (rawKind === undefined && rawLabel === undefined) return { sampleKind: null, sampleLabel: null };
+  if (typeof rawKind !== "string" || typeof rawLabel !== "string") return null;
+  if (rawKind !== CONTROLLED_SAMPLE_KIND) return null;
+  if (rawLabel.trim().length === 0 || rawLabel.length > SAMPLE_LABEL_MAX_LENGTH) return null;
+  if (rawLabel !== rawLabel.trim()) return null;
+  return { sampleKind: CONTROLLED_SAMPLE_KIND, sampleLabel: rawLabel };
+}
+
+function parseProject(value: unknown): WorkbenchProject | null {
+  if (!isRecord(value)) return null;
+  const id = requiredString(value.id);
+  const name = requiredString(value.name);
+  const budgetMinorUnits = nullableNumber(value.budgetMinorUnits);
+  const needByAt = nullableNumber(value.needByAt);
+  const organizationId = requiredString(value.organizationId);
+  if (id === null || organizationId === null || name === null || !isOneOf(value.visibility, ["open", "restricted"] as const) || !isFiniteNumber(value.createdAt) || budgetMinorUnits === undefined || needByAt === undefined) return null;
+  const sample = parseSampleMarker(value);
+  if (sample === null) return null;
+  let region: string | null = null;
+  let locationCurrency: string | null = null;
+  if (value.location !== undefined) {
+    if (!isRecord(value.location)) return null;
+    const locationRegion = requiredString(value.location.region);
+    const reportingCurrency = requiredString(value.location.reportingCurrency);
+    if (requiredString(value.location.id) === null || requiredString(value.location.name) === null || locationRegion === null || reportingCurrency === null || typeof value.location.operatingStatus !== "string") return null;
+    region = locationRegion;
+    locationCurrency = reportingCurrency;
+  }
+  const currency = nullableString(value.currency);
+  if (currency === undefined) return null;
+  return { id, organizationId, name, region, currency: currency ?? locationCurrency, budgetMinorUnits, needByAt, sampleKind: sample.sampleKind, sampleLabel: sample.sampleLabel };
+}
+
+function parseAccess(value: unknown): WorkbenchAccess | null {
+  if (!isRecord(value) || !isOneOf(value.role, ["viewer", "contributor", "approver", "owner"] as const) || !isRecord(value.capabilities)) return null;
+  const capabilities = value.capabilities;
+  if (typeof capabilities.canResearch !== "boolean" || typeof capabilities.canRecordEvidence !== "boolean" || typeof capabilities.canRecordQuote !== "boolean" || typeof capabilities.canCompare !== "boolean" || typeof capabilities.canCommunicate !== "boolean" || typeof capabilities.canClarify !== "boolean" || typeof capabilities.canOpenServiceCase !== "boolean") return null;
+  // E4: the backend projects canApprove from the caller's resolved role.
+  // A present non-boolean value rejects the payload; an absent value keeps
+  // the honest unrepresented-authority null instead of guessing.
+  const rawCanApprove = capabilities.canApprove;
+  if (rawCanApprove !== undefined && typeof rawCanApprove !== "boolean") return null;
+  return {
+    role: value.role,
+    capabilities: {
+      canResearch: capabilities.canResearch,
+      canRecordEvidence: capabilities.canRecordEvidence,
+      canRecordQuote: capabilities.canRecordQuote,
+      canCompare: capabilities.canCompare,
+      canCommunicate: capabilities.canCommunicate,
+      canClarify: capabilities.canClarify,
+      canApprove: rawCanApprove === undefined ? null : rawCanApprove,
+      canOpenServiceCase: capabilities.canOpenServiceCase,
+      canRecordOrder: null,
+      canResolveRisk: null,
+    },
+  };
+}
+
+function containsPrivateProjectionKey(value: unknown): boolean {
+  try {
+    const serialized = JSON.stringify(value);
+    return serialized === undefined || /"(?:[^"\\]*email[^"\\]*|[^"\\]*mailbox[^"\\]*|[^"\\]*rawHeaders?|providerId|recipientAddress|secret)"\s*:/i.test(serialized);
+  } catch {
+    return true;
+  }
+}
+
+function containsPrivateEquipmentKey(value: unknown): boolean {
+  try {
+    const serialized = JSON.stringify(value);
+    return serialized === undefined || /"(?:[^"\\]*storageRef[^"\\]*|[^"\\]*storageId[^"\\]*|[^"\\]*idempotency[^"\\]*|[^"\\]*documentId[^"\\]*|[^"\\]*assetId[^"\\]*|[^"\\]*projectId[^"\\]*|[^"\\]*organizationId[^"\\]*)"\s*:/i.test(serialized);
+  } catch {
+    return true;
+  }
+}
+
+function optionalNonEmptyString(value: unknown): string | null | undefined {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string") return undefined;
+  if (value.trim().length === 0) return null;
+  return value;
+}
+
+function hasOnlyKeys(value: Record<string, unknown>, allowed: readonly string[]): boolean {
+  return Object.keys(value).every((key) => allowed.includes(key));
+}
+
+/**
+ * Asset documents project exactly kind and createdAt. Any additional key —
+ * an id, storage locator, idempotency key, URL, or cross-shape reference —
+ * means the row is not the safe E1 projection and the payload is rejected.
+ */
+function parseAssetDocument(value: unknown): WorkbenchAssetDocument | null {
+  if (!isRecord(value) || !hasOnlyKeys(value, ["kind", "createdAt"])) return null;
+  const kind = requiredString(value.kind);
+  if (kind === null || !isFiniteNumber(value.createdAt)) return null;
+  return { kind, createdAt: value.createdAt };
+}
+
+const SERVICE_CASE_KEYS = ["id", "urgency", "summary", "state", "outcome", "createdAt", "updatedAt"] as const;
+
+function parseServiceCase(value: unknown): WorkbenchServiceCase | null {
+  if (!isRecord(value) || !hasOnlyKeys(value, SERVICE_CASE_KEYS)) return null;
+  const id = requiredString(value.id);
+  const urgency = requiredString(value.urgency);
+  const summary = requiredString(value.summary);
+  const state = requiredString(value.state);
+  const outcome = optionalNonEmptyString(value.outcome);
+  if (id === null || urgency === null || summary === null || state === null || outcome === undefined || !isFiniteNumber(value.createdAt) || !isFiniteNumber(value.updatedAt)) return null;
+  return { id, urgency, summary, state, outcome, createdAt: value.createdAt, updatedAt: value.updatedAt };
+}
+
+const ASSET_KEYS = ["id", "label", "serial", "constraints", "purchaseProvenance", "createdAt", "documents", "documentsTruncated", "serviceCases", "serviceCasesTruncated"] as const;
+
+function parseAsset(value: unknown): WorkbenchAsset | null {
+  if (!isRecord(value) || !hasOnlyKeys(value, ASSET_KEYS)) return null;
+  const id = requiredString(value.id);
+  const label = requiredString(value.label);
+  const serial = optionalNonEmptyString(value.serial);
+  const constraints = optionalNonEmptyString(value.constraints);
+  const purchaseProvenance = optionalNonEmptyString(value.purchaseProvenance);
+  if (id === null || label === null || serial === undefined || constraints === undefined || purchaseProvenance === undefined || !isFiniteNumber(value.createdAt)) return null;
+  if (!Array.isArray(value.documents) || typeof value.documentsTruncated !== "boolean" || !Array.isArray(value.serviceCases) || typeof value.serviceCasesTruncated !== "boolean") return null;
+  const documents: WorkbenchAssetDocument[] = [];
+  for (const entry of value.documents) {
+    const parsed = parseAssetDocument(entry);
+    if (parsed === null) return null;
+    documents.push(parsed);
+  }
+  const serviceCases: WorkbenchServiceCase[] = [];
+  for (const entry of value.serviceCases) {
+    const parsed = parseServiceCase(entry);
+    if (parsed === null) return null;
+    serviceCases.push(parsed);
+  }
+  return { id, label, serial, constraints, purchaseProvenance, createdAt: value.createdAt, documents, documentsTruncated: value.documentsTruncated, serviceCases, serviceCasesTruncated: value.serviceCasesTruncated };
+}
+
+/**
+ * Consume only the real bounded E1 equipment projection: installed assets
+ * with their safe documents and service cases plus explicit truncation
+ * flags. A missing block, a malformed row, a private locator, or a
+ * cross-shape reference rejects the payload instead of inventing an asset.
+ * Requirement, selection, or order state is never consulted here, so a
+ * selected or fulfilled requirement can never become an installed asset.
+ */
+function parseEquipment(value: unknown): WorkbenchEquipment | null {
+  if (!isRecord(value) || containsPrivateEquipmentKey(value)) return null;
+  if (!Array.isArray(value.assets) || typeof value.assetsTruncated !== "boolean") return null;
+  const assets: WorkbenchAsset[] = [];
+  for (const entry of value.assets) {
+    const parsed = parseAsset(entry);
+    if (parsed === null) return null;
+    assets.push(parsed);
+  }
+  return { assets, assetsTruncated: value.assetsTruncated };
+}
+
+/**
+ * E8 impact parser: stored trigger/state/order-impact plus bounded reason
+ * text only. Unknown charges, savings, availability, readiness, or delivery
+ * outcomes are never inferred here.
+ */
+function parseImpact(value: unknown): WorkbenchImpact | null {
+  if (!isRecord(value)) return null;
+  const id = requiredString(value.id);
+  const requirementId = requiredString(value.requirementId);
+  const reason = requiredString(value.reason);
+  const quoteVersion = optionalNonEmptyString(value.quoteVersion);
+  const predecessorQuoteVersion = optionalNonEmptyString(value.predecessorQuoteVersion);
+  const watchResult = optionalNonEmptyString(value.watchResult);
+  if (
+    id === null ||
+    requirementId === null ||
+    reason === null ||
+    reason.length > 2000 ||
+    quoteVersion === undefined ||
+    predecessorQuoteVersion === undefined ||
+    watchResult === undefined ||
+    !isOneOf(value.trigger, ["quoteRevision", "watchObservation"] as const) ||
+    !isOneOf(value.state, ["recorded", "unknown", "incomplete"] as const) ||
+    !isOneOf(value.orderImpact, ["none", "selectionOnly", "reviewRequired", "unknown"] as const) ||
+    !isFiniteNumber(value.placedOrderCount) ||
+    !Number.isSafeInteger(value.placedOrderCount) ||
+    (value.placedOrderCount as number) < 0 ||
+    !isFiniteNumber(value.createdAt)
+  ) return null;
+  return {
+    id,
+    requirementId,
+    trigger: value.trigger,
+    state: value.state,
+    orderImpact: value.orderImpact,
+    reason,
+    quoteVersion,
+    predecessorQuoteVersion,
+    watchResult,
+    placedOrderCount: value.placedOrderCount,
+    createdAt: value.createdAt,
+  };
+}
+
+/**
+ * E8 substitute parser: pending proposals require fresh approval while the
+ * server-projected basis is current. A stale basis disables approval with
+ * zero writes; decided proposals are terminal history.
+ */
+function parseSubstitute(value: unknown): WorkbenchSubstitute | null {
+  if (!isRecord(value)) return null;
+  const id = requiredString(value.id);
+  const requirementId = requiredString(value.requirementId);
+  const assessmentId = requiredString(value.assessmentId);
+  const proposedCandidateId = requiredString(value.proposedCandidateId);
+  const proposedQuoteId = requiredString(value.proposedQuoteId);
+  const proposedQuoteVersion = requiredString(value.proposedQuoteVersion);
+  const reason = requiredString(value.reason);
+  const basisReason = requiredString(value.basisReason);
+  if (
+    id === null ||
+    requirementId === null ||
+    assessmentId === null ||
+    proposedCandidateId === null ||
+    proposedQuoteId === null ||
+    proposedQuoteVersion === null ||
+    reason === null ||
+    reason.length > 2000 ||
+    basisReason === null ||
+    !isOneOf(value.state, ["pending", "approved", "rejected"] as const) ||
+    typeof value.basisStale !== "boolean" ||
+    !isFiniteNumber(value.createdAt) ||
+    !isFiniteNumber(value.updatedAt)
+  ) return null;
+  return {
+    id,
+    requirementId,
+    assessmentId,
+    proposedCandidateId,
+    proposedQuoteId,
+    proposedQuoteVersion,
+    state: value.state,
+    reason,
+    basisStale: value.basisStale,
+    basisReason,
+    createdAt: value.createdAt,
+    updatedAt: value.updatedAt,
+  };
+}
+
+/**
+ * Transform and validate the exact W1 `workbench/getProjection` result.
+ * Unsupported aggregate facts remain null instead of being inferred from
+ * candidate, quote, job, decision, or activity rows.
+ */
+export function parseWorkbenchSnapshot(value: unknown, expectedProjectId?: string): WorkbenchSnapshot | null {
+  if (!isRecord(value) || value.ok !== true || containsPrivateProjectionKey(value)) return null;
+  const project = parseProject(value.project);
+  const access = parseAccess(value.access);
+  const provenance = parseProjectionProvenance(value.provenance);
+  if (project === null || access === null || provenance === null || expectedProjectId !== undefined && project.id !== expectedProjectId) return null;
+  if (!Array.isArray(value.requirements) || !Array.isArray(value.candidates) || !Array.isArray(value.jobs) || !Array.isArray(value.decisions)) return null;
+  if (typeof value.requirementsTruncated !== "boolean" || typeof value.candidatesTruncated !== "boolean" || typeof value.jobsTruncated !== "boolean" || typeof value.decisionsTruncated !== "boolean") return null;
+  // E8 blocks are backward compatible: servers that predate them omit the
+  // arrays, which parse as empty without inventing due decisions.
+  const rawImpacts = value.impacts === undefined ? [] : value.impacts;
+  const rawSubstitutes = value.substitutes === undefined ? [] : value.substitutes;
+  if (!Array.isArray(rawImpacts) || !Array.isArray(rawSubstitutes)) return null;
+  const rawImpactsTruncated = value.impactsTruncated === undefined ? false : value.impactsTruncated;
+  const rawSubstitutesTruncated = value.substitutesTruncated === undefined ? false : value.substitutesTruncated;
+  if (typeof rawImpactsTruncated !== "boolean" || typeof rawSubstitutesTruncated !== "boolean") return null;
+  if (!isRecord(value.activity) || !Array.isArray(value.activity.page) || typeof value.activity.isDone !== "boolean") return null;
+  const continueCursor = nullableString(value.activity.continueCursor);
+  if (continueCursor === undefined) return null;
+  const equipment = parseEquipment(value.equipment);
+  if (equipment === null) return null;
+  const requirements: WorkbenchRequirement[] = [];
+  const offers: WorkbenchOffer[] = [];
+  const jobs: WorkbenchJob[] = [];
+  const decisions: WorkbenchDecision[] = [];
+  const activity: WorkbenchActivityItem[] = [];
+  const impacts: WorkbenchImpact[] = [];
+  const substitutes: WorkbenchSubstitute[] = [];
+  for (const entry of value.requirements) { const parsed = parseRequirement(entry); if (parsed === null) return null; requirements.push(parsed); }
+  for (const entry of value.candidates) { const parsed = parseOffer(entry); if (parsed === null) return null; offers.push(parsed); }
+  for (const entry of value.jobs) { const parsed = parseJob(entry); if (parsed === null) return null; jobs.push(parsed); }
+  for (const entry of value.decisions) { const parsed = parseDecision(entry); if (parsed === null) return null; decisions.push(parsed); }
+  for (const entry of value.activity.page) { const parsed = parseActivityItem(entry); if (parsed === null) return null; activity.push(parsed); }
+  for (const entry of rawImpacts) { const parsed = parseImpact(entry); if (parsed === null) return null; impacts.push(parsed); }
+  for (const entry of rawSubstitutes) { const parsed = parseSubstitute(entry); if (parsed === null) return null; substitutes.push(parsed); }
+  // E18 finding 3: each verdict must bind to the displayed comparison
+  // contract. The compared offer has to exist in this same snapshot and the
+  // verdict's againstQuoteId must equal that offer's current quote identity;
+  // an unresolvable or stale quote reference is not a displayable
+  // comparison and fails closed.
+  const offersById = new Map(offers.map((offer) => [offer.id, offer]));
+  for (const offer of offers) {
+    for (const verdict of offer.comparisons) {
+      const other = offersById.get(verdict.againstOfferId);
+      if (other === undefined || other.id === offer.id) return null;
+      if (other.quote === null || other.quote.id !== verdict.againstQuoteId) return null;
+    }
+  }
+  return {
+    project,
+    access,
+    requirements,
+    offers,
+    jobs,
+    decisions,
+    activity: { items: activity, continueCursor, isDone: value.activity.isDone },
+    provenance,
+    equipment,
+    impacts,
+    substitutes,
+    selectedOfferId: null,
+    selectedForecastMinorUnits: null,
+    committedMinorUnits: null,
+    paidMinorUnits: null,
+    deliveredQuantityByRequirement: {},
+    truncation: { requirements: value.requirementsTruncated, offers: value.candidatesTruncated, jobs: value.jobsTruncated, decisions: value.decisionsTruncated, impacts: rawImpactsTruncated, substitutes: rawSubstitutesTruncated, equipment: equipment.assetsTruncated },
+  };
+}

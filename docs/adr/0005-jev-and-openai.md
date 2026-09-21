@@ -1,6 +1,6 @@
 # ADR-0005: Jev-first decisions and OpenAI generation
 
-Status: Accepted for controlled Jev transport and validation; live access, domain calibration and OpenAI selection pending.
+Status: Accepted for controlled Jev transport and validation and the pinned OpenAI Responses contract; live access and domain calibration pending.
 Requirements: H-04, D-02, D-03, D-10, D-11, D-12, D-13, D-17.
 
 ## September 20, 2026 evidence amendment
@@ -8,7 +8,21 @@ Requirements: H-04, D-02, D-03, D-10, D-11, D-12, D-13, D-17.
 The pinned Jev HTTP transport and defensive response-validation contract is accepted for F1/R1/C1 use.
 Reviewed controlled evidence at `595d30c` passes J-01 and J-02 and partially supports J-03/J-04 through injected HTTP, timeout, cancellation, deadline and stale-result cases.
 No hosted TypeSafe credential, live `jev-1.13.0` call, shared application allowance, representative domain evaluation or threshold calibration was observed.
-J-05 through J-07 remain open, and OpenAI model selection remains pending.
+J-05 through J-07 remain open.
+
+## September 21, 2026 OpenAI contract amendment
+
+Current official OpenAI documentation confirms that the Responses API accepts text, image and file inputs and can return JSON through Structured Outputs.
+The official GPT-5.4 Mini model page lists image input, Structured Outputs, the Responses endpoint and the dated `gpt-5.4-mini-2026-03-17` snapshot.
+It lists standard text pricing of USD 0.75 per million input tokens, USD 0.075 per million cached input tokens and USD 4.50 per million output tokens as of this amendment.
+Sources: [Responses API](https://developers.openai.com/api/reference/cli/resources/responses/methods/create), [GPT-5.4 Mini](https://developers.openai.com/api/docs/models/gpt-5.4-mini).
+
+OpeningOS selects `gpt-5.4-mini-2026-03-17` for the hackathon's bounded commercial extraction, document interpretation, drafting and explanation workloads.
+The dated snapshot is preferred over a moving alias so controlled evaluations and stored model-version evidence remain reproducible.
+Requests use the Responses API with `store: false`, no provider tools, `truncation: "disabled"`, a bounded `max_output_tokens`, `reasoning.effort: "none"` and a strict JSON Schema response format.
+The server rejects missing or invalid pricing configuration before reserving or dispatching and binds the reservation to the exact model snapshot, pricing version, token ceilings and pricing basis.
+Controlled tests inject their pricing explicitly.
+They do not claim current account access, actual billed cost or live extraction quality.
 
 ## Decision
 

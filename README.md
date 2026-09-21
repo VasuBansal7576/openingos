@@ -5,9 +5,11 @@ The planned product connects requirements, source evidence, quote versions, appr
 
 ## Current state
 
-This repository contains the agreed PRD, accepted controlled architecture contracts, a React/Convex application foundation, controlled Jev and browser-executor modules, delivery tooling and the selected clickable design.
-The foundation compiles, builds and passes controlled contract tests, but the full purchasing product and durable shared schema are still being implemented.
-There is no hosted Convex deployment, live provider run, public site or production start command yet.
+This repository contains the agreed PRD, accepted controlled architecture contracts, the React/Convex purchasing application, controlled Jev and browser-executor modules, delivery tooling and the selected clickable design reference.
+Combined code checkpoint `e40da16` integrates authenticated isolated intake and sample projects, source-backed purchasing records, comparisons, owner-only communication boundaries, negotiation, recovery, equipment history and the production workbench UI.
+Its complete controlled local matrix, strict typechecks, production build and desktop/mobile browser QA pass.
+The six findings from the latest independent Astra review are repaired locally; latest-head GitHub CI and a fresh independent Astra verdict remain merge gates.
+There is no hosted Convex deployment, live provider run or public site yet, so external-provider and published-origin outcomes remain unverified.
 
 Open [the standalone purchasing workbench](design/purchasing-workbench.html) in a browser to inspect the selected flow.
 Its images, fonts and fixture runtime are embedded.
@@ -59,6 +61,8 @@ They exercise financial calculations and Jev transport validation without provid
 The controlled proof checkpoint `595d30c` passes 77 tests and independent Astra review with no remaining actionable findings.
 The application/browser checkpoint `6432e98` passes 23 repository tests, 77 proof tests, 155 browser-executor tests, 2 application tests, 19 provider-contract tests and 5 mounted user-path tests, with separate Astra acceptance.
 Its exact-head GitHub application and repository workflows passed.
+The current combined code checkpoint `e40da16` passes 23 repository tests, 77 proof tests, 15 evaluation tests, 342 F1 tests, 155 browser-executor tests, 152 application tests, 18 application Jev tests, 32 communication-contract tests and 554 direct Convex tests.
+Controlled Chrome QA at 1440 × 1200 and exact 390 × 844 covers same-state prototype comparison, loading, empty, error recovery, navigation and keyboard dialog behavior without claiming a hosted backend or live provider effect.
 CI now requires `delivery-guard-tests`, `workbench-artifact-tests`, `foundation-typecheck`, `foundation-contract-tests`, `app-typecheck`, `app-build`, `app-tests`, `app-provider-contracts` and `app-user-path`.
 These results are controlled evidence only; the [roadmap](ROADMAP.md) and [evidence matrix](docs/verification/evidence-matrix.md) retain the hosted and live gates.
 

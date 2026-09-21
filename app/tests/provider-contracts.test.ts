@@ -413,6 +413,15 @@ describe("S-03 AgentMail signature boundary", () => {
 
   const component = {} as unknown as AgentMailComponent;
 
+  test("verified component callbacks forward into the idempotent C1 handlers", async () => {
+    const httpSource = await Bun.file(new URL("../../convex/http.ts", import.meta.url)).text();
+    expect(httpSource).toContain('"communication/callbacks:onAgentMailEvent"');
+    expect(httpSource).toContain('"communication/callbacks:onAgentMailMessageReceived"');
+    expect(httpSource).toContain("ctx.runMutation(communicationEventRef, args)");
+    expect(httpSource).toContain("ctx.runMutation(communicationMessageRef, args)");
+    expect(httpSource).not.toContain("handler: async () => null");
+  });
+
   test("missing webhook secret rejects before product callback or purchasing update", async () => {
     const counters = { productCallbacks: 0, purchasingUpdates: 0 };
     const agentmail = new AgentMail(component, { webhookSecret: "" });

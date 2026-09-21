@@ -35,6 +35,9 @@ import {
   containsInstructionOverride,
   lookupCapability,
   roleSatisfies,
+  supportedWorkflowPayload,
+  workflowTextForPayload,
+  type RefusedScopeSegment,
 } from "./scope.js";
 import { COMMUNICATION_PROFILE_OWNER_ROLEPLAY } from "./provenance.js";
 import { approved, denial, type AuthorityResult, type Denial } from "./denials.js";
@@ -176,6 +179,20 @@ export interface RequestWorkInput {
   readonly requestId?: string;
 }
 
+/**
+ * Controlled-backend proof metadata for a mixed request.  The durable Job
+ * contract predates D-17 and intentionally remains unchanged here; this
+ * sidecar keeps the server-derived segment and refusals observable in the
+ * deterministic test backend without treating refused text as work.
+ */
+export interface ControlledScopeSegmentDecision {
+  readonly fingerprint: string;
+  readonly jobId: string;
+  readonly supportedSegment: string;
+  readonly refusedSegments: readonly RefusedScopeSegment[];
+  readonly createdAt: number;
+}
+
 export class ControlledBackend {
   private sequence = 0;
   readonly organizations = new Map<string, Organization>();
@@ -206,6 +223,7 @@ export class ControlledBackend {
   readonly quotes = new Map<string, Quote>();
   readonly sentMessages: ControlledSentMessage[] = [];
   readonly scopeDecisions: ScopeDecision[] = [];
+  readonly scopeSegmentDecisions: ControlledScopeSegmentDecision[] = [];
 
   private next(prefix: string): string {
     this.sequence += 1;
@@ -672,6 +690,7 @@ export class ControlledBackend {
       return denial("unavailable-capability", classified.reason);
     }
     const operationId = classified.operationId;
+    const supportedClassification = classified;
     const access = this.checkProjectAccess(
       input.identity,
       input.organizationId,
@@ -700,8 +719,64 @@ export class ControlledBackend {
       if (!grant.operations.includes(operationId)) {
         return denial("denied-capability", `grant does not authorize ${operationId}`);
       }
-      grantVersion = grant.revocationVersion;
-      inputVersions = { ...grant.inputVersions };
+      let boundGrant = grant;
+      const grantPayload = (() => {
+        try {
+          return JSON.parse(grant.canonicalPayload) as unknown;
+        } catch {
+          return null;
+        }
+      })();
+      const grantText = workflowTextForPayload(operationId, grantPayload);
+      if (grantText !== null) {
+        const grantClassified = classifyScope({ text: grantText, operationId });
+        if (grantClassified.verdict !== "supported") {
+          if (
+            !COMMUNICATION_KINDS.has(operationId) ||
+            supportedClassification.refusedSegments.length > 0
+          ) {
+            return denial("unrelated-refusal", "grant purpose is not supported");
+          }
+        } else {
+          const mixed =
+            supportedClassification.refusedSegments.length > 0 ||
+            grantClassified.refusedSegments.length > 0;
+          if (
+            mixed &&
+            grantClassified.supportedSegment !== supportedClassification.supportedSegment
+          ) {
+            return denial("changed-draft", "request segment does not match the approved grant");
+          }
+          if (mixed) {
+            const canonicalPayload = supportedWorkflowPayload(
+              operationId,
+              grantPayload,
+              supportedClassification.supportedSegment,
+            );
+            if (canonicalPayload === null) {
+              return denial("invalid-payload", "grant payload cannot carry the supported segment");
+            }
+            const canonical = canonicalJson(canonicalPayload);
+            if (canonical !== grant.canonicalPayload) {
+              const hasExistingWork = [...this.jobs.values()].some((job) => job.grantId === grant.id) ||
+                [...this.operations.values()].some((operation) => operation.grantId === grant.id);
+              if (hasExistingWork) {
+                return denial("changed-draft", "grant has already admitted a different payload");
+              }
+              boundGrant = {
+                ...grant,
+                canonicalPayload: canonical,
+                payloadHash: payloadHash(canonicalPayload),
+                payloadSha256: null,
+                revocationVersion: grant.revocationVersion + 1,
+              };
+              this.grants.set(grant.id, boundGrant);
+            }
+          }
+        }
+      }
+      grantVersion = boundGrant.revocationVersion;
+      inputVersions = { ...boundGrant.inputVersions };
     } else if (kind === "communication") {
       return denial("denied-capability", "communication requires a grant");
     }
@@ -726,8 +801,8 @@ export class ControlledBackend {
           communicationProfile: COMMUNICATION_PROFILE_OWNER_ROLEPLAY,
           recipientConfigVersion: this.getActiveRecipient()?.version ?? 0,
           inputVersions: Object.freeze({}),
-          canonicalPayload: canonicalJson({}),
-          payloadHash: payloadHash({}),
+          canonicalPayload: canonicalJson({ query: supportedClassification.supportedSegment }),
+          payloadHash: payloadHash({ query: supportedClassification.supportedSegment }),
           payloadSha256: null,
           // No-spend research authority with valid positive semantics:
           // positive round limit, zero cost ceiling (no reservation fits,
@@ -761,6 +836,22 @@ export class ControlledBackend {
     };
     this.jobs.set(job.id, job);
     this.recordScopeDecision(input, "supported", operationId, job.id, now);
+    if (supportedClassification.refusedSegments.length > 0) {
+      this.scopeSegmentDecisions.push(
+        Object.freeze({
+          fingerprint: payloadHash({
+            organizationId: input.organizationId,
+            projectId: input.projectId,
+            text: input.text,
+            operationId: input.operationId ?? null,
+          }),
+          jobId: job.id,
+          supportedSegment: supportedClassification.supportedSegment,
+          refusedSegments: Object.freeze([...supportedClassification.refusedSegments]),
+          createdAt: now,
+        }),
+      );
+    }
     return approved(Object.freeze(job));
   }
 
@@ -816,8 +907,77 @@ export class ControlledBackend {
     }
 
     const key = requestKey(job.organizationId, input.kind, input.requestId);
-    const canonical = canonicalJson(input.payload);
-    const hash = payloadHash(input.payload);
+    let canonical = canonicalJson(input.payload);
+    let hash = payloadHash(input.payload);
+    const operationText = workflowTextForPayload(input.kind, input.payload);
+    if (operationText !== null) {
+      const operationClassified = classifyScope({
+        text: operationText,
+        operationId: input.kind,
+      });
+      if (operationClassified.verdict === "unrelatedRefused") {
+        if (!COMMUNICATION_KINDS.has(input.kind)) {
+          return denial("unrelated-refusal", operationClassified.reason);
+        }
+      } else if (operationClassified.verdict === "unavailableRefused") {
+        return denial("unavailable-capability", operationClassified.reason);
+      } else {
+        const operationPayload = supportedWorkflowPayload(
+          input.kind,
+          input.payload,
+          operationClassified.supportedSegment,
+        );
+        if (operationPayload === null) {
+          return denial("invalid-payload", "operation payload cannot carry the supported segment");
+        }
+        const grantPayload = (() => {
+          try {
+            return JSON.parse(grant.canonicalPayload) as unknown;
+          } catch {
+            return null;
+          }
+        })();
+        const grantText = workflowTextForPayload(input.kind, grantPayload);
+        if (grantText !== null) {
+          const grantClassified = classifyScope({ text: grantText, operationId: input.kind });
+          if (grantClassified.verdict !== "supported") {
+            if (
+              !COMMUNICATION_KINDS.has(input.kind) ||
+              operationClassified.refusedSegments.length > 0
+            ) {
+              return denial("unrelated-refusal", "grant purpose is not supported");
+            }
+          } else {
+            const mixed =
+              operationClassified.refusedSegments.length > 0 ||
+              grantClassified.refusedSegments.length > 0;
+            if (
+              mixed &&
+              grantClassified.supportedSegment !== operationClassified.supportedSegment
+            ) {
+              return denial("changed-draft", "operation segment does not match the approved grant");
+            }
+            if (mixed) {
+              const supportedGrantPayload = supportedWorkflowPayload(
+                input.kind,
+                grantPayload,
+                operationClassified.supportedSegment,
+              );
+              if (
+                supportedGrantPayload === null ||
+                canonicalJson(supportedGrantPayload) !== grant.canonicalPayload
+              ) {
+                return denial("changed-draft", "operation segment does not match the approved grant");
+              }
+              canonical = canonicalJson(operationPayload);
+              hash = payloadHash(operationPayload);
+            }
+          }
+        } else if (operationClassified.refusedSegments.length > 0) {
+          return denial("changed-draft", "operation segment cannot bind to the approved grant");
+        }
+      }
+    }
 
     // Same-request dedupe precedes round-limit rejection: an identical
     // retry returns the one existing operation without consuming another
@@ -972,6 +1132,80 @@ export class ControlledBackend {
     }
     if (grantCommitted > grant.costCeilingMicroUsd) {
       return denial("grant-ceiling-exceeded", "grant-wide reservations exceed the grant cost ceiling");
+    }
+
+    // Re-derive a workflow segment from the stored operation before any
+    // provider-facing validation.  Legacy controlled communication fixtures
+    // may use a body that carries no classifier anchor, so those continue to
+    // rely on the exact grant payload binding below; shaped mixed payloads
+    // always take this stricter path.
+    let scopedPayload: unknown = null;
+    try {
+      scopedPayload = JSON.parse(operation.canonicalPayload) as unknown;
+    } catch {
+      return denial("invalid-payload", "operation payload is not valid JSON");
+    }
+    const operationText = workflowTextForPayload(operation.kind, scopedPayload);
+    if (operationText !== null) {
+      const operationClassified = classifyScope({
+        text: operationText,
+        operationId: operation.kind,
+      });
+      if (operationClassified.verdict === "unavailableRefused") {
+        return denial("unavailable-capability", operationClassified.reason);
+      }
+      if (operationClassified.verdict === "supported") {
+        const expectedPayload = supportedWorkflowPayload(
+          operation.kind,
+          scopedPayload,
+          operationClassified.supportedSegment,
+        );
+        if (
+          expectedPayload === null ||
+          (operationClassified.refusedSegments.length > 0 &&
+            canonicalJson(expectedPayload) !== operation.canonicalPayload)
+        ) {
+          return denial("unrelated-refusal", "operation payload is not the canonical supported segment");
+        }
+        let grantPayload: unknown = null;
+        try {
+          grantPayload = JSON.parse(grant.canonicalPayload) as unknown;
+        } catch {
+          return denial("invalid-payload", "grant payload is not valid JSON");
+        }
+        const grantText = workflowTextForPayload(operation.kind, grantPayload);
+        if (grantText !== null) {
+          const grantClassified = classifyScope({ text: grantText, operationId: operation.kind });
+          if (grantClassified.verdict !== "supported") {
+            if (
+              !COMMUNICATION_KINDS.has(operation.kind) ||
+              operationClassified.refusedSegments.length > 0
+            ) {
+              return denial("unrelated-refusal", "grant purpose is not supported");
+            }
+          } else {
+            const mixed =
+              operationClassified.refusedSegments.length > 0 ||
+              grantClassified.refusedSegments.length > 0;
+            if (grantClassified.supportedSegment !== operationClassified.supportedSegment) {
+              return denial("changed-draft", "operation segment no longer matches the approved grant");
+            }
+            const expectedGrantPayload = supportedWorkflowPayload(
+              operation.kind,
+              grantPayload,
+              operationClassified.supportedSegment,
+            );
+            if (
+              expectedGrantPayload === null ||
+              (mixed && canonicalJson(expectedGrantPayload) !== grant.canonicalPayload)
+            ) {
+              return denial("changed-draft", "operation segment no longer matches the approved grant");
+            }
+          }
+        }
+      } else if (!COMMUNICATION_KINDS.has(operation.kind)) {
+        return denial("unrelated-refusal", "operation payload is outside the purchasing workflow");
+      }
     }
 
     // Communication envelope first: header injections (alternate recipient,

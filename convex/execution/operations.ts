@@ -18,18 +18,21 @@
 import { v } from "convex/values";
 import type { Id } from "../_generated/dataModel.js";
 import { f1InternalMutation, f1Mutation, f1Query, type F1MutationCtx } from "../server.js";
-import { canonicalJson, parseBoundedPayloadJson, requestKey } from "../shared/hashing.js";
-import { normalizeMailbox } from "../shared/mailbox.js";
+import { canonicalJson, parseBoundedPayloadJson, payloadHash, requestKey } from "../shared/hashing.js";
 import { sameCanonicalPayload, sha256BindingOk, sha256HexOfCanonical } from "../shared/sha256.js";
 import { isExpired } from "../shared/time.js";
+import { isCommunicationDenial, validateOutboundPayload } from "../communication/contracts.js";
 import {
   MAX_JOBS_PER_GRANT,
   MAX_OPERATIONS_PER_GRANT,
   MAX_OPERATIONS_PER_JOB,
   MAX_RESERVATIONS_PER_JOB,
+  classifyScope,
   lookupCapability,
   validateWorkflowBinding,
   validateWorkflowPayload,
+  supportedWorkflowPayload,
+  workflowTextForPayload,
   workflowAuthorityForOperation,
   workflowAuthorityMatchesProject,
   workflowContextKey,
@@ -340,6 +343,96 @@ function parseCanonicalPayload(payload: string): unknown | null {
   }
 }
 
+type CommunicationEnvelopeResult =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly code: string; readonly message: string };
+
+type CommunicationGrant = {
+  readonly communicationProfile: string;
+  readonly recipientConfigVersion: number;
+  readonly conversationId?: Id<"conversations">;
+};
+
+function isCommunicationEnvelopeCandidate(value: unknown): value is Record<string, unknown> {
+  if (!isRecord(value)) return false;
+  return workflowTextForPayload("communication.send", value) !== null ||
+    "replyTo" in value ||
+    "reply_to" in value;
+}
+
+async function validateCommunicationEnvelope(
+  ctx: F1MutationCtx,
+  payload: unknown,
+  grant: CommunicationGrant,
+  operationRecipientConfigVersion?: number,
+): Promise<CommunicationEnvelopeResult> {
+  if (grant.communicationProfile !== COMMUNICATION_PROFILE_OWNER_ROLEPLAY) {
+    return {
+      ok: false,
+      code: "alternate-channel-denied",
+      message: "only the owner-roleplay profile is permitted",
+    };
+  }
+  const recipient = await ctx.db
+    .query("recipientConfigs")
+    .withIndex("by_active", (q) => q.eq("active", true))
+    .unique();
+  if (recipient === null) {
+    return { ok: false, code: "missing-recipient-config", message: "owner recipient is not configured" };
+  }
+  if (
+    (operationRecipientConfigVersion !== undefined &&
+      operationRecipientConfigVersion !== grant.recipientConfigVersion) ||
+    grant.recipientConfigVersion !== recipient.version
+  ) {
+    return {
+      ok: false,
+      code: "stale-recipient-version",
+      message: "recipient configuration changed; re-approval required",
+    };
+  }
+  const validated = validateOutboundPayload(payload, recipient.mailboxNormalized);
+  if (isCommunicationDenial(validated)) {
+    return validated.code === "malicious-content"
+      ? { ok: false, code: "unrelated-refusal", message: "communication payload is outside the purchasing workflow" }
+      : validated;
+  }
+  return { ok: true };
+}
+
+/**
+ * A communication grant may omit a conversation for a new RFQ. Once a grant
+ * or the current project context identifies one, however, the operation must
+ * carry that exact conversation. Multiple active conversations without a
+ * bound authority are ambiguous and fail closed.
+ */
+function communicationAuthorityMatchesContext(
+  grant: CommunicationGrant,
+  authority: WorkflowAuthority,
+  context: ProjectWorkflowContext,
+): boolean {
+  const authorityConversationId =
+    "conversationId" in authority ? authority.conversationId : undefined;
+  if (grant.conversationId !== undefined && authorityConversationId !== grant.conversationId) {
+    return false;
+  }
+  if (
+    context.purchasingConversationId !== undefined &&
+    authorityConversationId !== context.purchasingConversationId
+  ) {
+    return false;
+  }
+  return !(
+    context.hasPurchasingThread === true &&
+    context.purchasingConversationId === undefined &&
+    authorityConversationId === undefined
+  );
+}
+
+function isScopeInjectionRefusal(result: { readonly verdict: string; readonly reason: string }): boolean {
+  return result.reason === "supplier-evidence-instructions-cannot-expand-capabilities";
+}
+
 const createResultValidator = v.union(
   v.object({ ok: v.literal(true), operationId: v.id("operations"), deduped: v.boolean() }),
   denialValidator,
@@ -360,6 +453,35 @@ export const create = f1Mutation({
     payloadJson: v.string(),
     grantId: v.id("grants"),
     reservationId: v.optional(v.id("reservations")),
+    negotiationId: v.optional(v.id("negotiations")),
+    /**
+     * Exact saved-draft authority for a negotiation send (Astra repair:
+     * concurrent different-request dispatches reusing one round-0 draft).
+     *
+     * The orchestrator resolves the opaque draft bundle server-side and
+     * passes its pins here; this mutation verifies every pin against the
+     * live rows inside the same atomic transaction that inserts the
+     * operation, then pins the live values as the operation's
+     * `negotiationAuthority`. A stale draft (advanced round, changed quote
+     * or conversation, mismatched payload) denies here with zero new
+     * effect — even when the action-level pre-check raced it. The atomic
+     * `claim` rechecks the pinned authority against the live rows again
+     * immediately before provider effect, so two operations created from
+     * one draft under different request ids serialize on the mandate round:
+     * the first claim consumes it and the stale loser denies with no
+     * effect. Reply drift rides the same pins: an accepted reply bumps the
+     * live conversation version (or supersedes the quote), which the claim
+     * recheck denies; quarantined replies never enter workloads and hold
+     * the action before creation.
+     */
+    negotiationDraft: v.optional(v.object({
+      quoteVersion: v.string(),
+      quoteContentHash: v.string(),
+      roundsUsed: v.number(),
+      conversationVersion: v.optional(v.number()),
+      conversationState: v.optional(v.string()),
+      payloadHash: v.string(),
+    })),
   },
   returns: createResultValidator,
   handler: async (ctx, args) => {
@@ -427,9 +549,9 @@ export const create = f1Mutation({
 
     const parsed = parseBoundedPayloadJson(args.payloadJson);
     if (!parsed.ok) return { ok: false as const, code: parsed.code, message: parsed.message };
-    const canonical = parsed.payload.canonical;
-    const hash = parsed.payload.hash;
-    const operationPayload = parseCanonicalPayload(canonical);
+    let canonical = parsed.payload.canonical;
+    let hash = parsed.payload.hash;
+    let operationPayload = parseCanonicalPayload(canonical);
     if (operationPayload === null) {
       return { ok: false as const, code: "invalid-payload", message: "operation payload is not valid JSON" };
     }
@@ -466,6 +588,65 @@ export const create = f1Mutation({
       return { ok: false as const, code: "unrelated-refusal", message: "job is not bound to this OpeningOS workflow purpose" };
     }
 
+    const submittedCanonical = canonical;
+    const submittedHash = hash;
+    const grantPayload = parseCanonicalPayload(grant.canonicalPayload);
+    if (grantPayload === null) {
+      return { ok: false as const, code: "invalid-payload", message: "grant payload is not valid JSON" };
+    }
+
+    // Communication headers are checked before their body is interpreted as
+    // scope text. The exception below is deliberately not granted here: it
+    // also requires the exact grant payload and the authority checks that
+    // follow this section.
+    let operationEnvelope: CommunicationEnvelopeResult | null = null;
+    if (isCommunicationKind(args.kind)) {
+      if (isCommunicationEnvelopeCandidate(operationPayload)) {
+        operationEnvelope = await validateCommunicationEnvelope(ctx, operationPayload, grant);
+        if (!operationEnvelope.ok) {
+          return { ok: false as const, code: operationEnvelope.code, message: operationEnvelope.message };
+        }
+      }
+    }
+
+    // Admission accepts a caller's shaped request only long enough to derive
+    // its server-owned supported segment. A communication body with no
+    // standalone classifier anchor is deferred until the exact grant,
+    // workflow, and authority checks below have passed.
+    const operationText = workflowTextForPayload(args.kind, operationPayload);
+    if (operationText === null) {
+      return { ok: false as const, code: "unrelated-refusal", message: "operation payload is outside the purchasing workflow" };
+    }
+    const operationClassification = classifyScope({
+      text: operationText,
+      operationId: args.kind,
+      projectContext: context,
+    });
+    if (operationClassification.verdict === "unavailableRefused") {
+      return { ok: false as const, code: "unavailable-capability", message: operationClassification.reason };
+    }
+    if (operationClassification.verdict === "unrelatedRefused" && !isCommunicationKind(args.kind)) {
+      return { ok: false as const, code: "unrelated-refusal", message: operationClassification.reason };
+    }
+    if (operationClassification.verdict === "supported") {
+      const supportedPayload = supportedWorkflowPayload(
+        args.kind,
+        operationPayload,
+        operationClassification.supportedSegment,
+      );
+      if (supportedPayload === null) {
+        return { ok: false as const, code: "invalid-payload", message: "operation payload cannot carry the supported segment" };
+      }
+      if (
+        operationClassification.refusedSegments.length > 0 ||
+        canonicalJson(supportedPayload) === grant.canonicalPayload
+      ) {
+        canonical = canonicalJson(supportedPayload);
+        hash = payloadHash(supportedPayload);
+        operationPayload = supportedPayload;
+      }
+    }
+
     const operationPurpose = validateWorkflowBinding({
       operationId: args.kind,
       jobPurpose: job.workflowPurpose,
@@ -473,12 +654,8 @@ export const create = f1Mutation({
       context,
       payload: operationPayload,
     });
-    if (!operationPurpose.ok) {
+    if (!operationPurpose.ok && !isCommunicationKind(args.kind)) {
       return { ok: false as const, code: "unrelated-refusal", message: operationPurpose.reason ?? "operation purpose is not supported" };
-    }
-    const grantPayload = parseCanonicalPayload(grant.canonicalPayload);
-    if (grantPayload === null) {
-      return { ok: false as const, code: "invalid-payload", message: "grant payload is not valid JSON" };
     }
     const grantPurpose = validateWorkflowPayload({
       operationId: args.kind,
@@ -486,8 +663,49 @@ export const create = f1Mutation({
       payload: grantPayload,
       context,
     });
-    if (!grantPurpose.ok) {
+    if (!grantPurpose.ok && !isCommunicationKind(args.kind)) {
       return { ok: false as const, code: "unrelated-refusal", message: grantPurpose.reason ?? "grant purpose is not supported" };
+    }
+    const grantText = workflowTextForPayload(args.kind, grantPayload);
+    if (grantText === null) {
+      return { ok: false as const, code: "invalid-payload", message: "grant payload has no workflow text" };
+    }
+    const grantClassification = classifyScope({
+      text: grantText,
+      operationId: args.kind,
+      projectContext: context,
+    });
+    if (!isCommunicationKind(args.kind) && grantClassification.verdict !== "supported") {
+      return { ok: false as const, code: "unrelated-refusal", message: "grant purpose is not supported" };
+    }
+    if (grantClassification.verdict === "unavailableRefused") {
+      return { ok: false as const, code: "unavailable-capability", message: grantClassification.reason };
+    }
+    if (
+      operationClassification.verdict === "supported" &&
+      grantClassification.verdict === "supported"
+    ) {
+      const supportedGrantPayload = supportedWorkflowPayload(
+        args.kind,
+        grantPayload,
+        operationClassification.supportedSegment,
+      );
+      const canonicalizeSegments =
+        operationClassification.refusedSegments.length > 0 ||
+        grantClassification.refusedSegments.length > 0;
+      // A fully supported draft is still bound to the approved segment. Only
+      // mixed input compares against the canonical supported projection.
+      const comparableGrantPayload = canonicalizeSegments
+        ? supportedGrantPayload
+        : grantPayload;
+      if (
+        supportedGrantPayload === null ||
+        grantClassification.supportedSegment !== operationClassification.supportedSegment ||
+        comparableGrantPayload === null ||
+        canonicalJson(comparableGrantPayload) !== canonical
+      ) {
+        return { ok: false as const, code: "changed-draft", message: "operation segment does not match the approved grant" };
+      }
     }
     let operationAuthority: WorkflowAuthority = grantAuthority;
     if (
@@ -498,6 +716,12 @@ export const create = f1Mutation({
     ) {
       operationAuthority = { ...operationAuthority, requirementId: context.matchedRequirementId };
     }
+    if (job.workflowAuthority !== undefined) {
+      if (!authorityRefsCompatible(grantAuthority, job.workflowAuthority)) {
+        return { ok: false as const, code: "unrelated-refusal", message: "job authority does not match the grant" };
+      }
+      operationAuthority = job.workflowAuthority;
+    }
     if (
       isCommunicationKind(args.kind) &&
       context.purchasingConversationId !== undefined &&
@@ -506,12 +730,6 @@ export const create = f1Mutation({
       operationAuthority.conversationId === undefined
     ) {
       operationAuthority = { ...operationAuthority, conversationId: context.purchasingConversationId };
-    }
-    if (job.workflowAuthority !== undefined) {
-      if (!authorityRefsCompatible(grantAuthority, job.workflowAuthority)) {
-        return { ok: false as const, code: "unrelated-refusal", message: "job authority does not match the grant" };
-      }
-      operationAuthority = job.workflowAuthority;
     }
     if (
       !authorityRefsCompatible(grantAuthority, operationAuthority) ||
@@ -525,6 +743,50 @@ export const create = f1Mutation({
       ))
     ) {
       return { ok: false as const, code: "unrelated-refusal", message: "workflow authority is not current for this project" };
+    }
+    if (
+      isCommunicationKind(args.kind) &&
+      !communicationAuthorityMatchesContext(grant, operationAuthority, context)
+    ) {
+      return { ok: false as const, code: "unrelated-refusal", message: "communication conversation is not current for this project" };
+    }
+
+    // A no-anchor communication body may use the exception only when both
+    // snapshots are exact, owner-only envelopes under the current authority.
+    // Unavailable bodies and supplier-evidence instructions were rejected
+    // above and can never enter this branch.
+    const communicationPayloadMatchesGrant =
+      isCommunicationKind(args.kind) &&
+      sameCanonicalPayload(submittedCanonical, grant.canonicalPayload) &&
+      submittedHash === grant.payloadHash;
+    const communicationScopeException =
+      isCommunicationKind(args.kind) &&
+      operationEnvelope?.ok === true &&
+      communicationPayloadMatchesGrant &&
+      operationClassification.verdict === "unrelatedRefused" &&
+      grantClassification.verdict === "unrelatedRefused" &&
+      !isScopeInjectionRefusal(operationClassification) &&
+      !isScopeInjectionRefusal(grantClassification);
+    if (
+      isCommunicationKind(args.kind) &&
+      operationClassification.verdict === "unrelatedRefused" &&
+      grantClassification.verdict === "unrelatedRefused" &&
+      !communicationPayloadMatchesGrant
+    ) {
+      return { ok: false as const, code: "changed-draft", message: "operation payload does not exactly match the approved grant" };
+    }
+    if (!operationPurpose.ok && !communicationScopeException) {
+      return { ok: false as const, code: "unrelated-refusal", message: operationPurpose.reason ?? "operation purpose is not supported" };
+    }
+    if (!grantPurpose.ok && !communicationScopeException) {
+      return { ok: false as const, code: "unrelated-refusal", message: grantPurpose.reason ?? "grant purpose is not supported" };
+    }
+    if (
+      isCommunicationKind(args.kind) &&
+      !communicationScopeException &&
+      (operationClassification.verdict !== "supported" || grantClassification.verdict !== "supported")
+    ) {
+      return { ok: false as const, code: "unrelated-refusal", message: "communication payload is outside the purchasing workflow" };
     }
     const key = requestKey(args.organizationId, args.kind, args.requestId);
     // Same-request dedupe precedes round-limit rejection: an identical
@@ -572,6 +834,125 @@ export const create = f1Mutation({
         const conversation = await ctx.db.get(conversationId);
         if (conversation !== null) conversationVersion = conversation.version;
       }
+    }
+
+    // Negotiation authority binding (Devin findings 4060796830/4060796928):
+    // every pinned value is read server-side from the live rows at
+    // preparation and stored immutably on the operation. An old bound
+    // mandate without the approved conversation pin, a dead mandate, or a
+    // stale/superseded quote cannot produce a binding; the atomic claim
+    // rechecks every pin again immediately before provider effect.
+    let negotiationAuthority: {
+      negotiationId: Id<"negotiations">;
+      quoteId: Id<"quotes">;
+      quoteVersion: string;
+      quoteContentHash: string;
+      roundsUsed: number;
+      conversationId?: Id<"conversations">;
+      conversationVersion?: number;
+      conversationState?: "draft" | "queued" | "awaitingReply" | "replyReceived" | "closed" | "cancelled";
+    } | undefined;
+    if (args.negotiationId !== undefined) {
+      const negotiation = await ctx.db.get(args.negotiationId);
+      if (
+        negotiation === null ||
+        negotiation.organizationId !== args.organizationId ||
+        negotiation.projectId !== args.projectId
+      ) {
+        return { ok: false as const, code: "denied-membership", message: "negotiation mandate is not in this project" };
+      }
+      if (negotiation.state === "revoked") {
+        return { ok: false as const, code: "mandate-revoked", message: "negotiation mandate was revoked before preparation" };
+      }
+      if (negotiation.state !== "active") {
+        return { ok: false as const, code: "mandate-not-active", message: "negotiation mandate is not active" };
+      }
+      if (negotiation.expiresAt <= now) {
+        return { ok: false as const, code: "mandate-expired", message: "negotiation mandate expired before preparation" };
+      }
+      if (negotiation.roundsUsed >= negotiation.roundLimit) {
+        return { ok: false as const, code: "mandate-round-limit-reached", message: "negotiation mandate has no remaining rounds" };
+      }
+      const mandateQuote = await ctx.db.get(negotiation.quoteId);
+      if (
+        mandateQuote === null ||
+        mandateQuote.organizationId !== args.organizationId ||
+        mandateQuote.projectId !== args.projectId ||
+        mandateQuote.version !== negotiation.quoteVersion
+      ) {
+        return { ok: false as const, code: "mandate-quote-stale", message: "negotiation quote is no longer the mandate's exact version" };
+      }
+      const successorProbe = await ctx.db
+        .query("quotes")
+        .withIndex("by_project_and_supersedes", (q) =>
+          q.eq("projectId", args.projectId).eq("supersedes", mandateQuote.contentHash),
+        )
+        .first();
+      if (successorProbe !== null) {
+        return { ok: false as const, code: "mandate-quote-superseded", message: "negotiation quote version has been superseded" };
+      }
+      if (negotiation.conversationId !== undefined) {
+        const boundConversation = await ctx.db.get(negotiation.conversationId);
+        if (boundConversation === null) {
+          return { ok: false as const, code: "mandate-conversation-stale", message: "bound conversation is unavailable" };
+        }
+        if (negotiation.conversationVersion === undefined || negotiation.conversationState === undefined) {
+          return { ok: false as const, code: "mandate-approval-unpinned", message: "bound mandate lacks the approved conversation version" };
+        }
+        if (
+          negotiation.conversationState === "closed" ||
+          negotiation.conversationState === "cancelled"
+        ) {
+          return { ok: false as const, code: "mandate-conversation-closed", message: "bound conversation is closed or cancelled" };
+        }
+      }
+      // Atomic saved-draft binding: the exact draft pins must equal the live
+      // mandate rows inside this same transaction. A draft prepared under an
+      // older round, quote version, or conversation (or carrying a different
+      // payload than submitted here) denies before any operation row is
+      // inserted or allowance is bound.
+      if (args.negotiationDraft !== undefined) {
+        const draft = args.negotiationDraft;
+        if (!Number.isSafeInteger(draft.roundsUsed) || draft.roundsUsed < 0) {
+          return { ok: false as const, code: "invalid-payload", message: "saved draft round is not a usable bound" };
+        }
+        if (
+          draft.quoteVersion !== negotiation.quoteVersion ||
+          draft.quoteContentHash !== mandateQuote.contentHash
+        ) {
+          return { ok: false as const, code: "draft-quote-stale", message: "prepared draft quote version is no longer current" };
+        }
+        if (draft.roundsUsed !== negotiation.roundsUsed) {
+          return { ok: false as const, code: "draft-round-stale", message: "negotiation round advanced after this draft was prepared" };
+        }
+        const draftConversationVersion = draft.conversationVersion ?? null;
+        const liveConversationVersion = negotiation.conversationVersion ?? null;
+        if (draftConversationVersion !== liveConversationVersion) {
+          return { ok: false as const, code: "draft-conversation-changed", message: "prepared draft conversation version is no longer current" };
+        }
+        const draftConversationState = draft.conversationState ?? null;
+        const liveConversationState = negotiation.conversationState ?? null;
+        if (draftConversationState !== liveConversationState) {
+          return { ok: false as const, code: "draft-conversation-changed", message: "prepared draft conversation state is no longer current" };
+        }
+        if (draft.payloadHash !== hash && draft.payloadHash !== submittedHash) {
+          return { ok: false as const, code: "draft-payload-mismatch", message: "prepared draft payload no longer matches its approved hash" };
+        }
+      }
+      negotiationAuthority = {
+        negotiationId: args.negotiationId,
+        quoteId: negotiation.quoteId,
+        quoteVersion: negotiation.quoteVersion,
+        quoteContentHash: mandateQuote.contentHash,
+        roundsUsed: negotiation.roundsUsed,
+        ...(negotiation.conversationId === undefined ? {} : { conversationId: negotiation.conversationId }),
+        ...(negotiation.conversationVersion === undefined
+          ? {}
+          : { conversationVersion: negotiation.conversationVersion }),
+        ...(negotiation.conversationState === undefined
+          ? {}
+          : { conversationState: negotiation.conversationState }),
+      };
     }
 
     let reservationRef: Id<"reservations"> | undefined;
@@ -624,6 +1005,7 @@ export const create = f1Mutation({
         : {}),
       ...(conversationVersion === undefined ? {} : { conversationVersion }),
       workflowAuthority: operationAuthority,
+      ...(negotiationAuthority === undefined ? {} : { negotiationAuthority }),
       state: "prepared",
       ...(reservationRef === undefined ? {} : { reservationId: reservationRef }),
       createdAt: now,
@@ -715,6 +1097,10 @@ export const claim = f1InternalMutation({
     if (operationPayload === null) {
       return { ok: false as const, code: "invalid-payload", message: "operation payload is not valid JSON" };
     }
+    const grantPayload = parseCanonicalPayload(grant.canonicalPayload);
+    if (grantPayload === null) {
+      return { ok: false as const, code: "invalid-payload", message: "grant payload is not valid JSON" };
+    }
     const contextText =
       isRecord(operationPayload) && typeof operationPayload["query"] === "string"
         ? operationPayload["query"]
@@ -737,6 +1123,35 @@ export const claim = f1InternalMutation({
     ) {
       return { ok: false as const, code: "unrelated-refusal", message: "reply requires one exact active purchasing conversation" };
     }
+    const operationText = workflowTextForPayload(operation.kind, operationPayload);
+    if (operationText === null) {
+      return { ok: false as const, code: "unrelated-refusal", message: "operation payload is outside the purchasing workflow" };
+    }
+    const operationClassification = classifyScope({
+      text: operationText,
+      operationId: operation.kind,
+      projectContext: context,
+    });
+    if (operationClassification.verdict === "unavailableRefused") {
+      return { ok: false as const, code: "unavailable-capability", message: operationClassification.reason };
+    }
+    if (operationClassification.verdict === "unrelatedRefused" && !isCommunicationKind(operation.kind)) {
+      return { ok: false as const, code: "unrelated-refusal", message: operationClassification.reason };
+    }
+    if (operationClassification.verdict === "supported") {
+      const expectedOperationPayload = supportedWorkflowPayload(
+        operation.kind,
+        operationPayload,
+        operationClassification.supportedSegment,
+      );
+      if (
+        expectedOperationPayload === null ||
+        (operationClassification.refusedSegments.length > 0 &&
+          canonicalJson(expectedOperationPayload) !== operation.normalizedPayload)
+      ) {
+        return { ok: false as const, code: "unrelated-refusal", message: "operation payload is not the canonical supported segment" };
+      }
+    }
     const grantAuthority = workflowAuthorityForOperation(grant.workflowAuthorities, operation.kind);
     if (grantAuthority === null || operation.workflowAuthority === undefined) {
       return { ok: false as const, code: "unrelated-refusal", message: "operation authority is unavailable" };
@@ -744,7 +1159,13 @@ export const claim = f1InternalMutation({
     if (
       !authorityRefsCompatible(grantAuthority, operation.workflowAuthority) ||
       (job.workflowAuthority !== undefined &&
-        canonicalJson(job.workflowAuthority) !== canonicalJson(operation.workflowAuthority)) ||
+        canonicalJson(job.workflowAuthority) !== canonicalJson(operation.workflowAuthority) &&
+        !(isCommunicationKind(operation.kind) &&
+          authorityRefsCompatible(job.workflowAuthority, operation.workflowAuthority) &&
+          (!("conversationId" in job.workflowAuthority) ||
+            job.workflowAuthority.conversationId === undefined) &&
+          "conversationId" in operation.workflowAuthority &&
+          operation.workflowAuthority.conversationId !== undefined)) ||
       !(await validateWorkflowAuthority(
         ctx,
         operation.workflowAuthority,
@@ -756,6 +1177,12 @@ export const claim = f1InternalMutation({
     ) {
       return { ok: false as const, code: "unrelated-refusal", message: "operation authority is not current for this project" };
     }
+    if (
+      isCommunicationKind(operation.kind) &&
+      !communicationAuthorityMatchesContext(grant, operation.workflowAuthority, context)
+    ) {
+      return { ok: false as const, code: "unrelated-refusal", message: "communication conversation is not current for this project" };
+    }
     const purpose = validateWorkflowBinding({
       operationId: operation.kind,
       context,
@@ -763,12 +1190,8 @@ export const claim = f1InternalMutation({
       ...(job.workflowPurpose === undefined ? {} : { jobPurpose: job.workflowPurpose }),
       ...(job.workflowContext === undefined ? {} : { jobContext: job.workflowContext }),
     });
-    if (!purpose.ok) {
+    if (!purpose.ok && !isCommunicationKind(operation.kind)) {
       return { ok: false as const, code: "unrelated-refusal", message: purpose.reason ?? "job purpose is not supported" };
-    }
-    const grantPayload = parseCanonicalPayload(grant.canonicalPayload);
-    if (grantPayload === null) {
-      return { ok: false as const, code: "invalid-payload", message: "grant payload is not valid JSON" };
     }
     const grantPurpose = validateWorkflowPayload({
       operationId: operation.kind,
@@ -776,8 +1199,43 @@ export const claim = f1InternalMutation({
       payload: grantPayload,
       context,
     });
-    if (!grantPurpose.ok) {
+    if (!grantPurpose.ok && !isCommunicationKind(operation.kind)) {
       return { ok: false as const, code: "unrelated-refusal", message: grantPurpose.reason ?? "grant purpose is not supported" };
+    }
+    const grantText = workflowTextForPayload(operation.kind, grantPayload);
+    if (grantText === null) {
+      return { ok: false as const, code: "unrelated-refusal", message: "grant payload is outside the purchasing workflow" };
+    }
+    const grantClassification = classifyScope({
+      text: grantText,
+      operationId: operation.kind,
+      projectContext: context,
+    });
+    if (!isCommunicationKind(operation.kind) && grantClassification.verdict !== "supported") {
+      return { ok: false as const, code: "unrelated-refusal", message: "grant purpose is not supported" };
+    }
+    if (grantClassification.verdict === "unavailableRefused") {
+      return { ok: false as const, code: "unavailable-capability", message: grantClassification.reason };
+    }
+    if (
+      operationClassification.verdict === "supported" &&
+      grantClassification.verdict === "supported"
+    ) {
+      const expectedGrantPayload = supportedWorkflowPayload(
+        operation.kind,
+        grantPayload,
+        operationClassification.supportedSegment,
+      );
+      if (
+        expectedGrantPayload === null ||
+        grantClassification.supportedSegment !== operationClassification.supportedSegment ||
+        ((operationClassification.refusedSegments.length > 0 ||
+          grantClassification.refusedSegments.length > 0) &&
+          canonicalJson(expectedGrantPayload) !== grant.canonicalPayload) ||
+        grant.canonicalPayload !== operation.normalizedPayload
+      ) {
+        return { ok: false as const, code: "changed-draft", message: "operation segment no longer matches the approved grant" };
+      }
     }
     // F1-22: compare the operation's captured versions against current
     // authority. Coordinated job/grant advancement still stales prepared
@@ -816,58 +1274,53 @@ export const claim = f1InternalMutation({
       return { ok: false as const, code: "grant-ceiling-exceeded", message: "grant-wide reservations exceed the grant cost ceiling" };
     }
 
-    const storedPayload = operation.normalizedPayload;
-
     // Communication envelope first: header injections receive their precise
     // typed denial before the draft comparison.
     if (isCommunicationKind(operation.kind)) {
-      const recipient = await ctx.db
-        .query("recipientConfigs")
-        .withIndex("by_active", (q) => q.eq("active", true))
-        .unique();
-      if (recipient === null) {
-        return { ok: false as const, code: "missing-recipient-config", message: "owner recipient is not configured" };
-      }
-      if (
-        operation.recipientConfigVersion !== grant.recipientConfigVersion ||
-        grant.recipientConfigVersion !== recipient.version
-      ) {
-        return { ok: false as const, code: "stale-recipient-version", message: "recipient configuration changed; re-approval required" };
-      }
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(storedPayload);
-      } catch {
-        return { ok: false as const, code: "invalid-payload", message: "communication payload is not valid JSON" };
-      }
-      if (!isRecord(parsed)) {
-        return { ok: false as const, code: "invalid-payload", message: "communication payload must be an object" };
-      }
-      const to = typeof parsed["to"] === "string" ? normalizeMailbox(parsed["to"]) : "";
-      const cc = Array.isArray(parsed["cc"]) ? parsed["cc"] : null;
-      const bcc = Array.isArray(parsed["bcc"]) ? parsed["bcc"] : null;
-      if (to !== recipient.mailboxNormalized) {
-        return { ok: false as const, code: "recipient-mismatch", message: "recipient is not the configured owner mailbox" };
-      }
-      if (cc === null || cc.length !== 0) {
-        return { ok: false as const, code: "cc-not-empty", message: "CC must remain empty" };
-      }
-      if (bcc === null || bcc.length !== 0) {
-        return { ok: false as const, code: "bcc-not-empty", message: "BCC must remain empty" };
-      }
-      if (parsed["replyTo"] !== undefined) {
-        return { ok: false as const, code: "reply-to-redirect", message: "Reply-To redirection is denied" };
-      }
-      if (parsed["profile"] !== COMMUNICATION_PROFILE_OWNER_ROLEPLAY) {
-        return { ok: false as const, code: "alternate-channel-denied", message: "only the owner-roleplay profile is permitted" };
+      const envelope = await validateCommunicationEnvelope(
+        ctx,
+        operationPayload,
+        grant,
+        operation.recipientConfigVersion,
+      );
+      if (!envelope.ok) {
+        return { ok: false as const, code: envelope.code, message: envelope.message };
       }
     }
 
-    if (!sameCanonicalPayload(storedPayload, grant.canonicalPayload)) {
+    const communicationScopeException =
+      isCommunicationKind(operation.kind) &&
+      sameCanonicalPayload(operation.normalizedPayload, grant.canonicalPayload) &&
+      operation.normalizedPayloadHash === grant.payloadHash &&
+      operationClassification.verdict === "unrelatedRefused" &&
+      grantClassification.verdict === "unrelatedRefused" &&
+      !isScopeInjectionRefusal(operationClassification) &&
+      !isScopeInjectionRefusal(grantClassification);
+
+    // Compare the immutable snapshots before allowing the communication
+    // exception. A changed normalized payload is never rescued by a body
+    // that happens to be a valid owner-only envelope.
+    if (!sameCanonicalPayload(operation.normalizedPayload, grant.canonicalPayload)) {
       return { ok: false as const, code: "changed-draft", message: "approved draft changed after this operation was prepared" };
+    }
+    if (isCommunicationKind(operation.kind) && operation.normalizedPayloadHash !== grant.payloadHash) {
+      return { ok: false as const, code: "changed-draft", message: "approved draft hash changed after this operation was prepared" };
     }
     if (!sha256BindingOk(operation.payloadSha256, grant.payloadSha256)) {
       return { ok: false as const, code: "changed-draft", message: "payload digest no longer matches the approved draft" };
+    }
+    if (!purpose.ok && !communicationScopeException) {
+      return { ok: false as const, code: "unrelated-refusal", message: purpose.reason ?? "job purpose is not supported" };
+    }
+    if (!grantPurpose.ok && !communicationScopeException) {
+      return { ok: false as const, code: "unrelated-refusal", message: grantPurpose.reason ?? "grant purpose is not supported" };
+    }
+    if (
+      isCommunicationKind(operation.kind) &&
+      !communicationScopeException &&
+      (operationClassification.verdict !== "supported" || grantClassification.verdict !== "supported")
+    ) {
+      return { ok: false as const, code: "unrelated-refusal", message: "communication payload is outside the purchasing workflow" };
     }
 
     if (operation.conversationVersion !== undefined) {
@@ -935,10 +1388,109 @@ export const claim = f1InternalMutation({
       }
     }
 
+    // Negotiation authority recheck (Devin findings 4060796830/4060796928):
+    // runs inside the same atomic mutation that consumes the unique mandate
+    // round and mints the attempt token, immediately before provider effect.
+    // A revoked, expired, superseded, reply-changed, or round-moved mandate
+    // denies the claim with zero provider transport, and the prepared
+    // operation stays intact.
+    let negotiationRoundConsumed = false;
+    if (operation.negotiationAuthority !== undefined) {
+      const authority = operation.negotiationAuthority;
+      const negotiation = await ctx.db.get(authority.negotiationId);
+      if (
+        negotiation === null ||
+        negotiation.organizationId !== operation.organizationId ||
+        negotiation.projectId !== operation.projectId ||
+        negotiation.quoteId !== authority.quoteId ||
+        negotiation.quoteVersion !== authority.quoteVersion
+      ) {
+        return { ok: false as const, code: "mandate-not-current", message: "negotiation mandate is not current for this operation" };
+      }
+      if (negotiation.state === "revoked") {
+        return { ok: false as const, code: "mandate-revoked", message: "negotiation mandate was revoked after preparation" };
+      }
+      if (negotiation.state === "concluded") {
+        return { ok: false as const, code: "mandate-concluded", message: "negotiation mandate concluded after preparation" };
+      }
+      if (negotiation.state === "paused") {
+        return { ok: false as const, code: "mandate-paused", message: "negotiation mandate is paused" };
+      }
+      if (negotiation.state !== "active") {
+        return { ok: false as const, code: "mandate-not-active", message: "negotiation mandate is not active" };
+      }
+      if (negotiation.expiresAt <= now) {
+        return { ok: false as const, code: "mandate-expired", message: "negotiation mandate expired after preparation" };
+      }
+      if (negotiation.roundsUsed >= negotiation.roundLimit) {
+        return { ok: false as const, code: "mandate-round-limit-reached", message: "negotiation mandate has no remaining rounds" };
+      }
+      if (negotiation.roundsUsed !== authority.roundsUsed) {
+        return { ok: false as const, code: "mandate-round-changed", message: "negotiation round advanced after this operation was prepared" };
+      }
+      const mandateQuote = await ctx.db.get(authority.quoteId);
+      if (
+        mandateQuote === null ||
+        mandateQuote.organizationId !== operation.organizationId ||
+        mandateQuote.projectId !== operation.projectId
+      ) {
+        return { ok: false as const, code: "mandate-quote-stale", message: "negotiation quote is unavailable for this project" };
+      }
+      if (mandateQuote.version !== authority.quoteVersion || mandateQuote.contentHash !== authority.quoteContentHash) {
+        return { ok: false as const, code: "mandate-quote-changed", message: "negotiation quote changed after preparation" };
+      }
+      const quoteSuccessor = await ctx.db
+        .query("quotes")
+        .withIndex("by_project_and_supersedes", (q) =>
+          q.eq("projectId", operation.projectId).eq("supersedes", mandateQuote.contentHash),
+        )
+        .first();
+      if (quoteSuccessor !== null) {
+        return { ok: false as const, code: "mandate-quote-superseded", message: "negotiation quote version has been superseded" };
+      }
+      const boundConversationId = authority.conversationId;
+      if (boundConversationId !== undefined) {
+        if (authority.conversationVersion === undefined || authority.conversationState === undefined) {
+          // An old bound mandate without the approved conversation pins has
+          // no current approval basis; it stays fail-closed until an
+          // explicit reply-incorporation transition exists.
+          return { ok: false as const, code: "mandate-approval-unpinned", message: "bound mandate lacks the approved conversation version" };
+        }
+        const boundConversation = await ctx.db.get(boundConversationId);
+        if (
+          boundConversation === null ||
+          boundConversation.organizationId !== operation.organizationId ||
+          boundConversation.projectId !== operation.projectId
+        ) {
+          return { ok: false as const, code: "mandate-conversation-stale", message: "bound conversation is unavailable" };
+        }
+        if (boundConversation.state === "closed" || boundConversation.state === "cancelled") {
+          return { ok: false as const, code: "mandate-conversation-closed", message: "bound conversation is closed or cancelled" };
+        }
+        if (
+          boundConversation.version !== authority.conversationVersion ||
+          boundConversation.state !== authority.conversationState
+        ) {
+          // Covers both version drift (a recorded reply ingested by the
+          // callback) and same-version state drift until an explicit
+          // reply-incorporation transition exists.
+          return { ok: false as const, code: "mandate-conversation-changed", message: "bound conversation changed after mandate approval" };
+        }
+      }
+      await ctx.db.patch(authority.negotiationId, {
+        roundsUsed: negotiation.roundsUsed + 1,
+        updatedAt: now,
+      });
+      negotiationRoundConsumed = true;
+    }
+
     const token = crypto.randomUUID();
     await ctx.db.patch(args.operationId, {
       state: "dispatching",
       attemptToken: token,
+      ...(negotiationRoundConsumed
+        ? { negotiationRoundConsumed: true, negotiationRoundRefunded: false }
+        : {}),
       updatedAt: now,
     });
     await ctx.db.insert("attempts", {

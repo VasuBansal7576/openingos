@@ -47,8 +47,36 @@ import {
   storedFinancialEvidenceRefValidator,
   storedOrderLineValidator,
   storedSelectionLineValidator,
+  requirementMilestoneValidator,
 } from "./shared/domainContracts.js";
 import { workflowAuthoritiesValidator, workflowAuthorityValidator } from "./shared/scope.js";
+
+/**
+ * Negotiation authority binding (Devin findings 4060796830/4060796928):
+ * prepared negotiation sends carry an immutable pin of the exact mandate
+ * facts they were approved under. Every value is derived server-side from
+ * the live rows at preparation; the atomic claim rechecks each pin against
+ * the current rows immediately before provider effect. Optional so
+ * historical operations without the binding stay readable.
+ */
+const negotiationConversationStateValidator = v.union(
+  v.literal("draft"),
+  v.literal("queued"),
+  v.literal("awaitingReply"),
+  v.literal("replyReceived"),
+  v.literal("closed"),
+  v.literal("cancelled"),
+);
+const negotiationAuthorityValidator = v.object({
+  negotiationId: v.id("negotiations"),
+  quoteId: v.id("quotes"),
+  quoteVersion: v.string(),
+  quoteContentHash: v.string(),
+  roundsUsed: v.number(),
+  conversationId: v.optional(v.id("conversations")),
+  conversationVersion: v.optional(v.number()),
+  conversationState: v.optional(negotiationConversationStateValidator),
+});
 
 /**
  * Field-level evidence references for the F1 shared-domain graph use the
@@ -86,6 +114,12 @@ export default defineSchema({
     budgetMinorUnits: v.optional(v.number()),
     needByAt: v.optional(v.number()),
     createdAt: v.number(),
+    // E15 controlled sample marker (P-16, H-06). Absent on every
+    // non-sample project; present only on projects seeded by the
+    // controlled sample boundary. The workbench projection surfaces
+    // both fields so the sample-data label is durable, not UI text.
+    sampleKind: v.optional(v.string()),
+    sampleLabel: v.optional(v.string()),
   }).index("by_organization", ["organizationId"]),
 
   locations: defineTable({
@@ -128,6 +162,9 @@ export default defineSchema({
     budgetMinorUnits: v.optional(v.number()),
     currency: v.optional(v.string()),
     needByAt: v.optional(v.number()),
+    hardConstraints: v.optional(v.string()),
+    responsible: v.optional(v.string()),
+    requiredMilestone: v.optional(requirementMilestoneValidator),
     templateId: v.optional(v.id("templates")),
     templateVersion: v.optional(v.string()),
     createdAt: v.number(),
@@ -138,6 +175,24 @@ export default defineSchema({
     .index("by_project_and_state", ["projectId", "state"])
     .index("by_organization_and_project", ["organizationId", "projectId"])
     .index("by_organization_and_project_and_title", ["organizationId", "projectId", "title"]),
+
+  /** Immutable before/after history for optimistic requirement edits. */
+  requirementRevisions: defineTable({
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    requirementId: v.id("requirements"),
+    idempotencyKey: v.string(),
+    expectedVersion: v.number(),
+    previousVersion: v.number(),
+    nextVersion: v.number(),
+    patchCanonical: v.string(),
+    before: v.string(),
+    after: v.string(),
+    actor: v.string(),
+    createdAt: v.number(),
+  })
+    .index("by_project_and_key", ["projectId", "idempotencyKey"])
+    .index("by_requirement", ["requirementId"]),
 
   dependencies: defineTable({
     organizationId: v.id("organizations"),
@@ -158,6 +213,21 @@ export default defineSchema({
     .index("by_project", ["projectId"])
     .index("by_from_requirement", ["fromRequirementId"])
     .index("by_to_requirement", ["toRequirementId"]),
+
+  /** Immutable transition history for dependency verification decisions. */
+  dependencyRevisions: defineTable({
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    dependencyId: v.id("dependencies"),
+    beforeVerification: v.string(),
+    afterVerification: v.string(),
+    beforeEvidenceRefs: v.optional(v.array(domainEvidenceRefValidator)),
+    afterEvidenceRefs: v.optional(v.array(domainEvidenceRefValidator)),
+    reason: v.optional(v.string()),
+    actor: v.string(),
+    createdAt: v.number(),
+  })
+    .index("by_dependency", ["dependencyId"]),
 
   vendors: defineTable({
     organizationId: v.id("organizations"),
@@ -249,6 +319,10 @@ export default defineSchema({
     ),
     origin: v.union(v.literal("internal"), v.literal("ownerImport")),
     conflictEvidenceIds: v.array(v.id("productEvidence")),
+    // C1 inbound source link: an agentmail message marker records the exact
+    // evidence row it was extracted from, so replay and quote extraction use
+    // a durable link instead of scanning a project evidence prefix.
+    sourceEvidenceId: v.optional(v.id("evidence")),
     idempotencyKey: v.string(),
     // F1R-07: the normalized ingestion identity is immutable. Verification,
     // freshness, and status projections may change without changing replay
@@ -323,6 +397,16 @@ export default defineSchema({
     quoteVersion: v.string(),
     currency: v.string(),
     conversationId: v.optional(v.id("conversations")),
+    // Mandate-approved conversation identity, pinned server-side when
+    // openNegotiation binds the quote conversation: the exact approved
+    // version AND the exact approved state. Raw inbound callback ingestion
+    // never advances these pins: the callback already increments the live
+    // conversation version and sets replyReceived, so a newer or
+    // state-drifted live conversation creates a fail-closed mismatch until
+    // an explicit reply-incorporation transition exists. Optional for
+    // historical rows.
+    conversationVersion: v.optional(v.number()),
+    conversationState: v.optional(negotiationConversationStateValidator),
     mandateHash: v.string(),
     targetMinorUnits: v.optional(v.number()),
     roundLimit: v.number(),
@@ -373,6 +457,10 @@ export default defineSchema({
     snapshotHash: v.string(),
     selectionId: v.optional(v.id("selections")),
     quoteId: v.optional(v.id("quotes")),
+    // Derived server-side from the linked selection/quote. These fields let
+    // approval decisions re-check the exact requirement basis after edits.
+    requirementId: v.optional(v.id("requirements")),
+    requirementVersion: v.optional(v.number()),
     state: v.union(
       v.literal("pending"),
       v.literal("approved"),
@@ -648,6 +736,13 @@ export default defineSchema({
     expiresAt: v.optional(v.number()),
     updatedAt: v.number(),
   })
+    // S1/U1 projection pages one identity's authority horizons without
+    // scanning other identities; organization and project remain in the key
+    // for consumer-side tenant and project rechecks on each returned row.
+    .index(
+      "by_identity_and_authority_until_and_organization_and_project",
+      ["identity", "authorityUntil", "organizationId", "projectId"],
+    )
     .index(
       "by_organization_and_identity_and_scope_and_role_and_authority_until",
       ["organizationId", "identity", "scopeKey", "role", "authorityUntil"],
@@ -757,9 +852,16 @@ export default defineSchema({
     // -> operation and revalidated at each protected boundary. Missing
     // authority on legacy rows fails closed before new work is created.
     workflowAuthority: v.optional(workflowAuthorityValidator),
+    // E3 automatic-start idempotency: a client-supplied bounded key that
+    // binds one logical automatic research start to exactly one grant+job.
+    // Optional so legacy rows remain readable; new automatic starts with a
+    // key populate it. Scoped by the compound project index below so a key
+    // never replays across projects.
+    startIdempotencyKey: v.optional(v.string()),
   })
     .index("by_project", ["projectId"])
-    .index("by_grant", ["grantId"]),
+    .index("by_grant", ["grantId"])
+    .index("by_project_and_start_key", ["projectId", "startIdempotencyKey"]),
 
   operations: defineTable({
     organizationId: v.id("organizations"),
@@ -789,10 +891,26 @@ export default defineSchema({
     attemptToken: v.optional(v.string()),
     linkedResendOf: v.optional(v.id("operations")),
     workflowAuthority: v.optional(workflowAuthorityValidator),
+    // Optional immutable negotiation authority binding derived server-side
+    // at preparation and rechecked inside the atomic claim immediately
+    // before provider effect. Missing on historical rows keeps them
+    // claimable exactly as before; a bound mandate must stay exact, active,
+    // unexpired, round-current, and quote/conversation-current.
+    negotiationAuthority: v.optional(negotiationAuthorityValidator),
+    // The atomic claim consumes the bound negotiation round before provider
+    // effect. Definitive non-sends may refund only the operation that owns
+    // this marker; this prevents one concurrent attempt from refunding
+    // another attempt's round.
+    negotiationRoundConsumed: v.optional(v.boolean()),
+    negotiationRoundRefunded: v.optional(v.boolean()),
     createdAt: v.number(),
     updatedAt: v.number(),
   })
     .index("by_requestKey", ["requestKey"])
+    // Coordinated R1 historical bridge: the R1 owner scopes exact
+    // project-local prefix ranges over previous F03 target-bound requestKey
+    // values without grant enumeration or cross-project coupling.
+    .index("by_project_and_requestKey", ["projectId", "requestKey"])
     .index("by_job", ["jobId"])
     .index("by_job_and_state", ["jobId", "state"])
     .index("by_reservation", ["reservationId"])
@@ -840,14 +958,54 @@ export default defineSchema({
     // F1R-12: receipt ownership/facts are immutable and separate from the
     // operation binding and application projection below. Optional fields
     // preserve reads of historical receipts created before this contract.
+    // C1 callback binding facts are normalized provider identifiers. Keeping
+    // them outside `outcome` makes message and thread reconciliation use an
+    // exact compound index while the legacy JSON remains readable.
+    providerMessageId: v.optional(v.string()),
+    providerThreadId: v.optional(v.string()),
+    providerInboxId: v.optional(v.string()),
     organizationId: v.optional(v.id("organizations")),
     projectId: v.optional(v.id("projects")),
     operationId: v.optional(v.id("operations")),
     applicationOutcome: v.optional(v.union(v.literal("success"), v.literal("failure"), v.literal("unknown"))),
     applicationState: v.optional(v.string()),
     appliedAt: v.optional(v.number()),
+    // Fair replay rotation: the last time this row was evaluated by a
+    // waiting-set repair pass. Absent until the first evaluation; rows
+    // never evaluated sort ahead of retried rows.
+    replayLastAttemptAt: v.optional(v.number()),
     createdAt: v.number(),
-  }).index("by_provider_environment_and_event", ["provider", "environment", "eventId"]),
+  })
+    .index("by_provider_environment_and_event", ["provider", "environment", "eventId"])
+    // Full provider binding lookup used for callback-to-operation matching.
+    // The identifiers are optional for migration compatibility, so legacy
+    // rows without them are intentionally absent from this exact lookup.
+    .index(
+      "by_provider_environment_and_provider_message_and_thread_and_inbox",
+      ["provider", "environment", "providerMessageId", "providerThreadId", "providerInboxId"],
+    )
+    // Replies use the outbound thread and inbox but have a different message
+    // id, so conversation routing needs this second exact key.
+    .index(
+      "by_provider_environment_and_provider_thread_and_inbox",
+      ["provider", "environment", "providerThreadId", "providerInboxId"],
+    )
+    // Retained pre-binding replies query their exact waiting set through
+    // this key (Greptile r4058523015 repair). Patching a replayed row to
+    // observedSuccess removes it from the waiting set, so the next bounded
+    // read advances past completed rows without sampling a fixed prefix and
+    // without deleting the raw event record or its application outcome.
+    .index(
+      "by_provider_environment_and_thread_inbox_and_state",
+      ["provider", "environment", "providerThreadId", "providerInboxId", "applicationState"],
+    )
+    // Fair replay rotation: equality on the waiting set plus ascending
+    // order over the last evaluation time, so each bounded take returns
+    // the least-recently-attempted waiting rows first.
+    .index(
+      "by_provider_environment_and_thread_inbox_state_and_attempt",
+      ["provider", "environment", "providerThreadId", "providerInboxId", "applicationState", "replayLastAttemptAt"],
+    ),
 
   evidence: defineTable({
     organizationId: v.id("organizations"),
@@ -857,6 +1015,11 @@ export default defineSchema({
     providerIds: v.optional(v.string()),
     capturedAt: v.number(),
     contentHash: v.string(),
+    // Protected source bytes stay linked to the immutable content hash. UI
+    // projections expose only bounded, redacted excerpts from productEvidence;
+    // these fields are never part of a public projection or guest download.
+    protectedSourceText: v.optional(v.string()),
+    protectedSourceHtml: v.optional(v.string()),
     completeness: v.union(
       v.literal("complete"),
       v.literal("partial"),
@@ -869,7 +1032,12 @@ export default defineSchema({
       v.literal("fixture"),
     ),
     locator: v.optional(v.string()),
-  }).index("by_project", ["projectId"]),
+  })
+    .index("by_project", ["projectId"])
+    // Exact replay lookup for an inbound source snapshot by its content hash
+    // inside one project. Legacy markers without `sourceEvidenceId` use this
+    // instead of collecting an arbitrary project evidence prefix.
+    .index("by_project_and_contentHash", ["projectId", "contentHash"]),
 
   files: defineTable({
     organizationId: v.id("organizations"),
@@ -896,6 +1064,77 @@ export default defineSchema({
     counterpartyRole: v.string(),
     createdAt: v.number(),
   }).index("by_operation", ["operationId"]),
+
+  /**
+   * C1 durable provider-thread identity (Greptile r4058523017 repair).
+   *
+   * One row binds a provider thread in an inbox to the single purchasing
+   * conversation it belongs to. `recordProviderBinding` establishes the row
+   * when the first outbound send binds, and denies a later send whose grant
+   * resolves to a different conversation, so conflicting identities fail
+   * closed at bind time. Inbound routing and quote-source proof read this
+   * row through one exact indexed lookup instead of scanning every binding
+   * row under the thread, so legitimate long threads keep routing no matter
+   * how many binding rows they accumulate. Threads that predate this table
+   * fall back to the bounded legacy row scan.
+   */
+  threadBindings: defineTable({
+    provider: v.string(),
+    environment: v.string(),
+    providerThreadId: v.string(),
+    providerInboxId: v.string(),
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    conversationId: v.id("conversations"),
+    operationId: v.id("operations"),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_provider_environment_and_thread_and_inbox", [
+      "provider",
+      "environment",
+      "providerThreadId",
+      "providerInboxId",
+    ])
+    .index("by_conversation", ["conversationId"]),
+
+  /**
+   * C1 resumable thread-identity migration (Greptile r4058523017 follow-up).
+   *
+   * Threads that accumulated more than 64 binding rows before the durable
+   * thread binding existed cannot be proven unanimous inside one bounded
+   * read. This row carries the migration progress so successive bounded
+   * transactions eventually prove exactly one identity: `candidate...`
+   * fields name the identity under proof, `cursor` is the opaque Convex
+   * pagination continuation for the exact thread/inbox index (absent at
+   * the start), and `verifiedReads` counts exactly verified rows.
+   * Positional cursors never stall on equal timestamps. `conflicted` is
+   * terminal and never produces a binding; only `complete` writes it.
+   */
+  threadMigrationStates: defineTable({
+    provider: v.string(),
+    environment: v.string(),
+    providerThreadId: v.string(),
+    providerInboxId: v.string(),
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    candidateConversationId: v.optional(v.id("conversations")),
+    candidateOperationId: v.optional(v.id("operations")),
+    verifiedReads: v.number(),
+    cursor: v.optional(v.string()),
+    state: v.union(
+      v.literal("verifying"),
+      v.literal("complete"),
+      v.literal("conflicted"),
+    ),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  }).index("by_provider_environment_and_thread_and_inbox", [
+    "provider",
+    "environment",
+    "providerThreadId",
+    "providerInboxId",
+  ]),
 
   conversations: defineTable({
     organizationId: v.id("organizations"),
@@ -927,6 +1166,10 @@ export default defineSchema({
     requirementId: v.optional(v.id("requirements")),
     vendorId: v.optional(v.id("vendors")),
     rfqId: v.optional(v.id("rfqs")),
+    // New requirement-bound quotes pin the requirement version that produced
+    // them. Historical rows may omit this field and must fail closed when a
+    // new quote-only approval would otherwise need to infer the basis.
+    requirementVersion: v.optional(v.number()),
     version: v.string(),
     contentHash: v.string(),
     payloadSha256: v.optional(v.string()),
@@ -945,6 +1188,12 @@ export default defineSchema({
     supersedes: v.optional(v.string()),
     createdAt: v.number(),
   })
+    // S1/U1 candidate projection lookup: latest matching quote selection is
+    // bounded to one project, requirement, and vendor tuple by createdAt.
+    .index(
+      "by_project_and_requirement_and_vendor_and_created_at",
+      ["projectId", "requirementId", "vendorId", "createdAt"],
+    )
     .index("by_project", ["projectId"])
     .index("by_contentHash", ["contentHash"])
     .index("by_project_and_version", ["projectId", "version"])
@@ -969,6 +1218,144 @@ export default defineSchema({
     jobId: v.optional(v.id("jobs")),
     createdAt: v.number(),
   }).index("by_fingerprint", ["requestFingerprint"]),
+
+  /**
+   * E5 changed-term impact (P-11, P-12, D-15). An append-only,
+   * evidence-backed re-evaluation triggered by a superseding quote
+   * revision or an explicit watch observation. It distinguishes an
+   * unplaced selection change from already placed orders, carries
+   * explicit unknown and incomplete states, and never mutates
+   * selections, approvals, orders, or financial rows. A failed watch
+   * check stays `unknown` and can never mark a placed order delayed:
+   * no assessment field expresses delivery delay at all. Reason text
+   * derives only from stored rows, never from invented savings,
+   * availability, or vendor replies.
+   */
+  impactAssessments: defineTable({
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    idempotencyKey: v.string(),
+    requirementId: v.id("requirements"),
+    trigger: v.union(v.literal("quoteRevision"), v.literal("watchObservation")),
+    // Exact revision lineage for the quoteRevision trigger: the current
+    // (successor) revision and the predecessor content hash it supersedes.
+    quoteId: v.optional(v.id("quotes")),
+    quoteVersion: v.optional(v.string()),
+    predecessorQuoteId: v.optional(v.id("quotes")),
+    predecessorQuoteVersion: v.optional(v.string()),
+    // Watch-observation trigger: the watched candidate and the observed
+    // result. A failed check (error/unknown) keeps the assessment unknown.
+    watchId: v.optional(v.id("watches")),
+    watchResult: v.optional(
+      v.union(v.literal("ok"), v.literal("stale"), v.literal("error"), v.literal("unknown")),
+    ),
+    // Durable selection/order distinction: no selection is affected, only
+    // an unplaced selection, placed orders exist (fresh approval needed),
+    // or the impact itself is unknown after a failed watch check.
+    orderImpact: v.union(
+      v.literal("none"),
+      v.literal("selectionOnly"),
+      v.literal("reviewRequired"),
+      v.literal("unknown"),
+    ),
+    state: v.union(v.literal("recorded"), v.literal("unknown"), v.literal("incomplete")),
+    affectedSelectionId: v.optional(v.id("selections")),
+    placedOrderCount: v.number(),
+    reason: v.string(),
+    // Bounded per-candidate currentness re-evaluation. Statuses derive
+    // only from stored quote rows; no availability or price ranking.
+    alternatives: v.array(
+      v.object({
+        candidateId: v.id("candidates"),
+        status: v.union(
+          v.literal("current"),
+          v.literal("superseded"),
+          v.literal("noQuote"),
+          v.literal("unknown"),
+        ),
+        quoteId: v.optional(v.id("quotes")),
+        quoteVersion: v.optional(v.string()),
+        note: v.string(),
+      }),
+    ),
+    evidenceRefs: v.optional(v.array(domainEvidenceRefValidator)),
+    createdAt: v.number(),
+  })
+    .index("by_project", ["projectId"])
+    .index("by_project_and_key", ["projectId", "idempotencyKey"])
+    .index("by_requirement", ["requirementId"]),
+
+  /**
+   * E5 substitute proposal (P-12, P-13, D-15). Always requires fresh
+   * approval: it references the impact assessment that explains it,
+   * pins the exact proposed candidate, quote, and line quantities, and
+   * only a pending proposal whose quote revision and requirement
+   * version are still current can be decided by an approver. Deciding
+   * records a new approvals row whose snapshot binds the proposal
+   * decision. No proposal ever deletes or rewrites prior selection,
+   * approval, order, or financial history; executing an approved
+   * substitute remains an explicit new selection through the decision
+   * machinery.
+   */
+  substituteProposals: defineTable({
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    idempotencyKey: v.string(),
+    assessmentId: v.id("impactAssessments"),
+    requirementId: v.id("requirements"),
+    requirementVersion: v.number(),
+    currentSelectionId: v.optional(v.id("selections")),
+    proposedCandidateId: v.id("candidates"),
+    proposedQuoteId: v.id("quotes"),
+    proposedQuoteVersion: v.string(),
+    proposedLines: v.array(storedSelectionLineValidator),
+    reason: v.string(),
+    state: v.union(v.literal("pending"), v.literal("approved"), v.literal("rejected")),
+    decidedBy: v.optional(v.string()),
+    decidedAt: v.optional(v.number()),
+    decisionApprovalId: v.optional(v.id("approvals")),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_project", ["projectId"])
+    .index("by_project_and_key", ["projectId", "idempotencyKey"])
+    .index("by_requirement", ["requirementId"])
+    .index("by_assessment", ["assessmentId"]),
+
+  /**
+   * P-01 intake idempotency (PRD 10). One row per caller identity and
+   * client-supplied key binds the exact normalized intake payload to the
+   * created organization/project. Exact replay returns the stored
+   * workspace; a reused key with different normalized fields conflicts
+   * whole before any write. The compound index scopes the lookup to the
+   * caller's own identity, so no existence oracle leaks across tenants.
+   */
+  intakeRequests: defineTable({
+    identity: v.string(),
+    idempotencyKey: v.string(),
+    normalizedPayload: v.string(),
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    createdAt: v.number(),
+  }).index("by_identity_and_key", ["identity", "idempotencyKey"]),
+
+  /**
+   * E15 controlled sample idempotency (PRD 11 evaluator path, P-16, H-06).
+   * One row per caller identity and client-supplied key binds the fixed
+   * sample dataset marker to the created guest organization/project.
+   * Exact replay returns the stored workspace; each distinct key creates
+   * a distinct fresh guest organization and project. The compound index
+   * scopes the lookup to the caller's own identity, so no existence
+   * oracle leaks across tenants.
+   */
+  sampleProjectRequests: defineTable({
+    identity: v.string(),
+    idempotencyKey: v.string(),
+    normalizedPayload: v.string(),
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    createdAt: v.number(),
+  }).index("by_identity_and_key", ["identity", "idempotencyKey"]),
 });
 
 export { moneyValidator, evidenceRefValidator };

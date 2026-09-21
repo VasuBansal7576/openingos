@@ -17,12 +17,20 @@
 import { v } from "convex/values";
 import type { Id } from "../_generated/dataModel.js";
 import { f1InternalMutation, f1Query, type F1MutationCtx } from "../server.js";
-import { requestKey } from "../shared/hashing.js";
+import { canonicalJson, payloadHash, requestKey } from "../shared/hashing.js";
 import {
   MAX_OPERATIONS_PER_GRANT,
   MAX_OPERATIONS_PER_JOB,
 } from "../shared/scope.js";
 import { checkProjectAccess, denialValidator, identityOf } from "../access/checks.js";
+import {
+  MAX_RECONCILIATION_READS,
+  RECONCILIATION_RETRY_OWNER,
+  parseReconciliationPricingBasis,
+  type ReconciliationAttachment,
+} from "../communication/contracts.js";
+import { isValidSingleMailbox, normalizeMailbox } from "../shared/mailbox.js";
+import { COMMUNICATION_PROFILE_OWNER_ROLEPLAY } from "../shared/provenance.js";
 
 const outcomeValidator = v.union(
   v.literal("success"),
@@ -145,6 +153,339 @@ async function applyOutcome(
   return state;
 }
 
+const reconciliationAttachmentValidator = v.object({
+  filename: v.string(),
+  contentBase64: v.optional(v.string()),
+  contentType: v.optional(v.string()),
+});
+
+const reconciliationSnapshotValidator = v.object({
+  to: v.array(v.string()),
+  cc: v.array(v.string()),
+  bcc: v.array(v.string()),
+  subject: v.string(),
+  body: v.string(),
+  attachments: v.array(reconciliationAttachmentValidator),
+  threadId: v.optional(v.string()),
+});
+
+const reconciliationReadResultValidator = v.union(
+  v.object({
+    ok: v.literal(true),
+    allowed: v.literal(true),
+    snapshot: reconciliationSnapshotValidator,
+    readToken: v.string(),
+  }),
+  denialValidator,
+);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function stringList(value: unknown): readonly string[] | null {
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string")) return null;
+  return value.map((entry) => entry.trim());
+}
+
+function normalizedMailboxList(value: unknown): readonly string[] | null {
+  const list = stringList(value);
+  if (list === null || list.some((entry) => !isValidSingleMailbox(entry))) return null;
+  return list.map(normalizeMailbox);
+}
+
+function reconciliationAttachment(value: unknown): ReconciliationAttachment | null {
+  if (!isRecord(value) || typeof value["filename"] !== "string" || value["filename"].trim().length === 0) return null;
+  const content = value["contentBase64"] ?? value["content"];
+  const contentType = value["contentType"] ?? value["content_type"];
+  if (content !== undefined && typeof content !== "string") return null;
+  if (contentType !== undefined && typeof contentType !== "string") return null;
+  return {
+    filename: value["filename"].trim(),
+    ...(typeof content === "string" ? { contentBase64: content } : {}),
+    ...(typeof contentType === "string" ? { contentType } : {}),
+  };
+}
+
+function buildReconciliationSnapshot(
+  operation: {
+    readonly _id: Id<"operations">;
+    readonly kind: string;
+    readonly organizationId: Id<"organizations">;
+    readonly projectId: Id<"projects">;
+    readonly grantId: Id<"grants">;
+    readonly normalizedPayload: string;
+    readonly normalizedPayloadHash: string;
+    readonly recipientConfigVersion?: number;
+  },
+  row: {
+    readonly organizationId: Id<"organizations">;
+    readonly projectId: Id<"projects">;
+    readonly operationId: Id<"operations">;
+    readonly grantId: Id<"grants">;
+    readonly to: string;
+    readonly cc: readonly string[];
+    readonly bcc: readonly string[];
+    readonly communicationProfile: string;
+    readonly counterpartyRole: string;
+    readonly replyTo?: string;
+    readonly recipientConfigVersion: number;
+    readonly payloadHash: string;
+    readonly bodyHash: string;
+  },
+): {
+  to: string[];
+  cc: string[];
+  bcc: string[];
+  subject: string;
+  body: string;
+  attachments: ReconciliationAttachment[];
+} | null {
+  if (
+    (operation.kind !== "communication.send" && operation.kind !== "communication.clarify") ||
+    row.organizationId !== operation.organizationId ||
+    row.projectId !== operation.projectId ||
+    row.operationId !== operation._id ||
+    row.grantId !== operation.grantId ||
+    row.communicationProfile !== COMMUNICATION_PROFILE_OWNER_ROLEPLAY ||
+    row.counterpartyRole !== "ownerStandIn" ||
+    row.replyTo !== undefined ||
+    row.payloadHash !== operation.normalizedPayloadHash ||
+    (operation.recipientConfigVersion !== undefined && row.recipientConfigVersion !== operation.recipientConfigVersion)
+  ) return null;
+  let payload: unknown;
+  try {
+    payload = JSON.parse(operation.normalizedPayload);
+  } catch {
+    return null;
+  }
+  if (!isRecord(payload)) return null;
+  const to = payload["to"];
+  const cc = normalizedMailboxList(payload["cc"]);
+  const bcc = normalizedMailboxList(payload["bcc"]);
+  const subject = payload["subject"];
+  const body = payload["body"];
+  if (
+    typeof to !== "string" ||
+    !isValidSingleMailbox(to) ||
+    cc === null ||
+    bcc === null ||
+    typeof subject !== "string" ||
+    typeof body !== "string" ||
+    body.length === 0 ||
+    normalizeMailbox(row.to) !== normalizeMailbox(to) ||
+    canonicalJson(row.cc.map(normalizeMailbox)) !== canonicalJson(cc) ||
+    canonicalJson(row.bcc.map(normalizeMailbox)) !== canonicalJson(bcc) ||
+    row.bodyHash !== payloadHash(body)
+  ) return null;
+  const rawAttachments = payload["attachments"];
+  const attachments: ReconciliationAttachment[] = [];
+  if (rawAttachments !== undefined) {
+    if (!Array.isArray(rawAttachments)) return null;
+    for (const raw of rawAttachments) {
+      const parsed = reconciliationAttachment(raw);
+      if (parsed === null || parsed.contentBase64 === undefined) return null;
+      attachments.push(parsed);
+    }
+  }
+  return {
+    to: [normalizeMailbox(to)],
+    cc: [...cc],
+    bcc: [...bcc],
+    subject,
+    body,
+    attachments,
+  };
+}
+
+/**
+ * Admit one read-only provider reconciliation attempt. This is separate from
+ * send claiming because a cancelled or revoked job may still reconcile an
+ * already-dispatched effect, but it must carry the original reservation.
+ */
+async function admitReconciliationRead(
+  ctx: F1MutationCtx,
+  args: { readonly operationId: Id<"operations">; readonly attemptToken: string; readonly readNumber: number },
+) {
+  if (!Number.isSafeInteger(args.readNumber) || args.readNumber < 1 || args.readNumber > MAX_RECONCILIATION_READS) {
+    return { ok: false as const, code: "invalid-payload", message: "reconciliation read number is outside the bounded retry policy" };
+  }
+  const operation = await ctx.db.get(args.operationId);
+  if (operation === null) return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
+  if (
+    (operation.state !== "dispatching" && operation.state !== "outcomeUnknown") ||
+    operation.attemptToken !== args.attemptToken
+  ) {
+    return { ok: false as const, code: "already-claimed", message: "reconciliation token is not valid for this operation" };
+  }
+  const job = await ctx.db.get(operation.jobId);
+  const grant = await ctx.db.get(operation.grantId);
+  if (
+    job === null ||
+    grant === null ||
+    job.organizationId !== operation.organizationId ||
+    job.projectId !== operation.projectId ||
+    job.grantId !== operation.grantId ||
+    job.grantVersion !== operation.grantVersion ||
+    grant.organizationId !== operation.organizationId ||
+    grant.projectId !== operation.projectId
+  ) {
+    return { ok: false as const, code: "denied-membership", message: "operation authority is not available" };
+  }
+  const snapshots = await ctx.db
+    .query("outboundSnapshots")
+    .withIndex("by_operation", (q) => q.eq("operationId", args.operationId))
+    .take(2);
+  if (snapshots.length !== 1 || snapshots[0] === undefined) {
+    return { ok: false as const, code: "outcome-unknown", message: "immutable outbound snapshot is unavailable" };
+  }
+  const snapshot = buildReconciliationSnapshot(operation, snapshots[0]);
+  if (snapshot === null) {
+    return { ok: false as const, code: "outcome-unknown", message: "immutable outbound snapshot does not match the operation" };
+  }
+  if (operation.reservationId === undefined) {
+    return { ok: false as const, code: "allowance-exhausted", message: "reconciliation requires a reservation" };
+  }
+  const reservation = await ctx.db.get(operation.reservationId);
+  if (
+    reservation === null ||
+    reservation.state !== "open" ||
+    reservation.jobId !== operation.jobId ||
+    reservation.organizationId !== operation.organizationId
+  ) {
+    return { ok: false as const, code: "allowance-exhausted", message: "reconciliation reservation is unavailable" };
+  }
+  const pricing = parseReconciliationPricingBasis(reservation.pricingBasis);
+  const budget = await ctx.db.get(reservation.budgetId);
+  // ADR-0004: the org-wide `providerBudgets` row is one shared allowance
+  // ledger across branches, retries, and providers; its own basis label is
+  // not a per-reservation contract. The reservation's exact reconciliation
+  // basis is validated above, and the budget only must exist and belong to
+  // the operation organization.
+  if (
+    pricing === null ||
+    budget === null ||
+    budget.organizationId !== operation.organizationId ||
+    reservation.ceilingMicroUsd < pricing.readCostMicroUsd
+  ) {
+    return { ok: false as const, code: "stale-pricing-basis", message: "reconciliation pricing basis is unavailable or stale" };
+  }
+  const readToken = `${RECONCILIATION_RETRY_OWNER}:${args.attemptToken}:${args.readNumber}`;
+  const existingRows = await ctx.db
+    .query("attempts")
+    .withIndex("by_token", (q) => q.eq("token", readToken))
+    .take(2);
+  if (existingRows.length > 1 || (existingRows[0] !== undefined && existingRows[0].operationId !== args.operationId)) {
+    return { ok: false as const, code: "already-claimed", message: "reconciliation read token is already bound" };
+  }
+  if (existingRows[0] !== undefined) {
+    // A read token is a single-use global allocation, not an action-local
+    // cache key. A repeated action must move to another bounded slot (and
+    // pay for that fresh provider GET) rather than reusing this token.
+    return { ok: false as const, code: "already-claimed", message: "reconciliation read token was already used" };
+  }
+  const held = reservation.reservedMicroUsd + reservation.unresolvedMicroUsd;
+  if (!Number.isSafeInteger(held) || held < pricing.readCostMicroUsd) {
+    return { ok: false as const, code: "allowance-exhausted", message: "reconciliation reservation is exhausted" };
+  }
+  if (
+    budget.reservedMicroUsd < Math.min(reservation.reservedMicroUsd, pricing.readCostMicroUsd) ||
+    budget.unresolvedMicroUsd < Math.max(0, pricing.readCostMicroUsd - reservation.reservedMicroUsd)
+  ) {
+    return { ok: false as const, code: "allowance-exhausted", message: "reconciliation budget is exhausted" };
+  }
+  const fromReserved = Math.min(reservation.reservedMicroUsd, pricing.readCostMicroUsd);
+  const fromUnknown = pricing.readCostMicroUsd - fromReserved;
+  await ctx.db.patch(reservation.budgetId, {
+    reservedMicroUsd: budget.reservedMicroUsd - fromReserved,
+    unresolvedMicroUsd: budget.unresolvedMicroUsd - fromUnknown,
+    spentMicroUsd: budget.spentMicroUsd + pricing.readCostMicroUsd,
+    updatedAt: Date.now(),
+  });
+  await ctx.db.patch(reservation._id, {
+    reservedMicroUsd: reservation.reservedMicroUsd - fromReserved,
+    unresolvedMicroUsd: reservation.unresolvedMicroUsd - fromUnknown,
+    spentMicroUsd: reservation.spentMicroUsd + pricing.readCostMicroUsd,
+    updatedAt: Date.now(),
+  });
+  await ctx.db.insert("attempts", {
+    operationId: args.operationId,
+    token: readToken,
+    state: "dispatching",
+    createdAt: Date.now(),
+    detail: `${RECONCILIATION_RETRY_OWNER}:read:${args.readNumber}:admitted`,
+  });
+  return { ok: true as const, allowed: true as const, snapshot, readToken };
+}
+
+const finishReconciliationResultValidator = v.union(
+  v.object({ ok: v.literal(true), finished: v.number() }),
+  denialValidator,
+);
+
+/** Mark each admitted provider read with its observed reconciliation result. */
+async function finishReconciliationReads(
+  ctx: F1MutationCtx,
+  args: {
+    readonly operationId: Id<"operations">;
+    readonly attemptToken: string;
+    readonly reads: number;
+    readonly readTokens: readonly string[];
+    readonly outcome: "confirmed" | "unknown";
+    readonly detail: string;
+  },
+) {
+  if (!Number.isSafeInteger(args.reads) || args.reads < 0 || args.reads > MAX_RECONCILIATION_READS) {
+    return { ok: false as const, code: "invalid-payload", message: "reconciliation read count is outside the bounded retry policy" };
+  }
+  if (
+    args.readTokens.length !== args.reads ||
+    args.readTokens.length > MAX_RECONCILIATION_READS ||
+    new Set(args.readTokens).size !== args.readTokens.length
+  ) {
+    return { ok: false as const, code: "invalid-payload", message: "reconciliation read tokens do not match the bounded read count" };
+  }
+  if (args.outcome === "confirmed" && args.reads === 0) {
+    return { ok: false as const, code: "outcome-unknown", message: "confirmed reconciliation requires an admitted provider read" };
+  }
+  const operation = await ctx.db.get(args.operationId);
+  if (operation === null || operation.attemptToken !== args.attemptToken) {
+    return { ok: false as const, code: "already-claimed", message: "reconciliation token is not valid for this operation" };
+  }
+  const rows = await ctx.db
+    .query("attempts")
+    .withIndex("by_operation", (q) => q.eq("operationId", args.operationId))
+    .take(MAX_RECONCILIATION_READS + 2);
+  const prefix = `${RECONCILIATION_RETRY_OWNER}:${args.attemptToken}:`;
+  for (const token of args.readTokens) {
+    if (!token.startsWith(prefix)) {
+      return { ok: false as const, code: "invalid-payload", message: "reconciliation read token is not bound to this attempt" };
+    }
+  }
+  const allocatedRows = args.readTokens.map((token) => rows.find((candidate) => candidate.token === token));
+  if (allocatedRows.some((row) => row === undefined || row.state !== "dispatching")) {
+    return { ok: false as const, code: "outcome-unknown", message: "reconciliation read allocation is unavailable" };
+  }
+  const state = args.outcome === "confirmed" ? "observedSuccess" as const : "outcomeUnknown" as const;
+  let finished = 0;
+  for (const row of allocatedRows) {
+    if (row === undefined) continue;
+    await ctx.db.patch(row._id, { state, observedAt: Date.now(), detail: args.detail });
+    finished += 1;
+  }
+  if (args.outcome === "unknown" && operation.state === "dispatching") {
+    // Only the exact reads admitted by this action are finalized above. The
+    // operation may have other reads in flight under a concurrent action, so
+    // do not use the broad crash-reconciliation path here and relabel those
+    // other attempts prematurely.
+    await ctx.db.patch(operation._id, { state: "outcomeUnknown", updatedAt: Date.now() });
+  }
+  if (args.outcome === "confirmed" && finished === 0) {
+    return { ok: false as const, code: "outcome-unknown", message: "confirmed reconciliation has no admitted read" };
+  }
+  return { ok: true as const, finished };
+}
+
 /**
  * Internal: record a validated provider outcome for a claimed token.
  *
@@ -240,13 +581,57 @@ export const recordOutcome = f1InternalMutation({
  * Internal: reconcile after process loss. An abandoned `dispatching`
  * operation becomes `outcomeUnknown`. Never resends; never invents success.
  */
+const reconcileAfterCrashArgsValidator = v.object({
+  operationId: v.id("operations"),
+  mode: v.optional(v.union(v.literal("admitRead"), v.literal("finishReads"))),
+  attemptToken: v.optional(v.string()),
+  readNumber: v.optional(v.number()),
+  reads: v.optional(v.number()),
+  readTokens: v.optional(v.array(v.string())),
+  outcome: v.optional(v.union(v.literal("confirmed"), v.literal("unknown"))),
+  detail: v.optional(v.string()),
+});
+
+const reconcileAfterCrashResultValidator = v.union(
+  v.object({ ok: v.literal(true), reconciled: v.boolean(), state: v.string() }),
+  reconciliationReadResultValidator,
+  finishReconciliationResultValidator,
+  denialValidator,
+);
+
 export const reconcileAfterCrash = f1InternalMutation({
-  args: { operationId: v.id("operations") },
-  returns: v.union(
-    v.object({ ok: v.literal(true), reconciled: v.boolean(), state: v.string() }),
-    denialValidator,
-  ),
+  args: reconcileAfterCrashArgsValidator,
+  returns: reconcileAfterCrashResultValidator,
   handler: async (ctx, args) => {
+    if (args.mode === "admitRead") {
+      if (args.attemptToken === undefined || args.readNumber === undefined) {
+        return { ok: false as const, code: "invalid-payload", message: "reconciliation admission arguments are incomplete" };
+      }
+      return await admitReconciliationRead(ctx, {
+        operationId: args.operationId,
+        attemptToken: args.attemptToken,
+        readNumber: args.readNumber,
+      });
+    }
+    if (args.mode === "finishReads") {
+      if (
+        args.attemptToken === undefined ||
+        args.reads === undefined ||
+        args.readTokens === undefined ||
+        args.outcome === undefined ||
+        args.detail === undefined
+      ) {
+        return { ok: false as const, code: "invalid-payload", message: "reconciliation completion arguments are incomplete" };
+      }
+      return await finishReconciliationReads(ctx, {
+        operationId: args.operationId,
+        attemptToken: args.attemptToken,
+        reads: args.reads,
+        readTokens: args.readTokens,
+        outcome: args.outcome,
+        detail: args.detail,
+      });
+    }
     const operation = await ctx.db.get(args.operationId);
     if (operation === null) {
       return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };

@@ -2,7 +2,7 @@
 
 - **Project:** OpeningOS
 - **Event:** Convex All Gas Hackathon
-- **What it does:** Café procurement workbench with a controlled React/Convex foundation, typed Jev boundary and isolated browser-executor contracts; full product workflows remain in implementation.
+- **What it does:** Café procurement workbench with real authenticated intake, source-backed purchasing records, quote comparison, approvals, recovery, equipment history and isolated controlled sample projects on a React/Convex application foundation.
 - **Live app:** not deployed
 - **Repo:** https://github.com/VasuBansal7576/openingos
 - **Frontend:** React/Vite foundation; ChatGPT Sites publication target
@@ -12,7 +12,7 @@
 - **Auth:** Convex Auth foundation only; no hosted guest/private isolation proof
 - **AI models:** controlled Jev `jev-1.13.0` adapter tests only; no live application inference
 - **Started:** 2026-09-19T09:46:19Z
-- **Last updated:** 2026-09-20T07:30:00Z
+- **Last updated:** 2026-09-21T17:35:55Z
 
 ## Log
 
@@ -306,3 +306,326 @@ The implementation worker ran as GPT-5.6 Luna with max reasoning on the Vasu-own
 All evidence is controlled local execution only.
 No live provider, hosted identity, deployment, vendor outreach or external effect was claimed.
 F1 and PR merge remain open until this replacement exact head passes GitHub Actions and Greptile, GitHub reports no conflict and a fresh separate Astra reviewer accepts the same revision.
+
+### 2026-09-21 - 96f0f1f merged F1 checkpoint
+
+Exact PR head `92a49cd` passed every required GitHub Actions job and Greptile in 2 minutes 32 seconds, with all 13 historical review threads resolved and no new actionable finding.
+A separate GPT-6 Astra reviewer accepted that exact SHA after the full matrix and 22 fresh public-handler probes covering all six recent membership defects and adjacent authority edges.
+The reviewer also reproduced the expected failures on older baselines, exercised 400 to 450 history rows under a 64-document limit, and left the checkout clean at the unchanged SHA.
+PR #1 merged to `main` as `96f0f1f`, and the merged tree is identical to the tested and reviewed `92a49cd` tree.
+F1 shared contracts are complete for controlled implementation, which unblocks parallel R1 research, C1 communication and U1 workbench packages.
+Hosted Convex, provider credentials and allowances, the private owner mailbox, live provider calls and publication remain unverified and block only their live evidence paths.
+No controlled result is presented as live integration success.
+
+### 2026-09-21 - d53c2ef R1/C1/W1 integration checkpoint
+
+Integrated C1 owner-only communication, signed callback forwarding, reconciliation, quote ingestion and redacted evidence without performing a live send or callback.
+Integrated R1 bounded Firecrawl search, map and scrape operations with shared allowance reservations, cancellation and stale-result fencing, partial-result preservation and explicit controlled provenance.
+Integrated W1 authorized workbench projections using the identity-first authority index and project/requirement/vendor quote tuple index, including 300-row bounded-read regressions.
+Repaired Greptile's PR #2 finding by replacing both unrestricted negative-control scans with explicit 65-row reads while preserving their intended budget failures.
+The combined checkout passes TypeScript, production build, 23 repository tests, 77 proof tests, 244 F1 tests, 155 browser tests, 21 application/communication tests and 199 direct Convex tests.
+The next exact-head Greptile review found two actionable P1 defects: C1 could miss bindings beyond a 128-row prefix, and R1 exposed an evidence cursor while silently capping claims and candidates.
+R1 and C1 therefore remain open while indexed binding lookup and independently truthful pagination are repaired; U1 integration, live provider evidence, hosted Convex, credentials, allowances, owner-mailbox exchange and publication also remain open.
+No controlled result is presented as live integration success.
+
+### 2026-09-21 - R1/C1 indexed and paginated repair checkpoint
+
+Integrated the selected purchasing-workbench UI and its strict nested W1 access-boundary parser without inventing missing aggregates or approval authority.
+Integrated R1's independently bounded native pagination for evidence, normalized claims and candidates, including complete traversal of 130 claims and 130 candidates without duplicates or omissions, invalid-cursor handling and cross-project denial.
+Integrated C1's normalized AgentMail message, thread and inbox binding fields with exact compound indexes for callback-to-operation and inbound conversation routing.
+Current callback paths no longer depend on an arbitrary `processedEvents` prefix; legacy JSON recovery remains bounded and refuses an incomplete prefix rather than misbinding it.
+The combined local head through `ddc4d3a` passes TypeScript, production build, the full repository, money/Jev, F1, browser, application and communication suite, plus 203 direct Convex tests.
+Exact PR head `099d016` passed every expected GitHub Actions job and Greptile, and the two repaired P1 threads are resolved with controlled evidence replies.
+R1 and C1 are complete for controlled implementation; the latest Greptile pass opened two U1 P1 findings for activity pagination and reconnect action fencing.
+The real Convex UI adapter, D-17 mixed-scope partitioning and the repaired J-03 actual-action allowance fence are integrated locally through `c6c60fb`.
+The J-03 action now fails closed on missing, invalid, overflowing or stale server-configured pricing, reserves the full bounded three-attempt exposure and does not encode an invented live price.
+Its 15 focused controlled tests, TypeScript and production build pass on the combined checkout.
+The two U1 Greptile P1 repairs are integrated locally through `6c63609`: activity pages append with stable-ID deduplication while preserving the latest snapshot, and every server mutation stays visibly disabled during reconnect until a fresh connected snapshot arrives.
+The full local test matrix, strict TypeScript and production build pass; the exact-head Greptile discussions remain open until the repair is pushed and reviewed.
+The repaired E1 backend projection is integrated locally through `436dc61` and reads real authorized asset, safe document and service-case records with bounded results.
+Its 10 focused controlled tests, strict TypeScript and production build pass; equipment UI consumption, commissioning and service mutations remain open.
+Official OpenAI documentation resolved the pending controlled model contract to dated snapshot `gpt-5.4-mini-2026-03-17`; no live OpenAI account access or request was claimed.
+All evidence in this checkpoint is controlled local execution only.
+No live provider call, hosted deployment, owner-mailbox exchange or external effect was observed.
+
+### 2026-09-21 - U1 and J-06 controlled checkpoint
+
+PR head `df30e5f` contains the U1 pagination and reconnect-action repairs, and all four related D-17, J-03 and U1 review discussions now carry exact-head controlled evidence and are resolved.
+The full local test matrix, strict TypeScript and production build pass for that head.
+The controlled J-06 evaluation package is integrated locally through `1f98a60` and is now included in the default test command.
+Its versioned corpus covers incomplete offers, legitimate short follow-ups, unrelated requests, adversarial text and changed owner replies, with per-decision candidate error rates, intervention counts and separate model-versus-total latency.
+The 12 focused tests and strict TypeScript pass, but no live `jev-1.13.0` evaluation ran and no production threshold has been chosen.
+The controlled server-only OpenAI Responses boundary is integrated locally through `a0ec63f` and included in the default direct test suite.
+It uses dated snapshot `gpt-5.4-mini-2026-03-17`, strict source-backed extraction and supplier-draft schemas, bounded token and byte policies, a shared reservation fence, exactly one transport attempt and durable ambiguous-exposure accounting.
+The integrated 17 focused tests and full local matrix pass; no OpenAI credential or live request was used, and downstream approval and communication consumption remain open.
+Greptile subsequently identified one new P1 in production communication scope admission; a focused Luna repair is active and PR #2 will not merge until that exact-head finding and independent Astra review are complete.
+
+### 2026-09-21 - E1 equipment UI controlled checkpoint
+
+Integrated the real bounded E1 equipment projection into the selected purchasing workbench at local commit `8ac84de`.
+The Equipment view now renders only server-projected installed assets, safe purchase and warranty document metadata, and linked service cases, including explicit empty and truncation states.
+It does not infer assets from selected, ordered or fulfilled requirements.
+Service-case creation remains visibly disabled and produces zero adapter calls because no backend command route exists.
+An independent rerun passes all 47 app tests, strict TypeScript and the production build.
+This is controlled local evidence only.
+No hosted Convex read, service mutation, live provider call, owner-mailbox exchange or external effect was observed.
+The direct PR-thread audit also found four additional actionable Greptile discussions that were not represented by the green aggregate check: an activity-cursor race, duplicate J-06 IDs, ambiguous OpenAI response accounting and unbound OpenAI workload input.
+Focused Luna and Muse repairs are active, so PR #2 remains unmergeable until those fixes are integrated, tested, pushed and reviewed.
+
+### 2026-09-21 - PR #2 review-repair integration checkpoint
+
+Integrated the U1 activity race and J-06 duplicate-ID repairs through `b7c4002`.
+Stale head responses and failures can no longer overwrite newer live state, older activity pages cannot move the cursor backwards, and duplicate evaluation IDs are rejected before metric access or scoring.
+Integrated the E1 empty-field and W1 reactive-expiry repairs through `3a73e65`.
+Empty optional equipment strings now render as unrecorded metadata, while every newly created temporary project membership schedules an idempotent membership-scoped expiry transition that changes the watched database rows.
+Integrated the OpenAI review repairs through `de46ec6`.
+The complete parsed workload is now bound by a digest copied through grant, job and operation input versions and rechecked before claim and fetch; every non-success after fetch remains unresolved exposure rather than releasing allowance.
+Integrated the C1 short-draft repair and the coordinator-requested D-17 follow-up through `d734bba`.
+Exact generic owner-only drafts require current envelope, recipient, workflow, conversation and grant bindings, while mixed supported communication still persists and claims only its canonical supported segment.
+The combined latest local head passes `bun run test`, both TypeScript checks, the production build and `git diff --check`.
+The default matrix includes 23 repository checks, 77 money and Jev boundary proofs, 15 J-06 evaluation tests, 155 browser-executor tests, 21 application and communication tests, and 231 direct Convex tests.
+All evidence in this checkpoint is controlled local execution only.
+No hosted Convex run, live OpenAI, Jev, Firecrawl or AgentMail call, owner-mailbox exchange, genuine vendor result, public deployment or realized savings was observed.
+PR #2 remains open until this documented head is pushed, exact-head GitHub Actions and direct review-thread audit pass, a separate GPT-6 Astra session accepts the same revision, GitHub reports no conflict, and the selected desktop and narrow user flow is inspected.
+
+### 2026-09-21 - C1 create-time draft-binding repair checkpoint
+
+Greptile's exact-head rescan identified one additional P1: a changed fully supported supplier draft could consume an operation row and request key before claim-time validation rejected it.
+The Luna-owned repair is integrated through `c13f1b8` and binds the submitted fully supported envelope to the approved grant during operation creation.
+The regression proves the rejected draft leaves row counts and the request key unchanged, then permits the corrected approved draft to reuse that same key and reach claim.
+Mixed supported communication still persists only its approved segment, and the existing exact unrelated short-body, unavailable-capability, injection and tamper cases remain green.
+The worker's exact repair tree passed 782 controlled tests across the full repository matrix, strict TypeScript and the production build; the integration head independently passed the focused regression, strict TypeScript, production build and tree-equivalence check.
+No hosted Convex run, provider call, owner-mailbox exchange or external effect was performed.
+PR #2 still requires exact-head CI, direct Greptile thread closure, separate Astra acceptance and desktop/narrow browser inspection before merge.
+
+### 2026-09-21 - post-1a1bf7d controlled delivery wave
+
+The integration branch application-code baseline remains `1a1bf7d`, which includes server-side cross-client research-start idempotency and authoritative quote total/currentness projection in addition to the earlier R1, C1, U1 and E1 work; the later `24d4c70` checkpoint changes only this log and `ROADMAP.md`.
+Four ready, non-draft child PRs now expose further progress without claiming it is integrated: PR #7 at `e73277c` adds commissioning-to-asset and service outcomes, PR #8 at `f4c9177` adds changed-term impact and substitute approval fencing, PR #9 at `bc8bcfe` adds truthful usage/outcome metrics with explicit overflow unavailability, and PR #10 at `c6e6f76` repairs 390px navigation/heading fit and nested-dialog background inertness.
+Every one of those exact heads is conflict-free and passes the nine expected application and repository CI checks.
+Coordinator reruns passed 332 E11 direct tests plus 38 domain-contract tests, 13 focused E5 tests, 53 E10 direct-handler tests, 37 U1 workbench tests, strict TypeScript checks and production builds where applicable.
+Controlled Chrome inspection of PR #10 passed at 1440x900 and 390x844, with viewport and document widths equal, no overflow offenders, usable navigation, dialog focus containment, Escape close and exact background-state restoration.
+Greptile did not perform a code review on these latest heads because the connected trial reached its 50-credit limit; its quota comments are recorded as a blocker and never as approval.
+The completed PRs therefore remain unmerged while E6 controlled negotiation, E7 import/review gating and E9 second-location revalidation continue in isolated OpenCode high workers.
+All cited implementation and browser evidence is controlled.
+No hosted Convex deployment, live provider call, owner-mailbox exchange, genuine supplier response, public ChatGPT Sites origin, purchase, realized saving or commercial outcome was observed.
+
+### 2026-09-21 - E6 delivery and combined validation checkpoint
+
+Ready PR #11 at `157d09d` now contains the repaired controlled E6 negotiation policy and adapter contract.
+It enforces exact quote, conversation and grant bindings, mandatory draft source pins, a fixed server-derived subject, disclosure screening, dispatch-shaped outcomes and round advancement only for recorded success with a provider message ID.
+The module remains a pure controlled contract with no Convex persistence and no Jev, OpenAI or AgentMail call; production negotiation orchestration and live P-05/D-12 evidence remain open.
+Coordinator reruns passed 58 focused tests, strict TypeScript, the production build and all nine exact-head GitHub checks.
+The isolated validation branch at `25c6064` combines ready PRs #7 through #11 without changing the protected integration branch and passes strict TypeScript, production build, the full existing test command and 71 additional E5/E6 tests omitted from the shared test script.
+The shared test-registration gap is assigned to E8.
+E8 is active on supervised OpenCode Muse Spark 1.3 Contributor high dispatch `ctx_52e359d1617d`, with exclusive workbench projection, adapter, UI and test ownership.
+E7 pushed initial import/review commit `62dd541`, but coordinator review returned exact-source/BOM replay, deduplicated-key binding, promotion-collision and attachment-metadata defects to its OpenCode GLM high owner.
+E9 opened ready PR #12 at `513b28f`, but coordinator review returned missing source-project separation and malformed query-limit handling to its OpenCode GLM high owner.
+Neither repair package is accepted until its new exact head passes focused checks, the full matrix and all expected CI jobs.
+Greptile again supplied quota notices rather than code review, so the review gate remains unresolved.
+All cited evidence is controlled local or CI execution.
+No hosted Convex deployment, live provider call, owner-mailbox exchange, genuine supplier response, public origin, purchase, realized saving or commercial outcome was observed.
+
+### 2026-09-21 - selected workbench and negotiation-authority integration checkpoint
+
+Combined checkpoint `220165a` integrates the selected purchasing-desk rebuild, E7 import/review, E9 second-location reuse, E11 service outcomes, E12 production negotiation orchestration and the shared F1 negotiation-authority repair.
+The unrelated dark foundation page no longer replaces the product when Convex is unconfigured.
+Unconfigured, connecting, empty, error and reconnecting states now remain inside the same ivory-navigation, sage-desk and paper-surface design system as the accepted prototype without inserting sample suppliers, quotes or provider outcomes.
+The duplicate `O.OpeningOS.` brand and narrow header overflow were repaired.
+The exact merge candidate passes `bun run test`, strict TypeScript, the production build and `git diff --check`.
+Controlled Chrome DevTools inspection at 1440×1200 and exact 390×844 CSS viewports reports viewport width equal to document width, all five navigation controls present, provider-changing controls disabled, and zero console errors in the unconfigured state.
+This is controlled local evidence only.
+The populated authorized flow still requires Playwright or Orca Computer Use against a real backend projection, and no hosted Convex run, live provider call, owner-mailbox exchange, genuine supplier response, public origin, purchase, realized saving or commercial outcome was observed.
+Orca 1.4.205 reported ready after one restart and then exited before the first orchestration query, so no new worker was dispatched and no broad native permission was granted.
+
+### 2026-09-21 - E8 correctness repair and visual rejection checkpoint
+
+Ready PR #14 is repaired at `b23f6a7` so stale substitute approval remains a zero-write denial while an authorized user may still reject the stale proposal and preserve its history.
+The worker-reported complete controlled suite passes, including 18 Jev tests and 438 direct tests.
+A same-viewport comparison against `design/purchasing-workbench.html#/compare` failed visual acceptance: the production surface used a generic pale dashboard, KPI strip and rounded cards instead of the selected photographic desk, paper-quote composition, serif hierarchy, compact ivory navigation and yellow decision language.
+That failure is not reported as polish or acceptance.
+Verified OpenCode Muse Spark 1.3 Contributor high dispatch `ctx_9f394f101e6b` now owns an isolated production UI rebuild from exact head `b23f6a7`, limited to the workbench component, styles, UI tests and extracted original prototype assets.
+The worker must retain real server-projected data and actions, honest unknown and recovery states, responsive and keyboard behavior, and may not ship the fixture prototype runtime or fake provider outcomes.
+E11 review repair `9edc444` also denies open-to-resolved or open-to-closed transitions without an explicit outcome; its owned regressions pass, while the coordinator still owes one shared legacy expectation update before claiming exact-head CI success.
+All cited browser and test evidence is controlled.
+No hosted Convex deployment, live provider call, owner-mailbox exchange, genuine supplier response, public origin, purchase, realized saving or commercial outcome was observed.
+
+### 2026-09-21 - E7 and E9 repaired delivery checkpoint
+
+Ready PR #13 at `c895461` now contains the repaired controlled E7 import and review boundary.
+It preserves exact CSV source bytes including a leading BOM, binds every accepted idempotency key on both fresh and byte-deduplicated paths, preflights all selected promotion rows before the first write, and records canonical attachment metadata as hashed protected source evidence.
+Coordinator reruns passed 32 Bun parser tests, 15 direct handler tests, strict TypeScript and all nine exact-head GitHub checks.
+The E7 test files are not yet registered in the shared test command; E8 owns that combined-validation repair.
+Ready PR #12 at `67df399` now contains the repaired controlled E9 second-location reuse boundary.
+It denies reuse into the source project before writes and exposes fail-closed, cursor-paged current-fact revalidation so reused rows remain reachable behind authored rows.
+Coordinator reruns passed 8 focused direct tests, strict TypeScript and all nine exact-head GitHub checks.
+The main integration PR #2 exact head `cd5ba57` also passes all nine expected checks.
+E8 remains active on the clean combined validation branch, and the new E12 production negotiation orchestrator is active in a clean Vasu-owned worktree on verified OpenCode Muse Spark 1.3 Contributor high.
+The E12 worker owns only new `convex/negotiation/**` files and must reuse the accepted Jev, OpenAI, AgentMail and execution contracts with zero live sends in tests.
+Greptile remains unavailable because its connected trial reports the 50-credit limit exhausted; that quota notice is not code-review approval, so the ready child PRs remain unmerged pending an explicitly resolved review gate and fixed-head Astra review.
+All cited evidence is controlled local or CI execution.
+No hosted Convex deployment, live provider call, owner-mailbox exchange, genuine supplier response, public origin, purchase, realized saving or commercial outcome was observed.
+
+### 2026-09-21 - E11 integration, shared-budget repair and supervised cleanup checkpoint
+
+E11 is repaired and remotely preserved at `662b7c9`; its focused 27-test suite and 333-test direct matrix pass, PR #7 has all nine exact-head checks green, and PR #14 carries the exact E11 history at `787c815` with 439 direct tests, strict TypeScript, production build and all nine exact-head checks green.
+The two posted Devin findings on PR #14 now have exact-head test and controlled-browser evidence replies.
+PR #14 is still not accepted: the selected purchasing-desk fidelity rebuild remains active, and GitHub reports a base conflict with the earlier generic U1 UI that will be resolved only after the fidelity branch lands without removing E8 behavior tests.
+Ready PR #15 at `71c7a69` contains the first production negotiation orchestrator, but Devin identified five substantive lifecycle and concurrency defects; a verified OpenCode Muse Spark 1.3 Contributor high repair dispatch owns those findings, so the green initial CI is not treated as acceptance.
+Ready PR #16 at cleaned head `dc08600` removes the impossible per-model basis demand from the shared organization budget while retaining exact per-reservation basis fences; five controlled multi-model regressions and all 18 exact-head checks pass.
+The analogous reconciliation check in `convex/execution/attempts.ts` remains under a separate verified OpenCode GLM-5.3-Flash high package before PR #16 or E12 can be accepted.
+Completed E2, E5, E7, E9, E10, U1 and E11 task worktrees were verified clean and remotely preserved, then removed through Orca without forced branch deletion; active E6, E8, E12 and budget-repair worktrees remain.
+Greptile still supplies quota notices only, which are recorded as a review blocker rather than approval.
+All cited browser, model and provider evidence is controlled.
+No hosted Convex deployment, live provider call, owner-mailbox exchange, genuine supplier response, public origin, purchase, realized saving or commercial outcome was observed.
+
+### 2026-09-21 - Prototype-fidelity integration and exact-head CI checkpoint
+
+PR #14 now points to pushed head `ed0979c` and GitHub reports it conflict-free and mergeable.
+All nine expected application, foundation, workbench and delivery checks pass on that exact head.
+The selected purchasing-desk visual system now owns every honest connection state, including unconfigured, authenticating, loading, empty, error and reconnecting paths, instead of falling back to the rejected generic dark screen.
+Controlled Chrome DevTools inspection at 1440 by 1200 and exact 390 by 844 viewports found no console errors or horizontal overflow, while showing no fabricated suppliers, quotes, prices or provider outcomes.
+The full populated authorized journey still requires Playwright or Orca Computer Use against a real backend projection and is not claimed complete.
+The user-path CI failure introduced by the visual repair was reproduced and fixed by preserving the established retry control hook; the focused user path and application suites then passed and the replacement exact-head Actions run is green.
+Both PR #14 Devin findings have code and regression-test repairs with evidence replies.
+Greptile remains unavailable because the connected trial exhausted 50 credits, and Devin's current status is a skipped trial-expiry result rather than review acceptance.
+The separate fixed-head GPT-6 Astra review remains mandatory before merge.
+Orca 1.4.205 briefly reported ready and then became runtime-unavailable again, so no replacement worker was dispatched and no broad OpenCode permission was granted.
+All cited browser and provider evidence is controlled.
+No hosted Convex deployment, live provider call, owner-mailbox exchange, genuine supplier response, public origin, purchase, realized saving or commercial outcome was observed.
+
+### 2026-09-21 - P01 intake and fixed-head Astra repair integration
+
+Ready PR #18 at `edc0d04` adds a real atomic and idempotent intake boundary for opening, quote-comparison and equipment-case projects plus a connected empty-state form inside the selected purchasing workbench.
+The worker changed only its eleven assigned source and test files, pushed to the Vasu-owned remote, and opened a ready PR against the combined branch.
+The coordinator registered both new intake suites in shared CI, repaired the intentionally strict application-CI assertion, and integrated the package through `b94b839`.
+PR #18 passes all configured exact-head GitHub checks.
+Devin's status explicitly says its full review was skipped because the trial expired, and Greptile again posted only the exhausted 50-credit notice, so neither is counted as review approval.
+
+The separate GPT-6 Astra reviewer rejected unchanged PR #14 head `d582d0c` after reproducing five actionable defects.
+Those defects were an unbound caller-selected AgentMail sender inbox, cross-currency and tax-basis comparison rendered as a valid delta, changed request content accepted as an idempotent replay, a View original control without retrieval, and a 200 ms wall-clock membership expiry test.
+Verified OpenCode Muse Spark 1.3 Contributor high repaired sender binding and exact replay conflicts at PR #15 head `e4a9e51`.
+Verified OpenCode GLM-5.3-Flash high replaced the expiry sleep with a deterministic controlled-clock boundary at PR #16 head `d3648f5`.
+The P01 workbench integration was intended to own the money and original-source presentation repairs, but the independent fixed-head review later reproduced both defects.
+Three of the five original repairs are integrated without conflict at combined code checkpoint `b5db30e`: server-owned sender binding, exact replay conflict handling and deterministic membership-expiry tests.
+The money-comparison and original-source findings remain open.
+
+The complete combined `bun run test` command passes at that checkpoint.
+Recorded suites include 23 repository tests, 77 money and Jev proof tests, 15 evaluation tests, 338 F1 tests, 155 browser-executor tests, 91 application tests, 18 application Jev tests, 32 communication-contract tests and 509 direct Convex tests.
+Both strict TypeScript checks and the production Vite build also pass.
+Controlled Chrome DevTools Protocol inspection of the actual application at 1440 by 1200 and exact 390 by 844 reports viewport width equal to document width and zero overflow offenders.
+The rendered unconfigured state uses selected visual tokens without showing sample suppliers, invented prices or provider success, but it replaces the accepted public landing flow with a dominant backend-configuration error and therefore is not a prototype-fidelity pass.
+This is controlled local runtime evidence only.
+The populated connected journey, hosted Convex behavior, live providers and public origin remain unverified.
+
+The completed E6 and P01 worktrees were proven clean and remotely preserved, their exact worker terminals were closed, and Orca removed the worktrees non-forcibly.
+The disposable Chrome profiles used for verification were removed after screenshots and measurements were preserved, reclaiming about 367 MB.
+Exact PR #14 head `1b2850c` passed all nine configured GitHub checks, but a separate GPT-6 Astra review returned `CHANGES REQUIRED` after reproducing six findings: the two still-open money/source defects, temporary organization authority becoming permanent project authority, unsafe budget omission, inaccurate evidence claims and low-contrast comparison guidance.
+PR #14 cannot merge until those repairs land, exact-head CI passes again and a separate reviewer accepts the replacement commit.
+No hosted Convex deployment, live provider call, owner-mailbox exchange, genuine supplier response, public origin, purchase, realized saving or commercial outcome was observed.
+
+### 2026-09-21 - prototype fidelity, isolated sample projects and exact-head CI
+
+Combined checkpoint `9957b2d` integrates PR #19 accepted-prototype fidelity, the five patch-equivalent PR #20 authority and money repairs, and PR #21 authenticated isolated sample guest projects.
+GitHub automatically marked PRs #19 and #21 merged when their exact commits entered the combined base branch.
+PR #20 remains open because those same five patches were already applied under equivalent commits; no duplicate or conflicting merge is being attempted.
+The accepted ivory-navigation, sage-desk, photographic equipment and paper-quote composition now remains visible across honest connection states.
+The Northside action invokes the real `domain/sampleProject:createSampleGuestProject` mutation, creates a fresh finite-lived guest workspace, and renders through `workbench/projection:getProjection`; the browser contains no quote or savings fixture rows.
+Controlled Chrome DevTools verification generated the visual input through that real mutation and projection, then exercised exact 390 by 844 and 1440 by 1100 layouts, supplier and equipment tabs, exact EUR 550 comparison evidence, incomplete and incompatible offers, missing exact totals, dialog background isolation, Escape close and focus restoration.
+The temporary visual harness and generated projection were removed after verification.
+This is controlled local backend-generated evidence, not a hosted Convex run or live provider result.
+
+Both strict TypeScript checks, the production build and the complete local matrix pass at `9957b2d`: 23 repository tests, 77 proof tests, 15 evaluation tests, 342 F1 tests, 155 browser-executor tests, 117 application tests, 18 application Jev tests, 32 communication-contract tests and 527 direct Convex tests.
+All 18 configured application and repository GitHub checks pass on exact PR #14 head `9957b2d`, and GitHub reports it merge-clean.
+Greptile posted only its exhausted 50-credit notice and Devin reports its full review skipped because the trial expired; neither is counted as review approval.
+A separate GPT-6 Astra xhigh fixed-head review is in progress and remains mandatory before PR #14 can merge.
+
+Implementation workers used verified OpenCode models with high reasoning and deny-by-default permissions scoped to their owned files and test commands.
+Denied compound shell calls did not prompt the owner or broaden access.
+The Orca desktop runtime remained disconnected, so the coordinator did not reopen the app that had been interrupting the owner's work and continued through the validated non-interactive OpenCode CLI path.
+All temporary Chrome profiles were removed after their evidence was captured.
+No hosted Convex deployment, live provider call, owner-mailbox exchange, genuine supplier response, public origin, purchase, realized saving or commercial outcome was observed.
+
+### 2026-09-21 - integrated privacy, auth, parser and final workbench QA checkpoint
+
+Combined checkpoint `b47887e` integrates three ready child deliveries after exact-head checks passed.
+PR #22 stores the canonical owner mailbox envelope only in protected server evidence, returns a redacted preparation preview and resolves the envelope server-side at dispatch.
+PR #24 establishes a real Convex Auth anonymous session before discovery or mutations, reports retryable auth failure honestly and rejects malformed or stale comparison verdicts in the browser parser.
+PR #23 completes the selected prototype decision-desk pass with the photographic sage canvas, paper offers, yellow comparison tape, dark decision bar, concise controlled-fixture headings and a compact exact-390-pixel mobile composition.
+
+The first PR #23 merge-CI run exposed two stale UI tests after the stricter parser entered its base.
+The failure was reproduced locally, the tests were changed to assert fail-closed parsing without weakening the parser, and replacement head `6538246` passed both application-test runs and every other agreed GitHub check before merging.
+The OpenCode Muse Spark worker reproduced that integration failure but then received an external insufficient-balance response, so the coordinator completed only the narrow two-assertion repair directly.
+
+The complete local matrix passes on `b47887e`: 23 repository tests, 77 proof tests, 15 evaluation tests, 342 F1 tests, 155 browser-executor tests, 148 application tests, 18 application Jev tests, 32 communication-contract tests and 528 direct Convex tests.
+Both strict TypeScript checks and the production Vite build pass.
+Controlled Chrome QA at 1440 × 1200 and exact 390 × 844 covers same-state comparison with the selected prototype, loading, empty, explicit error, retry-to-ready, populated sample, Project and Suppliers navigation, dialog background inertness, Escape close, focus restoration and bounded no-send feedback with no runtime exception or page overflow.
+The sample state was generated through the real sample mutation and projection path, but this remains controlled local evidence.
+
+Completed E13, E15, E16, E17 and E18 task worktrees were verified remotely preserved and removed non-forcibly.
+Greptile remains unavailable because its connected plan reports the 50-credit limit exhausted, and Devin's green status explicitly says its review was skipped because the trial expired.
+A fresh separate GPT-6 Astra fixed-head review and latest-head combined CI remain mandatory before merge.
+No hosted Convex deployment, live provider call, owner-mailbox exchange, genuine supplier response, public origin, purchase, realized saving or commercial outcome was observed.
+
+### 2026-09-22 - six-finding Astra repair checkpoint
+
+The separate GPT-6 Astra xhigh review of exact PR #14 head `7019827` returned `CHANGES REQUIRED` with six actionable findings across negotiation authority, application authentication, negotiation workload evidence, spend state and older-order impact.
+Three supervised OpenCode Muse Spark 1.3 Free workers at high effort owned exclusive negotiation, auth and money/impact packages.
+GLM 5.3 Flash was attempted first for an implementation worker but the connected account returned insufficient balance before task work, so no result was attributed to it.
+
+Combined code checkpoint `e40da16` closes the six controlled defects.
+Prepared negotiation drafts now bind project, negotiation, quote, conversation, reply, round, move and payload exactly before a first dispatch.
+An opaque draft-ID approval action resolves the protected envelope server-side and issues the exact send grant without returning the owner mailbox, canonical payload or raw draft text.
+Negotiation model workloads now carry bounded current quote terms, permissible mandate context and the latest reply instead of fixed missing-term text.
+The application waits for server-confirmed authentication before discovery or creation, preserves server denials as retryable errors and clears a rejected session before retry.
+Usage metrics report paid cash separately from settled acquisition cost, with refunds and credits reducing only their matching state.
+Impact assessment walks bounded quote ancestry and selection history so an order on an older affected selection remains visible after a newer selection exists.
+
+Coordinator review rejected the first negotiation handoff because its read-only approval preview still depended on a pre-existing exact grant whose private payload a browser could not supply.
+The owner repaired the root cause and added a controlled end-to-end authority regression that starts without a send grant, prepares a draft, approves by draft ID, creates the public job and reservation, then dispatches once.
+Cross-project, stale, tampered and out-of-bound approvals create no grant.
+
+The complete local matrix passes at `e40da16`: 23 repository tests, 77 proof tests, 15 evaluation tests, 342 F1 tests, 155 browser-executor tests, 152 application tests, 18 application Jev tests, 32 communication-contract tests and 554 direct Convex tests.
+Both strict TypeScript checks and the production Vite build pass.
+The new spend regression is registered in the normal direct-test command, so GitHub application CI will execute it.
+All three repair branches were pushed, integrated and independently rerun before their terminals were closed and E19, E20 and E21 were removed through Orca.
+
+This checkpoint is controlled evidence only.
+No live provider call, owner-mailbox exchange, hosted Convex deployment, public site, genuine supplier reply, purchase, realized saving or commercial outcome was observed.
+PR #14 still requires latest-head GitHub CI and a fresh separate GPT-6 Astra verdict on the same fixed commit before merge.
+
+### 2026-09-22 - accepted-reply and reconnect-race repair checkpoint
+
+A later separate GPT-6 Astra review of exact PR #14 head `952d091` rejected two remaining defects.
+An accepted inbound reply longer than the bounded model context could lose a trailing final-offer or stop instruction, and a sample or intake request started before disconnect could load its stale project after a new authenticated connection was established.
+
+Local combined checkpoint `7ebca8b` repairs both defects.
+Negotiation processing now measures the complete mailbox-redacted accepted reply before slicing, records an explicit oversized state, and refuses model, draft and send effects until a newer bounded accepted marker supersedes it.
+Application creation now binds sample and intake completions to the dispatch connection epoch and adapter identity, so disconnect and reconnect invalidates the old completion while a fresh current-epoch attempt may still succeed.
+
+Focused coordinator reruns pass 23 user-path tests with 218 assertions, 87 negotiation-orchestrator tests, both strict TypeScript checks and the production build.
+The complete local `bun run test` command also exits successfully, including all 24 direct Vitest files and 572 direct Convex tests.
+The two OpenCode Muse Spark 1.3 Free high workers pushed their exact repair branches before their clean E27 and E28 worktrees were removed through Orca.
+The OpenCode Go subscription endpoint returned insufficient account funds before either assigned task could start, so no result is attributed to that provider path and the free Muse model was used without a broad permission grant.
+
+This checkpoint is controlled evidence only.
+No hosted Convex deployment, live provider call, owner-mailbox exchange, genuine supplier response, public origin, purchase, realized saving or commercial outcome was observed.
+PR #14 still requires a pushed exact-head GitHub CI pass and a fresh separate GPT-6 Astra acceptance on the same commit before merge.
+
+### 2026-09-22 - exact-head intake recovery acceptance
+
+OpenCode Muse Spark 1.3 Free at high effort repaired the two final intake findings from the separate review.
+The real workbench adapter no longer performs an eager projection load after intake creation, so the parent connection, authentication and adapter epoch fence decides whether the returned project may be adopted.
+The application also reconciles an unchanged logical intake retry to its original server idempotency key across disconnect and remount, while an edited payload keeps a fresh key.
+
+The repair was integrated and pushed as exact PR #14 head `3fb685c`.
+The complete local `bun run test` command passed, including 24 direct Vitest files and 572 direct Convex tests; the 24 user-path tests passed with 230 assertions, both strict TypeScript checks passed and the production Vite build passed.
+All nine required GitHub application and repository checks passed on the same SHA, the exact-head delivery helper returned `pass`, and GitHub reported the PR mergeable.
+
+A separate Codex CLI GPT-6 Astra xhigh session accepted exact clean head `3fb685c` after 73 focused intake, user-path and adapter tests with 481 assertions, four prior independent probes and two new fully mounted real-adapter probes.
+Those controlled probes proved that a stale intake success performs no projection read, an unchanged reconnect retry reuses its original key, a changed payload gets a fresh key and a current-epoch success loads exactly once.
+No actionable finding remained in the assigned follow-up scope.
+
+This checkpoint is controlled evidence only.
+No hosted Convex deployment, live provider call, owner-mailbox exchange, genuine supplier response, public origin, purchase, realized saving or commercial outcome was observed.
+Greptile remains unavailable because its connected trial reports the 50-credit limit exhausted, and Devin's expired-trial skip is not treated as review approval.

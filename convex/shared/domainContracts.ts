@@ -160,6 +160,102 @@ export const requirementPriorityValidator = v.union(
 );
 export type RequirementPriority = Infer<typeof requirementPriorityValidator>;
 
+/** The last fulfillment milestone that a requirement needs before readiness. */
+export const requirementMilestoneValidator = v.union(
+  v.literal("delivered"),
+  v.literal("installed"),
+  v.literal("commissioned"),
+);
+export type RequirementMilestone = Infer<typeof requirementMilestoneValidator>;
+
+/**
+ * Requirement inputs are user-authored text, so the backend keeps explicit
+ * bounds instead of allowing a single oversized field to consume the record
+ * or revision transaction budget. These are character bounds after trim.
+ */
+export const REQUIREMENT_KEY_MAX_LENGTH = 128;
+export const REQUIREMENT_TITLE_MAX_LENGTH = 256;
+export const REQUIREMENT_CATEGORY_MAX_LENGTH = 128;
+export const REQUIREMENT_UNIT_MAX_LENGTH = 64;
+export const REQUIREMENT_HARD_CONSTRAINTS_MAX_LENGTH = 4_096;
+export const REQUIREMENT_RESPONSIBLE_MAX_LENGTH = 256;
+export const REQUIREMENT_IDEMPOTENCY_KEY_MAX_LENGTH = 128;
+export const REQUIREMENT_REVISION_MAX_PAYLOAD_LENGTH = 16_384;
+export const REQUIREMENT_DATE_MAX_TIMESTAMP = 8_640_000_000_000_000;
+
+/**
+ * Dependency evidence is small, bounded provenance rather than an arbitrary
+ * document payload. These limits keep both the input and the append-only
+ * dependency revision inside a predictable transaction size.
+ */
+export const DEPENDENCY_EVIDENCE_MAX_REFS = 32;
+export const DEPENDENCY_EVIDENCE_SOURCE_ID_MAX_LENGTH = 256;
+export const DEPENDENCY_EVIDENCE_VERSION_MAX_LENGTH = 128;
+export const DEPENDENCY_EVIDENCE_LOCATOR_MAX_LENGTH = 2_048;
+
+/** Normalize required/optional text at a trusted command boundary. */
+export function normalizeBoundedText(
+  raw: string,
+  label: string,
+  maxLength: number,
+): string {
+  const normalized = raw.trim();
+  if (normalized.length === 0) throw new Error(`${label} required`);
+  if (normalized.length > maxLength) throw new Error(`${label} exceeds the supported length`);
+  return normalized;
+}
+
+/** Normalize and bound dependency evidence before any dependency write. */
+export function normalizeDependencyEvidenceRefs(
+  refs: readonly DomainEvidenceRef[] | undefined,
+): DomainEvidenceRef[] | undefined {
+  if (refs === undefined) return undefined;
+  if (refs.length > DEPENDENCY_EVIDENCE_MAX_REFS) {
+    throw new Error(
+      `dependency evidence references exceed the supported bound of ${DEPENDENCY_EVIDENCE_MAX_REFS}`,
+    );
+  }
+  return refs.map((ref, index) => {
+    const sourceId = normalizeBoundedText(
+      ref.sourceId,
+      `dependency evidence ${index + 1} source id`,
+      DEPENDENCY_EVIDENCE_SOURCE_ID_MAX_LENGTH,
+    );
+    const version = normalizeBoundedText(
+      ref.version,
+      `dependency evidence ${index + 1} version`,
+      DEPENDENCY_EVIDENCE_VERSION_MAX_LENGTH,
+    );
+    const locator = ref.locator === undefined
+      ? undefined
+      : normalizeBoundedText(
+        ref.locator,
+        `dependency evidence ${index + 1} locator`,
+        DEPENDENCY_EVIDENCE_LOCATOR_MAX_LENGTH,
+      );
+    return locator === undefined
+      ? { sourceId, version }
+      : { sourceId, version, locator };
+  });
+}
+
+/** Normalize a stable replay key without allowing whitespace-only keys. */
+export function normalizeRequirementIdempotencyKey(raw: string): string {
+  return normalizeBoundedText(raw, "idempotency key", REQUIREMENT_IDEMPOTENCY_KEY_MAX_LENGTH);
+}
+
+/** Requirement dates are persisted as finite, safe, positive epoch milliseconds. */
+export function normalizeRequirementDate(raw: number, label = "required date"): number {
+  if (
+    !Number.isSafeInteger(raw) ||
+    raw <= 0 ||
+    raw > REQUIREMENT_DATE_MAX_TIMESTAMP
+  ) {
+    throw new Error(`${label} must be a positive safe timestamp`);
+  }
+  return raw;
+}
+
 /** Dependency relationship kinds (PRD 15): technical vs scheduling. */
 export const dependencyKindValidator = v.union(
   v.literal("technical"),
@@ -277,8 +373,43 @@ export const requirementInputValidator = v.object({
   budgetMinorUnits: v.optional(v.number()),
   currency: v.optional(v.string()),
   needByAt: v.optional(v.number()),
+  hardConstraints: v.optional(v.string()),
+  responsible: v.optional(v.string()),
+  requiredMilestone: v.optional(requirementMilestoneValidator),
 });
 export type RequirementInput = Infer<typeof requirementInputValidator>;
+
+/** Mutable requirement fields are intentionally separate from creation. */
+export const requirementEditInputValidator = v.object({
+  organizationId: v.id("organizations"),
+  projectId: v.id("projects"),
+  requirementId: v.id("requirements"),
+  expectedVersion: v.number(),
+  idempotencyKey: v.string(),
+  title: v.optional(v.union(v.string(), v.null())),
+  category: v.optional(v.union(v.string(), v.null())),
+  quantity: v.optional(v.union(v.string(), v.null())),
+  unit: v.optional(v.union(v.string(), v.null())),
+  priority: v.optional(v.union(requirementPriorityValidator, v.null())),
+  budgetMinorUnits: v.optional(v.union(v.number(), v.null())),
+  currency: v.optional(v.union(v.string(), v.null())),
+  needByAt: v.optional(v.union(v.number(), v.null())),
+  hardConstraints: v.optional(v.union(v.string(), v.null())),
+  responsible: v.optional(v.union(v.string(), v.null())),
+  requiredMilestone: v.optional(v.union(requirementMilestoneValidator, v.null())),
+});
+export type RequirementEditInput = Infer<typeof requirementEditInputValidator>;
+
+/** Dependency verification is a separate transition from adding an edge. */
+export const dependencyVerificationInputValidator = v.object({
+  organizationId: v.id("organizations"),
+  projectId: v.id("projects"),
+  dependencyId: v.id("dependencies"),
+  verification: dependencyVerificationValidator,
+  evidenceRefs: v.optional(v.array(domainEvidenceRefValidator)),
+  reason: v.optional(v.string()),
+});
+export type DependencyVerificationInput = Infer<typeof dependencyVerificationInputValidator>;
 
 /**
  * Dependency edge input. Cycle-safe by construction: handlers reject
@@ -537,6 +668,26 @@ export const orderInputValidator = v.object({
 });
 export type OrderInput = Infer<typeof orderInputValidator>;
 
+/**
+ * E11 explicit commissioning asset payload (P-18). An optional,
+ * caller-supplied installed-asset proposal carried on a commissioning
+ * order event. Every field is optional except the label required at the
+ * handler when an asset is actually created; absent serial, location,
+ * constraints, or provenance are never inferred — the stored asset
+ * simply omits them. No warranty, vendor-outcome, or success facts are
+ * part of this payload: the event records the milestone, the asset
+ * records only what the caller explicitly supplied plus exact
+ * order/selection/requirement/quote/event lineage.
+ */
+export const commissioningAssetInputValidator = v.object({
+  label: v.optional(v.string()),
+  serial: v.optional(v.string()),
+  locationId: v.optional(v.id("locations")),
+  constraints: v.optional(v.string()),
+  purchaseProvenance: v.optional(v.string()),
+});
+export type CommissioningAssetInput = Infer<typeof commissioningAssetInputValidator>;
+
 export const orderEventInputValidator = v.object({
   organizationId: v.id("organizations"),
   projectId: v.id("projects"),
@@ -547,9 +698,120 @@ export const orderEventInputValidator = v.object({
   acceptedQuantity: v.optional(v.string()),
   acceptanceLines: v.optional(v.array(acceptanceLineInputValidator)),
   note: v.optional(v.string()),
+  // E11 (P-18): explicit installed-asset proposal. Only meaningful on a
+  // `commissioning` event; any other kind carrying this payload is
+  // denied so purchase intent alone can never invent an installed asset.
+  // Absent payload records the milestone with honest incomplete state
+  // (no asset is created or inferred).
+  commissioningAsset: v.optional(commissioningAssetInputValidator),
   idempotencyKey: v.string(),
 });
 export type OrderEventInput = Infer<typeof orderEventInputValidator>;
+
+/**
+ * E11 commissioning asset bounds (P-18/P-14). Caller-supplied text is
+ * trimmed and bounded at the trusted command boundary; empty supplied
+ * strings are rejected rather than stored as absent, so an explicit
+ * payload can never silently become an inferred one.
+ */
+export const COMMISSIONING_ASSET_LABEL_MAX_LENGTH = 256;
+export const COMMISSIONING_ASSET_SERIAL_MAX_LENGTH = 256;
+export const COMMISSIONING_ASSET_CONSTRAINTS_MAX_LENGTH = 4_096;
+export const COMMISSIONING_ASSET_PROVENANCE_MAX_LENGTH = 2_048;
+
+/**
+ * E11 composite-idempotency key (P-14). The installed asset created from
+ * a commissioning event replays under this deterministic project-scoped
+ * key derived from the event's own idempotency key, so duplicate
+ * callbacks and event replays resolve to the same asset row instead of
+ * a second installed record. Distinct event keys remain distinct
+ * intents.
+ */
+export const COMMISSIONING_ASSET_KEY_PREFIX = "commissioning:";
+
+export function commissioningAssetIdempotencyKey(eventKey: string): string {
+  const normalized = eventKey.trim();
+  if (normalized.length === 0) throw new Error("idempotency key required");
+  return `${COMMISSIONING_ASSET_KEY_PREFIX}${normalized}`;
+}
+
+/** Normalize a required commissioning asset label. */
+export function normalizeCommissioningLabel(raw: string): string {
+  const normalized = raw.trim();
+  if (normalized.length === 0) throw new Error("commissioning asset label required");
+  if (normalized.length > COMMISSIONING_ASSET_LABEL_MAX_LENGTH) {
+    throw new Error("commissioning asset label exceeds the supported length");
+  }
+  return normalized;
+}
+
+/** Normalize an optional commissioning asset text field. */
+export function normalizeOptionalCommissioningText(
+  raw: string | undefined,
+  label: string,
+  maxLength: number,
+): string | undefined {
+  if (raw === undefined) return undefined;
+  const normalized = raw.trim();
+  if (normalized.length === 0) throw new Error(`${label} required`);
+  if (normalized.length > maxLength) {
+    throw new Error(`${label} exceeds the supported length`);
+  }
+  return normalized;
+}
+
+/**
+ * E11 service-outcome semantics (P-18). Resolved/closed outcomes are
+ * explicit (required), bounded, idempotent (same state plus same
+ * outcome replays as success), and stable (a stored terminal outcome
+ * can never be silently overwritten or reopened).
+ */
+export const SERVICE_OUTCOME_MAX_LENGTH = 2_000;
+
+export type ServiceCaseLifecycleState =
+  | "open"
+  | "inProgress"
+  | "waitingForSupplier"
+  | "resolved"
+  | "closed";
+
+/** Normalize an explicit service outcome: trimmed, nonempty, bounded. */
+export function normalizeServiceOutcome(raw: string): string {
+  const normalized = raw.trim();
+  if (normalized.length === 0) throw new Error("service case outcome required");
+  if (normalized.length > SERVICE_OUTCOME_MAX_LENGTH) {
+    throw new Error("service case outcome exceeds the supported length");
+  }
+  return normalized;
+}
+
+/** Terminal outcomes that require an explicit bounded result. */
+export function requiresServiceOutcome(state: ServiceCaseLifecycleState): boolean {
+  return state === "resolved" || state === "closed";
+}
+
+/**
+ * Stable service-case transition table. Non-terminal states move freely
+ * among open/inProgress/waitingForSupplier and forward to
+ * resolved/closed (self-transitions replay idempotently). A resolved
+ * case may only replay itself or close; a closed case may only replay
+ * itself. Every other move — including any reopen of a terminal case
+ * to a non-terminal state — is invalid and fails closed.
+ */
+export function isValidServiceCaseTransition(
+  from: ServiceCaseLifecycleState,
+  to: ServiceCaseLifecycleState,
+): boolean {
+  if (from === "closed") return to === "closed";
+  if (from === "resolved") return to === "resolved" || to === "closed";
+  return (
+    to === "open" ||
+    to === "inProgress" ||
+    to === "waitingForSupplier" ||
+    to === "resolved" ||
+    to === "closed"
+  );
+}
 
 export const costEntryInputValidator = v.object({
   organizationId: v.id("organizations"),

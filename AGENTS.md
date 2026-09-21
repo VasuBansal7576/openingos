@@ -31,7 +31,8 @@ Do not treat proposed ADRs, a green tooling check, or demonstration fixtures as 
 - Use real providers for live runs and preserve honest waiting/failure states; label owner-authored terms as controlled demo evidence, never genuine vendor quotes or realized savings.
 - Use Orca for developer orchestration when authorized; it is not the customer application's runtime.
 - Use the active OpeningOS orchestrator as coordinator and a separate Codex CLI `gpt-6-astra` session as independent reviewer.
-- Use OpenCode Go `opencode-go/muse-spark-1.3-contributor` and Codex CLI `gpt-5.6-luna` as implementation workers; verify effective models before assigning work.
+- Prefer OpenCode implementation workers at high reasoning, using `opencode-go/muse-spark-1.3-contributor` or an available GLM 5.3 Flash model, and verify the effective model before assigning work.
+- Use Codex CLI implementation workers only when the task genuinely requires them or OpenCode cannot safely complete it; reserve the separate Codex CLI `gpt-6-astra` session for required independent integrated review.
 - The coordinator owns setup, proof tasks and routine technical decisions; accept or amend proposed ADRs from evidence before dependent workers start.
 - The coordinator handles routine worker permissions and recovery within existing authority, not blanket approvals, security bypasses or new spending.
 - Inspect each worker permission request, approve only a narrowly scoped command within its assigned package, and verify that the worker resumes after the decision.

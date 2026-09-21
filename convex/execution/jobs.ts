@@ -31,9 +31,12 @@ import {
   MAX_JOBS_PER_GRANT,
   MAX_OPERATIONS_PER_JOB,
   validateWorkflowPayload,
+  supportedWorkflowPayload,
+  workflowTextForPayload,
   workflowAuthorityForOperation,
   workflowAuthorityMatchesProject,
   workflowContextKey,
+  type ScopeVerdict,
   type WorkflowAuthority,
 } from "../shared/scope.js";
 import { checkProjectAccess, denialValidator, identityOf, requireCapability } from "../access/checks.js";
@@ -43,6 +46,20 @@ const jobKindValidator = v.union(
   v.literal("communication"),
   v.literal("execution"),
 );
+
+const refusedScopeSegmentValidator = v.object({
+  text: v.string(),
+  verdict: v.union(v.literal("unrelatedRefused"), v.literal("unavailableRefused")),
+  reason: v.string(),
+});
+
+const startedJobResultValidator = v.object({
+  ok: v.literal(true),
+  jobId: v.id("jobs"),
+  state: v.string(),
+  supportedSegment: v.string(),
+  refusedSegments: v.array(refusedScopeSegmentValidator),
+});
 
 const jobViewValidator = v.object({
   id: v.id("jobs"),
@@ -61,6 +78,20 @@ const jobViewValidator = v.object({
 
 const CANCELLATION_PAGE_SIZE = 16;
 const CANCELLATION_UNRESOLVED_SAMPLE_LIMIT = 16;
+
+// E3 server-side automatic-start idempotency: a stable bounded client key
+// binds one logical automatic research start to exactly one automatic grant
+// and one queued job. Client-side pending state is insufficient because two
+// separate clients (or two concurrent calls) never share it. The key is
+// validated before any write, scoped by the compound project index on jobs,
+// and replay compares the server-derived material fingerprint (project,
+// operation, kind, requirement authority, normalized supported payload) —
+// never the raw display text alone.
+const START_IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9:_-]{8,128}$/;
+
+function validStartIdempotencyKey(key: string): boolean {
+  return START_IDEMPOTENCY_KEY_PATTERN.test(key);
+}
 
 // An omitted grant may only create the bounded automatic research/read
 // authority. Record-changing operations remain valid when the caller carries
@@ -513,6 +544,10 @@ async function processReconciliationPage(
  * no job; supplier-evidence instructions cannot expand capabilities.
  * Research jobs without an explicit grant receive a server-bound
  * no-spend grant so the job always carries a versioned authority.
+ * Automatic starts may carry a bounded `idempotencyKey`: exact replays
+ * return the original queued job with no second grant or effect, while the
+ * same key with a materially different project, operation, kind, requirement
+ * authority, or normalized supported payload fails closed.
  */
 export const start = f1Mutation({
   args: {
@@ -522,9 +557,10 @@ export const start = f1Mutation({
     operationId: v.optional(v.string()),
     kind: v.optional(jobKindValidator),
     grantId: v.optional(v.id("grants")),
+    idempotencyKey: v.optional(v.string()),
   },
   returns: v.union(
-    v.object({ ok: v.literal(true), jobId: v.id("jobs"), state: v.string() }),
+    startedJobResultValidator,
     denialValidator,
   ),
   handler: async (ctx, args) => {
@@ -535,6 +571,17 @@ export const start = f1Mutation({
     const now = Date.now();
     if (containsInstructionOverride(args.text)) {
       return { ok: false as const, code: "prompt-injection-denied", message: "supplier evidence cannot expand capabilities" };
+    }
+
+    // E3: validate the bounded idempotency key before any write. Supplied
+    // grants keep their exact existing behavior, so a key combined with an
+    // explicit grant fails closed rather than changing that path.
+    const startKey = args.idempotencyKey;
+    if (startKey !== undefined && !validStartIdempotencyKey(startKey)) {
+      return { ok: false as const, code: "invalid-payload", message: "idempotencyKey must be 8-128 chars of A-Za-z0-9:_-" };
+    }
+    if (startKey !== undefined && args.grantId !== undefined) {
+      return { ok: false as const, code: "invalid-payload", message: "idempotency keys are automatic-start only" };
     }
 
     // Resolve the supplied grant before building context. A caller cannot
@@ -635,7 +682,7 @@ export const start = f1Mutation({
       }
     }
 
-    const classified = classifyScope({
+    let classified: ScopeVerdict = classifyScope({
       text: args.text,
       ...(args.operationId === undefined ? {} : { operationId: args.operationId }),
       projectContext: context,
@@ -646,6 +693,7 @@ export const start = f1Mutation({
     if (classified.verdict === "unavailableRefused") {
       return { ok: false as const, code: "unavailable-capability", message: classified.reason };
     }
+    let supportedClassification: Extract<ScopeVerdict, { verdict: "supported" }> = classified;
     const operationId = classified.operationId;
     const capability = requireCapability(operationId, access.value);
     if (!capability.ok) {
@@ -741,20 +789,78 @@ export const start = f1Mutation({
       if (boundClassified.operationId !== operationId || boundClassified.purpose !== classified.purpose) {
         return { ok: false as const, code: "unrelated-refusal", message: "request does not match the bound workflow authority" };
       }
+      classified = boundClassified;
+      supportedClassification = boundClassified;
       const grantPayload = parseCanonicalPayload(grant.canonicalPayload);
       if (grantPayload === null) {
         return { ok: false as const, code: "invalid-payload", message: "grant payload is not valid JSON" };
       }
+      const grantText = workflowTextForPayload(operationId, grantPayload);
+      if (grantText === null) {
+        return { ok: false as const, code: "invalid-payload", message: "grant payload has no workflow text" };
+      }
+      const grantClassified = classifyScope({
+        text: grantText,
+        operationId,
+        projectContext: context,
+      });
+      if (grantClassified.verdict !== "supported") {
+        return { ok: false as const, code: "unrelated-refusal", message: "grant purpose is not supported" };
+      }
+      const canonicalizeGrant =
+        supportedClassification.refusedSegments.length > 0 ||
+        grantClassified.refusedSegments.length > 0;
+      if (
+        canonicalizeGrant &&
+        grantClassified.supportedSegment !== supportedClassification.supportedSegment
+      ) {
+        return { ok: false as const, code: "changed-draft", message: "request segment does not match the approved grant" };
+      }
+      const canonicalGrantPayload = canonicalizeGrant
+        ? supportedWorkflowPayload(
+            operationId,
+            grantPayload,
+            supportedClassification.supportedSegment,
+          )
+        : grantPayload;
+      if (canonicalGrantPayload === null) {
+        return { ok: false as const, code: "invalid-payload", message: "grant payload cannot carry the supported segment" };
+      }
+      const canonicalGrant = canonicalizeGrant
+        ? canonicalJson(canonicalGrantPayload)
+        : grant.canonicalPayload;
       const purposePayload = validateWorkflowPayload({
         operationId,
         purpose: classified.purpose,
-        payload: grantPayload,
+        payload: canonicalGrantPayload,
         context,
       });
       if (!purposePayload.ok) {
         return { ok: false as const, code: "unrelated-refusal", message: purposePayload.reason ?? "grant purpose is not supported" };
       }
-      grantVersion = grant.revocationVersion;
+      if (grant.canonicalPayload !== canonicalGrant) {
+        const existingJobs = await ctx.db
+          .query("jobs")
+          .withIndex("by_grant", (q) => q.eq("grantId", grant._id))
+          .take(1);
+        const existingOperations = await ctx.db
+          .query("operations")
+          .withIndex("by_grant", (q) => q.eq("grantId", grant._id))
+          .take(1);
+        if (existingJobs.length > 0 || existingOperations.length > 0) {
+          return { ok: false as const, code: "changed-draft", message: "grant has already admitted a different payload" };
+        }
+        const nextGrantVersion = grant.revocationVersion + 1;
+        await ctx.db.patch(grant._id, {
+          canonicalPayload: canonicalGrant,
+          payloadHash: payloadHash(canonicalGrantPayload),
+          payloadSha256: await sha256HexOfCanonical(canonicalGrant),
+          revocationVersion: nextGrantVersion,
+        });
+        grantVersion = nextGrantVersion;
+      } else {
+        grantVersion = grant.revocationVersion;
+      }
       inputVersions = { ...grant.inputVersions };
     } else if (kind === "communication") {
       return { ok: false as const, code: "denied-capability", message: "communication requires a grant" };
@@ -796,7 +902,7 @@ export const start = f1Mutation({
         return { ok: false as const, code: "unrelated-refusal", message: "workflow authority is not current for this project" };
       }
       context = automaticContext;
-      const autoPayload = { query: args.text };
+      const autoPayload = { query: supportedClassification.supportedSegment };
       const automaticPayload = validateWorkflowPayload({
         operationId,
         purpose: classified.purpose,
@@ -806,11 +912,59 @@ export const start = f1Mutation({
       if (!automaticPayload.ok) {
         return { ok: false as const, code: "unrelated-refusal", message: automaticPayload.reason ?? "research payload is not supported" };
       }
+      const autoCanonical = canonicalJson(autoPayload);
+      // E3: exact replay returns the original job with no second grant or
+      // effect. The lookup is one bounded compound-index read scoped to this
+      // project, so a key from another project never replays here and leaks
+      // nothing. A stored row with a materially different operation, kind,
+      // requirement authority, or normalized supported payload conflicts
+      // instead of replaying. Authorization already passed above, so this
+      // probe cannot become a cross-project existence oracle.
+      if (startKey !== undefined) {
+        const priorRows = await ctx.db
+          .query("jobs")
+          .withIndex("by_project_and_start_key", (q) =>
+            q.eq("projectId", args.projectId).eq("startIdempotencyKey", startKey),
+          )
+          .take(2);
+        if (priorRows.length > 1) {
+          return { ok: false as const, code: "duplicate-conflict", message: "idempotency key maps to multiple jobs" };
+        }
+        const prior = priorRows[0];
+        if (prior !== undefined) {
+          const priorAuthority = prior.workflowAuthority;
+          const authorityMatches =
+            priorAuthority !== undefined &&
+            priorAuthority.operationId === operationId &&
+            canonicalJson(priorAuthority) === canonicalJson(grantAuthority);
+          const priorGrant = await ctx.db.get(prior.grantId);
+          const payloadMatches =
+            priorGrant !== null &&
+            priorGrant.organizationId === args.organizationId &&
+            priorGrant.projectId === args.projectId &&
+            priorGrant.canonicalPayload === autoCanonical;
+          if (
+            prior.organizationId !== args.organizationId ||
+            prior.projectId !== args.projectId ||
+            prior.kind !== kind ||
+            !authorityMatches ||
+            !payloadMatches
+          ) {
+            return { ok: false as const, code: "duplicate-conflict", message: "idempotency key was used with a different start" };
+          }
+          return {
+            ok: true as const,
+            jobId: prior._id,
+            state: prior.state,
+            supportedSegment: supportedClassification.supportedSegment,
+            refusedSegments: [...supportedClassification.refusedSegments],
+          };
+        }
+      }
       const recipient = await ctx.db
         .query("recipientConfigs")
         .withIndex("by_active", (q) => q.eq("active", true))
         .unique();
-      const autoCanonical = canonicalJson(autoPayload);
       grantId = await ctx.db.insert("grants", {
         organizationId: args.organizationId,
         projectId: args.projectId,
@@ -857,15 +1011,24 @@ export const start = f1Mutation({
       grantId,
       grantVersion,
       kind,
-      workflowPurpose: classified.purpose,
-      workflowContext: workflowContextKey(context, classified.purpose),
+      workflowPurpose: supportedClassification.purpose,
+      workflowContext: workflowContextKey(context, supportedClassification.purpose),
       workflowAuthority: grantAuthority,
       state: "queued",
       inputVersions,
       createdAt: now,
       updatedAt: now,
+      ...(startKey !== undefined && grantId !== args.grantId
+        ? { startIdempotencyKey: startKey }
+        : {}),
     });
-    return { ok: true as const, jobId, state: "queued" };
+    return {
+      ok: true as const,
+      jobId,
+      state: "queued",
+      supportedSegment: supportedClassification.supportedSegment,
+      refusedSegments: [...supportedClassification.refusedSegments],
+    };
   },
 });
 

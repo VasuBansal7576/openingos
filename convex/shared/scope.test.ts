@@ -69,6 +69,74 @@ describe("scope classification (D-17)", () => {
     if (verdict.verdict === "supported") expect(verdict.operationId).toBe("research.collect");
   });
 
+  test("mixed requests preserve one supported segment and explicit refusal metadata", () => {
+    const verdict = classifyScope({
+      text: "Research espresso-machine suppliers and tell me a joke",
+      operationId: "research.collect",
+    });
+    expect(verdict.verdict).toBe("supported");
+    if (verdict.verdict !== "supported") return;
+    expect(verdict.supportedSegment).toBe("Research espresso-machine suppliers");
+    expect(verdict.refusedSegments).toEqual([
+      {
+        text: "tell me a joke",
+        verdict: "unrelatedRefused",
+        reason: "request-is-not-an-allowlisted-openingos-workflow",
+      },
+    ]);
+  });
+
+  test("preserves decimal quantities as one supported clause", () => {
+    const verdict = classifyScope({
+      text: "Research suppliers for 2.5 kg coffee grinders",
+      operationId: "research.collect",
+    });
+    expect(verdict.verdict).toBe("supported");
+    if (verdict.verdict !== "supported") return;
+    expect(verdict.supportedSegment).toBe("Research suppliers for 2.5 kg coffee grinders");
+    expect(verdict.refusedSegments).toEqual([]);
+  });
+
+  test("keeps coordinated machines and grinders in one supported clause", () => {
+    const verdict = classifyScope({
+      text: "Research suppliers for espresso machines and grinders",
+      operationId: "research.collect",
+    });
+    expect(verdict.verdict).toBe("supported");
+    if (verdict.verdict !== "supported") return;
+    expect(verdict.supportedSegment).toBe("Research suppliers for espresso machines and grinders");
+    expect(verdict.refusedSegments).toEqual([]);
+  });
+
+  test("still separates an independent mixed request after coordinated objects", () => {
+    const verdict = classifyScope({
+      text: "Research suppliers for espresso machines and grinders, and tell me a joke",
+      operationId: "research.collect",
+    });
+    expect(verdict.verdict).toBe("supported");
+    if (verdict.verdict !== "supported") return;
+    expect(verdict.supportedSegment).toBe("Research suppliers for espresso machines and grinders");
+    expect(verdict.refusedSegments).toEqual([
+      {
+        text: "tell me a joke",
+        verdict: "unrelatedRefused",
+        reason: "request-is-not-an-allowlisted-openingos-workflow",
+      },
+    ]);
+  });
+
+  test("an unavailable purchase clause is refused without expanding research authority", () => {
+    const verdict = classifyScope({
+      text: "Research espresso-machine suppliers and place the equipment order",
+      operationId: "research.collect",
+    });
+    expect(verdict.verdict).toBe("supported");
+    if (verdict.verdict !== "supported") return;
+    expect(verdict.supportedSegment).toBe("Research espresso-machine suppliers");
+    expect(verdict.refusedSegments[0]?.verdict).toBe("unavailableRefused");
+    expect(verdict.refusedSegments[0]?.reason).toBe("operation-unavailable:purchase.placeOrder");
+  });
+
   test("relevant but unshipped capability is unavailable, not fulfilled", () => {
     const verdict = classifyScope({
       text: "Please place the equipment order with the supplier.",

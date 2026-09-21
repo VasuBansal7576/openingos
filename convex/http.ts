@@ -1,26 +1,43 @@
 import { AgentMail, vEvent, type AgentMailComponent } from "@agentmail/convex";
-import { httpRouter } from "convex/server";
+import { httpRouter, makeFunctionReference, type RegisteredMutation } from "convex/server";
 import { internal } from "./_generated/api";
 import { httpAction, internalMutation } from "./_generated/server";
 import { v } from "convex/values";
 import { auth } from "./auth";
+import * as communicationCallbacks from "./communication/callbacks";
 import { components } from "./models/components";
 
-/**
- * These callbacks are deliberately inert foundation sinks. F1 will replace
- * them with capability-checked product work only after signed AgentMail
- * delivery and idempotency have been established by the component.
- */
+type MutationArgs<T> = T extends RegisteredMutation<infer _Visibility, infer Args, infer _Return> ? Args : never;
+type MutationReturn<T> = T extends RegisteredMutation<infer _Visibility, infer _Args, infer Return> ? Awaited<Return> : never;
+
+const communicationEventRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof communicationCallbacks.onAgentMailEvent>,
+  MutationReturn<typeof communicationCallbacks.onAgentMailEvent>
+>("communication/callbacks:onAgentMailEvent");
+const communicationMessageRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof communicationCallbacks.onAgentMailMessageReceived>,
+  MutationReturn<typeof communicationCallbacks.onAgentMailMessageReceived>
+>("communication/callbacks:onAgentMailMessageReceived");
+
+/** Forward signature-verified AgentMail events into C1's idempotent ledger. */
 export const onAgentMailEvent = internalMutation({
   args: { event: vEvent },
   returns: v.null(),
-  handler: async () => null,
+  handler: async (ctx, args) => {
+    await ctx.runMutation(communicationEventRef, args);
+    return null;
+  },
 });
 
 export const onAgentMailMessageReceived = internalMutation({
   args: { message: v.any(), thread: v.any(), eventId: v.string() },
   returns: v.null(),
-  handler: async () => null,
+  handler: async (ctx, args) => {
+    await ctx.runMutation(communicationMessageRef, args);
+    return null;
+  },
 });
 
 // `componentsGeneric` is intentionally untyped until a deployment can emit
