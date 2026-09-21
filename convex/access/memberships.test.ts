@@ -4,6 +4,11 @@
  * These tests exercise the registered Convex mutation with synthetic
  * identities only. A temporary approver cannot extend access beyond the
  * authority expiry that permits the grant, including for self-access.
+ *
+ * Scheduled-expiry regressions run on a controlled clock: `Date.now` and the
+ * timer globals are replaced for the duration of a test, so the scheduler's
+ * expiry transition only executes when the test advances controlled time
+ * past the stored expiry and drains due callbacks. No wall-clock sleeping.
  */
 
 import { convexTest } from "convex-test";
@@ -12,7 +17,7 @@ import {
   type RegisteredMutation,
   type RegisteredQuery,
 } from "convex/server";
-import { expect, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
 import type { Id } from "../_generated/dataModel.js";
 import schema from "../schema.js";
 import { membershipScopeKey, PERMANENT_AUTHORITY_UNTIL } from "./checks.js";
@@ -169,16 +174,105 @@ async function membershipStatus(
 }
 
 /**
- * Let real-clock scheduled expiry transitions fire and drain. Temporary
- * grants in these tests expire ~200ms after creation, so a 1.5s settle
- * window proves the mutation-time schedule registered and executed.
+ * Controlled clock for the scheduled-expiry regressions (P-20 / D-14).
+ *
+ * Temporary grants in these tests expire a few hundred controlled-clock
+ * milliseconds after creation. While a clock is installed, `Date.now` reads
+ * controlled time and the timer globals register callbacks on the clock
+ * instead of the real event loop, so the scheduler's expiry timer can only
+ * run when the test advances controlled time to it. convex-test captures the
+ * real setTimeout for its own internal yielding before any clock is
+ * installed, and reads `globalThis.setTimeout` at scheduling time, so the
+ * replacement is observed end to end: the grant's `runAfter` delay is
+ * computed from controlled `Date.now` and the transition fires exactly at
+ * the controlled boundary.
  */
-async function settleScheduledExpiries(t: Kit): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, 1500));
-  // A due real-clock timer can be between the timer queue and the scheduler's
-  // in-flight set when CI is busy. Pump the scheduler until every due callback
-  // settles instead of sampling only the callbacks already marked in flight.
-  await t.finishAllScheduledFunctions(() => undefined);
+class ControlledClock {
+  private currentMs: number;
+  private readonly timers = new Map<number, { at: number; callback: () => void }>();
+  private nextTimerId = 1;
+  private readonly realDateNow: () => number = Date.now.bind(Date);
+  private readonly realSetTimeout = globalThis.setTimeout;
+  private readonly realClearTimeout = globalThis.clearTimeout;
+
+  constructor() {
+    this.currentMs = this.realDateNow();
+  }
+
+  install(): void {
+    const clock = this;
+    Date.now = () => clock.currentMs;
+    globalThis.setTimeout = ((callback: () => void, ms?: number) =>
+      clock.registerTimer(callback, ms ?? 0)) as unknown as typeof globalThis.setTimeout;
+    globalThis.clearTimeout = ((timerId: number) => {
+      clock.timers.delete(timerId);
+    }) as unknown as typeof globalThis.clearTimeout;
+  }
+
+  restore(): void {
+    Date.now = this.realDateNow;
+    globalThis.setTimeout = this.realSetTimeout;
+    globalThis.clearTimeout = this.realClearTimeout;
+  }
+
+  now(): number {
+    return this.currentMs;
+  }
+
+  /** Move controlled time forward to exactly `targetMs`. */
+  advanceTo(targetMs: number): void {
+    if (targetMs < this.currentMs) {
+      throw new Error("controlled clock cannot move backwards");
+    }
+    this.currentMs = targetMs;
+  }
+
+  private registerTimer(callback: () => void, ms: number): number {
+    const timerId = this.nextTimerId;
+    this.nextTimerId += 1;
+    this.timers.set(timerId, { at: this.currentMs + Math.max(0, ms), callback });
+    return timerId;
+  }
+
+  /** Run every timer callback whose controlled time has been reached. */
+  fireDueTimers(): void {
+    for (const [timerId, timer] of [...this.timers]) {
+      if (timer.at <= this.currentMs) {
+        this.timers.delete(timerId);
+        timer.callback();
+      }
+    }
+  }
+}
+
+let activeClock: ControlledClock | null = null;
+
+/**
+ * Install a controlled clock for the current test. The module-level
+ * `afterEach` below restores the real clock even when an assertion fails,
+ * so timer overrides never leak into the next test.
+ */
+function installControlledClock(): ControlledClock {
+  const clock = new ControlledClock();
+  clock.install();
+  activeClock = clock;
+  return clock;
+}
+
+afterEach(() => {
+  activeClock?.restore();
+  activeClock = null;
+});
+
+/**
+ * Drain the scheduler boundary deterministically: fire every callback the
+ * controlled time has reached (the registered expiry transition among them)
+ * and wait for all in-flight scheduled functions to settle. The controlled
+ * clock must already be at or past the expiry being tested, so this never
+ * depends on wall-clock waiting.
+ */
+async function settleScheduledExpiries(t: Kit, clock: ControlledClock): Promise<void> {
+  await t.finishAllScheduledFunctions(() => clock.fireDueTimers());
 }
 
 test("temporary approvers cannot grant access beyond their authority expiry", async () => {
@@ -765,6 +859,7 @@ test("revoke denies inaccessible existing and absent memberships uniformly", asy
 });
 
 test("temporary grants schedule expiry while permanent grants and stronger authority persist", async () => {
+  const clock = installControlledClock();
   const t = convexTest(schema, modules);
   const asOwner = t.withIdentity(OWNER);
   const organization = await asOwner.mutation(createOrganizationRef, {
@@ -782,7 +877,7 @@ test("temporary grants schedule expiry while permanent grants and stronger autho
   const expiring = "membership-regression-scheduled-expiring";
   const steady = "membership-regression-scheduled-steady";
   const dual = "membership-regression-scheduled-dual";
-  const expiresAt = Date.now() + 200;
+  const expiresAt = clock.now() + 200;
   const grant = {
     organizationId: organization.organizationId,
     projectId: project.projectId,
@@ -824,7 +919,11 @@ test("temporary grants schedule expiry while permanent grants and stronger autho
     expect(before, identity).toMatchObject({ ok: true, role });
   }
 
-  await settleScheduledExpiries(t);
+  // Advance the controlled clock exactly to the stored expiry and drain the
+  // scheduler boundary: the registered transition runs now, not on the wall
+  // clock.
+  clock.advanceTo(expiresAt);
+  await settleScheduledExpiries(t, clock);
 
   // The scheduled transition revoked the temporary-only grant.
   const expiredRole = await t.withIdentity({ tokenIdentifier: expiring }).query(myProjectRoleRef, grant);
@@ -866,6 +965,7 @@ test("temporary grants schedule expiry while permanent grants and stronger autho
 });
 
 test("temporary organization-owner project grants schedule their own expiry", async () => {
+  const clock = installControlledClock();
   const t = convexTest(schema, modules);
   const asOwner = t.withIdentity(OWNER);
   const organization = await asOwner.mutation(createOrganizationRef, {
@@ -875,7 +975,7 @@ test("temporary organization-owner project grants schedule their own expiry", as
   if (!organization.ok) throw new Error("organization setup failed");
 
   const temporaryOwner = "membership-regression-scheduled-organization-owner";
-  const authorityExpiry = Date.now() + 200;
+  const authorityExpiry = clock.now() + 200;
   await insertMembershipWithAuthority(t, {
     organizationId: organization.organizationId,
     identity: temporaryOwner,
@@ -909,7 +1009,10 @@ test("temporary organization-owner project grants schedule their own expiry", as
   });
   expect(beforeExpiry).toMatchObject({ ok: true, role: "owner" });
 
-  await settleScheduledExpiries(t);
+  // Controlled boundary: the derived project-owner grant's own scheduled
+  // transition fires exactly when controlled time reaches its stored expiry.
+  clock.advanceTo(authorityExpiry);
+  await settleScheduledExpiries(t, clock);
 
   const afterExpiry = await t.withIdentity({ tokenIdentifier: temporaryOwner }).query(myProjectRoleRef, {
     organizationId: organization.organizationId,
@@ -925,6 +1028,7 @@ test("temporary organization-owner project grants schedule their own expiry", as
 });
 
 test("expiry execution is safe when early, permanent, or membership-scoped to a missing row", async () => {
+  const clock = installControlledClock();
   const t = convexTest(schema, modules);
   const asOwner = t.withIdentity(OWNER);
   const organization = await asOwner.mutation(createOrganizationRef, {
@@ -943,11 +1047,12 @@ test("expiry execution is safe when early, permanent, or membership-scoped to a 
     projectId: project.projectId,
   };
 
+  const earlyExpiresAt = clock.now() + 400;
   const early = await asOwner.mutation(grantProjectAccessRef, {
     ...grant,
     targetIdentity: "membership-regression-expiry-early",
     role: "viewer",
-    expiresAt: Date.now() + 400,
+    expiresAt: earlyExpiresAt,
   });
   if (!early.ok) throw new Error("early grant setup failed");
   const permanent = await asOwner.mutation(grantProjectAccessRef, {
@@ -991,9 +1096,10 @@ test("expiry execution is safe when early, permanent, or membership-scoped to a 
   expect(await authorityCountFor(t, early.membershipId)).toBe(1);
   expect(await authorityCountFor(t, permanent.membershipId)).toBe(1);
 
-  // The early grant's own scheduled transition still lands afterwards while
-  // the permanent grant stays current.
-  await settleScheduledExpiries(t);
+  // The early grant's own scheduled transition still lands once controlled
+  // time passes its stored expiry, while the permanent grant stays current.
+  clock.advanceTo(earlyExpiresAt);
+  await settleScheduledExpiries(t, clock);
   expect(await t.withIdentity({ tokenIdentifier: "membership-regression-expiry-early" }).query(myProjectRoleRef, grant)).toMatchObject({
     ok: false,
   });
