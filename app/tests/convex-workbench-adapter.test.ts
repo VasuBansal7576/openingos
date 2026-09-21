@@ -5,7 +5,7 @@ import {
   createConvexWorkbenchAdapter,
   type ConvexWorkbenchClient,
 } from "../convex-workbench-adapter";
-import { parseWorkbenchSnapshot } from "../workbench-state";
+import { parseWorkbenchSnapshot, type WorkbenchAction } from "../workbench-state";
 
 function projection(projectId = "project-1"): Record<string, unknown> {
   return {
@@ -29,6 +29,8 @@ function projection(projectId = "project-1"): Record<string, unknown> {
         canCompare: true,
         canCommunicate: false,
         canClarify: false,
+        canApprove: false,
+        canOpenServiceCase: false,
       },
     },
     requirements: [],
@@ -57,6 +59,8 @@ function actionProjection(projectId = "project-1", requirementVersion = 4): Reco
         canCompare: true,
         canCommunicate: false,
         canClarify: false,
+        canApprove: true,
+        canOpenServiceCase: true,
       },
     },
     requirements: [{
@@ -136,6 +140,8 @@ function accessibleProjects(projectId = "project-1"): Record<string, unknown> {
           canCompare: true,
           canCommunicate: false,
           canClarify: false,
+          canApprove: false,
+          canOpenServiceCase: false,
         },
       },
     }],
@@ -632,6 +638,91 @@ test("a newer watched projection wins over a late load result", async () => {
   unsubscribe?.();
 });
 
+test("opens a current projected service case with exact authority and idempotency payload", async () => {
+  const calls: MutationCall[] = [];
+  const controls = controlledWatch(() => serviceActionProjection());
+  let mutationResult: unknown = { ok: false, code: "denied-project", message: "asset service access denied" };
+  const adapter = createConvexWorkbenchAdapter({
+    query: async () => serviceActionProjection(),
+    watchQuery: () => controls.watch,
+    mutation: async (reference: unknown, args: unknown) => {
+      calls.push({ reference, args });
+      return mutationResult;
+    },
+  } as unknown as ConvexWorkbenchClient);
+  const action: WorkbenchAction = {
+    type: "openServiceCase",
+    projectId: "project-1",
+    assetId: "asset-e1-1",
+    urgency: "high",
+    summary: "  Pressure fault on group head  ",
+    idempotencyKey: "case-key-1",
+  };
+
+  await adapter.load("project-1");
+  await expect(adapter.act(action)).resolves.toEqual({ ok: false, message: "asset service access denied" });
+  expect(getFunctionName(calls[0]?.reference as FunctionReference<"mutation">)).toBe("domain/fulfillment:openServiceCase");
+  expect(calls[0]?.args).toEqual({
+    organizationId: "organization-1",
+    projectId: "project-1",
+    assetId: "asset-e1-1",
+    urgency: "high",
+    summary: "Pressure fault on group head",
+    idempotencyKey: "case-key-1",
+  });
+
+  // Every attempted mutation invalidates the basis, including denial. A
+  // repeated click cannot send again until fresh server state arrives.
+  await expect(adapter.act(action)).resolves.toMatchObject({ ok: false });
+  expect(calls).toHaveLength(1);
+
+  await adapter.load("project-1");
+  mutationResult = { ok: true, caseId: "case-e1-1", deduplicated: true };
+  await expect(adapter.act(action)).resolves.toEqual({
+    ok: true,
+    message: "Service case already recorded by the server; this submission was deduplicated.",
+  });
+  expect(calls).toHaveLength(2);
+  expect(calls[1]?.args).toEqual(calls[0]?.args);
+});
+
+test("rejects viewer, missing, stale, and cross-project service-case inputs without mutation", async () => {
+  const calls: MutationCall[] = [];
+  const controls = controlledWatch(() => serviceActionProjection());
+  const adapter = createConvexWorkbenchAdapter({
+    query: async () => serviceActionProjection(),
+    watchQuery: () => controls.watch,
+    mutation: async (reference: unknown, args: unknown) => {
+      calls.push({ reference, args });
+      return { ok: true, caseId: "case-e1-1", deduplicated: false };
+    },
+  } as unknown as ConvexWorkbenchClient);
+  const baseAction: WorkbenchAction = { type: "openServiceCase", projectId: "project-1", assetId: "asset-e1-1", urgency: "normal", summary: "Inspect pump", idempotencyKey: "case-key" };
+
+  await expect(adapter.act(baseAction)).resolves.toMatchObject({ ok: false });
+  await adapter.load("project-1");
+  await expect(adapter.act({ ...baseAction, assetId: "asset-missing" })).resolves.toMatchObject({ ok: false });
+  await expect(adapter.act({ ...baseAction, projectId: "project-2" })).resolves.toMatchObject({ ok: false });
+  await expect(adapter.act({ ...baseAction, summary: "   " })).resolves.toMatchObject({ ok: false });
+  await expect(adapter.act({ ...baseAction, summary: "x".repeat(801) })).resolves.toMatchObject({ ok: false });
+  await expect(adapter.act({ ...baseAction, idempotencyKey: "   " })).resolves.toMatchObject({ ok: false });
+  expect(calls).toHaveLength(0);
+
+  const viewerCalls: MutationCall[] = [];
+  const viewerProjection = { ...serviceActionProjection(), access: projection().access };
+  const viewerAdapter = createConvexWorkbenchAdapter({
+    query: async () => viewerProjection,
+    watchQuery: () => controls.watch,
+    mutation: async (reference: unknown, args: unknown) => {
+      viewerCalls.push({ reference, args });
+      return { ok: true, caseId: "case-e1-1", deduplicated: false };
+    },
+  } as unknown as ConvexWorkbenchClient);
+  await viewerAdapter.load("project-1");
+  await expect(viewerAdapter.act(baseAction)).resolves.toMatchObject({ ok: false });
+  expect(viewerCalls).toHaveLength(0);
+});
+
 function assetFixture(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     id: "asset-e1-1",
@@ -658,6 +749,13 @@ function assetFixture(overrides: Record<string, unknown> = {}): Record<string, u
 
 function projectionWithAssets(assets: unknown): Record<string, unknown> {
   return { ...projection(), equipment: { assets, assetsTruncated: false } };
+}
+
+function serviceActionProjection(projectId = "project-1"): Record<string, unknown> {
+  return {
+    ...actionProjection(projectId),
+    equipment: { assets: [assetFixture()], assetsTruncated: false },
+  };
 }
 
 async function loadWithAssets(assets: unknown): Promise<unknown> {

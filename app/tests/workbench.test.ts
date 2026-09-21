@@ -37,6 +37,8 @@ const projection = {
       canCompare: true,
       canCommunicate: true,
       canClarify: true,
+      canApprove: true,
+      canOpenServiceCase: true,
     },
   },
   requirements: [{
@@ -98,7 +100,7 @@ const projection = {
     { id: "job-partial", kind: "recovery", status: "partial", cancellable: true, createdAt: Date.UTC(2026, 8, 20), updatedAt: Date.UTC(2026, 8, 20), grantVersion: 1, attempts: [{ state: "observedSuccess", createdAt: Date.UTC(2026, 8, 20) }] },
     { id: "job-paused", kind: "recovery", status: "paused", cancellable: true, createdAt: Date.UTC(2026, 8, 20), updatedAt: Date.UTC(2026, 8, 20), grantVersion: 1, attempts: [] },
   ],
-  decisions: [{ id: "approval-w1-1", kind: "approval", state: "requested", quoteId: "quote-w1-1", createdAt: Date.UTC(2026, 8, 20) }],
+  decisions: [{ id: "approval-w1-1", kind: "approval", state: "requested", scope: "selection:quote-w1-1", snapshotHash: "snapshot-hash-w1-1", quoteId: "quote-w1-1", createdAt: Date.UTC(2026, 8, 20) }],
   activity: { page: [{ id: "event-w1-1", kind: "quoteRecorded", createdAt: Date.UTC(2026, 8, 20) }], continueCursor: null, isDone: true },
   equipment: { assets: [], assetsTruncated: false },
   requirementsTruncated: false,
@@ -113,7 +115,10 @@ test("accepts the exact W1 projection without inventing aggregates or authority"
   expect(snapshot?.project.id).toBe(projection.project.id);
   expect(snapshot?.offers[0]?.quote?.comparableTotalMinorUnits).toBeNull();
   expect(snapshot?.committedMinorUnits).toBeNull();
-  expect(snapshot?.access.capabilities.canApprove).toBeNull();
+  expect(snapshot?.access.capabilities.canApprove).toBe(true);
+  expect(snapshot?.access.capabilities.canOpenServiceCase).toBe(true);
+  expect(snapshot?.decisions[0]?.scope).toBe("selection:quote-w1-1");
+  expect(snapshot?.decisions[0]?.snapshotHash).toBe("snapshot-hash-w1-1");
   expect(snapshot?.jobs.map((job) => job.delivery)).toEqual(["queued", "sent", "delivered", "unknown", "partial", "paused"]);
   expect(snapshot?.activity.items[0]?.summary).toBeNull();
 });
@@ -171,6 +176,12 @@ test("rejects the obsolete top-level access fixture", () => {
   expect(parseWorkbenchSnapshot({ ...legacyProjection, effectiveRole: "approver", capabilities: projection.access.capabilities }, projection.project.id)).toBeNull();
 });
 
+test("fails closed when server authority flags are absent or malformed", () => {
+  const { canApprove: _canApprove, ...withoutApproval } = projection.access.capabilities;
+  expect(parseWorkbenchSnapshot({ ...projection, access: { ...projection.access, capabilities: withoutApproval } }, projection.project.id)).toBeNull();
+  expect(parseWorkbenchSnapshot({ ...projection, access: { ...projection.access, capabilities: { ...projection.access.capabilities, canOpenServiceCase: "yes" } } }, projection.project.id)).toBeNull();
+});
+
 test("formats unknown money without turning missing charges into zero", () => {
   expect(formatMoney(null, "EUR")).toBe("Unknown");
   expect(formatMoney(795000, "EUR")).toContain("7,950");
@@ -206,7 +217,7 @@ function projectionWithEquipment(equipment: unknown): Record<string, unknown> {
 
 async function mountEquipmentTab(
   loadState: Parameters<typeof WorkbenchView>[0]["loadState"],
-  onAction: (action: WorkbenchAction) => WorkbenchActionResult,
+  onAction: (action: WorkbenchAction) => WorkbenchActionResult | Promise<WorkbenchActionResult>,
 ): Promise<{
   readonly container: HTMLElement;
   readonly findButton: (label: string) => HTMLButtonElement;
@@ -800,7 +811,7 @@ test("never infers an installed asset from a fulfilled requirement", async () =>
   }
 });
 
-test("renders real assets with documents, cases, truncation, and a disabled service action", async () => {
+test("renders real assets with documents, cases, truncation, and opens the service dialog", async () => {
   const snapshot = parseWorkbenchSnapshot(projectionWithEquipment({
     assets: [assetFixture({ documentsTruncated: true, serviceCasesTruncated: true })],
     assetsTruncated: true,
@@ -823,11 +834,13 @@ test("renders real assets with documents, cases, truncation, and a disabled serv
     expect(text).toContain("More documents exist than this projection shows");
     expect(text).toContain("More service cases exist than this projection shows");
     const serviceButton = mounted.findButton("Open service case");
-    expect(serviceButton.disabled).toBe(true);
-    expect(serviceButton.title).toContain("no backend command route exists");
+    expect(serviceButton.disabled).toBe(false);
     await act(async () => {
       serviceButton.click();
     });
+    expect(mounted.container.querySelector('[role="dialog"]')).not.toBeNull();
+    expect(mounted.container.textContent).toContain("What needs attention?");
+    expect(mounted.container.textContent).toContain("0/800 characters");
     expect(actionCalls).toEqual([]);
   } finally {
     await mounted.cleanup();
@@ -850,6 +863,27 @@ test("keeps the equipment service action disabled with zero adapter calls while 
     expect(mounted.container.textContent).toContain("Atlas 2G espresso machine");
     expect(mounted.findButton("Open service case").disabled).toBe(true);
     expect(actionCalls).toEqual([]);
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("enables a pending approval from its safe basis without requiring an evidence array", async () => {
+  const snapshot = parseWorkbenchSnapshot(projection, projection.project.id);
+  if (snapshot === null) throw new Error("W1 projection should parse");
+  const actionCalls: WorkbenchAction[] = [];
+  const mounted = await mountEquipmentTab({ state: "ready", snapshot }, (action: WorkbenchAction) => {
+    actionCalls.push(action);
+    return { ok: true, message: "approval recorded by server" };
+  });
+  try {
+    await mounted.clickTab("Inbox");
+    const approve = mounted.findButton("Approve this decision");
+    expect(approve.disabled).toBe(false);
+    expect(mounted.container.textContent).toContain("Immutable decision basis");
+    expect(mounted.container.textContent).toContain("snapshot-hash-w1-1");
+    await act(async () => { approve.click(); });
+    expect(actionCalls).toEqual([{ type: "approveDecision", projectId: "project-w1-1", decisionId: "approval-w1-1" }]);
   } finally {
     await mounted.cleanup();
   }

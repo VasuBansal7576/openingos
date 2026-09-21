@@ -26,7 +26,10 @@ export interface WorkbenchCapabilities {
   readonly canCompare: boolean;
   readonly canCommunicate: boolean;
   readonly canClarify: boolean;
-  readonly canApprove: boolean | null;
+  /** Server-authoritative approval capability. Missing/malformed values fail closed in the parser. */
+  readonly canApprove: boolean;
+  /** Server-authoritative service-case capability. Missing/malformed values fail closed in the parser. */
+  readonly canOpenServiceCase: boolean;
   readonly canRecordOrder: boolean | null;
   readonly canResolveRisk: boolean | null;
 }
@@ -153,6 +156,9 @@ export interface WorkbenchDecision {
   readonly offerId: string | null;
   readonly quoteId: string | null;
   readonly quoteVersion: string | null;
+  /** Safe immutable approval basis metadata, never the canonical snapshot. */
+  readonly scope: string | null;
+  readonly snapshotHash: string | null;
   readonly requestedAt: number;
   readonly evidenceIds: readonly string[];
   readonly summary: string | null;
@@ -244,6 +250,14 @@ export type WorkbenchAction =
   | { readonly type: "cancelJob"; readonly projectId: string; readonly jobId: string }
   | { readonly type: "selectOffer"; readonly projectId: string; readonly offerId: string; readonly quoteId: string; readonly quoteVersion: string }
   | { readonly type: "approveDecision"; readonly projectId: string; readonly decisionId: string }
+  | {
+      readonly type: "openServiceCase";
+      readonly projectId: string;
+      readonly assetId: string;
+      readonly urgency: "urgent" | "high" | "normal" | "low";
+      readonly summary: string;
+      readonly idempotencyKey: string;
+    }
   | { readonly type: "openEvidence"; readonly projectId: string; readonly evidenceId: string };
 
 export interface WorkbenchActionResult {
@@ -528,10 +542,12 @@ function parseDecision(value: unknown): WorkbenchDecision | null {
   const offerId = optionalId(value.candidateId);
   const quoteId = optionalId(value.quoteId);
   const quoteVersion = nullableString(value.quoteVersion);
+  const scope = nullableString(value.scope);
+  const snapshotHash = nullableString(value.snapshotHash);
   const decidedAt = nullableNumber(value.decidedAt);
-  if (id === null || type === null || rawState === null || requirementId === undefined || offerId === undefined || quoteId === undefined || quoteVersion === undefined || decidedAt === undefined || !isFiniteNumber(value.createdAt)) return null;
+  if (id === null || type === null || rawState === null || requirementId === undefined || offerId === undefined || quoteId === undefined || quoteVersion === undefined || scope === undefined || snapshotHash === undefined || decidedAt === undefined || !isFiniteNumber(value.createdAt)) return null;
   const state = type === "approval" && rawState === "pending" ? "requested" : rawState;
-  return { id, type, state, requirementId, offerId, quoteId, quoteVersion, requestedAt: value.createdAt, evidenceIds: [], summary: null, authorizationRequired: null };
+  return { id, type, state, requirementId, offerId, quoteId, quoteVersion, scope, snapshotHash, requestedAt: value.createdAt, evidenceIds: [], summary: null, authorizationRequired: null };
 }
 
 function parseActivityItem(value: unknown): WorkbenchActivityItem | null {
@@ -568,7 +584,7 @@ function parseProject(value: unknown): WorkbenchProject | null {
 function parseAccess(value: unknown): WorkbenchAccess | null {
   if (!isRecord(value) || !isOneOf(value.role, ["viewer", "contributor", "approver", "owner"] as const) || !isRecord(value.capabilities)) return null;
   const capabilities = value.capabilities;
-  if (typeof capabilities.canResearch !== "boolean" || typeof capabilities.canRecordEvidence !== "boolean" || typeof capabilities.canRecordQuote !== "boolean" || typeof capabilities.canCompare !== "boolean" || typeof capabilities.canCommunicate !== "boolean" || typeof capabilities.canClarify !== "boolean") return null;
+  if (typeof capabilities.canResearch !== "boolean" || typeof capabilities.canRecordEvidence !== "boolean" || typeof capabilities.canRecordQuote !== "boolean" || typeof capabilities.canCompare !== "boolean" || typeof capabilities.canCommunicate !== "boolean" || typeof capabilities.canClarify !== "boolean" || typeof capabilities.canApprove !== "boolean" || typeof capabilities.canOpenServiceCase !== "boolean") return null;
   return {
     role: value.role,
     capabilities: {
@@ -578,7 +594,8 @@ function parseAccess(value: unknown): WorkbenchAccess | null {
       canCompare: capabilities.canCompare,
       canCommunicate: capabilities.canCommunicate,
       canClarify: capabilities.canClarify,
-      canApprove: null,
+      canApprove: capabilities.canApprove,
+      canOpenServiceCase: capabilities.canOpenServiceCase,
       canRecordOrder: null,
       canResolveRisk: null,
     },

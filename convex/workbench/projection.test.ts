@@ -339,6 +339,29 @@ describe("U1 workbench projection", () => {
     expect(missing).toEqual({ ok: false, code: "denied-membership", message: "not authorized for this project" });
   });
 
+  test("projects approval and service-case authority from the resolved role", async () => {
+    const t = convexTest(schema, modules);
+    const project = await setupProject(t, OWNER, "role-flags");
+    const grant = await t.withIdentity(OWNER).mutation(grantProjectAccessRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      targetIdentity: "workbench-contributor",
+      role: "contributor",
+    });
+    if (!grant.ok) throw new Error(`contributor grant failed: ${JSON.stringify(grant)}`);
+    const contributor = await t.withIdentity({ tokenIdentifier: "workbench-contributor" }).query(getProjectionRef, { projectId: project.projectId, limit: 1 });
+    expect(contributor.ok).toBe(true);
+    if (!contributor.ok) throw new Error("contributor projection denied");
+    expect(contributor.access.role).toBe("contributor");
+    expect(contributor.access.capabilities.canApprove).toBe(false);
+    expect(contributor.access.capabilities.canOpenServiceCase).toBe(true);
+    const owner = await t.withIdentity(OWNER).query(getProjectionRef, { projectId: project.projectId, limit: 1 });
+    expect(owner.ok).toBe(true);
+    if (!owner.ok) throw new Error("owner projection denied");
+    expect(owner.access.capabilities.canApprove).toBe(true);
+    expect(owner.access.capabilities.canOpenServiceCase).toBe(true);
+  });
+
   test("paginates project listing and excludes expired project memberships", async () => {
     const t = convexTest(schema, modules);
     const first = await setupProject(t, OWNER, "page-0");
@@ -521,6 +544,11 @@ describe("U1 workbench projection", () => {
     expect(result.jobs.some((job) => job.status === "queued" && job.cancellable)).toBe(true);
     expect(result.jobs.some((job) => job.status === "sent" && !job.cancellable)).toBe(true);
     expect(result.decisions.some((decision) => decision.kind === "approval" && decision.state === "requested")).toBe(true);
+    expect(result.access.capabilities.canApprove).toBe(true);
+    expect(result.access.capabilities.canOpenServiceCase).toBe(true);
+    const approval = result.decisions.find((decision) => decision.kind === "approval");
+    expect(approval && "scope" in approval ? approval.scope : undefined).toBe("selection");
+    expect(approval && "snapshotHash" in approval ? approval.snapshotHash : undefined).toBe("actions-approval");
   });
 
   test("caps every visible collection under high-volume data and paginates activity", async () => {

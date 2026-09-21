@@ -58,6 +58,15 @@ type W1StartJobArgs = Record<string, unknown> & {
   readonly kind: "research";
 };
 
+type W1OpenServiceCaseArgs = Record<string, unknown> & {
+  readonly organizationId: Id<"organizations">;
+  readonly projectId: Id<"projects">;
+  readonly assetId: Id<"assets">;
+  readonly urgency: "urgent" | "high" | "normal" | "low";
+  readonly summary: string;
+  readonly idempotencyKey: string;
+};
+
 type W1PublicApi = {
   readonly "workbench/projection": {
     readonly listAccessibleProjects: FunctionReference<
@@ -76,6 +85,9 @@ type W1PublicApi = {
     readonly cancel: FunctionReference<"mutation", "public", W1CancelJobArgs, unknown>;
     readonly start: FunctionReference<"mutation", "public", W1StartJobArgs, unknown>;
   };
+  readonly "domain/fulfillment": {
+    readonly openServiceCase: FunctionReference<"mutation", "public", W1OpenServiceCaseArgs, unknown>;
+  };
 };
 
 /**
@@ -93,6 +105,8 @@ const decideApprovalReference = decisionsApi.decideApproval;
 const jobsApi = (api as unknown as W1PublicApi)["execution/jobs"];
 const cancelJobReference = jobsApi.cancel;
 const startJobReference = jobsApi.start;
+const fulfillmentApi = (api as unknown as W1PublicApi)["domain/fulfillment"];
+const openServiceCaseReference = fulfillmentApi.openServiceCase;
 
 const WORKBENCH_PROJECTION_LIMIT = 12;
 const PROJECT_DISCOVERY_LIMIT = 1;
@@ -151,6 +165,9 @@ function invalidProjectionError(): Error {
 const ACTION_UNAVAILABLE = "This workbench action is unavailable. Nothing was sent.";
 const ACTION_REQUIRES_CURRENT_PROJECTION = "This action requires a current validated project projection. Nothing was sent.";
 const RETRY_UNAVAILABLE = "Retry is unavailable because no safe retry contract is configured. Nothing was sent.";
+const SERVICE_CASE_SUMMARY_MAX_LENGTH = 800;
+const IDEMPOTENCY_KEY_MAX_LENGTH = 160;
+const SERVICE_CASE_URGENCIES = ["urgent", "high", "normal", "low"] as const;
 
 function positiveDecimal(value: string): boolean {
   if (!/^\d+(?:\.\d+)?$/.test(value)) return false;
@@ -211,6 +228,8 @@ function parseAccessibleProjectPage(value: unknown): AccessibleProjectPage {
       "canCompare",
       "canCommunicate",
       "canClarify",
+      "canApprove",
+      "canOpenServiceCase",
     ].every((key) => typeof capabilities[key] === "boolean")
   ) {
     throw new Error("Convex returned an invalid accessible-project response.");
@@ -462,6 +481,52 @@ export function createConvexWorkbenchAdapter(client: ConvexWorkbenchClient): Con
         return { ok: true, message: "Approval recorded by the server." };
       } catch (error) {
         return { ok: false, message: error instanceof Error ? error.message : "The server did not decide this approval." };
+      } finally {
+        invalidateProjection(projectId);
+      }
+    }
+
+    if (action.type === "openServiceCase") {
+      if (current.access.capabilities.canOpenServiceCase !== true) {
+        return { ok: false, message: "Service-case creation is not authorized for this project. Nothing was sent." };
+      }
+      const asset = current.equipment.assets.find((candidate) => candidate.id === action.assetId);
+      const summary = requiredString(action.summary)?.trim() ?? null;
+      const idempotencyKey = requiredString(action.idempotencyKey)?.trim() ?? null;
+      if (
+        asset === undefined ||
+        asset.id !== action.assetId ||
+        !isOneOf(action.urgency, SERVICE_CASE_URGENCIES) ||
+        summary === null ||
+        summary.length > SERVICE_CASE_SUMMARY_MAX_LENGTH ||
+        idempotencyKey === null ||
+        idempotencyKey.length > IDEMPOTENCY_KEY_MAX_LENGTH
+      ) {
+        return { ok: false, message: ACTION_REQUIRES_CURRENT_PROJECTION };
+      }
+      const args: W1OpenServiceCaseArgs = {
+        organizationId,
+        projectId,
+        assetId: asset.id as Id<"assets">,
+        urgency: action.urgency,
+        summary,
+        idempotencyKey,
+      };
+      try {
+        const result = await client.mutation(openServiceCaseReference, args);
+        const failure = mutationFailure(result, "The server did not record this service case.");
+        if (failure !== null) return failure;
+        if (!isRecord(result) || requiredString(result.caseId) === null || typeof result.deduplicated !== "boolean") {
+          return { ok: false, message: "The server did not return a valid service-case state." };
+        }
+        return {
+          ok: true,
+          message: result.deduplicated
+            ? "Service case already recorded by the server; this submission was deduplicated."
+            : "Service case recorded by the server.",
+        };
+      } catch (error) {
+        return { ok: false, message: error instanceof Error ? error.message : "The server did not record this service case." };
       } finally {
         invalidateProjection(projectId);
       }

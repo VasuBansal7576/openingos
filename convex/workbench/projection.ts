@@ -93,6 +93,8 @@ const capabilityFlagsValidator = v.object({
   canCompare: v.boolean(),
   canCommunicate: v.boolean(),
   canClarify: v.boolean(),
+  canApprove: v.boolean(),
+  canOpenServiceCase: v.boolean(),
 });
 
 const accessValidator = v.object({
@@ -238,6 +240,10 @@ const decisionValidator = v.object({
   candidateId: v.optional(v.id("candidates")),
   quoteId: v.optional(v.id("quotes")),
   quoteVersion: v.optional(v.string()),
+  // Approval basis is safe metadata only. The canonical snapshot remains
+  // server-private and is rechecked by the approval mutation.
+  scope: v.optional(v.string()),
+  snapshotHash: v.optional(v.string()),
   createdAt: v.number(),
   decidedAt: v.optional(v.number()),
 });
@@ -408,6 +414,10 @@ function capabilityFlags(role: DbRole) {
     canCompare: requireCapability("comparison.read", role).ok,
     canCommunicate: requireCapability("communication.send", role).ok,
     canClarify: requireCapability("communication.clarify", role).ok,
+    // These are explicit server-authoritative role predicates. The capability
+    // catalog intentionally has no purchase or service-booking operation.
+    canApprove: role === "owner" || role === "approver",
+    canOpenServiceCase: role === "owner" || role === "approver" || role === "contributor",
   };
 }
 
@@ -1203,6 +1213,8 @@ export const getProjection = f1Query({
         kind: "approval" as const,
         state: row.state === "pending" ? "requested" : row.state,
         ...(row.quoteId === undefined ? {} : { quoteId: row.quoteId }),
+        scope: row.scope,
+        snapshotHash: row.snapshotHash,
         createdAt: row.createdAt,
         ...(row.decidedAt === undefined ? {} : { decidedAt: row.decidedAt }),
       })),

@@ -1,9 +1,10 @@
-import { useMemo, useState, type ReactNode } from "react";
+import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import type {
   DeliveryState,
   WorkbenchAction,
   WorkbenchActionResult,
   WorkbenchActivityItem,
+  WorkbenchAsset,
   WorkbenchEvidence,
   WorkbenchLoadState,
   WorkbenchOffer,
@@ -305,7 +306,7 @@ function InboxView({ snapshot, onAction, onMessage }: { readonly snapshot: Workb
     const result = await onAction({ type: "approveDecision", projectId: snapshot.project.id, decisionId });
     onMessage(result.ok ? "Approval request recorded by the server." : result.message ?? "Approval was not recorded.");
   };
-  return <div className="wb-page"><PageHeading eyebrow="DECISIONS INBOX" title="Keep the consequential things visible." description="Review what changed, its effect, and the exact authorization still needed." />{openDecisions.length === 0 && jobs.length === 0 ? <EmptyState icon="inbox" title="Nothing needs your review" message="When a quote, provider outcome or requirement changes, the server will add a decision with its evidence." /> : <div className="wb-inbox-layout"><aside className="wb-inbox-list"><span className="wb-eyebrow">OPEN ITEMS</span>{openDecisions.map((decision) => <button className="wb-thread-card" key={decision.id} type="button"><span className="wb-thread-icon"><Icon name={decision.type === "recovery" ? "sync" : "file"} size={17} /></span><span><strong>{formatStateLabel(decision.type)} review</strong><small>{decision.summary ?? "Decision detail unavailable"}</small></span><Pill tone="warning">Review</Pill></button>)}{jobs.map((job) => <div className="wb-thread-card readonly" key={job.id}><span className="wb-thread-icon"><StatusDot state={job.delivery} /></span><span><strong>{formatStateLabel(job.kind)} job</strong><small>{job.summary ?? "Job detail unavailable"}</small></span><Pill tone={job.delivery === "delivered" ? "success" : job.delivery === "unknown" ? "warning" : job.delivery === "paused" ? "danger" : "neutral"}>{deliveryLabel(job.delivery)}</Pill></div>)}</aside><section className="wb-panel wb-conversation"><div className="wb-conversation-head"><div><span className="wb-eyebrow">CURRENT REVIEW</span><h2>{openDecisions.length > 0 ? openDecisions[0]!.summary ?? "Decision detail unavailable" : "Provider activity"}</h2><p>Project-scoped view · {snapshot.provenance.label}</p></div><Pill tone={openDecisions.length > 0 ? "warning" : "neutral"}>{openDecisions.length > 0 ? "Authorization needed" : "No new decision"}</Pill></div>{openDecisions.length > 0 ? <div className="wb-decision-body"><div className="wb-decision-evidence"><Icon name="file" size={19} /><div><strong>Evidence attached to this request</strong><p>{openDecisions[0]!.evidenceIds.length > 0 ? `${openDecisions[0]!.evidenceIds.length} source record${openDecisions[0]!.evidenceIds.length === 1 ? "" : "s"} in the server projection.` : "No evidence reference was returned. Approval stays blocked."}</p></div></div><div className="wb-decision-rule"><Icon name="shield" size={18} /><p>Approval is bound to the exact project, offer and quote version. A changed quote invalidates the old request.</p></div><ActionButton disabled={!onAction || snapshot.access.capabilities.canApprove !== true || openDecisions[0]!.evidenceIds.length === 0} onClick={() => { void approve(openDecisions[0]!.id); }} title={!onAction ? "Actions wait for a connected projection" : snapshot.access.capabilities.canApprove === null ? "Approval authority is not represented in this projection" : snapshot.access.capabilities.canApprove === false ? "Approver capability required" : undefined}>Approve this decision <Icon name="check" size={16} /></ActionButton></div> : <ActivityList items={snapshot.activity.items} />}</section></div>}<div className="wb-delivery-table"><div className="wb-section-heading compact"><div><span className="wb-eyebrow">OUTBOUND AND RECOVERY STATES</span><h2>Outcome is a separate fact.</h2></div></div>{jobs.length === 0 ? <EmptyState icon="truck" title="No provider jobs recorded" message="Queued, sent, delivered, unknown, partial and paused states will appear here from server state." /> : jobs.map((job) => <JobRow key={job.id} job={job} snapshot={snapshot} onAction={onAction} onMessage={onMessage} />)}</div></div>;
+  return <div className="wb-page"><PageHeading eyebrow="DECISIONS INBOX" title="Keep the consequential things visible." description="Review what changed, its effect, and the exact authorization still needed." />{openDecisions.length === 0 && jobs.length === 0 ? <EmptyState icon="inbox" title="Nothing needs your review" message="When a quote, provider outcome or requirement changes, the server will add a decision with its evidence." /> : <div className="wb-inbox-layout"><aside className="wb-inbox-list"><span className="wb-eyebrow">OPEN ITEMS</span>{openDecisions.map((decision) => <button className="wb-thread-card" key={decision.id} type="button"><span className="wb-thread-icon"><Icon name={decision.type === "recovery" ? "sync" : "file"} size={17} /></span><span><strong>{formatStateLabel(decision.type)} review</strong><small>{decision.summary ?? "Decision detail unavailable"}</small></span><Pill tone="warning">Review</Pill></button>)}{jobs.map((job) => <div className="wb-thread-card readonly" key={job.id}><span className="wb-thread-icon"><StatusDot state={job.delivery} /></span><span><strong>{formatStateLabel(job.kind)} job</strong><small>{job.summary ?? "Job detail unavailable"}</small></span><Pill tone={job.delivery === "delivered" ? "success" : job.delivery === "unknown" ? "warning" : job.delivery === "paused" ? "danger" : "neutral"}>{deliveryLabel(job.delivery)}</Pill></div>)}</aside><section className="wb-panel wb-conversation"><div className="wb-conversation-head"><div><span className="wb-eyebrow">CURRENT REVIEW</span><h2>{openDecisions.length > 0 ? openDecisions[0]!.summary ?? "Decision detail unavailable" : "Provider activity"}</h2><p>Project-scoped view · {snapshot.provenance.label}</p></div><Pill tone={openDecisions.length > 0 ? "warning" : "neutral"}>{openDecisions.length > 0 ? "Authorization needed" : "No new decision"}</Pill></div>{openDecisions.length > 0 ? <div className="wb-decision-body"><div className="wb-decision-evidence"><Icon name="shield" size={19} /><div><strong>Immutable decision basis</strong><p>{openDecisions[0]!.scope ?? "Decision scope is not present in this projection."}</p>{openDecisions[0]!.snapshotHash ? <code>Snapshot hash · {openDecisions[0]!.snapshotHash}</code> : <p>Snapshot hash is not present in this projection.</p>}{openDecisions[0]!.quoteId ? <p>Current quote · {openDecisions[0]!.quoteId}{openDecisions[0]!.quoteVersion ? ` · version ${openDecisions[0]!.quoteVersion}` : ""}</p> : <p>Current quote identity is not present in this projection.</p>}</div></div><div className="wb-decision-rule"><Icon name="shield" size={18} /><p>Approval is bound to the exact project, offer and quote version. A changed quote invalidates the old request. Approval records authorization only; it does not place an order.</p></div><ActionButton disabled={!onAction || snapshot.access.capabilities.canApprove !== true} onClick={() => { void approve(openDecisions[0]!.id); }} title={!onAction ? "Actions wait for a connected projection" : snapshot.access.capabilities.canApprove === false ? "Approver capability required" : undefined}>Approve this decision <Icon name="check" size={16} /></ActionButton></div> : <ActivityList items={snapshot.activity.items} />}</section></div>}<div className="wb-delivery-table"><div className="wb-section-heading compact"><div><span className="wb-eyebrow">OUTBOUND AND RECOVERY STATES</span><h2>Outcome is a separate fact.</h2></div></div>{jobs.length === 0 ? <EmptyState icon="truck" title="No provider jobs recorded" message="Queued, sent, delivered, unknown, partial and paused states will appear here from server state." /> : jobs.map((job) => <JobRow key={job.id} job={job} snapshot={snapshot} onAction={onAction} onMessage={onMessage} />)}</div></div>;
 }
 
 function JobRow({ job, snapshot, onAction, onMessage }: { readonly job: WorkbenchSnapshot["jobs"][number]; readonly snapshot: WorkbenchSnapshot; readonly onAction?: WorkbenchViewProps["onAction"]; readonly onMessage: (message: string) => void }) {
@@ -341,10 +342,182 @@ function AssetServiceCase({ serviceCase }: { readonly serviceCase: WorkbenchSnap
   );
 }
 
-function AssetCard({ asset }: { readonly asset: WorkbenchSnapshot["equipment"]["assets"][number] }) {
-  const headingId = `asset-${asset.id}-heading`;
+type ServiceCaseUrgency = "urgent" | "high" | "normal" | "low";
+const SERVICE_CASE_SUMMARY_LIMIT = 800;
+
+function createServiceCaseIdempotencyKey(): string {
+  try {
+    if (typeof globalThis.crypto?.randomUUID === "function") return globalThis.crypto.randomUUID();
+  } catch {
+    // Fall through to a local opaque key in runtimes without Web Crypto.
+  }
+  return `service-case-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function ServiceCaseDialog({
+  asset,
+  projectId,
+  onAction,
+  onMessage,
+  onClose,
+}: {
+  readonly asset: WorkbenchAsset;
+  readonly projectId: string;
+  readonly onAction?: WorkbenchViewProps["onAction"];
+  readonly onMessage: (message: string) => void;
+  readonly onClose: () => void;
+}) {
+  const [urgency, setUrgency] = useState<ServiceCaseUrgency>("normal");
+  const [summary, setSummary] = useState("");
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [idempotencyKey, setIdempotencyKey] = useState<string | null>(null);
+  const [submittedFingerprint, setSubmittedFingerprint] = useState<string | null>(null);
+  const dialogRef = useRef<HTMLElement | null>(null);
+  const submittingRef = useRef(false);
+  const previousActiveElement = useRef<HTMLElement | null>(null);
+  const idPrefix = useId().replace(/:/g, "");
+  const titleId = `${idPrefix}-service-case-title`;
+  const descriptionId = `${idPrefix}-service-case-description`;
+  const urgencyId = `${idPrefix}-service-case-urgency`;
+  const summaryId = `${idPrefix}-service-case-summary`;
+  const countId = `${idPrefix}-service-case-count`;
+  const errorId = `${idPrefix}-service-case-error`;
+
+  useEffect(() => {
+    previousActiveElement.current = typeof document === "undefined" ? null : document.activeElement as HTMLElement | null;
+    dialogRef.current?.focus();
+    return () => {
+      previousActiveElement.current?.focus();
+    };
+  }, []);
+
+  const fingerprintFor = (nextUrgency: ServiceCaseUrgency, nextSummary: string) => `${nextUrgency}\u0000${nextSummary.trim()}`;
+  const updateUrgency = (nextUrgency: ServiceCaseUrgency) => {
+    setUrgency(nextUrgency);
+    if (submittedFingerprint !== null && fingerprintFor(nextUrgency, summary) !== submittedFingerprint) {
+      setSubmittedFingerprint(null);
+      setIdempotencyKey(null);
+    }
+  };
+  const updateSummary = (nextSummary: string) => {
+    setSummary(nextSummary);
+    if (submittedFingerprint !== null && fingerprintFor(urgency, nextSummary) !== submittedFingerprint) {
+      setSubmittedFingerprint(null);
+      setIdempotencyKey(null);
+    }
+  };
+  const submit = async () => {
+    if (pending || submittingRef.current || !onAction) return;
+    const trimmedSummary = summary.trim();
+    if (trimmedSummary.length === 0 || trimmedSummary.length > SERVICE_CASE_SUMMARY_LIMIT) {
+      setError("Add a concise summary before opening the service case.");
+      return;
+    }
+    const fingerprint = fingerprintFor(urgency, summary);
+    const key = idempotencyKey ?? createServiceCaseIdempotencyKey();
+    submittingRef.current = true;
+    setIdempotencyKey(key);
+    setSubmittedFingerprint(fingerprint);
+    setError(null);
+    setPending(true);
+    try {
+      const result = await onAction({
+        type: "openServiceCase",
+        projectId,
+        assetId: asset.id,
+        urgency,
+        summary: trimmedSummary,
+        idempotencyKey: key,
+      });
+      if (!result.ok) {
+        setError(result.message ?? "The server did not record this service case.");
+        return;
+      }
+      onMessage(result.message ?? "Service case recorded by the server.");
+      onClose();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "The server did not record this service case.");
+    } finally {
+      submittingRef.current = false;
+      setPending(false);
+    }
+  };
+
   return (
-    <article className="wb-panel wb-equipment-card" aria-labelledby={headingId}>
+    <div className="wb-overlay wb-service-case-overlay">
+      <section
+        className="wb-service-case-panel"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        aria-describedby={error === null ? descriptionId : `${descriptionId} ${errorId}`}
+        aria-busy={pending}
+        tabIndex={-1}
+        ref={dialogRef}
+        onKeyDown={(event) => {
+          if (event.key === "Escape" && !pending) {
+            event.preventDefault();
+            onClose();
+          }
+        }}
+      >
+        <div className="wb-panel-head">
+          <div>
+            <span className="wb-eyebrow">SERVICE FOLLOW-THROUGH</span>
+            <h2 id={titleId}>Open a service case for {asset.label}</h2>
+          </div>
+          <button className="wb-icon-button" type="button" onClick={onClose} disabled={pending} aria-label="Close service case dialog">
+            <Icon name="close" size={18} />
+          </button>
+        </div>
+        <p className="wb-service-case-description" id={descriptionId}>
+          This records a project-scoped service request for the installed asset. It does not place an order or imply a provider outcome.
+        </p>
+        <form className="wb-service-case-form" onSubmit={(event) => { event.preventDefault(); void submit(); }}>
+          <div className="wb-form-field">
+            <label htmlFor={urgencyId}>Urgency</label>
+            <select id={urgencyId} value={urgency} onChange={(event) => updateUrgency(event.target.value as ServiceCaseUrgency)} disabled={pending}>
+              <option value="urgent">Urgent</option>
+              <option value="high">High</option>
+              <option value="normal">Normal</option>
+              <option value="low">Low</option>
+            </select>
+          </div>
+          <div className="wb-form-field">
+            <label htmlFor={summaryId}>What needs attention?</label>
+            <textarea
+              id={summaryId}
+              value={summary}
+              onChange={(event) => updateSummary(event.target.value)}
+              maxLength={SERVICE_CASE_SUMMARY_LIMIT}
+              rows={5}
+              placeholder="Describe the issue or requested service"
+              disabled={pending}
+              aria-describedby={countId}
+            />
+            <span className="wb-character-count" id={countId} aria-live="polite">{summary.length}/{SERVICE_CASE_SUMMARY_LIMIT} characters</span>
+          </div>
+          {error !== null ? <p className="wb-form-error" id={errorId} role="alert">{error}</p> : null}
+          <div className="wb-service-case-actions">
+            <ActionButton kind="text" onClick={onClose} disabled={pending}>Cancel</ActionButton>
+            <ActionButton kind="primary" type="submit" disabled={pending || !onAction || summary.trim().length === 0}>
+              {pending ? "Recording…" : "Open service case"}
+            </ActionButton>
+          </div>
+        </form>
+      </section>
+    </div>
+  );
+}
+
+function AssetCard({ asset, projectId, canOpenServiceCase, onAction, onMessage }: { readonly asset: WorkbenchSnapshot["equipment"]["assets"][number]; readonly projectId: string; readonly canOpenServiceCase: boolean; readonly onAction?: WorkbenchViewProps["onAction"]; readonly onMessage: (message: string) => void }) {
+  const headingId = `asset-${asset.id}-heading`;
+  const [dialogOpen, setDialogOpen] = useState(false);
+  const canOpen = canOpenServiceCase && onAction !== undefined;
+  return (
+    <>
+      <article className="wb-panel wb-equipment-card" aria-labelledby={headingId}>
       <div className="wb-equipment-top">
         <span className="wb-equipment-icon"><Icon name="wrench" size={26} /></span>
         <Pill tone="success">Installed asset record</Pill>
@@ -384,21 +557,24 @@ function AssetCard({ asset }: { readonly asset: WorkbenchSnapshot["equipment"]["
         )}
         {asset.serviceCasesTruncated ? <p className="wb-card-footnote" role="status"><Icon name="warning" size={13} /> More service cases exist than this projection shows. The list is truncated.</p> : null}
       </section>
-      <div className="wb-asset-foot">
-        <ActionButton
-          kind="secondary"
-          disabled
-          title="Service-case creation is unavailable: no backend command route exists for service cases. Nothing was sent."
-        >
-          Open service case
-        </ActionButton>
-        <p className="wb-micro"><Icon name="lock" size={12} /> Service-case creation is unavailable in this workbench. No backend command route exists, so this action stays disabled and sends nothing.</p>
-      </div>
-    </article>
+        <div className="wb-asset-foot">
+          <ActionButton
+            kind="secondary"
+            disabled={!canOpen}
+            onClick={() => setDialogOpen(true)}
+            title={!canOpen ? "Service-case creation waits for a connected authorized projection and contributor-or-higher authority." : undefined}
+          >
+            Open service case
+          </ActionButton>
+          <p className="wb-micro"><Icon name="lock" size={12} /> {canOpen ? "The server will record this request against the current asset." : "Service-case creation waits for a connected authorized contributor or higher role."}</p>
+        </div>
+      </article>
+      {dialogOpen && canOpen ? <ServiceCaseDialog asset={asset} projectId={projectId} onAction={onAction} onMessage={onMessage} onClose={() => setDialogOpen(false)} /> : null}
+    </>
   );
 }
 
-function EquipmentView({ snapshot }: { readonly snapshot: WorkbenchSnapshot }) {
+function EquipmentView({ snapshot, onAction, onMessage }: { readonly snapshot: WorkbenchSnapshot; readonly onAction?: WorkbenchViewProps["onAction"]; readonly onMessage: (message: string) => void }) {
   const { assets, assetsTruncated } = snapshot.equipment;
   return (
     <div className="wb-page">
@@ -418,10 +594,7 @@ function EquipmentView({ snapshot }: { readonly snapshot: WorkbenchSnapshot }) {
             <Icon name="lock" size={20} />
             <div>
               <strong>Asset creation is explicit</strong>
-              <p>There is no seeded equipment record in this projection. Service-case creation is unavailable because no backend command route exists, so the action below stays disabled and sends nothing.</p>
-              <ActionButton kind="secondary" disabled title="Service-case creation is unavailable: no backend command route exists for service cases. Nothing was sent.">
-                Open service case
-              </ActionButton>
+              <p>There is no installed-asset record in this projection. OpeningOS will not invent an asset or send a service request without one.</p>
             </div>
           </div>
         </div>
@@ -429,7 +602,7 @@ function EquipmentView({ snapshot }: { readonly snapshot: WorkbenchSnapshot }) {
         <>
           {assetsTruncated ? <div className="wb-inline-warning" role="status"><Icon name="warning" size={16} /> More installed assets exist than this projection shows. Showing the first {assets.length}.</div> : null}
           <div className="wb-equipment-list">
-            {assets.map((asset) => <AssetCard key={asset.id} asset={asset} />)}
+            {assets.map((asset) => <AssetCard key={asset.id} asset={asset} projectId={snapshot.project.id} canOpenServiceCase={snapshot.access.capabilities.canOpenServiceCase} onAction={onAction} onMessage={onMessage} />)}
           </div>
         </>
       )}
@@ -448,6 +621,6 @@ export default function WorkbenchView({ loadState, onRetry, onAction, onLoadMore
   if (!snapshot) {
     return <main className="wb-connected-empty"><div className="wb-empty-hero"><span className="wb-brand-mark">O<span>.</span></span><span className="wb-eyebrow">OPENINGOS / PURCHASING WORKBENCH</span><h1>Waiting for an authorized project.</h1><p>{loadState.state === "empty" ? `${loadState.message} No vendors, quotes or provider outcomes are shown until server state is available.` : "The backend is connected, but no project-scoped projection has arrived yet. No vendors, quotes or provider outcomes are shown until server state is available."}</p><div className="wb-honesty-card"><Icon name="lock" size={18} /><div><strong>Private by default</strong><p>Project IDs, recipient details and raw provider headers stay out of the public projection. Ask the coordinator to wire the authorized project adapter before using this view.</p></div></div>{loadState.state !== "loading" && onRetry ? <ActionButton onClick={onRetry} kind="secondary"><Icon name="refresh" size={15} /> Retry project state</ActionButton> : null}</div></main>;
   }
-  const tabContent = activeTab === "project" ? <ProjectView snapshot={snapshot} onReview={setSelectedOffer} onAction={connectedAction} onLoadMore={onLoadMore} onTabChange={setActiveTab} onMessage={setMessage} /> : activeTab === "suppliers" ? <SuppliersView snapshot={snapshot} onReview={setSelectedOffer} onOpenEvidence={setEvidence} /> : activeTab === "inbox" ? <InboxView snapshot={snapshot} onAction={connectedAction} onMessage={setMessage} /> : activeTab === "recovery" ? <RecoveryView snapshot={snapshot} onAction={connectedAction} onMessage={setMessage} /> : <EquipmentView snapshot={snapshot} />;
+  const tabContent = activeTab === "project" ? <ProjectView snapshot={snapshot} onReview={setSelectedOffer} onAction={connectedAction} onLoadMore={onLoadMore} onTabChange={setActiveTab} onMessage={setMessage} /> : activeTab === "suppliers" ? <SuppliersView snapshot={snapshot} onReview={setSelectedOffer} onOpenEvidence={setEvidence} /> : activeTab === "inbox" ? <InboxView snapshot={snapshot} onAction={connectedAction} onMessage={setMessage} /> : activeTab === "recovery" ? <RecoveryView snapshot={snapshot} onAction={connectedAction} onMessage={setMessage} /> : <EquipmentView snapshot={snapshot} onAction={connectedAction} onMessage={setMessage} />;
   return <div className="wb-app"><Header activeTab={activeTab} project={snapshot.project} onTabChange={setActiveTab} onOpenAssistant={() => setAssistantOpen(true)} /><LoadNotice loadState={loadState} onRetry={onRetry} /><OverviewStrip snapshot={snapshot} /><main id="workbench-main" tabIndex={-1}>{tabContent}</main>{message ? <div className="wb-toast" role="status" aria-live="polite"><span>{message}</span><button type="button" onClick={() => setMessage(null)} aria-label="Dismiss message"><Icon name="close" size={14} /></button></div> : null}{assistantOpen ? <AssistantRail snapshot={snapshot} onClose={() => setAssistantOpen(false)} /> : null}{evidence ? <EvidencePanel evidence={evidence} onClose={() => setEvidence(null)} /> : null}{selectedOffer ? <SelectionPanel offer={selectedOffer} snapshot={snapshot} onClose={() => setSelectedOffer(null)} onAction={connectedAction} onMessage={setMessage} /> : null}</div>;
 }
