@@ -425,3 +425,19 @@ Neither repair package is accepted until its new exact head passes focused check
 Greptile again supplied quota notices rather than code review, so the review gate remains unresolved.
 All cited evidence is controlled local or CI execution.
 No hosted Convex deployment, live provider call, owner-mailbox exchange, genuine supplier response, public origin, purchase, realized saving or commercial outcome was observed.
+
+### 2026-09-21 - E7 and E9 repaired delivery checkpoint
+
+Ready PR #13 at `c895461` now contains the repaired controlled E7 import and review boundary.
+It preserves exact CSV source bytes including a leading BOM, binds every accepted idempotency key on both fresh and byte-deduplicated paths, preflights all selected promotion rows before the first write, and records canonical attachment metadata as hashed protected source evidence.
+Coordinator reruns passed 32 Bun parser tests, 15 direct handler tests, strict TypeScript and all nine exact-head GitHub checks.
+The E7 test files are not yet registered in the shared test command; E8 owns that combined-validation repair.
+Ready PR #12 at `67df399` now contains the repaired controlled E9 second-location reuse boundary.
+It denies reuse into the source project before writes and exposes fail-closed, cursor-paged current-fact revalidation so reused rows remain reachable behind authored rows.
+Coordinator reruns passed 8 focused direct tests, strict TypeScript and all nine exact-head GitHub checks.
+The main integration PR #2 exact head `cd5ba57` also passes all nine expected checks.
+E8 remains active on the clean combined validation branch, and the new E12 production negotiation orchestrator is active in a clean Vasu-owned worktree on verified OpenCode Muse Spark 1.3 Contributor high.
+The E12 worker owns only new `convex/negotiation/**` files and must reuse the accepted Jev, OpenAI, AgentMail and execution contracts with zero live sends in tests.
+Greptile remains unavailable because its connected trial reports the 50-credit limit exhausted; that quota notice is not code-review approval, so the ready child PRs remain unmerged pending an explicitly resolved review gate and fixed-head Astra review.
+All cited evidence is controlled local or CI execution.
+No hosted Convex deployment, live provider call, owner-mailbox exchange, genuine supplier response, public origin, purchase, realized saving or commercial outcome was observed.
