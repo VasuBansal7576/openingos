@@ -426,6 +426,18 @@ Greptile again supplied quota notices rather than code review, so the review gat
 All cited evidence is controlled local or CI execution.
 No hosted Convex deployment, live provider call, owner-mailbox exchange, genuine supplier response, public origin, purchase, realized saving or commercial outcome was observed.
 
+### 2026-09-21 - E8 correctness repair and visual rejection checkpoint
+
+Ready PR #14 is repaired at `b23f6a7` so stale substitute approval remains a zero-write denial while an authorized user may still reject the stale proposal and preserve its history.
+The worker-reported complete controlled suite passes, including 18 Jev tests and 438 direct tests.
+A same-viewport comparison against `design/purchasing-workbench.html#/compare` failed visual acceptance: the production surface used a generic pale dashboard, KPI strip and rounded cards instead of the selected photographic desk, paper-quote composition, serif hierarchy, compact ivory navigation and yellow decision language.
+That failure is not reported as polish or acceptance.
+Verified OpenCode Muse Spark 1.3 Contributor high dispatch `ctx_9f394f101e6b` now owns an isolated production UI rebuild from exact head `b23f6a7`, limited to the workbench component, styles, UI tests and extracted original prototype assets.
+The worker must retain real server-projected data and actions, honest unknown and recovery states, responsive and keyboard behavior, and may not ship the fixture prototype runtime or fake provider outcomes.
+E11 review repair `9edc444` also denies open-to-resolved or open-to-closed transitions without an explicit outcome; its owned regressions pass, while the coordinator still owes one shared legacy expectation update before claiming exact-head CI success.
+All cited browser and test evidence is controlled.
+No hosted Convex deployment, live provider call, owner-mailbox exchange, genuine supplier response, public origin, purchase, realized saving or commercial outcome was observed.
+
 ### 2026-09-21 - E7 and E9 repaired delivery checkpoint
 
 Ready PR #13 at `c895461` now contains the repaired controlled E7 import and review boundary.
