@@ -295,7 +295,15 @@ interface AccessibleProjectPage {
 function parseAccessibleProjectPage(value: unknown): AccessibleProjectPage {
   if (!isRecord(value)) throw new Error("Convex returned an invalid accessible-project response.");
   if (containsPrivateProjectionKey(value)) throw new Error("Convex returned an invalid accessible-project response.");
-  if (value.ok === false) return { projectId: null, continueCursor: null, isDone: true };
+  // A server denial (for example forged-identity/unauthenticated after a
+  // rejected token) is an explicit recoverable error, never an empty
+  // workspace. Callers surface this with a retry path instead of enabling a
+  // creation flow that would hide the denial.
+  if (value.ok === false) {
+    const code = typeof value.code === "string" && value.code.trim().length > 0 ? value.code : "denied";
+    const detail = typeof value.message === "string" && value.message.trim().length > 0 ? value.message : "the server denied project discovery";
+    throw new Error(`Authorized projects could not be discovered (${code}: ${detail}). Retry to re-establish the backend identity.`);
+  }
   if (value.ok !== true) throw new Error("Convex returned an invalid accessible-project response.");
   if (
     !Array.isArray(value.projects) ||
@@ -491,6 +499,15 @@ export function createConvexWorkbenchAdapter(client: ConvexWorkbenchClient): Con
     }
     if (disposed) return null;
     if (readVersions.get(projectId) !== version) return null;
+    // A server denial (for example forged-identity/unauthenticated after a
+    // revoked or rejected token) is an explicit recoverable error, never an
+    // empty projection that would hide the denial behind a creation flow.
+    if (isRecord(result) && result.ok === false) {
+      invalidateProjection(projectId);
+      const code = typeof result.code === "string" && result.code.trim().length > 0 ? result.code : "denied";
+      const detail = typeof result.message === "string" && result.message.trim().length > 0 ? result.message : "the server denied this projection";
+      throw new Error(`The project projection could not be read (${code}: ${detail}). Retry to re-establish the backend identity.`);
+    }
     const snapshot = parseWorkbenchSnapshot(result, projectId);
     if (snapshot === null) {
       invalidateProjection(projectId);

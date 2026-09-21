@@ -750,3 +750,337 @@ test("demo and brief entries keep Escape and focus return behavior", async () =>
     await mounted.cleanup();
   }
 });
+
+test("demo and brief entries keep Escape and focus return behavior", async () => {
+  const mounted = await mountLanding({
+    backendStatus: "connected",
+    workbench: { state: "empty", message: "No authorized project projection is available yet." },
+    onSample: async () => ({ ok: true, projectId: "project-sample-focus" }),
+    onIntake: async () => ({ ok: true, projectId: "project-intake-focus" }),
+  });
+  try {
+    await mounted.clickButton("Try the Northside");
+    expect(mounted.container.textContent).toContain("Open a controlled sample project.");
+    const deadline = Date.now() + 1500;
+    while (!mounted.container.textContent?.includes("Sample project created. Loading the persisted project.") && Date.now() < deadline) {
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      });
+    }
+    expect(mounted.container.textContent).toContain("Sample project created. Loading the persisted project.");
+    await mounted.pressEscape();
+    expect(mounted.container.textContent).not.toContain("Open a controlled sample project.");
+    await mounted.clickButton("Start your own brief");
+    expect(mounted.container.textContent).toContain("Open a workspace");
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+function confirmedProjectProjection(): Record<string, unknown> {
+  return {
+    ok: true,
+    project: {
+      id: "project-1",
+      organizationId: "organization-1",
+      name: "Northside café",
+      visibility: "open",
+      currency: "EUR",
+      budgetMinorUnits: null,
+      needByAt: null,
+      createdAt: 1,
+    },
+    access: {
+      role: "viewer",
+      capabilities: {
+        canResearch: false,
+        canRecordEvidence: false,
+        canRecordQuote: false,
+        canCompare: true,
+        canCommunicate: false,
+        canClarify: false,
+        canApprove: false,
+        canOpenServiceCase: false,
+      },
+    },
+    requirements: [],
+    requirementsTruncated: false,
+    candidates: [],
+    candidatesTruncated: false,
+    jobs: [],
+    jobsTruncated: false,
+    decisions: [],
+    decisionsTruncated: false,
+    equipment: { assets: [], assetsTruncated: false },
+    activity: { page: [], continueCursor: null, isDone: true },
+    provenance: { mode: "unknown", label: "No supplier terms", ownerAuthoredTerms: false },
+  };
+}
+
+function confirmedProjectList(): Record<string, unknown> {
+  return {
+    ok: true,
+    projects: [{
+      id: "project-1",
+      organizationId: "organization-1",
+      name: "Northside café",
+      visibility: "open",
+      currency: "EUR",
+      createdAt: 1,
+      access: {
+        role: "viewer",
+        capabilities: {
+          canResearch: false,
+          canRecordEvidence: false,
+          canRecordQuote: false,
+          canCompare: true,
+          canCommunicate: false,
+          canClarify: false,
+          canApprove: false,
+          canOpenServiceCase: false,
+        },
+      },
+    }],
+    continueCursor: null,
+    isDone: true,
+  };
+}
+
+async function waitForText(container: Element, text: string, timeoutMs = 1_500): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!container.textContent?.includes(text) && Date.now() < deadline) {
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+  }
+  expect(container.textContent).toContain(text);
+}
+
+interface MountedHarness {
+  readonly container: Element;
+  readonly cleanup: () => Promise<void>;
+  readonly eventLog: string[];
+  readonly queryArgs: unknown[];
+  readonly mutationCalls: unknown[];
+  readonly releaseSignIn: (result: { tokens: { token: string; refreshToken: string } | null }) => void;
+}
+
+async function mountServerConfirmationHarness(options: {
+  readonly signInGate: Promise<{ tokens: { token: string; refreshToken: string } | null }>;
+  readonly listBehavior: (attempt: number) => unknown;
+}): Promise<MountedHarness> {
+  const dom = new HappyWindow({ url: "https://openingos.test/" });
+  const previousWindow = globalThis.window;
+  const previousDocument = globalThis.document;
+  const previousNavigator = globalThis.navigator;
+  const actEnvironment = globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean };
+  const previousActEnvironment = actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+  const browserGlobals = globalThis as unknown as { window: unknown; document: unknown; navigator: unknown };
+  browserGlobals.window = dom as unknown as globalThis.Window;
+  browserGlobals.document = dom.document as unknown as globalThis.Document;
+  browserGlobals.navigator = dom.navigator as unknown as globalThis.Navigator;
+  actEnvironment.IS_REACT_ACT_ENVIRONMENT = true;
+
+  const eventLog: string[] = [];
+  const queryArgs: unknown[] = [];
+  const mutationCalls: unknown[] = [];
+  let clientAttempts = 0;
+  let releaseSignIn: (result: { tokens: { token: string; refreshToken: string } | null }) => void = () => {};
+  const signInGate = new Promise<{ tokens: { token: string; refreshToken: string } | null }>((resolve) => {
+    releaseSignIn = resolve;
+  });
+  // The outer gate models a delayed provider round-trip; tests release it to
+  // simulate the server confirming the anonymous identity.
+  void options.signInGate.then(releaseSignIn);
+
+  const createClient = (): ConvexReactClient => {
+    clientAttempts += 1;
+    const attempt = clientAttempts;
+    const watch = {
+      localQueryResult: () => confirmedProjectProjection(),
+      onUpdate: (_callback: () => void) => () => {},
+    } as unknown as Watch<unknown>;
+    return {
+      address: "https://controlled.convex.cloud",
+      logger: false,
+      setAuth: (_fetchToken: unknown, onChange: (authenticated: boolean) => void) => onChange(false),
+      clearAuth: () => {},
+      connectionState: () => ({ isWebSocketConnected: true, hasEverConnected: true, connectionRetries: 0 }),
+      subscribeToConnectionState: (_callback: unknown) => () => {},
+      action: async (_name: unknown, args: unknown) => {
+        const provider = typeof args === "object" && args !== null && "provider" in args
+          ? String((args as { provider: unknown }).provider)
+          : "unknown";
+        eventLog.push(`action:${provider}`);
+        if (provider === "anonymous") return signInGate;
+        return {};
+      },
+      query: async (_reference: unknown, args: unknown) => {
+        queryArgs.push(args);
+        if (typeof args === "object" && args !== null && "projectId" in args) {
+          eventLog.push("query:projection");
+          return confirmedProjectProjection();
+        }
+        eventLog.push("query:listAccessibleProjects");
+        return options.listBehavior(attempt);
+      },
+      mutation: async (_reference: unknown, args: unknown) => {
+        mutationCalls.push(args);
+        return { ok: true, projectId: "project-should-not-exist" };
+      },
+      watchQuery: (_reference: unknown, _args: unknown) => watch,
+      close: async () => {},
+    } as unknown as ConvexReactClient;
+  };
+
+  const container = dom.document.createElement("div");
+  dom.document.body.append(container);
+  let root: ReturnType<typeof mountRootApplication> | null = null;
+  let cleaned = false;
+  const cleanup = async () => {
+    if (cleaned) return;
+    cleaned = true;
+    await act(async () => {
+      root?.unmount();
+    });
+    dom.close();
+    browserGlobals.window = previousWindow;
+    browserGlobals.document = previousDocument;
+    browserGlobals.navigator = previousNavigator;
+    if (previousActEnvironment === undefined) delete actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+    else actEnvironment.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment;
+  };
+  try {
+    await act(async () => {
+      root = mountRootApplication(container as unknown as globalThis.Element, {
+        clientFactory: () => createClient(),
+        configuredUrl: "https://controlled.convex.cloud",
+      });
+    });
+    return { container: container as unknown as Element, cleanup, eventLog, queryArgs, mutationCalls, releaseSignIn };
+  } catch (error) {
+    await cleanup();
+    throw error;
+  }
+}
+
+function neverResolveSignIn(): Promise<{ tokens: { token: string; refreshToken: string } | null }> {
+  return new Promise(() => {});
+}
+
+test("delayed server confirmation runs no discovery or mutation before sign-in resolves", async () => {
+  const harness = await mountServerConfirmationHarness({
+    signInGate: neverResolveSignIn(),
+    listBehavior: () => confirmedProjectList(),
+  });
+  try {
+    await waitForText(harness.container, "AUTHENTICATING");
+    // The anonymous sign-in was attempted through Convex Auth, but the
+    // server has not confirmed the identity yet: no discovery query, no
+    // projection query and no mutation may run on the local-only state.
+    const signInDeadline = Date.now() + 1_500;
+    while (!harness.eventLog.includes("action:anonymous") && Date.now() < signInDeadline) {
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      });
+    }
+    expect(harness.eventLog).toContain("action:anonymous");
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    });
+    expect(harness.eventLog).not.toContain("query:listAccessibleProjects");
+    expect(harness.eventLog).not.toContain("query:projection");
+    expect(harness.queryArgs).toHaveLength(0);
+    expect(harness.mutationCalls).toHaveLength(0);
+    expect(harness.container.textContent).toContain("AUTHENTICATING");
+    // The landing marketing copy names the demo café; the authorized
+    // project workbench ("YOUR DECISION DESK") must not render yet.
+    expect(harness.container.textContent).not.toContain("YOUR DECISION DESK");
+    expect(harness.container.textContent).not.toContain("NO AUTHORIZED PROJECT");
+
+    // The server confirms the identity: discovery runs only after the
+    // confirmation and the authorized project proceeds.
+    await act(async () => {
+      harness.releaseSignIn({ tokens: { token: "controlled-anonymous-token", refreshToken: "controlled-anonymous-refresh" } });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+    await waitForText(harness.container, "YOUR DECISION DESK");
+    expect(harness.eventLog.indexOf("action:anonymous")).toBeLessThan(harness.eventLog.indexOf("query:listAccessibleProjects"));
+    expect(harness.mutationCalls).toHaveLength(0);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("server rejection after token issuance shows a recovery error with no creation flow", async () => {
+  const harness = await mountServerConfirmationHarness({
+    signInGate: (async () => ({ tokens: { token: "controlled-anonymous-token", refreshToken: "controlled-anonymous-refresh" } }))(),
+    listBehavior: () => ({ ok: false, code: "forged-identity", message: "unauthenticated" }),
+  });
+  try {
+    await waitForText(harness.container, "PROJECT STATE UNAVAILABLE");
+    expect(harness.container.textContent).toContain("could not be discovered");
+    expect(harness.container.textContent).toContain("forged-identity");
+    // The denial is recoverable and explicit: a retry action is offered,
+    // while the empty-workspace creation flows stay disabled.
+    const buttons = Array.from(harness.container.querySelectorAll("button")).map((button) => button.textContent ?? "");
+    expect(buttons.some((text) => text.includes("Retry project state"))).toBe(true);
+    expect(harness.container.textContent).not.toContain("NO AUTHORIZED PROJECT");
+    expect(harness.container.textContent).not.toContain("Open a workspace");
+    expect(harness.container.textContent).not.toContain("Create controlled sample project");
+    // Only denied discoveries ran (StrictMode may mount the boundary
+    // twice, so accept one denial per mounted client): no projection load
+    // and no mutation was sent on the rejected identity.
+    expect(harness.queryArgs.length).toBeGreaterThanOrEqual(1);
+    for (const args of harness.queryArgs) {
+      expect(args).not.toMatchObject({ projectId: expect.anything() });
+    }
+    expect(harness.eventLog).not.toContain("query:projection");
+    expect(harness.mutationCalls).toHaveLength(0);
+
+    // The demo entry stays an explicit unavailable state without sending.
+    const demoButton = Array.from(harness.container.querySelectorAll("button")).find((button) =>
+      button.textContent?.includes("Try the Northside"),
+    );
+    expect(demoButton).not.toBeUndefined();
+    await act(async () => {
+      (demoButton as unknown as HTMLButtonElement).click();
+    });
+    expect(harness.container.textContent).toContain("The sample demo is not available in this build.");
+    expect(harness.mutationCalls).toHaveLength(0);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("retry after a discovery denial clears the rejected session and recovers", async () => {
+  const harness = await mountServerConfirmationHarness({
+    signInGate: (async () => ({ tokens: { token: "controlled-anonymous-token", refreshToken: "controlled-anonymous-refresh" } }))(),
+    // Deny every discovery on the first mount (StrictMode may mount the
+    // boundary twice) and confirm every discovery after the retry remount.
+    listBehavior: (attempt) =>
+      attempt <= 2
+        ? { ok: false, code: "forged-identity", message: "unauthenticated" }
+        : confirmedProjectList(),
+  });
+  try {
+    await waitForText(harness.container, "PROJECT STATE UNAVAILABLE");
+    const deniedAttempts = harness.queryArgs.length;
+    expect(deniedAttempts).toBeGreaterThanOrEqual(1);
+    const retryButton = Array.from(harness.container.querySelectorAll("button")).find((button) =>
+      button.textContent?.includes("Retry project state"),
+    );
+    expect(retryButton).not.toBeUndefined();
+    await act(async () => {
+      (retryButton as unknown as HTMLButtonElement).click();
+    });
+    // Retry re-establishes the session and re-runs discovery: the
+    // authorized project loads and the denial does not stick.
+    await waitForText(harness.container, "YOUR DECISION DESK");
+    expect(harness.queryArgs.length).toBeGreaterThan(deniedAttempts);
+    expect(harness.mutationCalls).toHaveLength(0);
+    expect(harness.container.textContent).not.toContain("PROJECT STATE UNAVAILABLE");
+  } finally {
+    await harness.cleanup();
+  }
+});
