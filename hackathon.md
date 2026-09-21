@@ -2,7 +2,7 @@
 
 - **Project:** OpeningOS
 - **Event:** Convex All Gas Hackathon
-- **What it does:** Café procurement workbench with a controlled React/Convex foundation, typed Jev boundary and isolated browser-executor contracts; full product workflows remain in implementation.
+- **What it does:** Café procurement workbench with real authenticated intake, source-backed purchasing records, quote comparison, approvals, recovery, equipment history and isolated controlled sample projects on a React/Convex application foundation.
 - **Live app:** not deployed
 - **Repo:** https://github.com/VasuBansal7576/openingos
 - **Frontend:** React/Vite foundation; ChatGPT Sites publication target
@@ -12,7 +12,7 @@
 - **Auth:** Convex Auth foundation only; no hosted guest/private isolation proof
 - **AI models:** controlled Jev `jev-1.13.0` adapter tests only; no live application inference
 - **Started:** 2026-09-19T09:46:19Z
-- **Last updated:** 2026-09-21T07:52:00Z
+- **Last updated:** 2026-09-21T16:10:00Z
 
 ## Log
 
@@ -522,4 +522,26 @@ The completed E6 and P01 worktrees were proven clean and remotely preserved, the
 The disposable Chrome profiles used for verification were removed after screenshots and measurements were preserved, reclaiming about 367 MB.
 Exact PR #14 head `1b2850c` passed all nine configured GitHub checks, but a separate GPT-6 Astra review returned `CHANGES REQUIRED` after reproducing six findings: the two still-open money/source defects, temporary organization authority becoming permanent project authority, unsafe budget omission, inaccurate evidence claims and low-contrast comparison guidance.
 PR #14 cannot merge until those repairs land, exact-head CI passes again and a separate reviewer accepts the replacement commit.
+No hosted Convex deployment, live provider call, owner-mailbox exchange, genuine supplier response, public origin, purchase, realized saving or commercial outcome was observed.
+
+### 2026-09-21 - prototype fidelity, isolated sample projects and exact-head CI
+
+Combined checkpoint `9957b2d` integrates PR #19 accepted-prototype fidelity, the five patch-equivalent PR #20 authority and money repairs, and PR #21 authenticated isolated sample guest projects.
+GitHub automatically marked PRs #19 and #21 merged when their exact commits entered the combined base branch.
+PR #20 remains open because those same five patches were already applied under equivalent commits; no duplicate or conflicting merge is being attempted.
+The accepted ivory-navigation, sage-desk, photographic equipment and paper-quote composition now remains visible across honest connection states.
+The Northside action invokes the real `domain/sampleProject:createSampleGuestProject` mutation, creates a fresh finite-lived guest workspace, and renders through `workbench/projection:getProjection`; the browser contains no quote or savings fixture rows.
+Controlled Chrome DevTools verification generated the visual input through that real mutation and projection, then exercised exact 390 by 844 and 1440 by 1100 layouts, supplier and equipment tabs, exact EUR 550 comparison evidence, incomplete and incompatible offers, missing exact totals, dialog background isolation, Escape close and focus restoration.
+The temporary visual harness and generated projection were removed after verification.
+This is controlled local backend-generated evidence, not a hosted Convex run or live provider result.
+
+Both strict TypeScript checks, the production build and the complete local matrix pass at `9957b2d`: 23 repository tests, 77 proof tests, 15 evaluation tests, 342 F1 tests, 155 browser-executor tests, 117 application tests, 18 application Jev tests, 32 communication-contract tests and 527 direct Convex tests.
+All 18 configured application and repository GitHub checks pass on exact PR #14 head `9957b2d`, and GitHub reports it merge-clean.
+Greptile posted only its exhausted 50-credit notice and Devin reports its full review skipped because the trial expired; neither is counted as review approval.
+A separate GPT-6 Astra xhigh fixed-head review is in progress and remains mandatory before PR #14 can merge.
+
+Implementation workers used verified OpenCode models with high reasoning and deny-by-default permissions scoped to their owned files and test commands.
+Denied compound shell calls did not prompt the owner or broaden access.
+The Orca desktop runtime remained disconnected, so the coordinator did not reopen the app that had been interrupting the owner's work and continued through the validated non-interactive OpenCode CLI path.
+All temporary Chrome profiles were removed after their evidence was captured.
 No hosted Convex deployment, live provider call, owner-mailbox exchange, genuine supplier response, public origin, purchase, realized saving or commercial outcome was observed.
