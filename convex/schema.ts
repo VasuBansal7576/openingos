@@ -1163,6 +1163,109 @@ export default defineSchema({
     jobId: v.optional(v.id("jobs")),
     createdAt: v.number(),
   }).index("by_fingerprint", ["requestFingerprint"]),
+
+  /**
+   * E5 changed-term impact (P-11, P-12, D-15). An append-only,
+   * evidence-backed re-evaluation triggered by a superseding quote
+   * revision or an explicit watch observation. It distinguishes an
+   * unplaced selection change from already placed orders, carries
+   * explicit unknown and incomplete states, and never mutates
+   * selections, approvals, orders, or financial rows. A failed watch
+   * check stays `unknown` and can never mark a placed order delayed:
+   * no assessment field expresses delivery delay at all. Reason text
+   * derives only from stored rows, never from invented savings,
+   * availability, or vendor replies.
+   */
+  impactAssessments: defineTable({
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    idempotencyKey: v.string(),
+    requirementId: v.id("requirements"),
+    trigger: v.union(v.literal("quoteRevision"), v.literal("watchObservation")),
+    // Exact revision lineage for the quoteRevision trigger: the current
+    // (successor) revision and the predecessor content hash it supersedes.
+    quoteId: v.optional(v.id("quotes")),
+    quoteVersion: v.optional(v.string()),
+    predecessorQuoteId: v.optional(v.id("quotes")),
+    predecessorQuoteVersion: v.optional(v.string()),
+    // Watch-observation trigger: the watched candidate and the observed
+    // result. A failed check (error/unknown) keeps the assessment unknown.
+    watchId: v.optional(v.id("watches")),
+    watchResult: v.optional(
+      v.union(v.literal("ok"), v.literal("stale"), v.literal("error"), v.literal("unknown")),
+    ),
+    // Durable selection/order distinction: no selection is affected, only
+    // an unplaced selection, placed orders exist (fresh approval needed),
+    // or the impact itself is unknown after a failed watch check.
+    orderImpact: v.union(
+      v.literal("none"),
+      v.literal("selectionOnly"),
+      v.literal("reviewRequired"),
+      v.literal("unknown"),
+    ),
+    state: v.union(v.literal("recorded"), v.literal("unknown"), v.literal("incomplete")),
+    affectedSelectionId: v.optional(v.id("selections")),
+    placedOrderCount: v.number(),
+    reason: v.string(),
+    // Bounded per-candidate currentness re-evaluation. Statuses derive
+    // only from stored quote rows; no availability or price ranking.
+    alternatives: v.array(
+      v.object({
+        candidateId: v.id("candidates"),
+        status: v.union(
+          v.literal("current"),
+          v.literal("superseded"),
+          v.literal("noQuote"),
+          v.literal("unknown"),
+        ),
+        quoteId: v.optional(v.id("quotes")),
+        quoteVersion: v.optional(v.string()),
+        note: v.string(),
+      }),
+    ),
+    evidenceRefs: v.optional(v.array(domainEvidenceRefValidator)),
+    createdAt: v.number(),
+  })
+    .index("by_project", ["projectId"])
+    .index("by_project_and_key", ["projectId", "idempotencyKey"])
+    .index("by_requirement", ["requirementId"]),
+
+  /**
+   * E5 substitute proposal (P-12, P-13, D-15). Always requires fresh
+   * approval: it references the impact assessment that explains it,
+   * pins the exact proposed candidate, quote, and line quantities, and
+   * only a pending proposal whose quote revision and requirement
+   * version are still current can be decided by an approver. Deciding
+   * records a new approvals row whose snapshot binds the proposal
+   * decision. No proposal ever deletes or rewrites prior selection,
+   * approval, order, or financial history; executing an approved
+   * substitute remains an explicit new selection through the decision
+   * machinery.
+   */
+  substituteProposals: defineTable({
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    idempotencyKey: v.string(),
+    assessmentId: v.id("impactAssessments"),
+    requirementId: v.id("requirements"),
+    requirementVersion: v.number(),
+    currentSelectionId: v.optional(v.id("selections")),
+    proposedCandidateId: v.id("candidates"),
+    proposedQuoteId: v.id("quotes"),
+    proposedQuoteVersion: v.string(),
+    proposedLines: v.array(storedSelectionLineValidator),
+    reason: v.string(),
+    state: v.union(v.literal("pending"), v.literal("approved"), v.literal("rejected")),
+    decidedBy: v.optional(v.string()),
+    decidedAt: v.optional(v.number()),
+    decisionApprovalId: v.optional(v.id("approvals")),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_project", ["projectId"])
+    .index("by_project_and_key", ["projectId", "idempotencyKey"])
+    .index("by_requirement", ["requirementId"])
+    .index("by_assessment", ["assessmentId"]),
 });
 
 export { moneyValidator, evidenceRefValidator };
