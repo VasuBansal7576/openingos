@@ -45,7 +45,7 @@ import {
   draftCarrierPayloadJson,
   sendEnvelope,
 } from "./orchestrator.js";
-import { canonicalJson } from "../shared/hashing.js";
+import { canonicalJson, payloadHash } from "../shared/hashing.js";
 
 const rawModules = import.meta.glob([
   "./*.ts",
@@ -1297,13 +1297,14 @@ async function runPrepare(
   fixture: Fixture,
   plan: StubPlan,
   move: "clarify" | "counter" = "clarify",
+  extra: { identity?: { tokenIdentifier: string } } = {},
 ) {
   const log = installFetchStub(plan, {
     draftKind: move,
     sources: fixture.expectedDraftSources,
     content: fixture.draftBody,
   });
-  const result = await fixture.t.withIdentity(OWNER).action(prepareRef, {
+  const result = await fixture.t.withIdentity(extra.identity ?? OWNER).action(prepareRef, {
     negotiationId: fixture.negotiationId,
     jevOperationId: fixture.jevOperationId,
     draftOperationId: fixture.draftOperationId,
@@ -1311,10 +1312,66 @@ async function runPrepare(
   return { result, log };
 }
 
+async function prepareValidDraftId(
+  fixture: Fixture,
+  move: "clarify" | "counter" = "clarify",
+): Promise<Id<"evidence">> {
+  const log = installFetchStub({}, {
+    draftKind: move,
+    sources: fixture.expectedDraftSources,
+    content: fixture.draftBody,
+  });
+  void log;
+  const result = await fixture.t.withIdentity(OWNER).action(prepareRef, {
+    negotiationId: fixture.negotiationId,
+    jevOperationId: fixture.jevOperationId,
+    draftOperationId: fixture.draftOperationId,
+  });
+  if (!result.ok || result.outcome !== "prepared") {
+    throw new Error(`valid draft preparation failed: ${JSON.stringify(result)}`);
+  }
+  return result.draftId;
+}
+
+async function insertDirectDraft(
+  fixture: Fixture,
+  body: string,
+  to: string = OWNER_MAILBOX,
+): Promise<Id<"evidence">> {
+  const envelopeCanonical = canonicalJson(sendEnvelope(to, body));
+  const hash = payloadHash(JSON.parse(envelopeCanonical) as Record<string, unknown>);
+  const negotiation = await fixture.t.run(async (ctx) => await ctx.db.get(fixture.negotiationId));
+  if (negotiation === null) throw new Error("missing negotiation for direct draft");
+  return await fixture.t.run(async (ctx) => {
+    return await ctx.db.insert("evidence", {
+      organizationId: fixture.organizationId,
+      projectId: fixture.projectId,
+      sourceKind: "negotiation-draft-v1",
+      capturedAt: Date.now(),
+      contentHash: hash,
+      protectedSourceText: canonicalJson({
+        conversationVersion: null,
+        envelopeCanonical,
+        move: "clarify",
+        negotiationId: String(fixture.negotiationId),
+        payloadHash: hash,
+        quoteContentHash: "hash-qv-1",
+        quoteId: String(fixture.quoteId),
+        quoteVersion: "qv-1",
+        roundsUsed: 0,
+      }),
+      completeness: "complete",
+      counterpartyRole: "ownerStandIn",
+      executionMode: "live",
+      locator: "negotiation-draft",
+    });
+  });
+}
+
 async function runDispatch(
   fixture: Fixture,
   requestId: string,
-  envelopeCanonical: string,
+  draftId: Id<"evidence">,
   plan: StubPlan,
   extra: { requestText?: string; identity?: { tokenIdentifier: string }; inboxId?: string } = {},
 ) {
@@ -1326,7 +1383,7 @@ async function runDispatch(
   const result = await fixture.t.withIdentity(extra.identity ?? OWNER).action(dispatchRef, {
     negotiationId: fixture.negotiationId,
     requestId,
-    envelopeCanonical,
+    draftId,
     inboxId: extra.inboxId ?? INBOX_ID,
     ...(extra.requestText === undefined ? {} : { requestText: extra.requestText }),
   });
@@ -1357,8 +1414,8 @@ describe("E12 Devin 4060796714: two-phase prepare and dispatch", () => {
   test("dispatch without an exact grant denies with zero sends", async () => {
     const t = init();
     const fixture = await createFixture(t);
-    const forged = canonicalJson(sendEnvelope(OWNER_MAILBOX, COUNTER_BODY));
-    const { result, log } = await runDispatch(fixture, "req-e12-nogrant", forged, {});
+    const forgedDraftId = await insertDirectDraft(fixture, COUNTER_BODY);
+    const { result, log } = await runDispatch(fixture, "req-e12-nogrant", forgedDraftId, {});
     expect(result).toMatchObject({ ok: false, code: "grant-not-current" });
     expect(log.jev).toHaveLength(0);
     expect(log.openai).toHaveLength(0);
@@ -1370,8 +1427,8 @@ describe("E12 Devin 4060796714: two-phase prepare and dispatch", () => {
   test("dispatch with a vendor recipient denies before any send", async () => {
     const t = init();
     const fixture = await createFixture(t);
-    const vendorEnvelope = canonicalJson(sendEnvelope("vendor@example.com", fixture.draftBody));
-    const { result, log } = await runDispatch(fixture, "req-e12-vendorto", vendorEnvelope, {});
+    const vendorDraftId = await insertDirectDraft(fixture, fixture.draftBody, "vendor@example.com");
+    const { result, log } = await runDispatch(fixture, "req-e12-vendorto", vendorDraftId, {});
     expect(result).toMatchObject({ ok: false });
     expect(log.agentmail).toHaveLength(0);
     for (const entry of log.agentmail) {
@@ -1382,11 +1439,36 @@ describe("E12 Devin 4060796714: two-phase prepare and dispatch", () => {
   test("dispatch with a non-fixed subject denies", async () => {
     const t = init();
     const fixture = await createFixture(t);
-    const tampered = canonicalJson({
+    const tamperedEnvelope = canonicalJson({
       ...sendEnvelope(OWNER_MAILBOX, fixture.draftBody),
       subject: "Urgent wire instruction",
     });
-    const { result, log } = await runDispatch(fixture, "req-e12-badsubject", tampered, {});
+    const tamperedHash = payloadHash(JSON.parse(tamperedEnvelope) as Record<string, unknown>);
+    const tamperedDraftId = await t.run(async (ctx) => {
+      return await ctx.db.insert("evidence", {
+        organizationId: fixture.organizationId,
+        projectId: fixture.projectId,
+        sourceKind: "negotiation-draft-v1",
+        capturedAt: Date.now(),
+        contentHash: tamperedHash,
+        protectedSourceText: canonicalJson({
+          conversationVersion: null,
+          envelopeCanonical: tamperedEnvelope,
+          move: "clarify",
+          negotiationId: String(fixture.negotiationId),
+          payloadHash: tamperedHash,
+          quoteContentHash: "hash-qv-1",
+          quoteId: String(fixture.quoteId),
+          quoteVersion: "qv-1",
+          roundsUsed: 0,
+        }),
+        completeness: "complete",
+        counterpartyRole: "ownerStandIn",
+        executionMode: "live",
+        locator: "negotiation-draft",
+      });
+    });
+    const { result, log } = await runDispatch(fixture, "req-e12-badsubject", tamperedDraftId, {});
     expect(result).toMatchObject({ ok: false, code: "outbound-denied" });
     expect(log.agentmail).toHaveLength(0);
   });
@@ -1394,9 +1476,9 @@ describe("E12 Devin 4060796714: two-phase prepare and dispatch", () => {
   test("dispatch D-17 unrelated creates no effect", async () => {
     const t = init();
     const fixture = await createFixture(t);
-    const envelope = canonicalJson(sendEnvelope(OWNER_MAILBOX, fixture.draftBody));
+    const draftId = await prepareValidDraftId(fixture);
     const before = await tableCounts(t);
-    const { result, log } = await runDispatch(fixture, "req-e12-dunrelated", envelope, {}, {
+    const { result, log } = await runDispatch(fixture, "req-e12-dunrelated", draftId, {}, {
       requestText: "do my homework assignment about ancient history",
     });
     expect(result).toMatchObject({ ok: false, code: "unrelated-refusal" });
@@ -1409,8 +1491,8 @@ describe("E12 Devin 4060796714: two-phase prepare and dispatch", () => {
   test("dispatch full success sends once to the owner only", async () => {
     const t = init();
     const fixture = await createFixture(t);
-    const envelope = canonicalJson(sendEnvelope(OWNER_MAILBOX, fixture.draftBody));
-    const { result, log } = await runDispatch(fixture, "req-e12-dsent", envelope, {});
+    const draftId = await prepareValidDraftId(fixture);
+    const { result, log } = await runDispatch(fixture, "req-e12-dsent", draftId, {});
     expect(result).toMatchObject({ ok: true, outcome: "sent", move: "none" });
     expect(log.jev).toHaveLength(0);
     expect(log.openai).toHaveLength(0);
@@ -1441,11 +1523,11 @@ describe("E12 Devin 4060796714: two-phase prepare and dispatch", () => {
   test("dispatch duplicate retry deduplicates with zero new sends", async () => {
     const t = init();
     const fixture = await createFixture(t);
-    const envelope = canonicalJson(sendEnvelope(OWNER_MAILBOX, fixture.draftBody));
-    const first = await runDispatch(fixture, "req-e12-ddedup", envelope, {});
+    const draftId = await prepareValidDraftId(fixture);
+    const first = await runDispatch(fixture, "req-e12-ddedup", draftId, {});
     expect(first.result).toMatchObject({ ok: true, outcome: "sent" });
     const countsAfterFirst = await tableCounts(t);
-    const second = await runDispatch(fixture, "req-e12-ddedup", envelope, {});
+    const second = await runDispatch(fixture, "req-e12-ddedup", draftId, {});
     expect(second.result).toMatchObject({ ok: true, outcome: "deduplicated" });
     expect(second.log.agentmail).toHaveLength(0);
     expect(second.log.jev).toHaveLength(0);
@@ -1460,6 +1542,9 @@ describe("E12 Devin 4060797039: atomic round accounting", () => {
     requestId: string,
     plan: StubPlan,
   ) {
+    // Direct server-side draft (bypasses prepare fences) so limit/stale
+    // cases still exercise dispatch accounting exactly.
+    const draftId = await insertDirectDraft(fixture, fixture.draftBody);
     const log = installFetchStub(plan, {
       draftKind: "clarify",
       sources: fixture.expectedDraftSources,
@@ -1468,7 +1553,7 @@ describe("E12 Devin 4060797039: atomic round accounting", () => {
     const result = await fixture.t.withIdentity(OWNER).action(dispatchRef, {
       negotiationId: fixture.negotiationId,
       requestId,
-      envelopeCanonical: canonicalJson(sendEnvelope(OWNER_MAILBOX, fixture.draftBody)),
+      draftId,
       inboxId: INBOX_ID,
     });
     return { result, log };
@@ -1610,7 +1695,7 @@ describe("E12 Devin 4060797122: bounded capacity search", () => {
     const result = await asOwner.action(dispatchRef, {
       negotiationId: fixture.negotiationId,
       requestId: "req-e12-pastwindow",
-      envelopeCanonical: envelope,
+      draftId: await insertDirectDraft(fixture, COUNTER_BODY),
       inboxId: INBOX_ID,
     });
     expect(result).toMatchObject({ ok: true, outcome: "sent" });
@@ -1626,9 +1711,9 @@ describe("E12 Astra F1: server-owned sender inbox binding", () => {
       const rows = await ctx.db.query("threadBindings").take(100);
       for (const row of rows) await ctx.db.delete(row._id);
     });
-    const envelope = canonicalJson(sendEnvelope(OWNER_MAILBOX, fixture.draftBody));
+    const draftId = await prepareValidDraftId(fixture);
     const before = await tableCounts(t);
-    const { result, log } = await runDispatch(fixture, "req-e12-f1-unbound", envelope, {});
+    const { result, log } = await runDispatch(fixture, "req-e12-f1-unbound", draftId, {});
     expect(result).toMatchObject({ ok: false, code: "sender-inbox-unbound" });
     expect(log.jev).toHaveLength(0);
     expect(log.openai).toHaveLength(0);
@@ -1642,9 +1727,9 @@ describe("E12 Astra F1: server-owned sender inbox binding", () => {
   test("foreign sender inbox fails closed with zero provider calls", async () => {
     const t = init();
     const fixture = await createFixture(t);
-    const envelope = canonicalJson(sendEnvelope(OWNER_MAILBOX, fixture.draftBody));
+    const draftId = await prepareValidDraftId(fixture);
     const before = await tableCounts(t);
-    const { result, log } = await runDispatch(fixture, "req-e12-f1-foreign", envelope, {}, {
+    const { result, log } = await runDispatch(fixture, "req-e12-f1-foreign", draftId, {}, {
       inboxId: "inbox-foreign-1",
     });
     expect(result).toMatchObject({ ok: false, code: "sender-inbox-foreign" });
@@ -1691,8 +1776,8 @@ describe("E12 Astra F1: server-owned sender inbox binding", () => {
         updatedAt: Date.now(),
       });
     });
-    const envelope = canonicalJson(sendEnvelope(OWNER_MAILBOX, fixture.draftBody));
-    const { result, log } = await runDispatch(fixture, "req-e12-f1-cross", envelope, {}, {
+    const draftId = await prepareValidDraftId(fixture);
+    const { result, log } = await runDispatch(fixture, "req-e12-f1-cross", draftId, {}, {
       inboxId: otherInbox,
     });
     // The other project's bound inbox does not authorize this project.
@@ -1713,8 +1798,8 @@ describe("E12 Astra F1: server-owned sender inbox binding", () => {
         await ctx.db.patch(row._id, { state: "closed", updatedAt: Date.now() });
       }
     });
-    const envelope = canonicalJson(sendEnvelope(OWNER_MAILBOX, fixture.draftBody));
-    const { result, log } = await runDispatch(fixture, "req-e12-f1-stale", envelope, {});
+    const draftId = await prepareValidDraftId(fixture);
+    const { result, log } = await runDispatch(fixture, "req-e12-f1-stale", draftId, {});
     expect(result).toMatchObject({ ok: false, code: "sender-inbox-stale" });
     expect(log.jev).toHaveLength(0);
     expect(log.openai).toHaveLength(0);
@@ -1751,12 +1836,12 @@ describe("E12 Astra F3: exact-replay idempotency", () => {
   test("same requestId with changed body conflicts with one provider call", async () => {
     const t = init();
     const fixture = await createFixture(t);
-    const envelope = canonicalJson(sendEnvelope(OWNER_MAILBOX, fixture.draftBody));
-    const first = await runDispatch(fixture, "req-e12-f3-body", envelope, {});
+    const draftId = await prepareValidDraftId(fixture);
+    const first = await runDispatch(fixture, "req-e12-f3-body", draftId, {});
     expect(first.result).toMatchObject({ ok: true, outcome: "sent" });
     expect(first.log.agentmail).toHaveLength(1);
-    const changed = canonicalJson(sendEnvelope(OWNER_MAILBOX, COUNTER_BODY));
-    const second = await runDispatch(fixture, "req-e12-f3-body", changed, {});
+    const changedDraftId = await insertDirectDraft(fixture, COUNTER_BODY);
+    const second = await runDispatch(fixture, "req-e12-f3-body", changedDraftId, {});
     expect(second.result).toMatchObject({ ok: false, code: "duplicate-conflict" });
     expect(second.log.jev).toHaveLength(0);
     expect(second.log.openai).toHaveLength(0);
@@ -1775,10 +1860,10 @@ describe("E12 Astra F3: exact-replay idempotency", () => {
   test("same requestId with changed inbox conflicts instead of sending", async () => {
     const t = init();
     const fixture = await createFixture(t);
-    const envelope = canonicalJson(sendEnvelope(OWNER_MAILBOX, fixture.draftBody));
-    const first = await runDispatch(fixture, "req-e12-f3-inbox", envelope, {});
+    const draftId = await prepareValidDraftId(fixture);
+    const first = await runDispatch(fixture, "req-e12-f3-inbox", draftId, {});
     expect(first.result).toMatchObject({ ok: true, outcome: "sent" });
-    const second = await runDispatch(fixture, "req-e12-f3-inbox", envelope, {}, {
+    const second = await runDispatch(fixture, "req-e12-f3-inbox", draftId, {}, {
       inboxId: "inbox-foreign-1",
     });
     // The replay binds the sender before dedup, so the changed inbox is a
@@ -1792,8 +1877,8 @@ describe("E12 Astra F3: exact-replay idempotency", () => {
   test("same requestId on another negotiation conflicts", async () => {
     const t = init();
     const fixture = await createFixture(t);
-    const envelope = canonicalJson(sendEnvelope(OWNER_MAILBOX, fixture.draftBody));
-    const first = await runDispatch(fixture, "req-e12-f3-neg", envelope, {});
+    const draftId = await prepareValidDraftId(fixture);
+    const first = await runDispatch(fixture, "req-e12-f3-neg", draftId, {});
     expect(first.result).toMatchObject({ ok: true, outcome: "sent" });
     const negotiationId2 = await t.run(async (ctx) => {
       const negotiation = await ctx.db.get(fixture.negotiationId);
@@ -1822,7 +1907,7 @@ describe("E12 Astra F3: exact-replay idempotency", () => {
     const second = await t.withIdentity(OWNER).action(dispatchRef, {
       negotiationId: negotiationId2,
       requestId: "req-e12-f3-neg",
-      envelopeCanonical: envelope,
+      draftId,
       inboxId: INBOX_ID,
     });
     expect(second).toMatchObject({ ok: false, code: "duplicate-conflict" });
@@ -1832,8 +1917,8 @@ describe("E12 Astra F3: exact-replay idempotency", () => {
   test("same requestId in another project conflicts", async () => {
     const t = init();
     const fixture = await createFixture(t);
-    const envelope = canonicalJson(sendEnvelope(OWNER_MAILBOX, fixture.draftBody));
-    const first = await runDispatch(fixture, "req-e12-f3-proj", envelope, {});
+    const draftId = await prepareValidDraftId(fixture);
+    const first = await runDispatch(fixture, "req-e12-f3-proj", draftId, {});
     expect(first.result).toMatchObject({ ok: true, outcome: "sent" });
     const asOwner = t.withIdentity(OWNER);
     const projectB = await asOwner.mutation(createProjectRef, {
@@ -1886,7 +1971,7 @@ describe("E12 Astra F3: exact-replay idempotency", () => {
     const second = await t.withIdentity(OWNER).action(dispatchRef, {
       negotiationId: negotiationB,
       requestId: "req-e12-f3-proj",
-      envelopeCanonical: envelope,
+      draftId,
       inboxId: INBOX_ID,
     });
     expect(second).toMatchObject({ ok: false, code: "duplicate-conflict" });
@@ -1896,7 +1981,7 @@ describe("E12 Astra F3: exact-replay idempotency", () => {
   test("concurrent same-key dispatches send exactly once", async () => {
     const t = init();
     const fixture = await createFixture(t);
-    const envelope = canonicalJson(sendEnvelope(OWNER_MAILBOX, fixture.draftBody));
+    const draftId = await prepareValidDraftId(fixture);
     const log = installFetchStub({}, {
       draftKind: "clarify",
       sources: fixture.expectedDraftSources,
@@ -1907,13 +1992,13 @@ describe("E12 Astra F3: exact-replay idempotency", () => {
       asOwner.action(dispatchRef, {
         negotiationId: fixture.negotiationId,
         requestId: "req-e12-f3-race",
-        envelopeCanonical: envelope,
+        draftId,
         inboxId: INBOX_ID,
       }),
       asOwner.action(dispatchRef, {
         negotiationId: fixture.negotiationId,
         requestId: "req-e12-f3-race",
-        envelopeCanonical: envelope,
+        draftId,
         inboxId: INBOX_ID,
       }),
     ]);
@@ -1927,5 +2012,83 @@ describe("E12 Astra F3: exact-replay idempotency", () => {
     // in-flight attempt) without a second provider call.
     expect(outcomes[1]).toBe("sent");
     expect(["deduplicated", "waiting"]).toContain(outcomes[0]);
+  });
+});
+
+describe("E17 mailbox privacy: guest-visible prepare carries no private recipient", () => {
+  test("authorized guest prepare returns opaque draft id plus redacted preview while server retains exact envelope", async () => {
+    const t = init();
+    const fixture = await createFixture(t);
+    const grantAccessRef = makeFunctionReference<
+      "mutation",
+      MutationArgs<typeof memberships.grantProjectAccess>,
+      MutationReturn<typeof memberships.grantProjectAccess>
+    >("access/memberships:grantProjectAccess");
+    const granted = await t.withIdentity(OWNER).mutation(grantAccessRef, {
+      organizationId: fixture.organizationId,
+      projectId: fixture.projectId,
+      targetIdentity: GUEST.tokenIdentifier,
+      role: "approver",
+    });
+    if (!granted.ok) throw new Error(`guest approver grant setup failed: ${granted.message}`);
+    const { result, log } = await runPrepare(fixture, {}, "clarify", { identity: GUEST });
+    expect(result).toMatchObject({ ok: true, outcome: "prepared" });
+    expect(log.jev).toHaveLength(1);
+    expect(log.openai).toHaveLength(1);
+    expect(log.agentmail).toHaveLength(0);
+    if (!result.ok || result.outcome !== "prepared") {
+      throw new Error(`expected prepared guest draft: ${JSON.stringify(result)}`);
+    }
+    // The guest-visible response carries no private mailbox, no canonical
+    // recipient, and no unredacted envelope.
+    const serialized = JSON.stringify(result);
+    expect(serialized).not.toContain(OWNER_MAILBOX);
+    expect(serialized).not.toContain("envelopeCanonical");
+    expect(serialized).not.toContain("owner-negotiation");
+    expect("envelopeCanonical" in (result as Record<string, unknown>)).toBe(false);
+    expect(typeof result.draftId).toBe("string");
+    expect(result.redactedPreview).not.toContain(OWNER_MAILBOX);
+    expect(result.redactedPreview).not.toContain("750000");
+    expect(result).toMatchObject({
+      move: "clarify",
+      quoteVersion: "qv-1",
+      quoteContentHash: "hash-qv-1",
+      roundsUsed: 0,
+    });
+    // Server-side the opaque draft retains the exact approved envelope needed
+    // for later dispatch, including the private owner recipient.
+    const stored = await t.run(async (ctx) => await ctx.db.get(result.draftId));
+    if (stored === null) throw new Error("missing server-side prepared draft");
+    expect(stored.organizationId).toBe(fixture.organizationId);
+    expect(stored.projectId).toBe(fixture.projectId);
+    expect(typeof stored.protectedSourceText).toBe("string");
+    const bundle = JSON.parse(stored.protectedSourceText as string) as {
+      envelopeCanonical: string;
+      negotiationId: string;
+      quoteVersion: string;
+      quoteContentHash: string;
+    };
+    const expectedEnvelope = canonicalJson(sendEnvelope(OWNER_MAILBOX, fixture.draftBody));
+    expect(bundle.envelopeCanonical).toBe(expectedEnvelope);
+    expect(bundle.envelopeCanonical).toContain(OWNER_MAILBOX);
+    expect(bundle.negotiationId).toBe(String(fixture.negotiationId));
+    expect(bundle.quoteVersion).toBe("qv-1");
+    expect(bundle.quoteContentHash).toBe("hash-qv-1");
+    expect(stored.contentHash).toBe(result.payloadHash);
+    // The same opaque draft dispatches exactly once to the owner only.
+    const dispatchLog = installFetchStub({}, {
+      draftKind: "clarify",
+      sources: fixture.expectedDraftSources,
+      content: fixture.draftBody,
+    });
+    const dispatched = await t.withIdentity(OWNER).action(dispatchRef, {
+      negotiationId: fixture.negotiationId,
+      requestId: "req-e17-guest-draft",
+      draftId: result.draftId,
+      inboxId: INBOX_ID,
+    });
+    expect(dispatched).toMatchObject({ ok: true, outcome: "sent" });
+    expect(dispatchLog.agentmail).toHaveLength(1);
+    expect(dispatchLog.agentmail[0]?.body).toContain(OWNER_MAILBOX);
   });
 });
