@@ -2152,12 +2152,16 @@ export const openServiceCase = f1Mutation({
  *
  * Outcomes are terminal-only, explicit, and bounded: a non-terminal
  * target carrying an outcome is denied, and a supplied outcome must be
- * nonempty within `SERVICE_OUTCOME_MAX_LENGTH`. A recorded terminal
- * outcome is stable — the same state plus the same outcome replays
- * idempotently, while a different outcome is denied instead of
- * silently overwriting. A terminal case without an outcome stays
- * explicitly outcome-less (absent, never inferred). Cross-project and
- * cross-organization cases fail closed through ownership checks.
+ * nonempty within `SERVICE_OUTCOME_MAX_LENGTH`. A resolved or closed
+ * target requires an explicit normalized outcome — supplied on the call
+ * or already stored (resolved-to-closed carries the immutable stored
+ * outcome forward) — and a terminal target with neither fails closed
+ * with no write instead of recording an outcome-less resolution. A
+ * recorded terminal outcome is stable — the same state plus the same
+ * outcome replays idempotently, while a different outcome is denied
+ * instead of silently overwriting. Nothing here is ever inferred.
+ * Cross-project and cross-organization cases fail closed through
+ * ownership checks.
  */
 export const updateServiceCase = f1Mutation({
   args: {
@@ -2223,6 +2227,13 @@ export const updateServiceCase = f1Mutation({
       return { ok: false as const, code: "invalid-payload", message: "service case outcome cannot be changed" };
     }
     const nextOutcome = normalizedOutcome ?? storedOutcome;
+    // Terminal targets require an explicit normalized outcome: supplied
+    // now or already stored (resolved-to-closed carries it forward). A
+    // terminal target with neither writes nothing and fails closed, so
+    // an outcome-less resolution can never be recorded or inferred.
+    if (requiresServiceOutcome(to) && nextOutcome === undefined) {
+      return { ok: false as const, code: "invalid-payload", message: "service case outcome required" };
+    }
     if (from === to && (nextOutcome ?? undefined) === (storedOutcome ?? undefined)) {
       return { ok: true as const };
     }
