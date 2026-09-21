@@ -2988,6 +2988,80 @@ describe("C1 Greptile P1 replay/scale repairs (r4058523015/r4058523016/r40585230
     expect(blocked[0]?.applicationState).toBe("outcomeUnknown");
   });
 
+  async function waitingAttemptStamps(f: Fixture, threadId: string): Promise<ReadonlyArray<number | undefined>> {
+    const rows = await f.t.run(async (ctx) =>
+      await ctx.db
+        .query("processedEvents")
+        .withIndex("by_provider_environment_and_provider_thread_and_inbox", (q) =>
+          q.eq("provider", "agentmail-inbound").eq("environment", "live").eq("providerThreadId", threadId).eq("providerInboxId", "owner-inbox"),
+        )
+        .take(16),
+    );
+    return rows.map((row) => row.replayLastAttemptAt);
+  }
+
+  test("replay ordering advances strictly under a frozen clock", async () => {
+    const f = await fixture();
+    await f.t.run(async (ctx) => {
+      const now = Date.now();
+      for (let index = 0; index < 8; index += 1) {
+        const messageId = `frozen-blocked-${index}`;
+        await ctx.db.insert("processedEvents", {
+          provider: "agentmail-inbound",
+          environment: "live",
+          eventId: `frozen-event-${index}`,
+          processingVersion: 1,
+          outcome: JSON.stringify({ messageId, threadId: "frozen-thread", inboxId: "owner-inbox", reason: "foreign" }),
+          providerMessageId: messageId,
+          providerThreadId: "frozen-thread",
+          providerInboxId: "owner-inbox",
+          applicationOutcome: "unknown",
+          applicationState: "outcomeUnknown",
+          createdAt: now + index,
+        });
+      }
+    });
+    const early = await f.t.mutation(ingestMessageRef, {
+      message: inbound("frozen-valid", "frozen-thread", "<p>Frozen terms</p>"),
+      thread: { thread_id: "frozen-thread" },
+      eventId: "frozen-valid-early",
+    });
+    expect(early).toMatchObject({ ok: true, state: "waitingForBinding" });
+    await f.t.mutation(bindingRef, {
+      operationId: f.operationId,
+      messageId: "frozen-outbound",
+      threadId: "frozen-thread",
+      inboxId: "owner-inbox",
+    });
+    // Freeze time for every explicit trigger: rotation must still advance.
+    // (The bind-time trigger already evaluated the blocked prefix once.)
+    vi.useFakeTimers();
+    try {
+      const peakBound = Math.max(
+        ...(await waitingAttemptStamps(f, "frozen-thread")).filter(
+          (stamp): stamp is number => typeof stamp === "number",
+        ),
+      );
+      const second = await f.t.mutation(replayRef, { threadId: "frozen-thread", inboxId: "owner-inbox" });
+      expect(second).toMatchObject({ ok: true, replayed: 1 });
+      expect(await projectEvidenceRows(f)).toHaveLength(1);
+      // New evaluations sort provably after the previous peak even though
+      // the clock never moved.
+      const secondStamps = await waitingAttemptStamps(f, "frozen-thread");
+      const definedSecond = secondStamps.filter((stamp): stamp is number => typeof stamp === "number");
+      expect(Math.max(...definedSecond)).toBeGreaterThan(peakBound);
+      const peakSecond = Math.max(...definedSecond);
+      const third = await f.t.mutation(replayRef, { threadId: "frozen-thread", inboxId: "owner-inbox" });
+      expect(third).toMatchObject({ ok: true, replayed: 0 });
+      const thirdStamps = await waitingAttemptStamps(f, "frozen-thread");
+      const definedThird = thirdStamps.filter((stamp): stamp is number => typeof stamp === "number");
+      expect(definedThird).toHaveLength(8);
+      expect(Math.max(...definedThird)).toBeGreaterThan(peakSecond);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("owner-authored content is stored as controlled demo evidence", async () => {
     const f = await fixture();
     await f.t.mutation(bindingRef, {
