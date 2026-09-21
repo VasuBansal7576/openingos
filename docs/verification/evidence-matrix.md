@@ -1,7 +1,8 @@
 # OpeningOS evidence matrix
 
 This matrix keeps every stable requirement ID tied to its original meaning in [PRD.md](../../PRD.md) and every sponsor/Jev case tied to the [implementation plan](../implementation/sponsor-integration-plan.md).
-It records evidence available at reviewed F1 checkpoint `92a49cd`, merged to `main` as `96f0f1f` on September 21, 2026.
+It records evidence through application integration baseline `1a1bf7d`, factual delivery-log head `48b2b41`, and the explicitly unintegrated ready heads listed below on September 21, 2026.
+Ready child PR evidence remains controlled and partial until its review gate passes and the fixed combined revision is independently accepted.
 
 Status meanings:
 
@@ -18,29 +19,29 @@ Passing controlled evidence never counts as a live provider, deployed applicatio
 | ID | Status | Current evidence and next gate |
 | --- | --- | --- |
 | P-01 | not-started | Full opening, comparison and equipment-case creation is not implemented. |
-| P-02 | not-started | Requirements and assumptions are not yet editable application records. |
-| P-03 | live-unverified | Research candidates need R1 plus real Firecrawl source evidence. |
-| P-04 | not-started | Compatibility rules, conversion and changed-constraint invalidation need R1/E1. |
+| P-02 | partial-controlled | Authorized requirement creation, optimistic edits and immutable revisions pass controlled handler tests; the complete application authoring/review flow remains open. |
+| P-03 | partial-controlled | Integrated R1 stores bounded source-backed candidates, claims and evidence with truthful pagination under controlled transport; live Firecrawl evidence remains unverified. |
+| P-04 | partial-controlled | Integrated domain handlers distinguish compatibility pass, fail and unknown, bind evidence and invalidate changed requirement inputs; final application flow and live source evidence remain open. |
 | P-05 | live-unverified | Requires the owner-only real AgentMail send/reply path and correct project update. |
-| P-06 | partial-controlled | Immutable financial snapshots and shared-charge calculations pass controlled proofs; quote ingestion/version UI remains. |
+| P-06 | partial-controlled | Immutable financial snapshots, C1 quote ingestion/versioning and authoritative current quote totals pass controlled tests; complete quote attachment/review UI remains open. |
 | P-07 | controlled-verified | Reviewed money proofs reject missing charges as zero and compare complete offers, including €7,950 versus €8,500. |
 | P-08 | controlled-verified | Reviewed money proofs keep selection, commitment, payment, partial quantities and adjustments distinct without double counting. |
-| P-09 | not-started | Priority/dependency readiness behavior needs domain implementation. |
-| P-10 | not-started | Quantity and commissioning readiness needs domain implementation. |
-| P-11 | not-started | Stock-check failure and placed-order delay semantics need R1/E1. |
-| P-12 | not-started | Disruption substitution and approval history need E1. |
-| P-13 | partial-controlled | Browser jobs fence stale, revoked and expired authority in controlled tests; communication effects and product approvals remain. |
+| P-09 | partial-controlled | PR #4 head `947561c` covers priority, dependency and ready-for-use timing with source lineage and bounded evidence; fixed combined review remains open. |
+| P-10 | partial-controlled | PR #4 covers accepted-quantity readiness and PR #7 covers commissioning-to-asset preconditions in controlled tests; the heads are not integrated or independently accepted together. |
+| P-11 | partial-controlled | Integrated R1 preserves unknown stock-check outcomes, and ready PR #8 separates public stock changes from placed-order impact; fixed combined review remains open. |
+| P-12 | partial-controlled | Ready PR #8 preserves original history, derives substitutes with explanation and requires fresh approval after a disruption; it is unintegrated and awaiting the review gate. |
+| P-13 | partial-controlled | Browser jobs and ready PRs #8 and #11 fence stale, revoked, changed and expired authority in controlled tests; production communication effects remain open. |
 | P-14 | partial-controlled | Controlled browser callbacks/jobs and financial proofs cover replay/idempotency subsets; outgoing mail and equipment records remain. |
 | P-15 | controlled-verified | F1 direct-handler tests deny cross-organization, forged-ID and restricted-project reads and writes. |
 | P-16 | controlled-verified | F1 direct-handler tests keep private quotes and financial limits inaccessible from isolated guest sessions. |
 | P-17 | partial-controlled | Controlled browser execution exposes bounded failure, cancellation and recovery states; provider outages/reconnect remain. |
-| P-18 | partial-controlled | The bounded authorized backend projection reads stored assets, safe document metadata and service cases with cross-project isolation and truncation tests; the workbench strictly consumes those real rows and renders honest empty/truncated states with service creation disabled. Commissioning and service/replacement mutations remain open. |
-| P-19 | not-started | Second-location reuse with fresh-fact checks needs E1. |
+| P-18 | partial-controlled | The integrated workbench reads real bounded asset, safe document and service-case records, and ready PR #7 adds controlled commissioning and service outcomes; PR #7 remains unintegrated and live equipment outcomes are unverified. |
+| P-19 | partial-controlled | PR #12 initially proved draft/notOrdered specification reuse and explicit fresh-fact revalidation without historical financial copies, but coordinator-found source-project and malformed-limit defects are under repair. |
 | P-20 | partial-controlled | F1 enforces contributor, approver and owner authority across project scopes; the due-decision workbench flow remains for U1/E1. |
 | P-21 | partial-controlled | Foundation UI has reviewed desktop/narrow and keyboard retry evidence; U1 now preserves paginated activity and visibly fences server mutations during reconnect, while the complete selected workflow and final visual inspection remain. |
-| P-22 | not-started | Usage/outcome metric records and truthful reporting need F1 through V1. |
-| P-23 | not-started | Negotiation mandate, disclosure, rounds and non-commitment need C1/E1. |
-| P-24 | not-started | Document/CSV import, invalid input and review flow need R1/E1. |
+| P-22 | partial-controlled | Ready PR #9 head `bc8bcfe` derives truthful usage/outcome metrics from stored records and reports unsafe overflow as unavailable; it remains unintegrated and no business outcome is claimed. |
+| P-23 | partial-controlled | Ready PR #11 head `157d09d` proves a controlled pure negotiation policy with exact mandate/basis, disclosure, round and termination fences; production persistence and provider orchestration remain open. |
+| P-24 | partial-controlled | E7 commit `62dd541` parses bounded equipment CSV and review-gates draft promotion, but coordinator-found exact-source, idempotency, collision and attachment-truth defects are under repair. |
 
 ## Hackathon delivery requirements
 
@@ -62,21 +63,21 @@ Passing controlled evidence never counts as a live provider, deployed applicatio
 
 | ID | Status | Current evidence and next gate |
 | --- | --- | --- |
-| D-01 | not-started | Source-backed vendor dashboard needs R1/U1. |
-| D-02 | not-started | Authorized contextual answers and version invalidation need R1/U1. |
+| D-01 | partial-controlled | Integrated R1/W1/U1 exposes bounded source-backed candidates, quote fields, coverage and freshness while preserving selection; final integrated UX and live sources remain open. |
+| D-02 | partial-controlled | Current authorized project records, source lineage and changed-input invalidation pass controlled backend and adapter tests; the complete contextual-answer experience remains open. |
 | D-03 | partial-controlled | Pinned Jev transport/validation passes controlled tests; deployed useful decisions and telemetry remain. |
 | D-04 | live-unverified | The local controlled executor is not a deployed plugin-free interactive browser job. |
 | D-05 | partial-controlled | Independently reviewed executor tests cover recovery, strategy changes, saved work and duplicate-effect fencing; deployed provider recovery remains. |
 | D-06 | partial-controlled | Independently reviewed executor tests cover bounded non-progress, cancellation, expiry and unrecoverable states; live allowance failure remains. |
 | D-07 | partial-controlled | F1 owner-transport tests enforce scoped covered clarification and changed-recipient review; C1 still owns the real transport flow. |
-| D-08 | not-started | Delivery/service/return/receiving visibility needs R1/U1. |
+| D-08 | partial-controlled | Workbench projections keep available delivery, service and document scope visible and unknown values explicit; complete return-cost and receiving coverage remains open. |
 | D-09 | partial-controlled | Controlled executor sessions bind organization/project/job and reject stale/wrong context; full app guest/private evidence isolation remains. |
 | D-10 | partial-controlled | Controlled tests record deterministic execution outcomes; representative end-to-end timing/cost/intervention evidence remains. |
-| D-11 | not-started | Jev research prioritization and deferred-supplier resumption need R1. |
+| D-11 | partial-controlled | Integrated R1 retains unpublished-price candidates and bounded deferred work with current evidence/version inputs; live Jev prioritization and resumed provider work remain unverified. |
 | D-12 | partial-controlled | The server-only OpenAI boundary now validates source-backed extraction and supplier drafts through a dated Responses snapshot, shared allowance fence and one-attempt accounting; live OpenAI access, downstream approval UI and owner-only AgentMail negotiation remain. |
-| D-13 | not-started | Supplier-resolvable uncertainty and focused review routing need R1/C1/E1. |
+| D-13 | partial-controlled | Integrated R1/C1 distinguishes incomplete supplier-resolvable evidence from authority/site-fact review and preserves independent controlled work; final integrated routing remains open. |
 | D-14 | controlled-verified | Reviewed F1 and browser tests enforce backend capability, grant, expiry, revocation, recipient and unknown-operation denial, including covered-action continuity. |
-| D-15 | not-started | Changed-term re-evaluation without history overwrite needs E1/U1. |
+| D-15 | partial-controlled | Ready PR #8 derives changed-term impact and substitutes from current quote lineage without overwriting selection/history and requires a fresh decision; UI integration and fixed-head review remain open. |
 | D-16 | controlled-verified | F1 concurrency tests prove organization-wide reservations prevent branches and retries from each consuming the full shared allowance. |
 | D-17 | controlled-verified | Integrated handler and controlled-store tests derive one supported purchasing segment, persist only its canonical payload, expose refused clauses, and revalidate at operation claim while pure unrelated, unavailable purchase, prompt-injection and evidence-expansion probes create no unauthorized work; separate Astra review remains. |
 
@@ -90,19 +91,19 @@ Passing controlled evidence never counts as a live provider, deployed applicatio
 | S-04 | controlled-verified | F1 direct-API tests isolate guest and private organizations, projects, provider IDs, evidence, quotes and budgets. |
 | S-05 | partial-controlled | F1 request idempotency and one-effect concurrency pass; C1 still must prove one actual HTTP send. |
 | S-06 | partial-controlled | F1 pre-claim revocation, expiry, changed-input and cancellation races create no effect; C1 still owns transport-level proof. |
-| S-07 | not-started | C1 late-send versus cancellation state separation. |
+| S-07 | partial-controlled | C1 controlled handler tests separate cancellation from late observed provider outcomes without reopening or automatic resend; live transport remains unverified. |
 | S-08 | controlled-verified | F1 shared-ledger concurrency prevents branch oversubscription and preserves unknown charges as reserved. |
 | S-09 | controlled-verified | F1 crash-point and replay tests reconcile claimed, unknown and late outcomes without authorizing an automatic resend. |
 | S-10 | controlled-verified | F1 backend tests refuse unrelated and unavailable work while a legitimate parallel research job continues. |
-| S-11 | not-started | R1 bounded Firecrawl retry-count proof. |
-| S-12 | live-unverified | R1 controlled response plus real allowance-exhaustion behavior. |
-| S-13 | not-started | R1 incomplete/truncated source recovery. |
-| S-14 | not-started | R1 stale/cancelled paid-operation and overwrite fencing. |
-| S-15 | not-started | C1 callback deduplication and bounded repair read. |
-| S-16 | not-started | C1 event-before-send-response reordering. |
-| S-17 | not-started | C1 ambiguous reconciliation remains unknown. |
-| S-18 | not-started | C1 component cleanup versus durable project evidence. |
-| S-19 | not-started | C1 malicious HTML/header/attachment boundary. |
+| S-11 | partial-controlled | Integrated R1 proves bounded explicit Firecrawl attempts with no hidden retry and charged attempt accounting under controlled transport; live Firecrawl remains unverified. |
+| S-12 | live-unverified | R1 controlled success/failure and allowance fences pass, but real provider allowance exhaustion has not been observed. |
+| S-13 | partial-controlled | R1 preserves incomplete, truncated and unstored source states with resumable bounded pagination in controlled handler tests. |
+| S-14 | partial-controlled | R1 controlled tests fence stale and cancelled paid operations and prevent late results from overwriting current source state. |
+| S-15 | partial-controlled | C1 signed callback deduplication and bounded indexed reconciliation/repair reads pass controlled handler tests; hosted callbacks remain unverified. |
+| S-16 | partial-controlled | C1 controlled tests preserve event-before-send-response ordering and apply late observations without duplicate effects. |
+| S-17 | partial-controlled | C1 controlled reconciliation keeps ambiguous outcomes unknown and never authorizes an automatic resend. |
+| S-18 | partial-controlled | C1 controlled cleanup tests retain durable project evidence while component transport state is bounded; hosted component cleanup remains unverified. |
+| S-19 | partial-controlled | C1 contracts and handlers reject unsafe HTML, header redirects and invalid/expired/remote attachments before transport; live malicious-provider input remains unverified. |
 | S-20 | partial-controlled | Foundation UI has truthful configured/unconfigured/retry states and reviewed responsive behavior; U1 renders last-known state during reconnect, blocks every server mutation until a fresh connected snapshot and preserves truthful activity cursors, while hosted reconnect behavior remains unverified. |
 | S-21 | live-unverified | Full published Firecrawl/Jev/OpenAI/AgentMail/Convex path has not run. |
 | S-22 | partial-controlled | F1 and browser tests enforce owner-only recipient versions and block alternate channels across API, model, retry and browser boundaries; C1 still owns the real transport integration. |
@@ -126,5 +127,8 @@ Passing controlled evidence never counts as a live provider, deployed applicatio
 - Money/Jev controlled checkpoint: `595d30c`, with 77 proof tests, 305 assertions and separate Astra review.
 - Foundation/browser checkpoint: `6432e98`, with application typecheck/build/tests, provider/user-path contracts and 155 browser tests green locally and in CI.
 - Shared-contract checkpoint: `92a49cd`, with 244 F1 tests, 180 direct-handler tests, exact-head Actions and Greptile green, and a separate Astra ACCEPT after 22 fresh actual-handler probes; merged as `96f0f1f` with an identical tree.
+- Application integration baseline: `1a1bf7d`, containing R1/C1/U1/E1, research-start idempotency, readiness and authoritative quote total/currentness controlled behavior; PR #2 remains open.
+- Ready unintegrated heads: PR #7 `e73277c`, PR #8 `f4c9177`, PR #9 `bc8bcfe`, PR #10 `c6e6f76` and PR #11 `157d09d`; all nine expected CI checks pass on each exact head, but Greptile supplied quota notices and the fixed combined Astra review remains open.
+- Repairing heads: E7 `62dd541` and PR #12 `513b28f`; neither is accepted while coordinator findings remain open.
 - Fixed-commit browser re-review artifacts are private temporary evidence and contain no live-provider result.
 - The selected design reference remains `design/purchasing-workbench.html`; it is not counted as application behavior.
