@@ -2396,3 +2396,92 @@ test("stale sample success never overwrites a newer project context", async () =
     else actEnvironment.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment;
   }
 });
+
+// -- E16 workbench fidelity: decision desk above finance, paper-document cards --
+
+test("E16 compare journey keeps the decision desk above finance with paper-document cards", () => {
+  const snapshot = parseWorkbenchSnapshot(projection, projection.project.id);
+  if (snapshot === null) throw new Error("W1 projection should parse");
+  const html = renderToStaticMarkup(createElement(WorkbenchView, { loadState: { state: "ready", snapshot } }));
+  expect(html).toContain("wb-bench-heading");
+  expect(html).toContain("wb-desk-layout");
+  expect(html).toContain("wb-project-lower");
+  expect(html).toContain("Everything on the table.");
+  expect(html).toContain("Unknown charges stay visible.");
+  expect(html).toContain("An incomplete offer is not ranked as a saving.");
+  expect(html).toContain("All 1 suppliers");
+  const benchAt = html.indexOf("wb-bench-heading");
+  const deskAt = html.indexOf("wb-desk-layout");
+  const lowerAt = html.indexOf("wb-project-lower");
+  expect(benchAt).toBeGreaterThanOrEqual(0);
+  expect(deskAt).toBeGreaterThan(benchAt);
+  expect(lowerAt).toBeGreaterThan(deskAt);
+  // Paper-document hierarchy per card: vendor head, quote rule, charge lines, total, validity, action.
+  const headAt = html.indexOf("wb-paper-head");
+  const ruleAt = html.indexOf("wb-paper-rule");
+  const chargesAt = html.indexOf("wb-charge-list");
+  const totalAt = html.indexOf("wb-quote-total");
+  const readyAt = html.indexOf("wb-paper-ready");
+  const bottomAt = html.indexOf("wb-paper-bottom");
+  expect(headAt).toBeGreaterThan(deskAt);
+  expect(ruleAt).toBeGreaterThan(headAt);
+  expect(chargesAt).toBeGreaterThan(ruleAt);
+  expect(totalAt).toBeGreaterThan(chargesAt);
+  expect(readyAt).toBeGreaterThan(totalAt);
+  expect(bottomAt).toBeGreaterThan(readyAt);
+  expect(bottomAt).toBeLessThan(lowerAt);
+  // Honesty labels survive the denser layout.
+  expect(html).toContain("Harbor Equipment");
+  expect(html).toContain("Missing terms");
+  expect(html).toContain("Validity not confirmed");
+  expect(html).toContain("Unknown charges block an unqualified saving claim.");
+  expect(html).toContain("Recorded owner exchange");
+  expect(html).toContain("No order is placed.");
+  expect(html).toContain("Selecting an offer does not place an order.");
+});
+
+test("E16 quote cards preserve explicit charge states with native money and validity", () => {
+  const snapshot = parseWorkbenchSnapshot(twoOfferProjection(), projection.project.id);
+  if (snapshot === null) throw new Error("Two-offer projection should parse");
+  const html = renderToStaticMarkup(createElement(WorkbenchView, { loadState: { state: "ready", snapshot } }));
+  expect(html).toContain("Total (EUR)");
+  expect(html).toContain("Tax inclusive");
+  expect(html).toContain("Validity not confirmed");
+  expect(html).toContain("wb-paper-ready");
+  expect(html).toContain("wb-paper-bottom");
+  expect(html).toContain("Original quote document · View original");
+  expect(html).not.toContain("Quoted total");
+  // Estimated and not-applicable states never collapse to zero or a plain total.
+  const estimated = parseWorkbenchSnapshot(withQuoteTotals(projectionWithCurrentCompleteQuote(), (quote) => ({
+    ...quote,
+    lines: [{ lineId: "machine", description: "Atlas 2G", quantity: "1", unitPrice: { currency: "EUR", minorUnits: 750000 } }],
+    charges: [
+      { chargeId: "charge-freight", label: "freight", scope: { kind: "quote" }, state: { kind: "estimated", estimate: { kind: "point", amount: { currency: "EUR", minorUnits: 60000 } } } },
+      { chargeId: "charge-installation", label: "installation", scope: { kind: "quote" }, state: { kind: "notApplicable", reason: "Counter pickup has no installation." } },
+    ],
+  })), projection.project.id);
+  if (estimated === null) throw new Error("Estimated projection should parse");
+  const estimatedHtml = renderToStaticMarkup(createElement(WorkbenchView, { loadState: { state: "ready", snapshot: estimated } }));
+  expect(estimatedHtml).toContain("Estimated");
+  expect(estimatedHtml).toContain("Not applicable");
+});
+
+test("E16 responsive CSS keeps desk density without horizontal overflow", async () => {
+  const css = await Bun.file(new URL("../styles.css", import.meta.url)).text();
+  // Slim status strip keeps the desk above the fold.
+  expect(css).toContain(".wb-compare { padding-top: 1.4rem;");
+  expect(css).toContain(".wb-overview-intro strong { margin-top: .1rem;");
+  // Bench heading carries the compare journey without the tall page heading.
+  expect(css).toContain(".wb-bench-heading-actions");
+  expect(css).toContain(".wb-compare .wb-scope-row { margin-bottom: 1rem;");
+  // Paper-document density: tight kicker/tags, lines before total, ready + bottom rows.
+  expect(css).toContain(".wb-paper-kicker { margin: .1875rem 0 .8rem;");
+  expect(css).toContain(".wb-paper-ready");
+  expect(css).toContain(".wb-paper-bottom");
+  expect(css).toContain(".wb-desk-layout > .wb-load-more { grid-column: 1 / -1;");
+  // Narrow viewports stack the desk with no rotated-paper overflow.
+  const narrow = css.slice(css.indexOf("@media (max-width: 540px)"));
+  expect(narrow).toContain(".wb-desk-layout { grid-template-columns: minmax(0, 1fr);");
+  expect(narrow).toContain(".wb-desk-layout > .wb-empty { grid-column: 1;");
+  expect(narrow).toContain("transform: none;");
+});

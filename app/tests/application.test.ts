@@ -195,4 +195,22 @@ describe("public landing fidelity", () => {
     expect(packageJson).toContain('"test": "bun run test:repository && bun run test:proofs && bun run test:evals && bun run test:f1 && bun run test:browser && bun run test:app && bun test convex/communication/contracts.test.ts && bun run test:direct"');
     expect(workflow).toContain("- run: bun run test\n");
   });
+
+  test("production compare keeps bench density with honest states at desktop and narrow widths", async () => {
+    const css = await Bun.file(new URL("../styles.css", import.meta.url)).text();
+    expect(css).toContain(".wb-compare");
+    expect(css).toContain(".wb-bench-heading { display: flex;");
+    expect(css).toContain(".wb-desk-layout { display: grid; grid-template-columns: .83fr 1.2fr 1.2fr .85fr;");
+    expect(css).toContain(".wb-paper-ready");
+    expect(css).toContain(".wb-paper-bottom");
+    expect(css).toContain(".wb-comparison-tape");
+    expect(css).toContain(".wb-bench-action { display: grid; grid-column: 1 / -1;");
+    const narrow = css.slice(css.indexOf("@media (max-width: 540px)"));
+    expect(narrow).toContain(".wb-desk-layout { grid-template-columns: minmax(0, 1fr);");
+    expect(narrow).toContain(".wb-bench-action { grid-template-columns: minmax(0, 1fr);");
+    expect(narrow).toContain("transform: none;");
+    const phone = css.slice(css.indexOf("@media (max-width: 480px)"));
+    expect(phone).toContain(".wb-bench-heading h1");
+    expect(phone).toContain("overflow-wrap: break-word");
+  });
 });

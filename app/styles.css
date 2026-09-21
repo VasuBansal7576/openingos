@@ -90,16 +90,24 @@ h1, h2, h3, p { margin-top: 0; }
 .wb-assistant-button:hover, .wb-icon-button:hover { background: var(--wb-soft); }
 .ui-icon { flex: none; }
 
-/* Slim honest status strip over the desk */
-.wb-overview-strip { display: grid; grid-template-columns: 1.25fr repeat(4, minmax(8rem, 1fr)); gap: 0; padding: .85rem 1.9rem; border-bottom: 1px solid var(--wb-border); background: #f5efdeeb; }
-.wb-overview-intro, .wb-metric { display: flex; min-height: 3.6rem; flex-direction: column; justify-content: center; padding: 0 1.3rem; border-right: 1px solid var(--wb-border); }
+/* Slim honest status strip over the desk: single compact row so the decision desk stays above the fold */
+.wb-overview-strip { display: grid; grid-template-columns: 1.25fr repeat(4, minmax(8rem, 1fr)); gap: 0; padding: .5rem 1.9rem; border-bottom: 1px solid var(--wb-border); background: #f5efdeeb; }
+.wb-overview-intro, .wb-metric { display: flex; min-height: 2.9rem; flex-direction: column; justify-content: center; padding: 0 1.1rem; border-right: 1px solid var(--wb-border); }
 .wb-overview-intro { padding-left: 0; }
 .wb-metric:last-child { border-right: 0; padding-right: 0; }
-.wb-overview-intro strong { margin-top: .2rem; font-family: var(--wb-serif); font-size: 1.5rem; font-weight: 400; letter-spacing: -.03em; }
-.wb-overview-intro > span:last-child, .wb-metric small { color: var(--wb-muted); font-size: .62rem; }
-.wb-metric > span { color: var(--wb-muted); font-size: .63rem; }
-.wb-metric strong { margin-top: .25rem; font-family: var(--wb-serif); font-size: 1.25rem; font-weight: 400; letter-spacing: -.03em; }
-.wb-metric small { margin-top: .13rem; }
+.wb-overview-intro strong { margin-top: .1rem; font-family: var(--wb-serif); font-size: 1.15rem; font-weight: 400; letter-spacing: -.03em; line-height: 1.1; }
+.wb-overview-intro > span:last-child, .wb-metric small { color: var(--wb-muted); font-size: .6rem; line-height: 1.35; }
+.wb-metric > span { color: var(--wb-muted); font-size: .6rem; }
+.wb-metric strong { margin-top: .1rem; font-family: var(--wb-serif); font-size: 1.02rem; font-weight: 400; letter-spacing: -.03em; line-height: 1.1; }
+.wb-metric small { margin-top: .08rem; }
+
+/* Compare journey sits tight under the strip: bench heading, desk papers, tape, action */
+.wb-compare { padding-top: 1.4rem; }
+.wb-compare .wb-bench-heading { padding-top: 0; }
+.wb-bench-heading-actions { display: flex; flex-wrap: wrap; align-items: center; gap: .6rem; margin-top: .9rem; flex: none; }
+.wb-compare .wb-scope-row { margin-bottom: 1rem; }
+.wb-desk-layout > .wb-load-more { grid-column: 1 / -1; }
+.wb-desk-layout > .wb-empty { grid-column: 2 / -1; min-width: 0; }
 
 /* Flow pages sit directly on the desk canvas */
 .wb-page { max-width: 78rem; min-height: calc(100vh - 13rem); margin: auto; padding: 2.625rem 2.625rem 3.125rem; }
@@ -186,18 +194,22 @@ h1, h2, h3, p { margin-top: 0; }
 .wb-vendor-monogram.large { width: 3.2rem; height: 3.2rem; font-size: 1.7rem; }
 .wb-offer-header h3 { margin: .15rem 0 .18rem; font-family: var(--wb-serif); font-size: 1.9rem; font-weight: 400; letter-spacing: -.03em; line-height: 1.04; overflow-wrap: break-word; }
 .wb-offer-header p { margin: 0 0 .1rem; color: #728075; font-size: .62rem; line-height: 1.4; }
-.wb-paper-kicker { margin: .1875rem 0 1.8125rem; font-size: .375rem; letter-spacing: .1em; }
+.wb-paper-kicker { margin: .1875rem 0 .8rem; font-size: .375rem; letter-spacing: .1em; }
 .wb-paper-rule { display: flex; align-items: center; justify-content: space-between; padding-bottom: .625rem; border-bottom: 1px solid var(--wb-rule); font-size: .5625rem; font-weight: 750; letter-spacing: .08em; }
 .wb-paper-rule > span { align-self: center; font-size: .375rem; font-weight: 450; }
-.wb-offer-tags { display: flex; flex-wrap: wrap; gap: .4rem; margin: 1.1rem 0; }
-.wb-quote-summary { margin-top: auto; }
-.wb-quote-total { display: flex; align-items: flex-end; justify-content: space-between; padding: .8rem 0; border-top: 1px solid var(--wb-rule); border-bottom: 1px solid var(--wb-rule); }
+.wb-offer-tags { display: flex; flex-wrap: wrap; gap: .4rem; margin: .7rem 0 .8rem; }
+.wb-quote-summary { margin-top: 0; }
+.wb-quote-total { display: flex; align-items: flex-end; justify-content: space-between; gap: .7rem; padding: .7rem 0; border-top: 1px solid var(--wb-rule); border-bottom: 1px solid var(--wb-rule); }
 .wb-quote-total span { color: #728075; font-size: .61rem; }
-.wb-quote-total strong { font-family: var(--wb-serif); font-size: 1.6rem; font-weight: 400; letter-spacing: -.03em; }
-.wb-charge-list { display: grid; gap: 0; padding: .2rem 0; }
-.wb-charge-list > div { display: flex; justify-content: space-between; gap: .7rem; padding: .72rem 0; border-bottom: 1px solid var(--wb-thin-rule); color: #728075; font-size: .61rem; }
-.wb-charge-list strong { color: var(--wb-ink); font-weight: 700; }
+.wb-quote-total strong { font-family: var(--wb-serif); font-size: 1.6rem; font-weight: 400; letter-spacing: -.03em; text-align: right; }
+.wb-charge-list { display: grid; gap: 0; padding: .1rem 0; }
+.wb-charge-list > div { display: flex; justify-content: space-between; gap: .7rem; padding: .6rem 0; border-bottom: 1px solid var(--wb-thin-rule); color: #728075; font-size: .61rem; }
+.wb-charge-list strong { color: var(--wb-ink); font-weight: 700; text-align: right; }
 .wb-charge-list > div.missing strong { color: var(--wb-coral); }
+.wb-paper-meta { display: flex; justify-content: flex-end; padding: .45rem 0 0; color: #728075; font-size: .58rem; }
+.wb-paper-ready { display: flex; align-items: center; gap: .4rem; margin-top: .7rem; color: #304e3b; font-size: .6rem; font-weight: 600; }
+.wb-paper-bottom { display: flex; align-items: center; justify-content: space-between; gap: .55rem; margin-top: .8rem; color: #728075; font-size: .59rem; }
+.wb-paper-bottom > span { max-width: 8rem; }
 .wb-unknown-note, .wb-quote-unknown { display: flex; align-items: flex-start; gap: .4rem; padding: .6rem; border-radius: .25rem; color: #8d492b; background: #fff1e8; font-size: .61rem; line-height: 1.4; }
 .wb-quote-unknown { margin-top: auto; }
 .wb-missing-terms { display: flex; align-items: center; justify-content: space-between; gap: .3125rem; width: 100%; margin-top: .6rem; padding: .625rem .5rem; border: 0; color: var(--wb-coral); background: var(--wb-coral-bg); font-size: .5625rem; font-weight: 700; }
@@ -607,6 +619,9 @@ h1, h2, h3, p { margin-top: 0; }
   .wb-polaroid { width: 8.125rem; padding: .5rem .5rem .8125rem; }
   .wb-scope-note { padding: .8125rem; }
   .wb-offer-card, .wb-paper-1, .wb-paper-2 { grid-column: 1; min-width: 0; min-height: 0; padding: 1.5625rem; transform: none; }
+  .wb-desk-layout > .wb-empty { grid-column: 1; }
+  .wb-paper-bottom { align-items: flex-start; flex-direction: column; }
+  .wb-paper-bottom > span { max-width: none; }
   .wb-offer-header h3 { font-size: 2.125rem; }
   .wb-comparison-tape { max-width: 100%; gap: .75rem; margin: 1rem auto 1.5625rem; padding: .8125rem 1rem; transform: none; font-size: .5625rem; }
   .wb-bench-action { grid-template-columns: minmax(0, 1fr); gap: 1.25rem; margin: 1.875rem 0 0; padding: 1.5625rem 1.25rem 1.25rem; }
