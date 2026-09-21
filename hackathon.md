@@ -493,3 +493,31 @@ The separate fixed-head GPT-6 Astra review remains mandatory before merge.
 Orca 1.4.205 briefly reported ready and then became runtime-unavailable again, so no replacement worker was dispatched and no broad OpenCode permission was granted.
 All cited browser and provider evidence is controlled.
 No hosted Convex deployment, live provider call, owner-mailbox exchange, genuine supplier response, public origin, purchase, realized saving or commercial outcome was observed.
+
+### 2026-09-21 - P01 intake and fixed-head Astra repair integration
+
+Ready PR #18 at `edc0d04` adds a real atomic and idempotent intake boundary for opening, quote-comparison and equipment-case projects plus a connected empty-state form inside the selected purchasing workbench.
+The worker changed only its eleven assigned source and test files, pushed to the Vasu-owned remote, and opened a ready PR against the combined branch.
+The coordinator registered both new intake suites in shared CI, repaired the intentionally strict application-CI assertion, and integrated the package through `b94b839`.
+PR #18 passes all configured exact-head GitHub checks.
+Devin's status explicitly says its full review was skipped because the trial expired, and Greptile again posted only the exhausted 50-credit notice, so neither is counted as review approval.
+
+The separate GPT-6 Astra reviewer rejected unchanged PR #14 head `d582d0c` after reproducing five actionable defects.
+Those defects were an unbound caller-selected AgentMail sender inbox, cross-currency and tax-basis comparison rendered as a valid delta, changed request content accepted as an idempotent replay, a View original control without retrieval, and a 200 ms wall-clock membership expiry test.
+Verified OpenCode Muse Spark 1.3 Contributor high repaired sender binding and exact replay conflicts at PR #15 head `e4a9e51`.
+Verified OpenCode GLM-5.3-Flash high replaced the expiry sleep with a deterministic controlled-clock boundary at PR #16 head `d3648f5`.
+The P01 workbench integration owns the money and original-source presentation repairs.
+All five repairs are integrated without conflict at combined code checkpoint `b5db30e`.
+
+The complete combined `bun run test` command passes at that checkpoint.
+Recorded suites include 23 repository tests, 77 money and Jev proof tests, 15 evaluation tests, 338 F1 tests, 155 browser-executor tests, 91 application tests, 18 application Jev tests, 32 communication-contract tests and 509 direct Convex tests.
+Both strict TypeScript checks and the production Vite build also pass.
+Controlled Chrome DevTools Protocol inspection of the actual application at 1440 by 1200 and exact 390 by 844 reports viewport width equal to document width and zero overflow offenders.
+The rendered unconfigured state uses the selected sage desk, paper surfaces, serif hierarchy, compact ivory navigation and yellow decision language without showing sample suppliers, invented prices or provider success.
+This is controlled local runtime evidence only.
+The populated connected journey, hosted Convex behavior, live providers and public origin remain unverified.
+
+The completed E6 and P01 worktrees were proven clean and remotely preserved, their exact worker terminals were closed, and Orca removed the worktrees non-forcibly.
+The disposable Chrome profiles used for verification were removed after screenshots and measurements were preserved, reclaiming about 367 MB.
+The fresh combined descendant still needs exact-head GitHub CI and a new independent Astra ACCEPT verdict before PR #14 can merge.
+No hosted Convex deployment, live provider call, owner-mailbox exchange, genuine supplier response, public origin, purchase, realized saving or commercial outcome was observed.

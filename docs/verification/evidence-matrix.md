@@ -1,8 +1,8 @@
 # OpeningOS evidence matrix
 
 This matrix keeps every stable requirement ID tied to its original meaning in [PRD.md](../../PRD.md) and every sponsor/Jev case tied to the [implementation plan](../implementation/sponsor-integration-plan.md).
-It records controlled evidence through pushed PR #14 head `ed0979c` on September 21, 2026.
-The integrated child-package evidence remains partial until the fixed combined revision receives independent Astra review.
+It records controlled evidence through combined repair code checkpoint `b5db30e` on September 21, 2026.
+The integrated child-package evidence remains partial until the pushed descendant of that fixed code receives independent Astra acceptance.
 
 Status meanings:
 
@@ -18,7 +18,7 @@ Passing controlled evidence never counts as a live provider, deployed applicatio
 
 | ID | Status | Current evidence and next gate |
 | --- | --- | --- |
-| P-01 | not-started | Full opening, comparison and equipment-case creation is not implemented. |
+| P-01 | partial-controlled | Ready PR #18 head `edc0d04`, integrated through `b94b839`, implements atomic idempotent opening, quote-comparison and equipment-case intake plus the connected empty-state form. Application and direct intake suites pass and are registered in shared CI; hosted creation against an authorized Convex deployment remains unverified. |
 | P-02 | partial-controlled | Authorized requirement creation, optimistic edits and immutable revisions pass controlled handler tests; the complete application authoring/review flow remains open. |
 | P-03 | partial-controlled | Integrated R1 stores bounded source-backed candidates, claims and evidence with truthful pagination under controlled transport; live Firecrawl evidence remains unverified. |
 | P-04 | partial-controlled | Integrated domain handlers distinguish compatibility pass, fail and unknown, bind evidence and invalidate changed requirement inputs; final application flow and live source evidence remain open. |
@@ -38,9 +38,9 @@ Passing controlled evidence never counts as a live provider, deployed applicatio
 | P-18 | partial-controlled | PR #14 reads real bounded asset, safe document and service-case records and includes controlled commissioning and explicit terminal service outcomes; live equipment outcomes are unverified. |
 | P-19 | partial-controlled | Integrated controlled reuse preserves source-project separation, copies only reusable draft/notOrdered specifications, revalidates fresh facts and rejects malformed limits without historical financial copies; independent combined review remains open. |
 | P-20 | partial-controlled | F1 enforces contributor, approver and owner authority across project scopes; the due-decision workbench flow remains for U1/E1. |
-| P-21 | partial-controlled | The selected purchasing-desk system renders real projections plus honest unconfigured, loading, empty, error and reconnecting states at PR #14 head `ed0979c`; controlled 1440×1200 and exact 390×844 Chrome inspection reports no horizontal overflow or console errors. The populated authorized flow still needs Playwright or Orca Computer Use. |
-| P-22 | partial-controlled | Ready PR #9 head `bc8bcfe` derives truthful usage/outcome metrics from stored records and reports unsafe overflow as unavailable; it remains unintegrated and no business outcome is claimed. |
-| P-23 | partial-controlled | Ready PR #11 head `157d09d` proves a controlled pure negotiation policy with exact mandate/basis, disclosure, round and termination fences; production persistence and provider orchestration remain open. |
+| P-21 | partial-controlled | The selected purchasing-desk system renders real projections plus honest unconfigured, loading, empty, error and reconnecting states through combined code checkpoint `b5db30e`. Controlled Chrome DevTools Protocol inspection at 1440×1200 and exact 390×844 reports viewport width equal to document width with zero overflow offenders. The populated authorized flow still needs Playwright or Orca Computer Use against an authorized backend. |
+| P-22 | partial-controlled | Integrated PR #9 code derives truthful usage/outcome metrics from stored records and reports unsafe overflow as unavailable; no hosted business outcome is claimed. |
+| P-23 | partial-controlled | Integrated E6 policy plus E12 production handlers enforce exact mandate, basis, sender binding, disclosure, round, replay and termination fences under controlled tests. PR #15 head `e4a9e51` closes Astra's unbound-inbox and changed-replay findings; live Jev, OpenAI and AgentMail negotiation remains unverified. |
 | P-24 | partial-controlled | Integrated E7 parses bounded equipment CSV, preserves exact BOM source replay and canonical attachments, binds deduplicated identities, rejects promotion collisions atomically and review-gates draft promotion. Live import evidence and fixed-head review remain open. |
 
 ## Hackathon delivery requirements
@@ -128,6 +128,6 @@ Passing controlled evidence never counts as a live provider, deployed applicatio
 - Foundation/browser checkpoint: `6432e98`, with application typecheck/build/tests, provider/user-path contracts and 155 browser tests green locally and in CI.
 - Shared-contract checkpoint: `92a49cd`, with 244 F1 tests, 180 direct-handler tests, exact-head Actions and Greptile green, and a separate Astra ACCEPT after 22 fresh actual-handler probes; merged as `96f0f1f` with an identical tree.
 - Application integration baseline: `1a1bf7d`, containing R1/C1/U1/E1, research-start idempotency, readiness and authoritative quote total/currentness controlled behavior; PR #2 remains open.
-- Combined pushed checkpoint: PR #14 head `ed0979c`, integrating repaired E7/E9/E11/E12 packages, shared negotiation authority and the selected purchasing-desk UI. The full local matrix, strict TypeScript, production build, controlled desktop/narrow browser checks and all nine exact-head GitHub checks pass; independent Astra review remains open.
+- Combined repair code checkpoint: `b5db30e`, integrating P01 intake and all five findings from Astra's rejection of `d582d0c`. The full local matrix passes with 23 repository, 77 proof, 15 eval, 338 F1, 155 browser, 91 application, 18 Jev, 32 communication and 509 direct tests, plus both strict TypeScript checks and the production build. Fresh exact-head GitHub checks and independent Astra acceptance remain open until its pushed descendant settles.
 - Fixed-commit browser re-review artifacts are private temporary evidence and contain no live-provider result.
 - The selected design reference remains `design/purchasing-workbench.html`; it is not counted as application behavior.
