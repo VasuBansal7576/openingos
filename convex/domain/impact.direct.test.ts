@@ -112,6 +112,11 @@ const createWatchRef = makeFunctionReference<
   MutationArgs<typeof workspace.createWatch>,
   MutationReturn<typeof workspace.createWatch>
 >("domain/workspace:createWatch");
+const createRfqRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof sourcing.createRfq>,
+  MutationReturn<typeof sourcing.createRfq>
+>("domain/sourcing:createRfq");
 const assessQuoteRevisionImpactRef = makeFunctionReference<
   "mutation",
   MutationArgs<typeof impact.assessQuoteRevisionImpact>,
@@ -871,13 +876,26 @@ describe("E5 substitute proposals", () => {
       quoteId: quoteB1.quoteId,
       requirementId: seed.requirementId,
     });
+    const approvalSnapshot = JSON.parse(approvalRow!.snapshotCanonical);
+    expect(approvalSnapshot.currentSelectionId).toBe(seed.selectionId);
+    // Decision replay safety: an identical approval retry returns the
+    // stable original result without adding another approval row.
+    const approvalRetry = await t.withIdentity(OWNER).mutation(decideSubstituteProposalRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      proposalId: created.proposalId,
+      decision: "approved",
+    });
+    if (!approvalRetry.ok) throw new Error("approval retry failed");
+    expect(approvalRetry.decisionApprovalId).toBe(approved.decisionApprovalId);
+    // An opposite later decision is a deterministic conflict with no writes.
     const reDecision = await t.withIdentity(OWNER).mutation(decideSubstituteProposalRef, {
       organizationId: project.organizationId,
       projectId: project.projectId,
       proposalId: created.proposalId,
       decision: "rejected",
     });
-    expect(reDecision).toMatchObject({ ok: false, code: "invalid-payload" });
+    expect(reDecision).toMatchObject({ ok: false, code: "duplicate-conflict" });
     // Executing the approved substitute is an explicit new selection; the
     // old selection, order, and approval history all remain intact.
     const substitute = await t.withIdentity(OWNER).mutation(recordSelectionRef, {
@@ -944,6 +962,22 @@ describe("E5 substitute proposals", () => {
     });
     if (!rejected.ok) throw new Error("rejection failed");
     expect(rejected.decisionApprovalId).toBeUndefined();
+    // Rejection replay returns the stable result; approval now conflicts.
+    const rejectionRetry = await t.withIdentity(OWNER).mutation(decideSubstituteProposalRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      proposalId: created.proposalId,
+      decision: "rejected",
+    });
+    if (!rejectionRetry.ok) throw new Error("rejection replay failed");
+    expect(rejectionRetry.decisionApprovalId).toBeUndefined();
+    const lateApproval = await t.withIdentity(OWNER).mutation(decideSubstituteProposalRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      proposalId: created.proposalId,
+      decision: "approved",
+    });
+    expect(lateApproval).toMatchObject({ ok: false, code: "duplicate-conflict" });
     // Requirement edits fence a fresh proposal the same way.
     const secondContext = await seedProposalContext(t, "fence2");
     const secondProposal = await t.withIdentity(OWNER).mutation(createSubstituteProposalRef, proposalArgs(
@@ -1109,5 +1143,188 @@ describe("E5 substitute proposals", () => {
       message: "mixed-currency-requires-accepted-conversion-basis",
     });
     expect(seed.quoteA1).toBeDefined();
+  });
+
+  test("proposal creation enforces authoritative candidate-to-quote lineage", async () => {
+    const t = convexTest(schema, modules);
+    const { project, seed, assessment, quoteB1 } = await seedProposalContext(t, "lineage");
+    // A quote bound to another vendor's offer can never back the proposal.
+    const wrongVendor = await t.withIdentity(OWNER).mutation(createSubstituteProposalRef, proposalArgs(
+      project,
+      assessment.assessmentId,
+      seed.candidateB,
+      seed.quoteA1,
+      `line-q-a1-lineage`,
+      { idempotencyKey: "proposal-wrong-vendor" },
+    ));
+    expect(wrongVendor).toMatchObject({ ok: false, code: "denied-project", message: "proposed quote is bound to another vendor offer" });
+    // An RFQ-scoped quote whose scope excludes the candidate vendor is
+    // refused even when the quote itself carries no vendor binding.
+    await t.withIdentity(OWNER).mutation(createRfqRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      requirementId: seed.requirementId,
+      idempotencyKey: "lineage-rfq",
+      scenarioVendorIds: [seed.vendorA],
+      lineItems: [{ itemId: "item-1", description: "Item 1", quantity: "2", unit: "piece" }],
+      briefHash: "controlled-brief-hash",
+      conversationState: "draft",
+    });
+    const scopedQuote = await t.withIdentity(OWNER).mutation(recordQuoteRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      version: "q-rfq-lineage",
+      currency: "EUR",
+      lines: [{
+        lineId: "line-q-rfq-lineage",
+        description: "Item rfq",
+        quantity: "2",
+        unitPrice: { currency: "EUR", minorUnits: 1_000 },
+        evidenceRefs: [],
+      }],
+      charges: [],
+      taxBasis: { kind: "inclusive", basisId: "controlled-rfq", evidenceRefs: [] },
+      evidenceRefs: [],
+      requirementId: seed.requirementId,
+      rfqId: (await t.run(async (ctx) => {
+        const row = await ctx.db
+          .query("rfqs")
+          .withIndex("by_project_and_key", (q) =>
+            q.eq("projectId", project.projectId).eq("idempotencyKey", "lineage-rfq"),
+          )
+          .unique();
+        return row!._id;
+      })),
+    });
+    if (!scopedQuote.ok) throw new Error(`rfq quote setup failed: ${JSON.stringify(scopedQuote)}`);
+    const scopeExcluded = await t.withIdentity(OWNER).mutation(createSubstituteProposalRef, proposalArgs(
+      project,
+      assessment.assessmentId,
+      seed.candidateB,
+      scopedQuote.quoteId,
+      "line-q-rfq-lineage",
+      { idempotencyKey: "proposal-rfq-excluded" },
+    ));
+    expect(scopeExcluded).toMatchObject({ ok: false, code: "denied-project", message: "proposed quote RFQ scope excludes the candidate vendor" });
+    // Positive control: a candidate whose vendor is inside the RFQ scope
+    // passes the lineage checks, and no denial above wrote anything.
+    const scopeIncluded = await t.withIdentity(OWNER).mutation(createSubstituteProposalRef, proposalArgs(
+      project,
+      assessment.assessmentId,
+      seed.candidateA,
+      scopedQuote.quoteId,
+      "line-q-rfq-lineage",
+      { idempotencyKey: "proposal-rfq-included" },
+    ));
+    if (!scopeIncluded.ok) throw new Error(`in-scope proposal failed: ${JSON.stringify(scopeIncluded)}`);
+    expect(scopeIncluded.deduplicated).toBe(false);
+    const pendingCount = await t.run(async (ctx) => {
+      const rows = await ctx.db
+        .query("substituteProposals")
+        .withIndex("by_project", (q) => q.eq("projectId", project.projectId))
+        .collect();
+      return rows.filter((row) => row.state === "pending").length;
+    });
+    expect(pendingCount).toBe(1);
+    expect(quoteB1.contentHash).toBeDefined();
+  });
+
+  test("selection drift between proposal creation and approval fences the decision", async () => {
+    const t = convexTest(schema, modules);
+    // Case A: the captured selection is replaced by another selection.
+    const { project, seed, assessment, quoteB1 } = await seedProposalContext(t, "drift");
+    const created = await t.withIdentity(OWNER).mutation(createSubstituteProposalRef, proposalArgs(
+      project,
+      assessment.assessmentId,
+      seed.candidateB,
+      quoteB1.quoteId,
+      "line-q-b1-drift",
+      { idempotencyKey: "proposal-drift" },
+    ));
+    if (!created.ok) throw new Error("proposal setup failed");
+    await t.withIdentity(OWNER).mutation(recordSelectionRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      requirementId: seed.requirementId,
+      candidateId: seed.candidateB,
+      quoteId: quoteB1.quoteId,
+      quoteVersion: "q-b1-drift",
+      quantity: "1",
+      requirementVersion: 1,
+      idempotencyKey: "drift-new-selection",
+    });
+    const drifted = await t.withIdentity(OWNER).mutation(decideSubstituteProposalRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      proposalId: created.proposalId,
+      decision: "approved",
+    });
+    expect(drifted).toMatchObject({ ok: false, code: "stale-proposal-basis" });
+    const driftView = await t.withIdentity(OWNER).query(getSubstituteProposalRef, {
+      organizationId: project.organizationId,
+      projectId: project.projectId,
+      proposalId: created.proposalId,
+    });
+    if (!driftView.ok) throw new Error("drift view failed");
+    expect(driftView.proposal.state).toBe("pending");
+    // Case B: the proposal was created with no selection and one arrives.
+    const noSelectionProject = await setupProject(t, OWNER, "drift-noselection");
+    const reqId = await createRequirement(t, noSelectionProject, "drift-noselection-req");
+    const vendor = await createVendor(t, noSelectionProject, "Drift no-selection vendor");
+    const candidate = await createCandidate(t, noSelectionProject, reqId, vendor, "drift-noselection");
+    const quoteV1 = await createQuote(t, noSelectionProject, reqId, vendor, "q-ns-v1");
+    const watchId = await createWatch(t, noSelectionProject, candidate, "drift-ns-watch");
+    const watchAssessment = await t.withIdentity(OWNER).mutation(assessWatchObservationRef, {
+      organizationId: noSelectionProject.organizationId,
+      projectId: noSelectionProject.projectId,
+      idempotencyKey: "drift-ns-impact",
+      watchId,
+      result: "ok",
+    });
+    if (!watchAssessment.ok) throw new Error("no-selection assessment failed");
+    const noSelectionProposal = await t.withIdentity(OWNER).mutation(createSubstituteProposalRef, {
+      organizationId: noSelectionProject.organizationId,
+      projectId: noSelectionProject.projectId,
+      idempotencyKey: "proposal-drift-noselection",
+      assessmentId: watchAssessment.assessmentId,
+      proposedCandidateId: candidate,
+      proposedQuoteId: quoteV1.quoteId,
+      proposedLines: [{ quoteLineId: "line-q-ns-v1", quantity: "2", unit: "piece" }],
+      reason: "Watch observation suggests reviewing this candidate",
+    });
+    if (!noSelectionProposal.ok) throw new Error(`no-selection proposal failed: ${JSON.stringify(noSelectionProposal)}`);
+    const capturedView = await t.withIdentity(OWNER).query(getSubstituteProposalRef, {
+      organizationId: noSelectionProject.organizationId,
+      projectId: noSelectionProject.projectId,
+      proposalId: noSelectionProposal.proposalId,
+    });
+    if (!capturedView.ok) throw new Error("captured view failed");
+    expect(capturedView.proposal.currentSelectionId).toBeUndefined();
+    await t.withIdentity(OWNER).mutation(recordSelectionRef, {
+      organizationId: noSelectionProject.organizationId,
+      projectId: noSelectionProject.projectId,
+      requirementId: reqId,
+      candidateId: candidate,
+      quoteId: quoteV1.quoteId,
+      quoteVersion: "q-ns-v1",
+      quantity: "2",
+      requirementVersion: 1,
+      idempotencyKey: "drift-ns-selection",
+    });
+    const becameSelected = await t.withIdentity(OWNER).mutation(decideSubstituteProposalRef, {
+      organizationId: noSelectionProject.organizationId,
+      projectId: noSelectionProject.projectId,
+      proposalId: noSelectionProposal.proposalId,
+      decision: "approved",
+    });
+    expect(becameSelected).toMatchObject({ ok: false, code: "stale-proposal-basis" });
+    const approvalCount = await t.run(async (ctx) => {
+      const rows = await ctx.db
+        .query("approvals")
+        .withIndex("by_project", (q) => q.eq("projectId", project.projectId))
+        .collect();
+      return rows.length;
+    });
+    expect(approvalCount).toBe(0);
   });
 });

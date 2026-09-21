@@ -679,6 +679,29 @@ export const createSubstituteProposal = f1Mutation({
       }
       return { ok: true as const, proposalId: existing._id, deduplicated: true };
     }
+    // Authoritative candidate-to-quote lineage, mirroring recordSelection
+    // (F1R-03): a quote bound to another vendor's offer, an out-of-project
+    // RFQ, another requirement's RFQ, or an RFQ scope that excludes the
+    // candidate vendor can never back this proposal.
+    if (quote.value.vendorId !== undefined && quote.value.vendorId !== candidate.value.vendorId) {
+      return { ok: false as const, code: "denied-project", message: "proposed quote is bound to another vendor offer" };
+    }
+    if (quote.value.rfqId !== undefined) {
+      const rfq = await ctx.db.get(quote.value.rfqId);
+      if (
+        rfq === null ||
+        rfq.organizationId !== args.organizationId ||
+        rfq.projectId !== args.projectId
+      ) {
+        return { ok: false as const, code: "denied-project", message: "proposed quote RFQ is not in this project" };
+      }
+      if (rfq.requirementId !== assessment.value.requirementId) {
+        return { ok: false as const, code: "denied-project", message: "proposed quote RFQ is bound to another requirement" };
+      }
+      if (!rfq.scenarioVendorIds.includes(candidate.value.vendorId)) {
+        return { ok: false as const, code: "denied-project", message: "proposed quote RFQ scope excludes the candidate vendor" };
+      }
+    }
     if (
       requirement.value.currency !== undefined &&
       requirement.value.currency !== quote.value.currency
@@ -741,12 +764,18 @@ function sameLines(
 
 /**
  * Decide a pending substitute proposal. Rejection is always available to
- * an approver while the proposal is pending. Approval is fenced: the
- * requirement version and the proposed quote revision must both still be
- * current, so changed offer terms or edited requirements cannot let an
- * obsolete proposal take effect (P-13). An approved proposal records a
- * fresh approvals row whose snapshot binds the exact decision; prior
- * selections, approvals, orders, and financial rows are never touched.
+ * an approver while the proposal is pending. Replay safety: after
+ * authorization and tenancy checks, an identical retried decision on an
+ * already decided proposal returns the stable original result without
+ * adding another approval row, while an opposite later decision fails as
+ * a deterministic `duplicate-conflict` with no writes. Approval is
+ * fenced: the requirement version, the proposed quote revision, and the
+ * captured current selection identity must all still be current, so
+ * changed offer terms, edited requirements, or selection drift cannot
+ * let an obsolete proposal take effect (P-13). An approved proposal
+ * records a fresh approvals row whose snapshot binds the exact decision
+ * including the captured selection; prior selections, approvals,
+ * orders, and financial rows are never touched.
  */
 export const decideSubstituteProposal = f1Mutation({
   args: {
@@ -775,8 +804,20 @@ export const decideSubstituteProposal = f1Mutation({
     if (!proposal.ok) {
       return { ok: false as const, code: proposal.code, message: proposal.message };
     }
+    // Decision replay safety, checked after authorization and tenancy but
+    // before the pending-only rule: an identical retry returns the stable
+    // original result without adding another approval row, while an
+    // opposite later decision is a deterministic conflict with no writes.
     if (proposal.value.state !== "pending") {
-      return { ok: false as const, code: "invalid-payload", message: "proposal is no longer pending" };
+      if (args.decision === proposal.value.state) {
+        return {
+          ok: true as const,
+          ...(proposal.value.decisionApprovalId === undefined
+            ? {}
+            : { decisionApprovalId: proposal.value.decisionApprovalId }),
+        };
+      }
+      return { ok: false as const, code: "duplicate-conflict", message: "proposal was already decided differently" };
     }
     let decisionApprovalId: Id<"approvals"> | undefined;
     if (args.decision === "approved") {
@@ -813,12 +854,25 @@ export const decideSubstituteProposal = f1Mutation({
       if (successor !== null) {
         return { ok: false as const, code: "stale-proposal-basis", message: "proposed quote terms changed; renewed authority required" };
       }
+      // Selection drift fence: the approval re-reads the latest selection
+      // for the requirement and requires its identity to equal the value
+      // captured at proposal creation, including no-selection becoming
+      // selected or a selected requirement changing its selection.
+      const latest = await latestSelection(ctx, {
+        organizationId: args.organizationId,
+        projectId: args.projectId,
+        requirementId: proposal.value.requirementId,
+      });
+      if ((latest?._id ?? undefined) !== proposal.value.currentSelectionId) {
+        return { ok: false as const, code: "stale-proposal-basis", message: "the current selection changed since the proposal; renewed authority required" };
+      }
       const snapshotCanonical = canonicalJson({
         kind: "substituteProposal",
         proposalId: proposal.value._id,
         assessmentId: proposal.value.assessmentId,
         requirementId: proposal.value.requirementId,
         requirementVersion: proposal.value.requirementVersion,
+        currentSelectionId: proposal.value.currentSelectionId,
         proposedCandidateId: proposal.value.proposedCandidateId,
         proposedQuoteId: proposal.value.proposedQuoteId,
         proposedQuoteVersion: proposal.value.proposedQuoteVersion,
