@@ -640,6 +640,21 @@ describe("R1 project research pagination", () => {
       "http://[fe80::1]/",
       "http://[ff02::1]/",
       "http://[::]/",
+      // IPv4-compatible IPv6 transition forms (Greptile r4058487301): the
+      // dotted-quad spellings and every normalized hex equivalent represent
+      // the embedded loopback/private IPv4 address and must not pass.
+      "http://[::127.0.0.1]/",
+      "http://[::10.0.0.1]/",
+      "http://[::7f00:1]/",
+      "http://[::a00:1]/",
+      "http://[0:0:0:0:0:0:127.0.0.1]/",
+      "http://[0:0:0:0:0:0:10.0.0.1]/product",
+      // IPv4-translated form with a private/loopback embedded address.
+      "http://[::ffff:0:127.0.0.1]/",
+      "http://[::ffff:0:10.0.0.1]/",
+      // 6to4 and NAT64 encodings of loopback must stay rejected.
+      "http://[2002:7f00:1::]/",
+      "http://[64:ff9b::127.0.0.1]/",
       "http://0.0.0.0/",
       "http://100.64.0.1/",
       "http://10.0.0.2/",
@@ -727,6 +742,24 @@ describe("R1 collection-target binding (F03)", () => {
       sourceUrl: "http://[::1]/sitemap.xml",
     });
     expect(loopback).toMatchObject({ ok: false, code: "invalid-payload" });
+    const compatible = await asOwner.mutation(requestGrantedResearchRef, {
+      projectId: fixture.projectId,
+      researchIntent: INTENT,
+      requestId: "f03-compat-ipv6",
+      grantId: fixture.grantId,
+      mode: "scrape",
+      sourceUrl: "http://[::10.0.0.1]/product",
+    });
+    expect(compatible).toMatchObject({ ok: false, code: "invalid-payload" });
+    const translated = await asOwner.mutation(requestGrantedResearchRef, {
+      projectId: fixture.projectId,
+      researchIntent: INTENT,
+      requestId: "f03-translated-ipv6",
+      grantId: fixture.grantId,
+      mode: "map",
+      sourceUrl: "http://[::ffff:0:127.0.0.1]/sitemap.xml",
+    });
+    expect(translated).toMatchObject({ ok: false, code: "invalid-payload" });
     const after = await t.run(async (ctx) => ({
       jobs: (
         await ctx.db.query("jobs").withIndex("by_project", (q) => q.eq("projectId", fixture.projectId)).take(16)
@@ -872,5 +905,137 @@ describe("R1 collection-target binding (F03)", () => {
       }),
     });
     expect(matched.ok).toBe(true);
+  });
+
+  test("cross-grant same-requestId never mints a second job, reservation, or operation", async () => {
+    // Controlled regression for Greptile r4058487296: the changed-target
+    // check used to scan only the supplied grant, so presenting another
+    // valid grant with the same client request ID and another target
+    // created a second job, reservation, and billable provider exposure.
+    const t = init();
+    const fixture = await createFixture(t, "xgrant-fixture");
+    const asOwner = t.withIdentity(OWNER);
+    const secondGrant = await asOwner.mutation(issueGrantRef, {
+      organizationId: fixture.organizationId,
+      projectId: fixture.projectId,
+      operations: ["research.collect"],
+      communicationProfile: "ownerRoleplay",
+      recipientConfigVersion: 0,
+      inputVersions: { brief: "r1-v1" },
+      payloadJson: canonicalJson({ query: INTENT }),
+      costCeilingMicroUsd: 250_000,
+      roundLimit: 8,
+      expiresAt: Date.now() + 60 * 60 * 1000,
+    });
+    if (!secondGrant.ok) throw new Error(`second grant setup failed: ${secondGrant.message}`);
+    const countRows = (): Promise<{ jobs: number; firstGrantOps: number; secondGrantOps: number }> =>
+      t.run(async (ctx) => ({
+        jobs: (
+          await ctx.db.query("jobs").withIndex("by_project", (q) => q.eq("projectId", fixture.projectId)).take(32)
+        ).length,
+        firstGrantOps: (
+          await ctx.db.query("operations").withIndex("by_grant", (q) => q.eq("grantId", fixture.grantId)).take(65)
+        ).length,
+        secondGrantOps: (
+          await ctx.db.query("operations").withIndex("by_grant", (q) => q.eq("grantId", secondGrant.grantId)).take(65)
+        ).length,
+      }));
+    const first = await asOwner.mutation(requestGrantedResearchRef, {
+      projectId: fixture.projectId,
+      researchIntent: INTENT,
+      requestId: "xgrant-1",
+      grantId: fixture.grantId,
+      mode: "search",
+    });
+    expect(first.ok).toBe(true);
+    if (!first.ok || first.operationId === null) throw new Error("first cross-grant request failed");
+    expect(await countRows()).toEqual({ jobs: 2, firstGrantOps: 2, secondGrantOps: 0 });
+    // Same client request ID under another valid grant with another target
+    // conflicts instead of creating a second job/reservation/operation.
+    const changedTarget = await asOwner.mutation(requestGrantedResearchRef, {
+      projectId: fixture.projectId,
+      researchIntent: INTENT,
+      requestId: "xgrant-1",
+      grantId: secondGrant.grantId,
+      mode: "scrape",
+      sourceUrl: "https://supplier.example.test/other",
+    });
+    expect(changedTarget).toMatchObject({ ok: false, code: "duplicate-conflict" });
+    // A changed target without a source URL conflicts as well: search with
+    // an attached source URL binds a different collection target than bare
+    // search.
+    const changedSourceOnly = await asOwner.mutation(requestGrantedResearchRef, {
+      projectId: fixture.projectId,
+      researchIntent: INTENT,
+      requestId: "xgrant-1",
+      grantId: secondGrant.grantId,
+      mode: "search",
+      sourceUrl: "https://supplier.example.test/other",
+    });
+    expect(changedSourceOnly).toMatchObject({ ok: false, code: "duplicate-conflict" });
+    expect(await countRows()).toEqual({ jobs: 2, firstGrantOps: 2, secondGrantOps: 0 });
+    // An identical retry under the other grant stays idempotent: it returns
+    // the original operation without minting another job or reservation.
+    const identical = await asOwner.mutation(requestGrantedResearchRef, {
+      projectId: fixture.projectId,
+      researchIntent: INTENT,
+      requestId: "xgrant-1",
+      grantId: secondGrant.grantId,
+      mode: "search",
+    });
+    expect(identical.ok).toBe(true);
+    if (!identical.ok || identical.operationId === null) throw new Error("cross-grant identical retry failed");
+    expect(identical.operationId).toBe(first.operationId);
+    expect(identical.jobId).toBe(first.jobId);
+    expect(await countRows()).toEqual({ jobs: 2, firstGrantOps: 2, secondGrantOps: 0 });
+  });
+
+  test("same client requestId in another project is an independent request", async () => {
+    // The cross-grant fence is scoped to one logical project/client request
+    // ID: reusing the client request ID in a different project must succeed
+    // with its own job, proving no cross-project blocking or disclosure.
+    const t = init();
+    const fixture = await createFixture(t, "xproject-fixture");
+    const asOwner = t.withIdentity(OWNER);
+    const otherProject = await asOwner.mutation(createProjectRef, {
+      organizationId: fixture.organizationId,
+      name: "R1 cross-project research",
+      visibility: "open",
+    });
+    if (!otherProject.ok) throw new Error(`second project setup failed: ${otherProject.message}`);
+    const otherGrant = await asOwner.mutation(issueGrantRef, {
+      organizationId: fixture.organizationId,
+      projectId: otherProject.projectId,
+      operations: ["research.collect"],
+      communicationProfile: "ownerRoleplay",
+      recipientConfigVersion: 0,
+      inputVersions: { brief: "r1-v1" },
+      payloadJson: canonicalJson({ query: INTENT }),
+      costCeilingMicroUsd: 250_000,
+      roundLimit: 8,
+      expiresAt: Date.now() + 60 * 60 * 1000,
+    });
+    if (!otherGrant.ok) throw new Error(`cross-project grant setup failed: ${otherGrant.message}`);
+    const first = await asOwner.mutation(requestGrantedResearchRef, {
+      projectId: fixture.projectId,
+      researchIntent: INTENT,
+      requestId: "xproject-shared-id",
+      grantId: fixture.grantId,
+      mode: "search",
+    });
+    expect(first.ok).toBe(true);
+    if (!first.ok || first.operationId === null) throw new Error("first project request failed");
+    const other = await asOwner.mutation(requestGrantedResearchRef, {
+      projectId: otherProject.projectId,
+      researchIntent: INTENT,
+      requestId: "xproject-shared-id",
+      grantId: otherGrant.grantId,
+      mode: "scrape",
+      sourceUrl: "https://supplier.example.test/other",
+    });
+    expect(other.ok).toBe(true);
+    if (!other.ok || other.operationId === null) throw new Error("cross-project request was blocked");
+    expect(other.operationId).not.toBe(first.operationId);
+    expect(other.jobId).not.toBe(first.jobId);
   });
 });
