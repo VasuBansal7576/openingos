@@ -526,11 +526,6 @@ describe("F1 multi-model shared provider allowance", () => {
     });
     const { calls } = stubFamilyFetch();
 
-    const preClaimDebug = await t.run(async (ctx) => {
-      const operation = await ctx.db.get(fixture.jev.operationId);
-      return { op: operation?.state, reservation: await ctx.db.get(fixture.jev.reservationId) };
-    });
-    console.log("DEBUG_PRE", JSON.stringify(preClaimDebug));
     const jevResult = await t.withIdentity(OWNER).action(classifyRef, {
       operationId: fixture.jev.operationId,
       identity: fixture.identity,
