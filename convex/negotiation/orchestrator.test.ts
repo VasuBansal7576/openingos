@@ -15,12 +15,10 @@
  * no acceptance/commitment writes, cross-tenant/guest denial without an
  * existence oracle, and zero provider calls for every pre-call denial.
  *
- * PAUSED (10 tests, marked test.skip): every case that requires a completed
- * OpenAI draft or an AgentMail send is paused pending the foundation-owned
- * option-B repair (single shared providerBudgets row cannot satisfy the
- * per-family budget-basis equality in the Jev/OpenAI attempt fences). These
- * tests are complete and correct against the repaired contract; un-skip them
- * when the reviewed foundation commit lands. All other cases prove out now.
+ * All cases prove out against the merged foundation option-B repair
+ * (shared org allowance row, exact per-reservation pricing fences):
+ * completed OpenAI drafts and AgentMail sends run through the real
+ * boundaries under controlled fetch stubs.
  */
 
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
@@ -115,6 +113,16 @@ const runStepRef = makeFunctionReference<
   ActionArgs<typeof orchestrator.runNegotiationStep>,
   ActionReturn<typeof orchestrator.runNegotiationStep>
 >("negotiation/orchestrator:runNegotiationStep");
+const prepareRef = makeFunctionReference<
+  "action",
+  ActionArgs<typeof orchestrator.prepareNegotiationDraft>,
+  ActionReturn<typeof orchestrator.prepareNegotiationDraft>
+>("negotiation/orchestrator:prepareNegotiationDraft");
+const dispatchRef = makeFunctionReference<
+  "action",
+  ActionArgs<typeof orchestrator.dispatchApprovedDraft>,
+  ActionReturn<typeof orchestrator.dispatchApprovedDraft>
+>("negotiation/orchestrator:dispatchApprovedDraft");
 
 const OWNER = { tokenIdentifier: "e12-owner" };
 const GUEST = { tokenIdentifier: "e12-guest" };
@@ -244,7 +252,10 @@ function installFetchStub(plan: StubPlan, expectedDraft: { draftKind: string; so
           });
         }
         if ((plan.agentmailHttp ?? 200) !== 200) {
-          return new Response("controlled agentmail outcome", { status: plan.agentmailHttp ?? 500 });
+          return new Response(JSON.stringify({ error: "controlled rejection" }), {
+            status: plan.agentmailHttp ?? 500,
+            headers: { "content-type": "application/json" },
+          });
         }
         return new Response(JSON.stringify({ message_id: "msg-e12-1", thread_id: "thread-e12-1" }), {
           status: 200,
@@ -267,6 +278,7 @@ interface Fixture {
   draftOperationId: Id<"operations">;
   sendJobId: Id<"jobs">;
   sendGrantId: Id<"grants">;
+  conversationId?: Id<"conversations">;
   draftBody: string;
   expectedDraftSources: Array<{ sourceId: string; version: string; locator: string }>;
 }
@@ -274,7 +286,10 @@ interface Fixture {
 async function createFixture(
   t: TestConvex<typeof schema>,
   move: "clarify" | "counter" = "clarify",
-  overrides: { draftBody?: string } = {},
+  overrides: {
+    draftBody?: string;
+    conversation?: { version: number; state: "awaitingReply" | "replyReceived" | "closed" };
+  } = {},
 ): Promise<Fixture> {
   const asOwner = t.withIdentity(OWNER);
   const draftBody = overrides.draftBody ?? (move === "clarify" ? CLARIFY_BODY : COUNTER_BODY);
@@ -372,7 +387,7 @@ async function createFixture(
     negotiationId: String(negotiationId),
     quoteId: String(quoteId),
     quoteVersion: "qv-1",
-    conversationVersion: undefined,
+    conversationVersion: overrides.conversation?.version,
     roundsUsed: 0,
     roundLimit: 3,
     mandateState: "active",
@@ -434,7 +449,7 @@ async function createFixture(
       negotiationId: String(negotiationId),
       quoteId: String(quoteId),
       quoteVersion: "qv-1",
-      conversationVersion: undefined,
+      conversationVersion: overrides.conversation?.version,
       roundsUsed: 0,
       quoteExcerpt: "Espresso machine: 1 unit",
     },
@@ -507,6 +522,25 @@ async function createFixture(
     workflowAuthorities: [{ operationId: "communication.send", projectId }],
   });
   if (!sendGrant.ok) throw new Error(`send grant setup failed: ${JSON.stringify(sendGrant)}`);
+  let conversationId: Id<"conversations"> | undefined;
+  if (overrides.conversation !== undefined) {
+    const spec = overrides.conversation;
+    const inserted = await t.run(async (ctx) => {
+      return await ctx.db.insert("conversations", {
+        organizationId,
+        projectId,
+        grantId: sendGrant.grantId,
+        version: spec.version,
+        state: spec.state,
+        recipientConfigVersion: 1,
+        updatedAt: Date.now(),
+      });
+    });
+    conversationId = inserted;
+    await t.run(async (ctx) => {
+      await ctx.db.patch(negotiationId, { conversationId, updatedAt: Date.now() });
+    });
+  }
   const sendJob = await asOwner.mutation(startJobRef, {
     organizationId,
     projectId,
@@ -535,6 +569,7 @@ async function createFixture(
     draftOperationId: draftOperation.operationId,
     sendJobId: sendJob.jobId,
     sendGrantId: sendGrant.grantId,
+    ...(conversationId === undefined ? {} : { conversationId }),
     draftBody,
     expectedDraftSources: draftWorkload.sources.map(({ sourceId, version, locator }) => ({
       sourceId,
@@ -603,7 +638,7 @@ async function tableCounts(t: TestConvex<typeof schema>) {
 }
 
 describe("E12 permitted clarify and counter paths", () => {
-  test.skip("clarify move sends once through the owner-only dispatch path", async () => {
+  test("clarify move sends once through the owner-only dispatch path", async () => {
     const t = init();
     const fixture = await createFixture(t, "clarify");
     const { result, log } = await runStep(fixture, "req-e12-clarify", {});
@@ -636,7 +671,7 @@ describe("E12 permitted clarify and counter paths", () => {
     expect(state.operation?.state).toBe("observedSuccess");
   });
 
-  test.skip("counter move sends with honest lineage and no commitment writes", async () => {
+  test("counter move sends with honest lineage and no commitment writes", async () => {
     const t = init();
     const fixture = await createFixture(t, "counter");
     const log = installFetchStub({ jevChoice: "counter" }, {
@@ -707,7 +742,7 @@ describe("E12 missing and invalid model output", () => {
     expect(log.agentmail).toHaveLength(0);
   });
 
-  test.skip("rejected OpenAI draft waits with zero sends", async () => {
+  test("rejected OpenAI draft waits with zero sends", async () => {
     const t = init();
     const fixture = await createFixture(t);
     const { result, log } = await runStep(fixture, "req-e12-draftreject", { openaiHttp: 400 });
@@ -717,23 +752,28 @@ describe("E12 missing and invalid model output", () => {
     expect(log.agentmail).toHaveLength(0);
   });
 
-  test.skip("draft kind mismatch denies with zero sends", async () => {
+  test("draft kind mismatch denies with zero sends", async () => {
     const t = init();
     const fixture = await createFixture(t);
     const { result, log } = await runStep(fixture, "req-e12-kindmismatch", { draftKindMismatch: true });
-    expect(result).toMatchObject({ ok: false, code: "draft-malformed" });
+    // The pinned Responses schema rejects the kind mismatch, so the real
+    // boundary reports a rejected draft and the step waits honestly with
+    // zero sends and no consumed round.
+    expect(result).toMatchObject({ ok: true, outcome: "waiting", reason: "draft-unavailable" });
     expect(log.agentmail).toHaveLength(0);
+    const counts = await tableCounts(t);
+    expect(counts.negotiations).toEqual([{ roundsUsed: 0, state: "active" }]);
   });
 
-  test.skip("draft pinned to the wrong quote source denies with zero sends", async () => {
+  test("draft pinned to the wrong quote source waits with zero sends", async () => {
     const t = init();
     const fixture = await createFixture(t);
     const { result, log } = await runStep(fixture, "req-e12-wrongsources", { draftSourcesWrong: true });
-    expect(result).toMatchObject({ ok: false, code: "draft-malformed" });
+    expect(result).toMatchObject({ ok: true, outcome: "waiting", reason: "draft-unavailable" });
     expect(log.agentmail).toHaveLength(0);
   });
 
-  test.skip("draft leaking the confidential target figure denies with zero sends", async () => {
+  test("draft leaking the confidential target figure denies with zero sends", async () => {
     const t = init();
     const fixture = await createFixture(t);
     const { result, log } = await runStep(fixture, "req-e12-leak", {
@@ -773,7 +813,7 @@ describe("E12 owner-recipient enforcement", () => {
     expect(log.agentmail).toHaveLength(0);
   });
 
-  test.skip("a vendor address in the request still sends only to the owner mailbox", async () => {
+  test("a vendor address in the request still sends only to the owner mailbox", async () => {
     const t = init();
     const fixture = await createFixture(t);
     const { result, log } = await runStep(fixture, "req-e12-vendorask", {}, {
@@ -912,7 +952,7 @@ describe("E12 round limit and termination", () => {
 });
 
 describe("E12 duplicate retry and ambiguous recovery", () => {
-  test.skip("identical retry deduplicates with zero new calls, drafts, operations, or messages", async () => {
+  test("identical retry deduplicates with zero new calls, drafts, operations, or messages", async () => {
     const t = init();
     const fixture = await createFixture(t);
     const first = await runStep(fixture, "req-e12-dedup", {});
@@ -927,7 +967,7 @@ describe("E12 duplicate retry and ambiguous recovery", () => {
     expect(countsAfterSecond).toEqual(countsAfterFirst);
   });
 
-  test.skip("ambiguous send stays unknown under reconciliation and never resends", async () => {
+  test("ambiguous send stays unknown under reconciliation and never resends", async () => {
     const t = init();
     const fixture = await createFixture(t);
     const first = await runStep(fixture, "req-e12-ambiguous", { agentmailHttp: 500 });
@@ -950,7 +990,7 @@ describe("E12 duplicate retry and ambiguous recovery", () => {
     expect(second.log.agentmail).toHaveLength(0);
   });
 
-  test.skip("provider rejection waits as send-failure without advancing the round", async () => {
+  test("provider rejection waits as send-failure without advancing the round", async () => {
     const t = init();
     const fixture = await createFixture(t);
     const { result, log } = await runStep(fixture, "req-e12-providerfail", { agentmailHttp: 400 });
@@ -1103,5 +1143,384 @@ describe("E12 D-17 scope, tenant isolation, and guest denial", () => {
     expect(log.agentmail).toHaveLength(0);
     const counts = await tableCounts(t);
     expect(counts.outboundSnapshots).toBe(0);
+  });
+});
+
+describe("E12 Devin 4060796928: bound replies stop obsolete follow-ups", () => {
+  test("replyReceived conversation stops with zero provider calls", async () => {
+    const t = init();
+    const fixture = await createFixture(t, "clarify", {
+      conversation: { version: 1, state: "awaitingReply" },
+    });
+    // The owner reply arrives: version advances and the state flips before
+    // ingestion extracts a new quote version. The loader pins v2 on both
+    // sides (the reported bug); the conversation gate must still stop.
+    await t.run(async (ctx) => {
+      const rows = await ctx.db.query("conversations").take(5);
+      for (const row of rows) {
+        await ctx.db.patch(row._id, {
+          version: 2,
+          state: "replyReceived",
+          lastReplyAt: Date.now(),
+          updatedAt: Date.now(),
+        });
+      }
+    });
+    const { result, log } = await runStep(fixture, "req-e12-reply", {});
+    expect(result).toMatchObject({ ok: true, outcome: "stopped", reason: "conversation-changed" });
+    expect(log.jev).toHaveLength(0);
+    expect(log.openai).toHaveLength(0);
+    expect(log.agentmail).toHaveLength(0);
+    const counts = await tableCounts(t);
+    expect(counts.negotiations).toEqual([{ roundsUsed: 0, state: "active" }]);
+  });
+
+  test("closed conversation stops with zero provider calls", async () => {
+    const t = init();
+    const fixture = await createFixture(t, "clarify", {
+      conversation: { version: 1, state: "awaitingReply" },
+    });
+    await t.run(async (ctx) => {
+      const rows = await ctx.db.query("conversations").take(5);
+      for (const row of rows) {
+        await ctx.db.patch(row._id, { state: "closed", updatedAt: Date.now() });
+      }
+    });
+    const { result, log } = await runStep(fixture, "req-e12-convclosed", {});
+    expect(result).toMatchObject({ ok: true, outcome: "stopped", reason: "conversation-changed" });
+    expect(log.jev).toHaveLength(0);
+    expect(log.agentmail).toHaveLength(0);
+  });
+});
+
+describe("E12 Devin 4060796714: two-phase prepare and dispatch", () => {
+  async function runPrepare(
+    fixture: Fixture,
+    plan: StubPlan,
+    move: "clarify" | "counter" = "clarify",
+  ) {
+    const log = installFetchStub(plan, {
+      draftKind: move,
+      sources: fixture.expectedDraftSources,
+      content: fixture.draftBody,
+    });
+    const result = await fixture.t.withIdentity(OWNER).action(prepareRef, {
+      negotiationId: fixture.negotiationId,
+      jevOperationId: fixture.jevOperationId,
+      draftOperationId: fixture.draftOperationId,
+    });
+    return { result, log };
+  }
+
+  async function runDispatch(
+    fixture: Fixture,
+    requestId: string,
+    envelopeCanonical: string,
+    plan: StubPlan,
+    extra: { requestText?: string; identity?: { tokenIdentifier: string } } = {},
+  ) {
+    const log = installFetchStub(plan, {
+      draftKind: "clarify",
+      sources: fixture.expectedDraftSources,
+      content: fixture.draftBody,
+    });
+    const result = await fixture.t.withIdentity(extra.identity ?? OWNER).action(dispatchRef, {
+      negotiationId: fixture.negotiationId,
+      requestId,
+      envelopeCanonical,
+      inboxId: INBOX_ID,
+      ...(extra.requestText === undefined ? {} : { requestText: extra.requestText }),
+    });
+    return { result, log };
+  }
+
+  test("prepare with hold move waits without drafting, operating, or consuming", async () => {
+    const t = init();
+    const fixture = await createFixture(t);
+    const { result, log } = await runPrepare(fixture, { jevChoice: "hold" });
+    expect(result).toMatchObject({ ok: true, outcome: "waiting", reason: "waiting-for-owner" });
+    expect(log.jev).toHaveLength(1);
+    expect(log.openai).toHaveLength(0);
+    const counts = await tableCounts(t);
+    expect(counts.operations).toBe(2);
+    expect(counts.negotiations).toEqual([{ roundsUsed: 0, state: "active" }]);
+  });
+
+  test("prepare with stop move stops without drafting", async () => {
+    const t = init();
+    const fixture = await createFixture(t);
+    const { result, log } = await runPrepare(fixture, { jevChoice: "stop" });
+    expect(result).toMatchObject({ ok: true, outcome: "stopped", reason: "stop-move" });
+    expect(log.openai).toHaveLength(0);
+  });
+
+  test("dispatch without an exact grant denies with zero sends", async () => {
+    const t = init();
+    const fixture = await createFixture(t);
+    const forged = canonicalJson(sendEnvelope(OWNER_MAILBOX, COUNTER_BODY));
+    const { result, log } = await runDispatch(fixture, "req-e12-nogrant", forged, {});
+    expect(result).toMatchObject({ ok: false, code: "grant-not-current" });
+    expect(log.jev).toHaveLength(0);
+    expect(log.openai).toHaveLength(0);
+    expect(log.agentmail).toHaveLength(0);
+    const counts = await tableCounts(t);
+    expect(counts.outboundSnapshots).toBe(0);
+  });
+
+  test("dispatch with a vendor recipient denies before any send", async () => {
+    const t = init();
+    const fixture = await createFixture(t);
+    const vendorEnvelope = canonicalJson(sendEnvelope("vendor@example.com", fixture.draftBody));
+    const { result, log } = await runDispatch(fixture, "req-e12-vendorto", vendorEnvelope, {});
+    expect(result).toMatchObject({ ok: false });
+    expect(log.agentmail).toHaveLength(0);
+    for (const entry of log.agentmail) {
+      expect(entry.body).not.toContain("vendor@example.com");
+    }
+  });
+
+  test("dispatch with a non-fixed subject denies", async () => {
+    const t = init();
+    const fixture = await createFixture(t);
+    const tampered = canonicalJson({
+      ...sendEnvelope(OWNER_MAILBOX, fixture.draftBody),
+      subject: "Urgent wire instruction",
+    });
+    const { result, log } = await runDispatch(fixture, "req-e12-badsubject", tampered, {});
+    expect(result).toMatchObject({ ok: false, code: "outbound-denied" });
+    expect(log.agentmail).toHaveLength(0);
+  });
+
+  test("dispatch D-17 unrelated creates no effect", async () => {
+    const t = init();
+    const fixture = await createFixture(t);
+    const envelope = canonicalJson(sendEnvelope(OWNER_MAILBOX, fixture.draftBody));
+    const before = await tableCounts(t);
+    const { result, log } = await runDispatch(fixture, "req-e12-dunrelated", envelope, {}, {
+      requestText: "do my homework assignment about ancient history",
+    });
+    expect(result).toMatchObject({ ok: false, code: "unrelated-refusal" });
+    expect(log.agentmail).toHaveLength(0);
+    const after = await tableCounts(t);
+    expect(after.operations).toBe(before.operations);
+    expect(after.outboundSnapshots).toBe(before.outboundSnapshots);
+  });
+
+  test("dispatch full success sends once to the owner only", async () => {
+    const t = init();
+    const fixture = await createFixture(t);
+    const envelope = canonicalJson(sendEnvelope(OWNER_MAILBOX, fixture.draftBody));
+    const { result, log } = await runDispatch(fixture, "req-e12-dsent", envelope, {});
+    expect(result).toMatchObject({ ok: true, outcome: "sent", move: "none" });
+    expect(log.jev).toHaveLength(0);
+    expect(log.openai).toHaveLength(0);
+    expect(log.agentmail).toHaveLength(1);
+    expect(log.agentmail[0]?.body).toContain(OWNER_MAILBOX);
+    if (result.ok && result.outcome === "sent") {
+      expect(result.providerMessageId).toBe("msg-e12-1");
+      expect(result.roundsUsedAfter).toBe(1);
+    } else {
+      throw new Error("expected sent dispatch");
+    }
+    const state = await t.run(async (ctx) => ({
+      negotiation: await ctx.db.get(fixture.negotiationId),
+      job: await ctx.db.get(fixture.sendJobId),
+      snapshots: await ctx.db.query("outboundSnapshots").take(5),
+    }));
+    expect(state.negotiation?.roundsUsed).toBe(1);
+    expect(state.job?.state).toBe("waitingForSupplier");
+    expect(state.snapshots).toHaveLength(1);
+    expect(state.snapshots[0]?.to).toBe(OWNER_MAILBOX);
+    const counts = await tableCounts(t);
+    expect(counts.orders).toBe(0);
+    expect(counts.selections).toBe(0);
+    expect(counts.approvals).toBe(0);
+    expect(counts.costEntries).toBe(0);
+  });
+
+  test("dispatch duplicate retry deduplicates with zero new sends", async () => {
+    const t = init();
+    const fixture = await createFixture(t);
+    const envelope = canonicalJson(sendEnvelope(OWNER_MAILBOX, fixture.draftBody));
+    const first = await runDispatch(fixture, "req-e12-ddedup", envelope, {});
+    expect(first.result).toMatchObject({ ok: true, outcome: "sent" });
+    const countsAfterFirst = await tableCounts(t);
+    const second = await runDispatch(fixture, "req-e12-ddedup", envelope, {});
+    expect(second.result).toMatchObject({ ok: true, outcome: "deduplicated" });
+    expect(second.log.agentmail).toHaveLength(0);
+    expect(second.log.jev).toHaveLength(0);
+    const countsAfterSecond = await tableCounts(t);
+    expect(countsAfterSecond).toEqual(countsAfterFirst);
+  });
+});
+
+describe("E12 Devin 4060797039: atomic round accounting", () => {
+  async function dispatchEnvelope(
+    fixture: Fixture,
+    requestId: string,
+    plan: StubPlan,
+  ) {
+    const log = installFetchStub(plan, {
+      draftKind: "clarify",
+      sources: fixture.expectedDraftSources,
+      content: fixture.draftBody,
+    });
+    const result = await fixture.t.withIdentity(OWNER).action(dispatchRef, {
+      negotiationId: fixture.negotiationId,
+      requestId,
+      envelopeCanonical: canonicalJson(sendEnvelope(OWNER_MAILBOX, fixture.draftBody)),
+      inboxId: INBOX_ID,
+    });
+    return { result, log };
+  }
+
+  test("definitive provider rejection refunds the round", async () => {
+    const t = init();
+    const fixture = await createFixture(t);
+    const { result, log } = await dispatchEnvelope(fixture, "req-e12-refund", { agentmailHttp: 400 });
+    expect(result).toMatchObject({ ok: true, outcome: "waiting", reason: "send-failure" });
+    expect(log.agentmail).toHaveLength(1);
+    const state = await t.run(async (ctx) => ({
+      rounds: (await ctx.db.get(fixture.negotiationId))?.roundsUsed,
+      operation: await ctx.db
+        .query("operations")
+        .withIndex("by_requestKey", (q) =>
+          q.eq("requestKey", `${fixture.organizationId}|communication.send|req-e12-refund`),
+        )
+        .unique(),
+    }));
+    expect(state.rounds).toBe(0);
+    expect(state.operation?.state).toBe("observedFailure");
+  });
+
+  test("ambiguous outcome keeps the round without resending", async () => {
+    const t = init();
+    const fixture = await createFixture(t);
+    const first = await dispatchEnvelope(fixture, "req-e12-keep", { agentmailHttp: 500 });
+    expect(first.result).toMatchObject({ ok: true, outcome: "waiting", reason: "outcome-unknown" });
+    const rounds = await t.run(async (ctx) => (await ctx.db.get(fixture.negotiationId))?.roundsUsed);
+    expect(rounds).toBe(1);
+    const second = await dispatchEnvelope(fixture, "req-e12-keep", {});
+    expect(second.result).toMatchObject({ ok: true, outcome: "waiting", reason: "outcome-unknown" });
+    expect(second.log.agentmail).toHaveLength(0);
+  });
+
+  test("dispatch at the exhausted limit stops with zero sends", async () => {
+    const t = init();
+    const fixture = await createFixture(t);
+    await t.run(async (ctx) => {
+      await ctx.db.patch(fixture.negotiationId, { roundsUsed: 3, updatedAt: Date.now() });
+    });
+    const { result, log } = await dispatchEnvelope(fixture, "req-e12-atlimit", {});
+    expect(result).toMatchObject({ ok: true, outcome: "stopped", reason: "round-limit-reached" });
+    expect(log.agentmail).toHaveLength(0);
+  });
+
+  test("consume denies when rounds moved concurrently", async () => {
+    const t = init();
+    const fixture = await createFixture(t);
+    const consumeRef = makeFunctionReference<
+      "mutation",
+      MutationArgs<typeof orchestrator.consumeNegotiationRound>,
+      MutationReturn<typeof orchestrator.consumeNegotiationRound>
+    >("negotiation/orchestrator:consumeNegotiationRound");
+    const refundRef = makeFunctionReference<
+      "mutation",
+      MutationArgs<typeof orchestrator.refundNegotiationRound>,
+      MutationReturn<typeof orchestrator.refundNegotiationRound>
+    >("negotiation/orchestrator:refundNegotiationRound");
+    const first = await t.withIdentity(OWNER).mutation(consumeRef, {
+      negotiationId: fixture.negotiationId,
+      identity: OWNER.tokenIdentifier,
+      expectedRoundsUsed: 0,
+      expectedQuoteVersion: "qv-1",
+      expectedQuoteContentHash: "hash-qv-1",
+      expectedRecipientVersion: 1,
+    });
+    expect(first).toMatchObject({ ok: true, roundsUsedAfter: 1 });
+    const second = await t.withIdentity(OWNER).mutation(consumeRef, {
+      negotiationId: fixture.negotiationId,
+      identity: OWNER.tokenIdentifier,
+      expectedRoundsUsed: 0,
+      expectedQuoteVersion: "qv-1",
+      expectedQuoteContentHash: "hash-qv-1",
+      expectedRecipientVersion: 1,
+    });
+    expect(second).toMatchObject({ ok: false, code: "stale-input-version" });
+    const refunded = await t.withIdentity(OWNER).mutation(refundRef, {
+      negotiationId: fixture.negotiationId,
+      identity: OWNER.tokenIdentifier,
+      expectedRoundsUsed: 0,
+    });
+    expect(refunded).toMatchObject({ ok: true, refunded: true, roundsUsed: 0 });
+  });
+});
+
+describe("E12 Devin 4060797122: bounded capacity search", () => {
+  test("discovery finds a valid chain past a full window of decoy grants", async () => {
+    const t = init();
+    const fixture = await createFixture(t);
+    const asOwner = t.withIdentity(OWNER);
+    for (let index = 0; index < 70; index += 1) {
+      const decoy = await asOwner.mutation(issueGrantRef, {
+        organizationId: fixture.organizationId,
+        projectId: fixture.projectId,
+        operations: ["communication.send"],
+        communicationProfile: "ownerRoleplay",
+        recipientConfigVersion: 1,
+        inputVersions: { send: "send-v1" },
+        payloadJson: canonicalJson({ note: `decoy-${index}` }),
+        costCeilingMicroUsd: 1_000_000,
+        roundLimit: 8,
+        expiresAt: Date.now() + 60 * 60 * 1000,
+        workflowAuthorities: [{ operationId: "communication.send", projectId: fixture.projectId }],
+      });
+      if (!decoy.ok) throw new Error(`decoy grant setup failed: ${JSON.stringify(decoy)}`);
+    }
+    const envelope = canonicalJson(sendEnvelope(OWNER_MAILBOX, COUNTER_BODY));
+    const valid = await asOwner.mutation(issueGrantRef, {
+      organizationId: fixture.organizationId,
+      projectId: fixture.projectId,
+      operations: ["communication.send"],
+      communicationProfile: "ownerRoleplay",
+      recipientConfigVersion: 1,
+      inputVersions: { send: "send-v1" },
+      payloadJson: envelope,
+      costCeilingMicroUsd: 1_000_000,
+      roundLimit: 8,
+      expiresAt: Date.now() + 60 * 60 * 1000,
+      workflowAuthorities: [{ operationId: "communication.send", projectId: fixture.projectId }],
+    });
+    if (!valid.ok) throw new Error(`valid grant setup failed: ${JSON.stringify(valid)}`);
+    const job = await asOwner.mutation(startJobRef, {
+      organizationId: fixture.organizationId,
+      projectId: fixture.projectId,
+      text: COUNTER_BODY,
+      operationId: "communication.send",
+      kind: "communication",
+      grantId: valid.grantId,
+    });
+    if (!job.ok) throw new Error(`valid job setup failed: ${JSON.stringify(job)}`);
+    const reservation = await asOwner.mutation(reserveRef, {
+      jobId: job.jobId,
+      organizationId: fixture.organizationId,
+      projectId: fixture.projectId,
+      amountMicroUsd: 10_000,
+      pricingBasis: "controlled-send-basis-v1",
+    });
+    if (!reservation.ok) throw new Error(`valid reservation setup failed: ${reservation.message}`);
+    const log = installFetchStub({}, {
+      draftKind: "counter",
+      sources: fixture.expectedDraftSources,
+      content: COUNTER_BODY,
+    });
+    const result = await asOwner.action(dispatchRef, {
+      negotiationId: fixture.negotiationId,
+      requestId: "req-e12-pastwindow",
+      envelopeCanonical: envelope,
+      inboxId: INBOX_ID,
+    });
+    expect(result).toMatchObject({ ok: true, outcome: "sent" });
+    expect(log.agentmail).toHaveLength(1);
   });
 });

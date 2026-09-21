@@ -52,10 +52,11 @@ import type {
 import { v } from "convex/values";
 import type { Id } from "../_generated/dataModel.js";
 import { f1Action, f1InternalMutation, f1InternalQuery, f1Query } from "../server.js";
+import type { F1DataModel } from "../server.js";
+import type { GenericActionCtx } from "convex/server";
 import {
   checkNegotiationBounds,
   checkNegotiationFences,
-  deduplicateNegotiationRetry,
   NEGOTIATION_MAX_DRAFT_BYTES,
   NEGOTIATION_OPENAI_MODEL,
   NEGOTIATION_OPERATION_KIND,
@@ -194,6 +195,36 @@ interface PinnedContext {
 
 function genericDenial(): { ok: false; code: string; message: string } {
   return { ok: false, code: "denied-membership", message: "not authorized for this project" };
+}
+
+/**
+ * Negotiation-local conversation gate (Devin 4060796928 repair).
+ *
+ * E6 fences pin conversation identity but never inspect conversation state,
+ * so a bound owner reply that advanced the version would pass the equality
+ * fence and the step could send an obsolete follow-up without reading the
+ * reply. PRD requires a supplier reply to stop obsolete queued follow-ups
+ * before dispatch, so a bound conversation sitting in `replyReceived`,
+ * `closed`, or `cancelled` stops the step with zero provider calls. The
+ * reply must first be ingested into a new quote version and mandate basis
+ * before another outbound step may proceed.
+ *
+ * Residual shared need: the mandate-approved conversation version is not a
+ * persisted negotiations field, so an already-processed reply (state moved
+ * past `replyReceived` without a new quote version) still passes on current
+ * pins. Persisting that basis is a foundation-owned schema change.
+ */
+function conversationGate(conversationState: string | undefined): {
+  readonly stopped: boolean;
+} {
+  if (
+    conversationState === "replyReceived" ||
+    conversationState === "closed" ||
+    conversationState === "cancelled"
+  ) {
+    return { stopped: true };
+  }
+  return { stopped: false };
 }
 
 /**
@@ -480,6 +511,112 @@ export function sendEnvelope(
   };
 }
 
+type NegotiationActionCtx = GenericActionCtx<F1DataModel>;
+
+/**
+ * Resolve live rows into pinned snapshots or a denial. Shared by every
+ * entrypoint so auth, D-17, capability, and pinning never drift between
+ * the single-step and two-phase flows.
+ */
+async function resolvePins(
+  ctx: NegotiationActionCtx,
+  negotiationId: Id<"negotiations">,
+  identity: string,
+  requestText: string | undefined,
+): Promise<
+  { readonly ok: true; readonly pinned: PinnedContext } | { readonly ok: false; readonly code: string; readonly message: string }
+> {
+  const loaded = await ctx.runQuery(loadContextRef, {
+    negotiationId,
+    identity,
+    ...(requestText === undefined ? {} : { requestText }),
+  });
+  if (!loaded.ok) return { ok: false, code: loaded.code, message: loaded.message };
+  return {
+    ok: true,
+    pinned: {
+      organizationId: loaded.organizationId as Id<"organizations">,
+      projectId: loaded.projectId as Id<"projects">,
+      projectName: loaded.projectName,
+      negotiationId: loaded.negotiationId as Id<"negotiations">,
+      quoteId: loaded.quoteId as Id<"quotes">,
+      mandateState: loaded.mandateState,
+      mandateQuoteVersion: loaded.mandateQuoteVersion,
+      mandateQuoteContentHash: loaded.mandateQuoteContentHash,
+      mandateConversationId:
+        loaded.mandateHasConversation && loaded.currentConversationId !== undefined
+          ? (loaded.currentConversationId as Id<"conversations">)
+          : undefined,
+      mandateConversationVersion: loaded.mandateConversationVersion,
+      roundsUsed: loaded.roundsUsed,
+      roundLimit: loaded.roundLimit,
+      expiresAt: loaded.expiresAt,
+      targetMinorUnits: loaded.targetMinorUnits,
+      quoteVersion: loaded.quote.version,
+      quoteContentHash: loaded.quote.contentHash,
+      quoteExcerpt: loaded.quote.excerpt,
+      quoteSuperseded: loaded.quoteSuperseded,
+      conversationVersion: loaded.currentConversationVersion,
+      conversationState: loaded.conversationState,
+      recipientConfigured: loaded.recipientConfigured,
+      recipientConfigVersion: loaded.recipientConfigVersion,
+      recipientMailboxNormalized: loaded.recipientMailboxNormalized,
+    },
+  };
+}
+
+/**
+ * Validate a caller-supplied approved envelope against the live owner
+ * mailbox and mandate disclosure. The grant equality check (exact payload
+ * approval) happens separately in discovery; this gate ensures the text
+ * itself is safe and well-formed before any operation exists.
+ */
+function validateApprovedEnvelope(
+  envelopeCanonical: unknown,
+  recipientMailboxNormalized: string | undefined,
+  targetMinorUnits: number | undefined,
+):
+  | { readonly ok: true; readonly body: string; readonly redactedPreview: string }
+  | { readonly ok: false; readonly code: string; readonly message: string } {
+  if (typeof envelopeCanonical !== "string" || envelopeCanonical.trim().length === 0) {
+    return { ok: false, code: "invalid-payload", message: "approved envelope is required" };
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(envelopeCanonical) as unknown;
+  } catch {
+    return { ok: false, code: "invalid-payload", message: "approved envelope is not valid JSON" };
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return { ok: false, code: "invalid-payload", message: "approved envelope must be an object" };
+  }
+  const record = value as Record<string, unknown>;
+  if (record["subject"] !== NEGOTIATION_SUBJECT) {
+    return { ok: false, code: "outbound-denied", message: "envelope subject is not the fixed server subject" };
+  }
+  if (typeof record["body"] !== "string" || record["body"].trim().length === 0) {
+    return { ok: false, code: "draft-malformed", message: "approved envelope carries no draft text" };
+  }
+  if (new TextEncoder().encode(record["body"]).byteLength > NEGOTIATION_MAX_DRAFT_BYTES) {
+    return { ok: false, code: "draft-malformed", message: "approved envelope draft exceeds the output bound" };
+  }
+  const outbound = validateOutboundPayload(value, recipientMailboxNormalized);
+  if (isCommunicationDenial(outbound)) {
+    return { ok: false, code: "outbound-denied", message: outbound.message };
+  }
+  if (canonicalJson(value) !== outbound.canonical) {
+    return { ok: false, code: "outbound-denied", message: "payload canonical form changed" };
+  }
+  const checked = validateNegotiationDraft(record["body"], {
+    ...(targetMinorUnits === undefined ? {} : { targetMinorUnits }),
+    ...(recipientMailboxNormalized === undefined
+      ? {}
+      : { ownerMailboxNormalized: recipientMailboxNormalized }),
+  });
+  if (!checked.ok) return { ok: false, code: checked.code, message: checked.message };
+  return { ok: true, body: record["body"], redactedPreview: checked.redactedPreview };
+}
+
 function mandateSnapshotOf(pinned: PinnedContext): MandateSnapshot {
   return {
     negotiationId: String(pinned.negotiationId),
@@ -557,7 +694,25 @@ const sendCandidateValidator = v.object({
 /**
  * Discover the exact send grant/job/reservation bound to one validated
  * envelope. Reads only; fails closed when nothing current authorizes it.
+ *
+ * Bounded pagination (Devin 4060797122 repair): fixed-window `.take()`
+ * scans could hide a valid chain behind older unusable grants, so every
+ * level paginates to proof of exhaustion. Hitting a page bound with more
+ * rows remaining returns an explicit `capacity-search-exhausted` denial
+ * instead of a false `grant-not-current` absence.
  */
+/**
+ * Bounded scan windows with overflow detection. Convex allows only one
+ * `.paginate()` call per function execution, so capacity search uses
+ * `take(window + 1)` reads: a full (window + 1)th row proves truncation and
+ * returns an explicit `capacity-search-exhausted` denial instead of a false
+ * absence. Windows comfortably exceed the F1 admission bounds
+ * (MAX_JOBS_PER_GRANT, MAX_OPERATIONS_PER_GRANT, MAX_OPERATIONS_PER_JOB,
+ * MAX_RESERVATIONS_PER_JOB are all 64).
+ */
+const DISCOVER_GRANT_WINDOW = 128;
+const DISCOVER_JOB_WINDOW = 65;
+const DISCOVER_RESERVATION_WINDOW = 65;
 export const discoverSendCapacity = f1InternalQuery({
   args: {
     organizationId: v.id("organizations"),
@@ -583,10 +738,6 @@ export const discoverSendCapacity = f1InternalQuery({
       return { ok: false as const, code: access.code, message: access.message };
     }
     const now = Date.now();
-    const grants = await ctx.db
-      .query("grants")
-      .withIndex("by_project_and_status", (q) => q.eq("projectId", args.projectId).eq("status", "active"))
-      .take(64);
     const recipients = await ctx.db
       .query("recipientConfigs")
       .withIndex("by_active", (q) => q.eq("active", true))
@@ -595,6 +746,17 @@ export const discoverSendCapacity = f1InternalQuery({
       return { ok: false as const, code: "recipient-missing", message: "owner recipient is not configured" };
     }
     const recipient = recipients[0];
+    const grants = await ctx.db
+      .query("grants")
+      .withIndex("by_project_and_status", (q) => q.eq("projectId", args.projectId).eq("status", "active"))
+      .take(DISCOVER_GRANT_WINDOW + 1);
+    if (grants.length > DISCOVER_GRANT_WINDOW) {
+      return {
+        ok: false as const,
+        code: "capacity-search-exhausted",
+        message: "grant search exceeded its bounded window without proving exhaustion",
+      };
+    }
     for (const grant of grants) {
       if (
         grant.organizationId !== args.organizationId ||
@@ -609,7 +771,14 @@ export const discoverSendCapacity = f1InternalQuery({
       const jobs = await ctx.db
         .query("jobs")
         .withIndex("by_grant", (q) => q.eq("grantId", grant._id))
-        .take(16);
+        .take(DISCOVER_JOB_WINDOW + 1);
+      if (jobs.length > DISCOVER_JOB_WINDOW) {
+        return {
+          ok: false as const,
+          code: "capacity-search-exhausted",
+          message: "job search exceeded its bounded window without proving exhaustion",
+        };
+      }
       for (const job of jobs) {
         if (
           job.organizationId !== args.organizationId ||
@@ -625,9 +794,18 @@ export const discoverSendCapacity = f1InternalQuery({
         const reservations = await ctx.db
           .query("reservations")
           .withIndex("by_job", (q) => q.eq("jobId", job._id))
-          .take(16);
+          .take(DISCOVER_RESERVATION_WINDOW + 1);
+        if (reservations.length > DISCOVER_RESERVATION_WINDOW) {
+          return {
+            ok: false as const,
+            code: "capacity-search-exhausted",
+            message: "reservation search exceeded its bounded window without proving exhaustion",
+          };
+        }
         for (const reservation of reservations) {
-          if (reservation.state !== "open" || reservation.organizationId !== args.organizationId) continue;
+          if (reservation.state !== "open" || reservation.organizationId !== args.organizationId) {
+            continue;
+          }
           const bound = await ctx.db
             .query("operations")
             .withIndex("by_reservation", (q) => q.eq("reservationId", reservation._id))
@@ -725,10 +903,207 @@ const outcomeValidator = v.union(
 );
 
 /**
- * Persist honest round accounting and job states against existing records.
- * Rounds advance only for an observed send; waiting maps to the existing
- * supplier/user wait states. Terminal, denied, and deduplicated outcomes
- * write nothing. Never touches quotes, orders, selections, or commitments.
+ * Atomically consume one negotiation round before the external effect
+ * (Devin 4060797039 repair).
+ *
+ * Post-send incrementing loses rounds under concurrency: two accepted sends
+ * can observe the same pre-send count and only one increment survives, and a
+ * post-send membership loss drops the increment entirely. Consuming first,
+ * in the same transaction that re-verifies mandate state, expiry, round
+ * limit, quote/conversation pins, and recipient version, makes every send
+ * own exactly one recorded round. Definitive non-sends refund through
+ * `refundNegotiationRound`; ambiguous outcomes never refund, so a possibly
+ * sent message always keeps its round. Over-counting on crash before refund
+ * is the documented conservative direction; under-counting is impossible.
+ */
+export const consumeNegotiationRound = f1InternalMutation({
+  args: {
+    negotiationId: v.id("negotiations"),
+    identity: v.string(),
+    expectedRoundsUsed: v.number(),
+    expectedQuoteVersion: v.string(),
+    expectedQuoteContentHash: v.string(),
+    expectedConversationVersion: v.optional(v.number()),
+    expectedRecipientVersion: v.number(),
+  },
+  returns: v.union(
+    v.object({ ok: v.literal(true), roundsUsedAfter: v.number() }),
+    denialValidator,
+  ),
+  handler: async (ctx, args) => {
+    if (args.identity.trim().length === 0) {
+      return { ok: false as const, code: "forged-identity", message: "missing identity proof" };
+    }
+    const negotiation = await ctx.db.get(args.negotiationId);
+    if (negotiation === null) return genericDenial();
+    const access = await checkProjectAccess(
+      ctx,
+      args.identity,
+      negotiation.organizationId,
+      negotiation.projectId,
+      "approver",
+      Date.now(),
+    );
+    if (!access.ok) {
+      if (access.code === "denied-membership") return genericDenial();
+      return { ok: false as const, code: access.code, message: access.message };
+    }
+    const now = Date.now();
+    if (negotiation.state === "paused") {
+      return { ok: false as const, code: "mandate-paused", message: "negotiation mandate is paused" };
+    }
+    if (negotiation.state === "revoked") {
+      return { ok: false as const, code: "mandate-revoked", message: "negotiation mandate was revoked" };
+    }
+    if (negotiation.state === "concluded") {
+      return { ok: false as const, code: "mandate-concluded", message: "negotiation mandate concluded" };
+    }
+    if (negotiation.state === "expired" || now >= negotiation.expiresAt) {
+      return { ok: false as const, code: "mandate-expired", message: "negotiation mandate expired" };
+    }
+    if (negotiation.state !== "active") {
+      return { ok: false as const, code: "mandate-not-active", message: "negotiation mandate is not active" };
+    }
+    if (negotiation.roundsUsed !== args.expectedRoundsUsed) {
+      return {
+        ok: false as const,
+        code: "stale-input-version",
+        message: "negotiation rounds changed before the send; re-approval required",
+      };
+    }
+    if (negotiation.roundsUsed >= negotiation.roundLimit) {
+      return { ok: false as const, code: "round-limit-reached", message: "negotiation round limit reached" };
+    }
+    const quote = await ctx.db.get(negotiation.quoteId);
+    if (
+      quote === null ||
+      quote.organizationId !== negotiation.organizationId ||
+      quote.projectId !== negotiation.projectId ||
+      quote.version !== args.expectedQuoteVersion ||
+      quote.contentHash !== args.expectedQuoteContentHash
+    ) {
+      return { ok: false as const, code: "quote-changed", message: "bound quote changed before the send" };
+    }
+    const successors = await ctx.db
+      .query("quotes")
+      .withIndex("by_project_and_supersedes", (q) =>
+        q.eq("projectId", negotiation.projectId).eq("supersedes", quote.contentHash),
+      )
+      .take(1);
+    if (successors.length > 0) {
+      return { ok: false as const, code: "quote-superseded", message: "bound quote was superseded before the send" };
+    }
+    if (negotiation.conversationId !== undefined) {
+      const conversation = await ctx.db.get(negotiation.conversationId);
+      if (
+        conversation === null ||
+        conversation.organizationId !== negotiation.organizationId ||
+        conversation.projectId !== negotiation.projectId ||
+        conversation.version !== args.expectedConversationVersion ||
+        conversation.state === "replyReceived" ||
+        conversation.state === "closed" ||
+        conversation.state === "cancelled"
+      ) {
+        return {
+          ok: false as const,
+          code: "conversation-changed",
+          message: "bound conversation changed before the send",
+        };
+      }
+    } else if (args.expectedConversationVersion !== undefined) {
+      return {
+        ok: false as const,
+        code: "conversation-changed",
+        message: "bound conversation changed before the send",
+      };
+    }
+    const recipients = await ctx.db
+      .query("recipientConfigs")
+      .withIndex("by_active", (q) => q.eq("active", true))
+      .take(2);
+    if (recipients.length !== 1 || recipients[0] === undefined) {
+      return { ok: false as const, code: "recipient-missing", message: "owner recipient is not configured" };
+    }
+    if (recipients[0].version !== args.expectedRecipientVersion) {
+      return {
+        ok: false as const,
+        code: "recipient-changed",
+        message: "recipient configuration changed; re-approval required",
+      };
+    }
+    await ctx.db.patch(args.negotiationId, {
+      roundsUsed: negotiation.roundsUsed + 1,
+      updatedAt: now,
+    });
+    return { ok: true as const, roundsUsedAfter: negotiation.roundsUsed + 1 };
+  },
+});
+
+const consumeRoundRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof consumeNegotiationRound>,
+  MutationReturn<typeof consumeNegotiationRound>
+>("negotiation/orchestrator:consumeNegotiationRound");
+
+/**
+ * Refund a consumed round when provably no send occurred (definitive
+ * dispatch denial, definitive provider rejection, or a denied operation
+ * that never dispatched). Best-effort and conditional: it decrements only
+ * when the count is exactly one above the pre-consume expectation, so a
+ * refund can never erase another attempt's round. Ambiguous outcomes never
+ * reach this mutation.
+ */
+export const refundNegotiationRound = f1InternalMutation({
+  args: {
+    negotiationId: v.id("negotiations"),
+    identity: v.string(),
+    expectedRoundsUsed: v.number(),
+  },
+  returns: v.union(
+    v.object({ ok: v.literal(true), refunded: v.boolean(), roundsUsed: v.number() }),
+    denialValidator,
+  ),
+  handler: async (ctx, args) => {
+    if (args.identity.trim().length === 0) {
+      return { ok: false as const, code: "forged-identity", message: "missing identity proof" };
+    }
+    const negotiation = await ctx.db.get(args.negotiationId);
+    if (negotiation === null) return genericDenial();
+    const access = await checkProjectAccess(
+      ctx,
+      args.identity,
+      negotiation.organizationId,
+      negotiation.projectId,
+      "approver",
+      Date.now(),
+    );
+    if (!access.ok) {
+      if (access.code === "denied-membership") return genericDenial();
+      return { ok: false as const, code: access.code, message: access.message };
+    }
+    if (negotiation.roundsUsed === args.expectedRoundsUsed + 1) {
+      await ctx.db.patch(args.negotiationId, {
+        roundsUsed: args.expectedRoundsUsed,
+        updatedAt: Date.now(),
+      });
+      return { ok: true as const, refunded: true, roundsUsed: args.expectedRoundsUsed };
+    }
+    return { ok: true as const, refunded: false, roundsUsed: negotiation.roundsUsed };
+  },
+});
+
+const refundRoundRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof refundNegotiationRound>,
+  MutationReturn<typeof refundNegotiationRound>
+>("negotiation/orchestrator:refundNegotiationRound");
+
+/**
+ * Persist honest job states against existing records. Round accounting now
+ * lives in `consumeNegotiationRound`/`refundNegotiationRound`; this mutation
+ * only moves jobs into the existing supplier/user wait states on sent and
+ * waiting outcomes. Terminal, denied, and deduplicated outcomes write
+ * nothing. Never touches quotes, orders, selections, or commitments.
  */
 export const applyStepOutcome = f1InternalMutation({
   args: {
@@ -773,11 +1148,7 @@ export const applyStepOutcome = f1InternalMutation({
         job.state === "waitingForSupplier" ||
         job.state === "waitingForUser" ||
         job.state === "pausedBudget";
-      if (args.outcome === "sent" && negotiation.roundsUsed === args.expectedRoundsUsed) {
-        await ctx.db.patch(negotiation._id, {
-          roundsUsed: negotiation.roundsUsed + 1,
-          updatedAt: Date.now(),
-        });
+      if (args.outcome === "sent") {
         if (patchable) {
           await ctx.db.patch(job._id, { state: "waitingForSupplier", updatedAt: Date.now() });
         }
@@ -786,7 +1157,7 @@ export const applyStepOutcome = f1InternalMutation({
           outcome: "sent" as const,
           jobId: job._id,
           jobState: "waitingForSupplier",
-          expectedRoundsUsed: args.expectedRoundsUsed + 1,
+          expectedRoundsUsed: negotiation.roundsUsed,
         };
       }
       if (args.outcome === "waiting" && args.jobState !== undefined && patchable) {
@@ -805,15 +1176,11 @@ export const applyStepOutcome = f1InternalMutation({
         expectedRoundsUsed: negotiation.roundsUsed,
       };
     }
-    if (args.outcome === "sent" && negotiation.roundsUsed === args.expectedRoundsUsed) {
-      await ctx.db.patch(negotiation._id, {
-        roundsUsed: negotiation.roundsUsed + 1,
-        updatedAt: Date.now(),
-      });
+    if (args.outcome === "sent") {
       return {
         ok: true as const,
         outcome: "sent" as const,
-        expectedRoundsUsed: args.expectedRoundsUsed + 1,
+        expectedRoundsUsed: negotiation.roundsUsed,
       };
     }
     return { ok: true as const, outcome: args.outcome, expectedRoundsUsed: negotiation.roundsUsed };
@@ -862,10 +1229,19 @@ export const probeSendReadiness = f1InternalQuery({
     if (recipients.length !== 1) {
       return { ok: false as const, code: "recipient-missing", message: "owner recipient is not configured" };
     }
+    // Same bounded-window contract as discovery: never mistake a
+    // truncated scan for absence.
     const grants = await ctx.db
       .query("grants")
       .withIndex("by_project_and_status", (q) => q.eq("projectId", args.projectId).eq("status", "active"))
-      .take(64);
+      .take(DISCOVER_GRANT_WINDOW + 1);
+    if (grants.length > DISCOVER_GRANT_WINDOW) {
+      return {
+        ok: false as const,
+        code: "capacity-search-exhausted",
+        message: "grant search exceeded its bounded window without proving exhaustion",
+      };
+    }
     for (const grant of grants) {
       // Send capacity is specifically a grant carrying the orchestrator's
       // `send` input-version marker (draft/model grants use their own
@@ -883,7 +1259,14 @@ export const probeSendReadiness = f1InternalQuery({
       const jobs = await ctx.db
         .query("jobs")
         .withIndex("by_grant", (q) => q.eq("grantId", grant._id))
-        .take(16);
+        .take(DISCOVER_JOB_WINDOW + 1);
+      if (jobs.length > DISCOVER_JOB_WINDOW) {
+        return {
+          ok: false as const,
+          code: "capacity-search-exhausted",
+          message: "job search exceeded its bounded window without proving exhaustion",
+        };
+      }
       for (const job of jobs) {
         if (
           job.organizationId !== args.organizationId ||
@@ -895,7 +1278,14 @@ export const probeSendReadiness = f1InternalQuery({
         const reservations = await ctx.db
           .query("reservations")
           .withIndex("by_job", (q) => q.eq("jobId", job._id))
-          .take(8);
+          .take(DISCOVER_RESERVATION_WINDOW + 1);
+        if (reservations.length > DISCOVER_RESERVATION_WINDOW) {
+          return {
+            ok: false as const,
+            code: "capacity-search-exhausted",
+            message: "reservation search exceeded its bounded window without proving exhaustion",
+          };
+        }
         if (reservations.some((reservation) => reservation.state === "open")) {
           return { ok: true as const };
         }
@@ -1174,104 +1564,64 @@ export const stepStatus = f1Query({
   },
 });
 
+const preparedResultValidator = v.union(
+  v.object({
+    ok: v.literal(true),
+    outcome: v.literal("prepared"),
+    move: v.string(),
+    envelopeCanonical: v.string(),
+    payloadHash: v.string(),
+    quoteVersion: v.string(),
+    quoteContentHash: v.string(),
+    conversationVersion: v.optional(v.number()),
+    roundsUsed: v.number(),
+    redactedPreview: v.string(),
+  }),
+  v.object({
+    ok: v.literal(true),
+    outcome: v.literal("waiting"),
+    move: v.string(),
+    reason: v.string(),
+    roundsUsedAfter: v.number(),
+    redactedPreview: v.string(),
+  }),
+  v.object({
+    ok: v.literal(true),
+    outcome: v.literal("stopped"),
+    move: v.string(),
+    reason: v.string(),
+    roundsUsedAfter: v.number(),
+    redactedPreview: v.string(),
+  }),
+  denialValidator,
+);
+
 /**
- * Run exactly one bounded negotiation step. Public action: authenticates the
- * caller, pins authority server-side, drives Jev classification, OpenAI
- * drafting, E6 validation, and the single owner-only dispatch path, then
- * persists honest round/job state. Unrelated requests create no
- * negotiation, model, communication, or execution effect.
+ * Phase one of the two-phase flow (Devin 4060796714 repair): classify the
+ * move, generate and validate the draft, and return its exact canonical
+ * envelope WITHOUT sending. A generated draft can never match a
+ * pre-issued grant, so the envelope goes to the approval flow, which
+ * issues an exact send grant; `dispatchApprovedDraft` sends only under
+ * that grant. Consumes no round and creates no operation.
  */
-export const runNegotiationStep = f1Action({
+export const prepareNegotiationDraft = f1Action({
   args: {
     negotiationId: v.id("negotiations"),
-    requestId: v.string(),
     jevOperationId: v.id("operations"),
     draftOperationId: v.id("operations"),
-    inboxId: v.string(),
     requestText: v.optional(v.string()),
   },
-  returns: stepResultValidator,
+  returns: preparedResultValidator,
   handler: async (ctx, args) => {
     const authIdentity = await ctx.auth.getUserIdentity();
     const identity = authIdentity?.tokenIdentifier ?? null;
     if (identity === null || identity.trim().length === 0) {
       return deniedResult("forged-identity", "unauthenticated");
     }
-    if (args.requestId.trim().length === 0 || args.requestId.length > 128) {
-      return deniedResult("invalid-bounds", "request id is required");
-    }
-    if (!INBOX_ID_PATTERN.test(args.inboxId)) {
-      return deniedResult("invalid-payload", "provider inbox id is invalid");
-    }
-    const loaded = await ctx.runQuery(loadContextRef, {
-      negotiationId: args.negotiationId,
-      identity,
-      ...(args.requestText === undefined ? {} : { requestText: args.requestText }),
-    });
-    if (!loaded.ok) return deniedResult(loaded.code, loaded.message);
-
-    const pinned: PinnedContext = {
-      organizationId: loaded.organizationId as Id<"organizations">,
-      projectId: loaded.projectId as Id<"projects">,
-      projectName: loaded.projectName,
-      negotiationId: loaded.negotiationId as Id<"negotiations">,
-      quoteId: loaded.quoteId as Id<"quotes">,
-      mandateState: loaded.mandateState,
-      mandateQuoteVersion: loaded.mandateQuoteVersion,
-      mandateQuoteContentHash: loaded.mandateQuoteContentHash,
-      mandateConversationId:
-        loaded.mandateHasConversation && loaded.currentConversationId !== undefined
-          ? (loaded.currentConversationId as Id<"conversations">)
-          : undefined,
-      mandateConversationVersion: loaded.mandateConversationVersion,
-      roundsUsed: loaded.roundsUsed,
-      roundLimit: loaded.roundLimit,
-      expiresAt: loaded.expiresAt,
-      targetMinorUnits: loaded.targetMinorUnits,
-      quoteVersion: loaded.quote.version,
-      quoteContentHash: loaded.quote.contentHash,
-      quoteExcerpt: loaded.quote.excerpt,
-      quoteSuperseded: loaded.quoteSuperseded,
-      conversationVersion: loaded.currentConversationVersion,
-      conversationState: loaded.conversationState,
-      recipientConfigured: loaded.recipientConfigured,
-      recipientConfigVersion: loaded.recipientConfigVersion,
-      recipientMailboxNormalized: loaded.recipientMailboxNormalized,
-    };
-
-    // Idempotency pre-check: zero provider calls when this request key
-    // already has a send operation. Terminal success deduplicates;
-    // anything else stays unknown under reconciliation, never resends.
-    const prior = await ctx.runQuery(inspectOperationRef, {
-      organizationId: String(pinned.organizationId),
-      requestId: args.requestId,
-      identity,
-    });
-    if (!("status" in prior)) return deniedResult(prior.code, prior.message);
-    if (prior.status === "deduplicated") {
-      return {
-        ok: true as const,
-        outcome: "deduplicated" as const,
-        move: "none",
-        requestKey: prior.requestKey,
-        payloadHash: prior.payloadHash ?? "unknown",
-        roundsUsedAfter: pinned.roundsUsed,
-        redactedPreview: "deduplicated — no supplier-visible text prepared",
-      };
-    }
-    if (prior.status === "unknown") {
-      return {
-        ok: true as const,
-        outcome: "waiting" as const,
-        move: "none",
-        reason: "outcome-unknown",
-        roundsUsedAfter: pinned.roundsUsed,
-        redactedPreview: "waiting — prior attempt outcome is unknown under reconciliation",
-      };
-    }
-
+    const resolved = await resolvePins(ctx, args.negotiationId, identity, args.requestText);
+    if (!resolved.ok) return deniedResult(resolved.code, resolved.message);
+    const pinned = resolved.pinned;
     const mandate = mandateSnapshotOf(pinned);
-    // Pre-call fences: every denial below performs zero provider calls.
     const bounds = checkNegotiationBounds(mandate, currentSnapshotOf(pinned, null));
     if (bounds !== null) return deniedResult(bounds.code, bounds.message);
     const earlyFence = checkNegotiationFences(mandate, currentSnapshotOf(pinned, null));
@@ -1298,15 +1648,16 @@ export const runNegotiationStep = f1Action({
       }
       return deniedResult(earlyFence.code, earlyFence.message);
     }
-
-    // Readiness runs before the first provider call so allowance and
-    // recipient denials also cost zero provider calls.
-    const readiness = await ctx.runQuery(probeReadinessRef, {
-      organizationId: pinned.organizationId,
-      projectId: pinned.projectId,
-      identity,
-    });
-    if (!readiness.ok) return deniedResult(readiness.code, readiness.message);
+    if (conversationGate(pinned.conversationState).stopped) {
+      return {
+        ok: true as const,
+        outcome: "stopped" as const,
+        move: "none",
+        reason: "conversation-changed",
+        roundsUsedAfter: pinned.roundsUsed,
+        redactedPreview: "stopped — bound reply arrived; ingestion must update the mandate basis first",
+      };
+    }
 
     const jevWorkload = buildNegotiationJevWorkload({
       negotiationId: String(pinned.negotiationId),
@@ -1329,12 +1680,6 @@ export const runNegotiationStep = f1Action({
     const selected = selectNegotiationMove(injectedJev.value);
     if (!selected.ok) {
       if (selected.kind === "waiting") {
-        await ctx.runMutation(applyOutcomeRef, {
-          negotiationId: pinned.negotiationId,
-          identity,
-          outcome: "waiting",
-          expectedRoundsUsed: pinned.roundsUsed,
-        });
         return {
           ok: true as const,
           outcome: "waiting" as const,
@@ -1357,12 +1702,6 @@ export const runNegotiationStep = f1Action({
       };
     }
     if (selected.move === "hold") {
-      await ctx.runMutation(applyOutcomeRef, {
-        negotiationId: pinned.negotiationId,
-        identity,
-        outcome: "waiting",
-        expectedRoundsUsed: pinned.roundsUsed,
-      });
       return {
         ok: true as const,
         outcome: "waiting" as const,
@@ -1447,9 +1786,7 @@ export const runNegotiationStep = f1Action({
         redactedPreview: "waiting — no supplier-visible text prepared",
       };
     }
-    if (
-      (pinned.conversationVersion ?? null) !== (draftValue.sourceConversationVersion ?? null)
-    ) {
+    if ((pinned.conversationVersion ?? null) !== (draftValue.sourceConversationVersion ?? null)) {
       return {
         ok: true as const,
         outcome: "waiting" as const,
@@ -1482,42 +1819,141 @@ export const runNegotiationStep = f1Action({
     if (envelopeCanonical !== outbound.canonical) {
       return deniedResult("outbound-denied", "payload canonical form changed");
     }
+    return {
+      ok: true as const,
+      outcome: "prepared" as const,
+      move,
+      envelopeCanonical,
+      payloadHash: payloadHash(envelope),
+      quoteVersion: pinned.quoteVersion,
+      quoteContentHash: pinned.quoteContentHash,
+      ...(pinned.conversationVersion === undefined
+        ? {}
+        : { conversationVersion: pinned.conversationVersion }),
+      roundsUsed: pinned.roundsUsed,
+      redactedPreview: checked.redactedPreview,
+    };
+  },
+});
 
-    // Post-draft recheck: re-read everything before the consequential send.
-    const reloaded = await ctx.runQuery(loadContextRef, {
-      negotiationId: args.negotiationId,
+const prepareDraftRef = makeFunctionReference<
+  "action",
+  ActionArgs<typeof prepareNegotiationDraft>,
+  ActionReturn<typeof prepareNegotiationDraft>
+>("negotiation/orchestrator:prepareNegotiationDraft");
+
+/**
+ * Phase two of the two-phase flow: send a previously prepared and approved
+ * draft. The caller supplies the exact canonical envelope; approval is
+ * proven by a live grant whose canonical payload equals it byte-for-byte,
+ * and every mandate/quote/conversation/recipient/round pin is re-fenced
+ * live before the single dispatch. Makes no model calls by construction,
+ * so every denial here costs zero provider calls.
+ */
+export const dispatchApprovedDraft = f1Action({
+  args: {
+    negotiationId: v.id("negotiations"),
+    requestId: v.string(),
+    envelopeCanonical: v.string(),
+    inboxId: v.string(),
+    requestText: v.optional(v.string()),
+  },
+  returns: stepResultValidator,
+  handler: async (ctx, args) => {
+    const authIdentity = await ctx.auth.getUserIdentity();
+    const identity = authIdentity?.tokenIdentifier ?? null;
+    if (identity === null || identity.trim().length === 0) {
+      return deniedResult("forged-identity", "unauthenticated");
+    }
+    if (args.requestId.trim().length === 0 || args.requestId.length > 128) {
+      return deniedResult("invalid-bounds", "request id is required");
+    }
+    if (!INBOX_ID_PATTERN.test(args.inboxId)) {
+      return deniedResult("invalid-payload", "provider inbox id is invalid");
+    }
+    const resolved = await resolvePins(ctx, args.negotiationId, identity, args.requestText);
+    if (!resolved.ok) return deniedResult(resolved.code, resolved.message);
+    const pinned = resolved.pinned;
+    const mandate = mandateSnapshotOf(pinned);
+    const bounds = checkNegotiationBounds(mandate, currentSnapshotOf(pinned, null));
+    if (bounds !== null) return deniedResult(bounds.code, bounds.message);
+    const earlyFence = checkNegotiationFences(mandate, currentSnapshotOf(pinned, null));
+    if (earlyFence !== null) {
+      if (earlyFence.kind === "stopped") {
+        return {
+          ok: true as const,
+          outcome: "stopped" as const,
+          move: "none",
+          reason: earlyFence.reason,
+          roundsUsedAfter: pinned.roundsUsed,
+          redactedPreview: "stopped — no supplier-visible text prepared",
+        };
+      }
+      if (earlyFence.kind === "waiting") {
+        return {
+          ok: true as const,
+          outcome: "waiting" as const,
+          move: "none",
+          reason: earlyFence.reason,
+          roundsUsedAfter: pinned.roundsUsed,
+          redactedPreview: "waiting — no supplier-visible text prepared",
+        };
+      }
+      return deniedResult(earlyFence.code, earlyFence.message);
+    }
+    if (conversationGate(pinned.conversationState).stopped) {
+      return {
+        ok: true as const,
+        outcome: "stopped" as const,
+        move: "none",
+        reason: "conversation-changed",
+        roundsUsedAfter: pinned.roundsUsed,
+        redactedPreview: "stopped — bound reply arrived; ingestion must update the mandate basis first",
+      };
+    }
+    const approved = validateApprovedEnvelope(
+      args.envelopeCanonical,
+      pinned.recipientMailboxNormalized,
+      pinned.targetMinorUnits,
+    );
+    if (!approved.ok) return deniedResult(approved.code, approved.message);
+
+    const prior = await ctx.runQuery(inspectOperationRef, {
+      organizationId: String(pinned.organizationId),
+      requestId: args.requestId,
       identity,
-      ...(args.requestText === undefined ? {} : { requestText: args.requestText }),
     });
-    if (!reloaded.ok) return deniedResult(reloaded.code, reloaded.message);
-    if (
-      reloaded.mandateQuoteVersion !== pinned.mandateQuoteVersion ||
-      reloaded.mandateQuoteContentHash !== pinned.mandateQuoteContentHash ||
-      reloaded.roundsUsed !== pinned.roundsUsed ||
-      reloaded.currentQuoteVersion !== pinned.quoteVersion ||
-      reloaded.currentQuoteContentHash !== pinned.quoteContentHash ||
-      reloaded.quoteSuperseded ||
-      (reloaded.mandateConversationVersion ?? null) !== (pinned.conversationVersion ?? null) ||
-      reloaded.recipientConfigured !== true ||
-      reloaded.recipientConfigVersion !== pinned.recipientConfigVersion ||
-      reloaded.recipientMailboxNormalized !== pinned.recipientMailboxNormalized
-    ) {
-      return deniedResult(
-        "stale-input-version",
-        "negotiation inputs changed during drafting; re-approval required",
-      );
+    if (!("status" in prior)) return deniedResult(prior.code, prior.message);
+    if (prior.status === "deduplicated") {
+      return {
+        ok: true as const,
+        outcome: "deduplicated" as const,
+        move: "none",
+        requestKey: prior.requestKey,
+        payloadHash: prior.payloadHash ?? "unknown",
+        roundsUsedAfter: pinned.roundsUsed,
+        redactedPreview: "deduplicated — no supplier-visible text prepared",
+      };
+    }
+    if (prior.status === "unknown") {
+      return {
+        ok: true as const,
+        outcome: "waiting" as const,
+        move: "none",
+        reason: "outcome-unknown",
+        roundsUsedAfter: pinned.roundsUsed,
+        redactedPreview: "waiting — prior attempt outcome is unknown under reconciliation",
+      };
     }
 
     const capacity = await ctx.runQuery(discoverCapacityRef, {
       organizationId: pinned.organizationId,
       projectId: pinned.projectId,
       identity,
-      envelopeCanonical,
+      envelopeCanonical: args.envelopeCanonical,
     });
     if (!capacity.ok) return deniedResult(capacity.code, capacity.message);
 
-    // Fence the exact send-grant binding through E6 before creating the
-    // operation: recipient, grant, round, quote, and conversation pins.
     const fenced = checkNegotiationFences(
       mandate,
       currentSnapshotOf(pinned, {
@@ -1530,60 +1966,120 @@ export const runNegotiationStep = f1Action({
         return {
           ok: true as const,
           outcome: "stopped" as const,
-          move,
+          move: "none",
           reason: fenced.reason,
           roundsUsedAfter: pinned.roundsUsed,
-          redactedPreview: checked.redactedPreview,
+          redactedPreview: approved.redactedPreview,
         };
       }
       if (fenced.kind === "waiting") {
         return {
           ok: true as const,
           outcome: "waiting" as const,
-          move,
+          move: "none",
           reason: fenced.reason,
           roundsUsedAfter: pinned.roundsUsed,
-          redactedPreview: checked.redactedPreview,
+          redactedPreview: approved.redactedPreview,
         };
       }
       return deniedResult(fenced.code, fenced.message);
     }
 
-    const hash = payloadHash(envelope);
+    const envelopeValue = JSON.parse(args.envelopeCanonical) as Record<string, unknown>;
+    const hash = payloadHash(envelopeValue);
     const key = requestKey(String(pinned.organizationId), NEGOTIATION_OPERATION_KIND, args.requestId);
-    const gate = deduplicateNegotiationRetry(key, hash, null);
-    if (gate.outcome === "conflict") {
-      return deniedResult("retry-conflict", "request key reused with a changed payload");
+    const consumed = await ctx.runMutation(consumeRoundRef, {
+      negotiationId: pinned.negotiationId,
+      identity,
+      expectedRoundsUsed: pinned.roundsUsed,
+      expectedQuoteVersion: pinned.quoteVersion,
+      expectedQuoteContentHash: pinned.quoteContentHash,
+      ...(pinned.conversationVersion === undefined
+        ? {}
+        : { expectedConversationVersion: pinned.conversationVersion }),
+      expectedRecipientVersion: pinned.recipientConfigVersion ?? -1,
+    });
+    if (!consumed.ok) {
+      if (
+        consumed.code === "mandate-revoked" ||
+        consumed.code === "mandate-concluded" ||
+        consumed.code === "mandate-expired" ||
+        consumed.code === "round-limit-reached"
+      ) {
+        return {
+          ok: true as const,
+          outcome: "stopped" as const,
+          move: "none",
+          reason: consumed.code,
+          roundsUsedAfter: pinned.roundsUsed,
+          redactedPreview: approved.redactedPreview,
+        };
+      }
+      if (
+        consumed.code === "quote-changed" ||
+        consumed.code === "quote-superseded" ||
+        consumed.code === "conversation-changed"
+      ) {
+        return {
+          ok: true as const,
+          outcome: "stopped" as const,
+          move: "none",
+          reason: consumed.code,
+          roundsUsedAfter: pinned.roundsUsed,
+          redactedPreview: approved.redactedPreview,
+        };
+      }
+      if (consumed.code === "mandate-paused") {
+        return {
+          ok: true as const,
+          outcome: "waiting" as const,
+          move: "none",
+          reason: "mandate-paused",
+          roundsUsedAfter: pinned.roundsUsed,
+          redactedPreview: approved.redactedPreview,
+        };
+      }
+      return deniedResult(consumed.code, consumed.message);
     }
+    const refundConsumed = async (): Promise<number> => {
+      const refunded = await ctx.runMutation(refundRoundRef, {
+        negotiationId: pinned.negotiationId,
+        identity,
+        expectedRoundsUsed: pinned.roundsUsed,
+      });
+      return refunded.ok ? refunded.roundsUsed : consumed.roundsUsedAfter;
+    };
+
     const created = await ctx.runMutation(createOperationRef, {
       jobId: capacity.jobId,
       organizationId: pinned.organizationId,
       projectId: pinned.projectId,
       kind: NEGOTIATION_OPERATION_KIND,
       requestId: args.requestId,
-      payloadJson: envelopeCanonical,
+      payloadJson: args.envelopeCanonical,
       grantId: capacity.grantId,
       reservationId: capacity.reservationId,
     });
     if (!created.ok) {
+      await refundConsumed();
       if (created.code === "duplicate-conflict") {
         return deniedResult("retry-conflict", "request key reused with a changed payload");
       }
       return deniedResult(created.code, created.message);
     }
     if (created.deduped) {
+      const roundsUsedAfter = await refundConsumed();
       return {
         ok: true as const,
         outcome: "deduplicated" as const,
-        move,
+        move: "none",
         requestKey: key,
         payloadHash: hash,
-        roundsUsedAfter: pinned.roundsUsed,
-        redactedPreview: checked.redactedPreview,
+        roundsUsedAfter,
+        redactedPreview: approved.redactedPreview,
       };
     }
 
-    // The single send path: exactly one dispatch per created operation.
     const dispatched = await ctx.runAction(dispatchRef, {
       operationId: created.operationId,
       identity,
@@ -1591,13 +2087,14 @@ export const runNegotiationStep = f1Action({
     });
     const dispatchDenial = actionDenialOf(dispatched);
     if (dispatchDenial !== null) {
+      const roundsUsedAfter = await refundConsumed();
       await ctx.runMutation(applyOutcomeRef, {
         negotiationId: pinned.negotiationId,
         identity,
         outcome: "waiting",
         jobId: capacity.jobId,
         jobState: "waitingForSupplier",
-        expectedRoundsUsed: pinned.roundsUsed,
+        expectedRoundsUsed: roundsUsedAfter,
       });
       return deniedResult("dispatch-denied", dispatchDenial.message);
     }
@@ -1613,21 +2110,22 @@ export const runNegotiationStep = f1Action({
       return deniedResult("provider-result-malformed", "dispatch result outcome is malformed");
     }
     if (success.outcome === "failure") {
+      const roundsUsedAfter = await refundConsumed();
       await ctx.runMutation(applyOutcomeRef, {
         negotiationId: pinned.negotiationId,
         identity,
         outcome: "waiting",
         jobId: capacity.jobId,
         jobState: "waitingForSupplier",
-        expectedRoundsUsed: pinned.roundsUsed,
+        expectedRoundsUsed: roundsUsedAfter,
       });
       return {
         ok: true as const,
         outcome: "waiting" as const,
-        move,
+        move: "none",
         reason: "send-failure",
-        roundsUsedAfter: pinned.roundsUsed,
-        redactedPreview: checked.redactedPreview,
+        roundsUsedAfter,
+        redactedPreview: approved.redactedPreview,
       };
     }
     if (success.outcome === "unknown" || !success.recorded || success.providerMessageId === null) {
@@ -1637,15 +2135,15 @@ export const runNegotiationStep = f1Action({
         outcome: "waiting",
         jobId: capacity.jobId,
         jobState: "waitingForSupplier",
-        expectedRoundsUsed: pinned.roundsUsed,
+        expectedRoundsUsed: consumed.roundsUsedAfter,
       });
       return {
         ok: true as const,
         outcome: "waiting" as const,
-        move,
+        move: "none",
         reason: "outcome-unknown",
-        roundsUsedAfter: pinned.roundsUsed,
-        redactedPreview: checked.redactedPreview,
+        roundsUsedAfter: consumed.roundsUsedAfter,
+        redactedPreview: approved.redactedPreview,
       };
     }
     const applied = await ctx.runMutation(applyOutcomeRef, {
@@ -1654,18 +2152,116 @@ export const runNegotiationStep = f1Action({
       outcome: "sent",
       jobId: capacity.jobId,
       jobState: "waitingForSupplier",
-      expectedRoundsUsed: pinned.roundsUsed,
+      expectedRoundsUsed: consumed.roundsUsedAfter,
     });
     if (!applied.ok) return deniedResult(applied.code, applied.message);
     return {
       ok: true as const,
       outcome: "sent" as const,
-      move,
+      move: "none",
       requestKey: key,
       payloadHash: hash,
-      roundsUsedAfter: applied.expectedRoundsUsed,
+      roundsUsedAfter: consumed.roundsUsedAfter,
       providerMessageId: success.providerMessageId,
-      redactedPreview: checked.redactedPreview,
+      redactedPreview: approved.redactedPreview,
     };
+  },
+});
+
+const dispatchDraftRef = makeFunctionReference<
+  "action",
+  ActionArgs<typeof dispatchApprovedDraft>,
+  ActionReturn<typeof dispatchApprovedDraft>
+>("negotiation/orchestrator:dispatchApprovedDraft");
+
+/**
+ * Run exactly one bounded negotiation step. Public action: authenticates the
+ * caller, pins authority server-side, drives Jev classification, OpenAI
+ * drafting, E6 validation, and the single owner-only dispatch path, then
+ * persists honest round/job state. Unrelated requests create no
+ * negotiation, model, communication, or execution effect.
+ */
+export const runNegotiationStep = f1Action({
+  args: {
+    negotiationId: v.id("negotiations"),
+    requestId: v.string(),
+    jevOperationId: v.id("operations"),
+    draftOperationId: v.id("operations"),
+    inboxId: v.string(),
+    requestText: v.optional(v.string()),
+  },
+  returns: stepResultValidator,
+  handler: async (ctx, args) => {
+    // Single-step composition: prepare (classify + draft + validate, no
+    // send) followed by dispatch (exact-grant approval + single send).
+    // Composing the two phases instead of duplicating them keeps every
+    // fence identical between the flows, and dispatch re-fences everything
+    // live, so the check-to-send window is as narrow as the phase boundary.
+    const authIdentity = await ctx.auth.getUserIdentity();
+    const identity = authIdentity?.tokenIdentifier ?? null;
+    if (identity === null || identity.trim().length === 0) {
+      return deniedResult("forged-identity", "unauthenticated");
+    }
+    if (args.requestId.trim().length === 0 || args.requestId.length > 128) {
+      return deniedResult("invalid-bounds", "request id is required");
+    }
+    if (!INBOX_ID_PATTERN.test(args.inboxId)) {
+      return deniedResult("invalid-payload", "provider inbox id is invalid");
+    }
+    const resolved = await resolvePins(ctx, args.negotiationId, identity, args.requestText);
+    if (!resolved.ok) return deniedResult(resolved.code, resolved.message);
+    const prior = await ctx.runQuery(inspectOperationRef, {
+      organizationId: String(resolved.pinned.organizationId),
+      requestId: args.requestId,
+      identity,
+    });
+    if (!("status" in prior)) return deniedResult(prior.code, prior.message);
+    if (prior.status === "deduplicated") {
+      return {
+        ok: true as const,
+        outcome: "deduplicated" as const,
+        move: "none",
+        requestKey: prior.requestKey,
+        payloadHash: prior.payloadHash ?? "unknown",
+        roundsUsedAfter: resolved.pinned.roundsUsed,
+        redactedPreview: "deduplicated — no supplier-visible text prepared",
+      };
+    }
+    if (prior.status === "unknown") {
+      return {
+        ok: true as const,
+        outcome: "waiting" as const,
+        move: "none",
+        reason: "outcome-unknown",
+        roundsUsedAfter: resolved.pinned.roundsUsed,
+        redactedPreview: "waiting — prior attempt outcome is unknown under reconciliation",
+      };
+    }
+    const readiness = await ctx.runQuery(probeReadinessRef, {
+      organizationId: resolved.pinned.organizationId,
+      projectId: resolved.pinned.projectId,
+      identity,
+    });
+    if (!readiness.ok) return deniedResult(readiness.code, readiness.message);
+
+    const prepared = await ctx.runAction(prepareDraftRef, {
+      negotiationId: args.negotiationId,
+      jevOperationId: args.jevOperationId,
+      draftOperationId: args.draftOperationId,
+      ...(args.requestText === undefined ? {} : { requestText: args.requestText }),
+    });
+    if (!prepared.ok) return deniedResult(prepared.code, prepared.message);
+    if (prepared.outcome !== "prepared") {
+      return prepared;
+    }
+    const dispatched = await ctx.runAction(dispatchDraftRef, {
+      negotiationId: args.negotiationId,
+      requestId: args.requestId,
+      envelopeCanonical: prepared.envelopeCanonical,
+      inboxId: args.inboxId,
+      ...(args.requestText === undefined ? {} : { requestText: args.requestText }),
+    });
+    if (!dispatched.ok) return dispatched;
+    return { ...dispatched, move: prepared.move };
   },
 });
