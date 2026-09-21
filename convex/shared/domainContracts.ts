@@ -160,6 +160,58 @@ export const requirementPriorityValidator = v.union(
 );
 export type RequirementPriority = Infer<typeof requirementPriorityValidator>;
 
+/** The last fulfillment milestone that a requirement needs before readiness. */
+export const requirementMilestoneValidator = v.union(
+  v.literal("delivered"),
+  v.literal("installed"),
+  v.literal("commissioned"),
+);
+export type RequirementMilestone = Infer<typeof requirementMilestoneValidator>;
+
+/**
+ * Requirement inputs are user-authored text, so the backend keeps explicit
+ * bounds instead of allowing a single oversized field to consume the record
+ * or revision transaction budget. These are character bounds after trim.
+ */
+export const REQUIREMENT_KEY_MAX_LENGTH = 128;
+export const REQUIREMENT_TITLE_MAX_LENGTH = 256;
+export const REQUIREMENT_CATEGORY_MAX_LENGTH = 128;
+export const REQUIREMENT_UNIT_MAX_LENGTH = 64;
+export const REQUIREMENT_HARD_CONSTRAINTS_MAX_LENGTH = 4_096;
+export const REQUIREMENT_RESPONSIBLE_MAX_LENGTH = 256;
+export const REQUIREMENT_IDEMPOTENCY_KEY_MAX_LENGTH = 128;
+export const REQUIREMENT_REVISION_MAX_PAYLOAD_LENGTH = 16_384;
+export const REQUIREMENT_DATE_MAX_TIMESTAMP = 8_640_000_000_000_000;
+
+/** Normalize required/optional text at a trusted command boundary. */
+export function normalizeBoundedText(
+  raw: string,
+  label: string,
+  maxLength: number,
+): string {
+  const normalized = raw.trim();
+  if (normalized.length === 0) throw new Error(`${label} required`);
+  if (normalized.length > maxLength) throw new Error(`${label} exceeds the supported length`);
+  return normalized;
+}
+
+/** Normalize a stable replay key without allowing whitespace-only keys. */
+export function normalizeRequirementIdempotencyKey(raw: string): string {
+  return normalizeBoundedText(raw, "idempotency key", REQUIREMENT_IDEMPOTENCY_KEY_MAX_LENGTH);
+}
+
+/** Requirement dates are persisted as finite, safe, positive epoch milliseconds. */
+export function normalizeRequirementDate(raw: number, label = "required date"): number {
+  if (
+    !Number.isSafeInteger(raw) ||
+    raw <= 0 ||
+    raw > REQUIREMENT_DATE_MAX_TIMESTAMP
+  ) {
+    throw new Error(`${label} must be a positive safe timestamp`);
+  }
+  return raw;
+}
+
 /** Dependency relationship kinds (PRD 15): technical vs scheduling. */
 export const dependencyKindValidator = v.union(
   v.literal("technical"),
@@ -277,8 +329,43 @@ export const requirementInputValidator = v.object({
   budgetMinorUnits: v.optional(v.number()),
   currency: v.optional(v.string()),
   needByAt: v.optional(v.number()),
+  hardConstraints: v.optional(v.string()),
+  responsible: v.optional(v.string()),
+  requiredMilestone: v.optional(requirementMilestoneValidator),
 });
 export type RequirementInput = Infer<typeof requirementInputValidator>;
+
+/** Mutable requirement fields are intentionally separate from creation. */
+export const requirementEditInputValidator = v.object({
+  organizationId: v.id("organizations"),
+  projectId: v.id("projects"),
+  requirementId: v.id("requirements"),
+  expectedVersion: v.number(),
+  idempotencyKey: v.string(),
+  title: v.optional(v.union(v.string(), v.null())),
+  category: v.optional(v.union(v.string(), v.null())),
+  quantity: v.optional(v.union(v.string(), v.null())),
+  unit: v.optional(v.union(v.string(), v.null())),
+  priority: v.optional(v.union(requirementPriorityValidator, v.null())),
+  budgetMinorUnits: v.optional(v.union(v.number(), v.null())),
+  currency: v.optional(v.union(v.string(), v.null())),
+  needByAt: v.optional(v.union(v.number(), v.null())),
+  hardConstraints: v.optional(v.union(v.string(), v.null())),
+  responsible: v.optional(v.union(v.string(), v.null())),
+  requiredMilestone: v.optional(v.union(requirementMilestoneValidator, v.null())),
+});
+export type RequirementEditInput = Infer<typeof requirementEditInputValidator>;
+
+/** Dependency verification is a separate transition from adding an edge. */
+export const dependencyVerificationInputValidator = v.object({
+  organizationId: v.id("organizations"),
+  projectId: v.id("projects"),
+  dependencyId: v.id("dependencies"),
+  verification: dependencyVerificationValidator,
+  evidenceRefs: v.optional(v.array(domainEvidenceRefValidator)),
+  reason: v.optional(v.string()),
+});
+export type DependencyVerificationInput = Infer<typeof dependencyVerificationInputValidator>;
 
 /**
  * Dependency edge input. Cycle-safe by construction: handlers reject
