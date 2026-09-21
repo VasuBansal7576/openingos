@@ -454,6 +454,34 @@ export const create = f1Mutation({
     grantId: v.id("grants"),
     reservationId: v.optional(v.id("reservations")),
     negotiationId: v.optional(v.id("negotiations")),
+    /**
+     * Exact saved-draft authority for a negotiation send (Astra repair:
+     * concurrent different-request dispatches reusing one round-0 draft).
+     *
+     * The orchestrator resolves the opaque draft bundle server-side and
+     * passes its pins here; this mutation verifies every pin against the
+     * live rows inside the same atomic transaction that inserts the
+     * operation, then pins the live values as the operation's
+     * `negotiationAuthority`. A stale draft (advanced round, changed quote
+     * or conversation, mismatched payload) denies here with zero new
+     * effect — even when the action-level pre-check raced it. The atomic
+     * `claim` rechecks the pinned authority against the live rows again
+     * immediately before provider effect, so two operations created from
+     * one draft under different request ids serialize on the mandate round:
+     * the first claim consumes it and the stale loser denies with no
+     * effect. Reply drift rides the same pins: an accepted reply bumps the
+     * live conversation version (or supersedes the quote), which the claim
+     * recheck denies; quarantined replies never enter workloads and hold
+     * the action before creation.
+     */
+    negotiationDraft: v.optional(v.object({
+      quoteVersion: v.string(),
+      quoteContentHash: v.string(),
+      roundsUsed: v.number(),
+      conversationVersion: v.optional(v.number()),
+      conversationState: v.optional(v.string()),
+      payloadHash: v.string(),
+    })),
   },
   returns: createResultValidator,
   handler: async (ctx, args) => {
@@ -876,6 +904,39 @@ export const create = f1Mutation({
           negotiation.conversationState === "cancelled"
         ) {
           return { ok: false as const, code: "mandate-conversation-closed", message: "bound conversation is closed or cancelled" };
+        }
+      }
+      // Atomic saved-draft binding: the exact draft pins must equal the live
+      // mandate rows inside this same transaction. A draft prepared under an
+      // older round, quote version, or conversation (or carrying a different
+      // payload than submitted here) denies before any operation row is
+      // inserted or allowance is bound.
+      if (args.negotiationDraft !== undefined) {
+        const draft = args.negotiationDraft;
+        if (!Number.isSafeInteger(draft.roundsUsed) || draft.roundsUsed < 0) {
+          return { ok: false as const, code: "invalid-payload", message: "saved draft round is not a usable bound" };
+        }
+        if (
+          draft.quoteVersion !== negotiation.quoteVersion ||
+          draft.quoteContentHash !== mandateQuote.contentHash
+        ) {
+          return { ok: false as const, code: "draft-quote-stale", message: "prepared draft quote version is no longer current" };
+        }
+        if (draft.roundsUsed !== negotiation.roundsUsed) {
+          return { ok: false as const, code: "draft-round-stale", message: "negotiation round advanced after this draft was prepared" };
+        }
+        const draftConversationVersion = draft.conversationVersion ?? null;
+        const liveConversationVersion = negotiation.conversationVersion ?? null;
+        if (draftConversationVersion !== liveConversationVersion) {
+          return { ok: false as const, code: "draft-conversation-changed", message: "prepared draft conversation version is no longer current" };
+        }
+        const draftConversationState = draft.conversationState ?? null;
+        const liveConversationState = negotiation.conversationState ?? null;
+        if (draftConversationState !== liveConversationState) {
+          return { ok: false as const, code: "draft-conversation-changed", message: "prepared draft conversation state is no longer current" };
+        }
+        if (draft.payloadHash !== hash && draft.payloadHash !== submittedHash) {
+          return { ok: false as const, code: "draft-payload-mismatch", message: "prepared draft payload no longer matches its approved hash" };
         }
       }
       negotiationAuthority = {

@@ -2858,3 +2858,222 @@ describe("Astra finding 3: approval establishes exact send authority from draftI
     expect(await grantCount(t)).toBe(before);
   });
 });
+
+describe("Astra review2: reply meaning, quarantine, scan bounds, money, draft race", () => {
+  const lineBase = {
+    lineId: "l1",
+    description: "Espresso machine",
+    quantity: "1 unit",
+    unitPrice: { currency: "EUR", minorUnits: 750000 },
+    evidenceRefs: [],
+  };
+  const taxBase = { kind: "inclusive", basisId: "vat-included", evidenceRefs: [] } as const;
+
+  test("workload money states explicit major units with minor-unit counts", () => {
+    const terms = summarizeQuoteTerms({
+      version: "qv-1",
+      contentHash: "hash-qv-1",
+      currency: "EUR",
+      lines: [lineBase],
+      charges: [
+        { chargeId: "c1", label: "Freight", scope: { kind: "quote" }, state: { kind: "known", amount: { currency: "EUR", minorUnits: 60000 } }, evidenceRefs: [] },
+        { chargeId: "c2", label: "Installation", scope: { kind: "quote" }, state: { kind: "estimated", estimate: { kind: "range", minimum: { currency: "EUR", minorUnits: 30000 }, maximum: { currency: "EUR", minorUnits: 50000 } } }, evidenceRefs: [] },
+        { chargeId: "c3", label: "Warranty", scope: { kind: "quote" }, state: { kind: "estimated", estimate: { kind: "point", amount: { currency: "EUR", minorUnits: 12000 } } }, evidenceRefs: [] },
+      ],
+      taxBasis: { ...taxBase },
+    });
+    // Line price, known charge, range estimate, and point estimate each name
+    // the currency, the major-unit figure, and the minor-unit count.
+    expect(terms).toContain("EUR 7500.00 (750000 minor units)");
+    expect(terms).toContain("Freight: known EUR 600.00 (60000 minor units)");
+    expect(terms).toContain("Installation: estimated range EUR 300.00 (30000 minor units) to EUR 500.00 (50000 minor units)");
+    expect(terms).toContain("Warranty: estimated EUR 120.00 (12000 minor units)");
+    expect(terms).not.toMatch(/750000EUR/);
+    expect(terms).not.toMatch(/60000EUR/);
+    expect(terms).not.toMatch(/30000-50000/);
+  });
+
+  test("accepted reply meaning and source reach the Jev workload; digest-only stays sourceless", () => {
+    const base = {
+      negotiationId: "n1",
+      quoteId: "q1",
+      quoteVersion: "qv-1",
+      quoteContentHash: "hash-qv-1",
+      quoteTerms: "terms",
+      missingTerms: "none-complete",
+      replyDigest: "digest",
+      conversationVersion: 1 as number | undefined,
+      roundsUsed: 0,
+      roundLimit: 3,
+      mandateState: "active",
+    };
+    const without = buildNegotiationJevWorkload(base);
+    expect(without.state["replyMeaning"]).toBe("no-accepted-reply");
+    expect(without.state["replySource"]).toBe("no-source");
+    const meaning = "This is our final offer: freight included, no further discount on the installation charge.";
+    const withReply = buildNegotiationJevWorkload({
+      ...base,
+      replyMeaning: meaning,
+      replySource: "agentmail:msg-1@source:1#message:msg-1",
+    });
+    expect(withReply.state["replyMeaning"]).toContain("final offer");
+    expect(withReply.state["replySource"]).toContain("agentmail:msg-1");
+    expect(canonicalJson(withReply)).not.toBe(canonicalJson(without));
+    const draftBase = {
+      negotiationId: "n1",
+      quoteId: "q1",
+      quoteVersion: "qv-1",
+      quoteContentHash: "hash-qv-1",
+      quoteTerms: "terms",
+      missingTerms: "none-complete",
+      mandateState: "active",
+      conversationId: "c1" as string | undefined,
+      conversationVersion: 1 as number | undefined,
+      roundsUsed: 0,
+      roundLimit: 3,
+    };
+    const draftWith = buildNegotiationDraftWorkload(
+      { ...draftBase, replyExcerpt: meaning, replyVersion: "v1@100" },
+      "clarify",
+    );
+    const replySource = draftWith.sources.find((source) => source.locator === "latest-reply");
+    expect(replySource?.content).toContain("final offer");
+  });
+
+  async function seedInboundMarker(
+    fixture: Fixture,
+    marker: { messageId: string; text: string; version: string; capturedAt: number },
+  ): Promise<void> {
+    await fixture.t.run(async (ctx) => {
+      const evidenceId = await ctx.db.insert("evidence", {
+        organizationId: fixture.organizationId,
+        projectId: fixture.projectId,
+        sourceKind: "agentmail.message",
+        providerIds: JSON.stringify({
+          messageId: marker.messageId,
+          threadId: "seed-thread-e12-conversation",
+          inboxId: INBOX_ID,
+        }),
+        capturedAt: marker.capturedAt,
+        contentHash: `hash-${marker.messageId}`,
+        protectedSourceText: marker.text,
+        completeness: "complete",
+        counterpartyRole: "ownerStandIn",
+        executionMode: "recorded",
+        locator: `redacted:hash-${marker.messageId}`,
+      });
+      await ctx.db.insert("productEvidence", {
+        organizationId: fixture.organizationId,
+        projectId: fixture.projectId,
+        field: "agentmail.message",
+        sourceKind: "agentmail.message",
+        capturedAt: marker.capturedAt,
+        originalValue: marker.text,
+        normalizedValue: marker.text,
+        verification: "unverified",
+        freshness: "fresh",
+        counterpartyRole: "ownerStandIn",
+        executionMode: "recorded",
+        origin: "ownerImport",
+        conflictEvidenceIds: [],
+        idempotencyKey: marker.messageId,
+        ingestionIdentity: marker.messageId,
+        sourceEvidenceId: evidenceId,
+        version: marker.version,
+        createdAt: Date.now(),
+      });
+    });
+  }
+
+  test("quarantined unexpected-sender evidence never promotes text and waits for review", async () => {
+    const t = init();
+    const fixture = await createFixture(t, "clarify", {
+      conversation: { version: 1, state: "awaitingReply" },
+    });
+    await seedInboundMarker(fixture, {
+      messageId: "astra-quarantine-1",
+      text: "Unexpected sender final offer text with a supposed discount.",
+      version: "source:1:review",
+      capturedAt: Date.now(),
+    });
+    const { result, log } = await runPrepare(fixture, {});
+    expect(result).toMatchObject({ ok: true, outcome: "waiting", reason: "owner-reply-needs-review" });
+    expect(log.jev).toHaveLength(0);
+    expect(log.openai).toHaveLength(0);
+    expect(log.agentmail).toHaveLength(0);
+    const counts = await tableCounts(t);
+    expect(counts.negotiations).toEqual([{ roundsUsed: 0, state: "active" }]);
+  });
+
+  test("forty unrelated rows do not erase the bound accepted reply", async () => {
+    const t = init();
+    const fixture = await createFixture(t, "clarify", {
+      conversation: { version: 1, state: "awaitingReply" },
+    });
+    const capturedAt = Date.now();
+    await seedInboundMarker(fixture, {
+      messageId: "astra-kept-reply",
+      text: "Owner reply: this is our final offer with freight included.",
+      version: "source:1",
+      capturedAt,
+    });
+    await fixture.t.run(async (ctx) => {
+      for (let index = 0; index < 40; index += 1) {
+        await ctx.db.insert("productEvidence", {
+          organizationId: fixture.organizationId,
+          projectId: fixture.projectId,
+          field: "vendor.price",
+          sourceKind: "firecrawl.extract",
+          capturedAt: capturedAt + 1 + index,
+          originalValue: `unrelated ${index}`,
+          normalizedValue: `unrelated ${index}`,
+          verification: "unverified",
+          freshness: "fresh",
+          counterpartyRole: "vendor",
+          executionMode: "recorded",
+          origin: "internal",
+          conflictEvidenceIds: [],
+          idempotencyKey: `unrelated-${index}`,
+          ingestionIdentity: `unrelated-${index}`,
+          version: "v1",
+          createdAt: Date.now(),
+        });
+      }
+    });
+    // The bound reply is still found past the 40 newer rows, so the Jev
+    // workload digest changes and preparation waits honestly instead of
+    // negotiating past it.
+    const { result, log } = await runPrepare(fixture, {});
+    expect(result).toMatchObject({ ok: true, outcome: "waiting", reason: "jev-stale" });
+    expect(log.agentmail).toHaveLength(0);
+  });
+
+  test("one draft dispatches once across two request ids; the stale loser has no effect", async () => {
+    const t = init();
+    const fixture = await createFixture(t);
+    const draftId = await prepareValidDraftId(fixture);
+    const countOperations = async (): Promise<number> =>
+      await t.run(async (ctx) => (await ctx.db.query("operations").collect()).length);
+    const opsBefore = await countOperations();
+    const first = await runDispatch(fixture, "req-race-winner", draftId, {});
+    expect(first.result).toMatchObject({ ok: true, outcome: "sent" });
+    expect(first.log.agentmail).toHaveLength(1);
+    if (first.result.ok && first.result.outcome === "sent") {
+      expect(first.result.roundsUsedAfter).toBe(1);
+    } else {
+      throw new Error("expected the first dispatch to send");
+    }
+    const opsAfterFirst = await countOperations();
+    expect(opsAfterFirst).toBe(opsBefore + 1);
+    // A different request id reusing the same saved round-0 draft denies as
+    // stale with zero sends and zero new rows.
+    const second = await runDispatch(fixture, "req-race-loser", draftId, {});
+    expect(second.result).toMatchObject({ ok: false, code: "draft-round-stale" });
+    expect(second.log.jev).toHaveLength(0);
+    expect(second.log.openai).toHaveLength(0);
+    expect(second.log.agentmail).toHaveLength(0);
+    expect(await countOperations()).toBe(opsAfterFirst);
+    const rounds = await t.run(async (ctx) => (await ctx.db.get(fixture.negotiationId))?.roundsUsed);
+    expect(rounds).toBe(1);
+  });
+});
