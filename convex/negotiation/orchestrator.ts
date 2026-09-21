@@ -658,6 +658,190 @@ function validateApprovedEnvelope(
   return { ok: true, body: record["body"], redactedPreview: checked.redactedPreview };
 }
 
+/**
+ * E17 mailbox-privacy repair: prepared drafts persist server-side only.
+ *
+ * The unredacted owner envelope (containing the private `To` mailbox) is
+ * stored in the protected `evidence.protectedSourceText` field, which never
+ * enters a public projection or guest download. The client receives only the
+ * opaque evidence-row id (`draftId`) plus a redacted preview. Dispatch
+ * resolves the envelope server-side from that id under the same approver
+ * authority, preserving exact grant binding, idempotency, and owner-only
+ * transport without ever returning the mailbox.
+ */
+const DRAFT_EVIDENCE_SOURCE_KIND = "negotiation-draft-v1" as const;
+
+export const savePreparedNegotiationDraft = f1InternalMutation({
+  args: {
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    negotiationId: v.id("negotiations"),
+    quoteId: v.id("quotes"),
+    quoteVersion: v.string(),
+    quoteContentHash: v.string(),
+    conversationVersion: v.optional(v.number()),
+    roundsUsed: v.number(),
+    move: v.string(),
+    envelopeCanonical: v.string(),
+    payloadHash: v.string(),
+    identity: v.string(),
+  },
+  returns: v.union(v.object({ ok: v.literal(true), draftId: v.id("evidence") }), denialValidator),
+  handler: async (ctx, args) => {
+    if (args.identity.trim().length === 0) {
+      return { ok: false as const, code: "forged-identity", message: "missing identity proof" };
+    }
+    const access = await checkProjectAccess(
+      ctx,
+      args.identity,
+      args.organizationId,
+      args.projectId,
+      "approver",
+      Date.now(),
+    );
+    if (!access.ok) {
+      if (access.code === "denied-membership") return genericDenial();
+      return { ok: false as const, code: access.code, message: access.message };
+    }
+    const negotiation = await ctx.db.get(args.negotiationId);
+    if (
+      negotiation === null ||
+      negotiation.organizationId !== args.organizationId ||
+      negotiation.projectId !== args.projectId
+    ) {
+      return genericDenial();
+    }
+    const draftId = await ctx.db.insert("evidence", {
+      organizationId: args.organizationId,
+      projectId: args.projectId,
+      sourceKind: DRAFT_EVIDENCE_SOURCE_KIND,
+      capturedAt: Date.now(),
+      contentHash: args.payloadHash,
+      protectedSourceText: canonicalJson({
+        conversationVersion: args.conversationVersion ?? null,
+        envelopeCanonical: args.envelopeCanonical,
+        move: args.move,
+        negotiationId: String(args.negotiationId),
+        payloadHash: args.payloadHash,
+        quoteContentHash: args.quoteContentHash,
+        quoteId: String(args.quoteId),
+        quoteVersion: args.quoteVersion,
+        roundsUsed: args.roundsUsed,
+      }),
+      completeness: "complete",
+      counterpartyRole: "ownerStandIn",
+      executionMode: "live",
+      locator: "negotiation-draft",
+    });
+    return { ok: true as const, draftId };
+  },
+});
+
+const saveDraftRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof savePreparedNegotiationDraft>,
+  MutationReturn<typeof savePreparedNegotiationDraft>
+>("negotiation/orchestrator:savePreparedNegotiationDraft");
+
+export const loadPreparedNegotiationDraft = f1InternalQuery({
+  args: {
+    draftId: v.id("evidence"),
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    negotiationId: v.id("negotiations"),
+    identity: v.string(),
+  },
+  returns: v.union(
+    v.object({
+      ok: v.literal(true),
+      envelopeCanonical: v.string(),
+      quoteVersion: v.string(),
+      quoteContentHash: v.string(),
+      conversationVersion: v.optional(v.number()),
+      roundsUsed: v.number(),
+      move: v.string(),
+      payloadHash: v.string(),
+    }),
+    denialValidator,
+  ),
+  handler: async (ctx, args) => {
+    if (args.identity.trim().length === 0) {
+      return { ok: false as const, code: "forged-identity", message: "missing identity proof" };
+    }
+    const access = await checkProjectAccess(
+      ctx,
+      args.identity,
+      args.organizationId,
+      args.projectId,
+      "approver",
+      Date.now(),
+    );
+    if (!access.ok) {
+      if (access.code === "denied-membership") return genericDenial();
+      return { ok: false as const, code: access.code, message: access.message };
+    }
+    const row = await ctx.db.get(args.draftId);
+    // Tenant isolation is organization-scoped (request keys are
+    // organization-scoped). Project/negotiation mismatches are left for the
+    // F3 exact-replay conflict check downstream so reused keys conflict
+    // rather than reporting a false generic denial; no envelope ever returns
+    // to the caller on any path.
+    if (
+      row === null ||
+      row.organizationId !== args.organizationId ||
+      row.sourceKind !== DRAFT_EVIDENCE_SOURCE_KIND ||
+      typeof row.protectedSourceText !== "string"
+    ) {
+      return genericDenial();
+    }
+    let bundle: unknown;
+    try {
+      bundle = JSON.parse(row.protectedSourceText) as unknown;
+    } catch {
+      return genericDenial();
+    }
+    if (typeof bundle !== "object" || bundle === null || Array.isArray(bundle)) {
+      return genericDenial();
+    }
+    const record = bundle as Record<string, unknown>;
+    if (
+      typeof record["envelopeCanonical"] !== "string" ||
+      typeof record["quoteVersion"] !== "string" ||
+      typeof record["quoteContentHash"] !== "string" ||
+      typeof record["move"] !== "string" ||
+      typeof record["payloadHash"] !== "string" ||
+      typeof record["roundsUsed"] !== "number"
+    ) {
+      return genericDenial();
+    }
+    const conversationVersion =
+      record["conversationVersion"] === null || record["conversationVersion"] === undefined
+        ? undefined
+        : typeof record["conversationVersion"] === "number"
+          ? (record["conversationVersion"] as number)
+          : undefined;
+    if (record["conversationVersion"] !== null && record["conversationVersion"] !== undefined && conversationVersion === undefined) {
+      return genericDenial();
+    }
+    return {
+      ok: true as const,
+      envelopeCanonical: record["envelopeCanonical"] as string,
+      quoteVersion: record["quoteVersion"] as string,
+      quoteContentHash: record["quoteContentHash"] as string,
+      ...(conversationVersion === undefined ? {} : { conversationVersion }),
+      roundsUsed: record["roundsUsed"] as number,
+      move: record["move"] as string,
+      payloadHash: record["payloadHash"] as string,
+    };
+  },
+});
+
+const loadDraftRef = makeFunctionReference<
+  "query",
+  QueryArgs<typeof loadPreparedNegotiationDraft>,
+  QueryReturn<typeof loadPreparedNegotiationDraft>
+>("negotiation/orchestrator:loadPreparedNegotiationDraft");
+
 function mandateSnapshotOf(pinned: PinnedContext): MandateSnapshot {
   return {
     negotiationId: String(pinned.negotiationId),
@@ -1738,7 +1922,7 @@ const preparedResultValidator = v.union(
     ok: v.literal(true),
     outcome: v.literal("prepared"),
     move: v.string(),
-    envelopeCanonical: v.string(),
+    draftId: v.id("evidence"),
     payloadHash: v.string(),
     quoteVersion: v.string(),
     quoteContentHash: v.string(),
@@ -1766,12 +1950,15 @@ const preparedResultValidator = v.union(
 );
 
 /**
- * Phase one of the two-phase flow (Devin 4060796714 repair): classify the
- * move, generate and validate the draft, and return its exact canonical
- * envelope WITHOUT sending. A generated draft can never match a
- * pre-issued grant, so the envelope goes to the approval flow, which
- * issues an exact send grant; `dispatchApprovedDraft` sends only under
- * that grant. Consumes no round and creates no operation.
+ * Phase one of the two-phase flow (Devin 4060796714 repair, E17 mailbox
+ * privacy): classify the move, generate and validate the draft, persist its
+ * exact canonical envelope server-side, and return only an opaque draft id
+ * plus a redacted preview WITHOUT sending. A generated draft can never match
+ * a pre-issued grant, so the approval flow issues an exact send grant from
+ * the stored envelope; `dispatchApprovedDraft` resolves that envelope
+ * server-side from the draft id and sends only under that grant. Consumes no
+ * round and creates no send operation; the unredacted recipient never leaves
+ * the backend in this response.
  */
 export const prepareNegotiationDraft = f1Action({
   args: {
@@ -1988,12 +2175,32 @@ export const prepareNegotiationDraft = f1Action({
     if (envelopeCanonical !== outbound.canonical) {
       return deniedResult("outbound-denied", "payload canonical form changed");
     }
+    const hash = payloadHash(envelope);
+    // E17: persist the unredacted owner envelope server-side only. The
+    // caller receives an opaque draft id plus a redacted preview; the
+    // mailbox and canonical recipient never leave the backend in this
+    // response.
+    const stored = await ctx.runMutation(saveDraftRef, {
+      organizationId: pinned.organizationId,
+      projectId: pinned.projectId,
+      negotiationId: pinned.negotiationId,
+      quoteId: pinned.quoteId,
+      quoteVersion: pinned.quoteVersion,
+      quoteContentHash: pinned.quoteContentHash,
+      ...(pinned.conversationVersion === undefined ? {} : { conversationVersion: pinned.conversationVersion }),
+      roundsUsed: pinned.roundsUsed,
+      move,
+      envelopeCanonical,
+      payloadHash: hash,
+      identity,
+    });
+    if (!stored.ok) return deniedResult(stored.code, stored.message);
     return {
       ok: true as const,
       outcome: "prepared" as const,
       move,
-      envelopeCanonical,
-      payloadHash: payloadHash(envelope),
+      draftId: stored.draftId,
+      payloadHash: hash,
       quoteVersion: pinned.quoteVersion,
       quoteContentHash: pinned.quoteContentHash,
       ...(pinned.conversationVersion === undefined
@@ -2013,8 +2220,10 @@ const prepareDraftRef = makeFunctionReference<
 
 /**
  * Phase two of the two-phase flow: send a previously prepared and approved
- * draft. The caller supplies the exact canonical envelope; approval is
- * proven by a live grant whose canonical payload equals it byte-for-byte,
+ * draft. The caller supplies only the opaque server-side draft id; the exact
+ * canonical envelope is resolved server-side under the same approver
+ * authority and never returns to the client. Approval is proven by a live
+ * grant whose canonical payload equals the stored envelope byte-for-byte,
  * and every mandate/quote/conversation/recipient/round pin is re-fenced
  * live before the single dispatch. Makes no model calls by construction,
  * so every denial here costs zero provider calls.
@@ -2023,7 +2232,7 @@ export const dispatchApprovedDraft = f1Action({
   args: {
     negotiationId: v.id("negotiations"),
     requestId: v.string(),
-    envelopeCanonical: v.string(),
+    draftId: v.id("evidence"),
     inboxId: v.string(),
     requestText: v.optional(v.string()),
   },
@@ -2080,8 +2289,21 @@ export const dispatchApprovedDraft = f1Action({
         redactedPreview: "stopped — bound reply arrived; ingestion must update the mandate basis first",
       };
     }
+    const approvedDraft = await ctx.runQuery(loadDraftRef, {
+      organizationId: pinned.organizationId,
+      projectId: pinned.projectId,
+      negotiationId: pinned.negotiationId,
+      draftId: args.draftId,
+      identity,
+    });
+    if (!approvedDraft.ok) return deniedResult(approvedDraft.code, approvedDraft.message);
+    // The stored draft is bound to one negotiation; a draft id from another
+    // negotiation fails closed here with no oracle and zero provider calls.
+    // Quote/round drift still fails closed through the live fences below and
+    // the exact-grant equality check.
+    const envelopeCanonical: string = approvedDraft.envelopeCanonical;
     const approved = validateApprovedEnvelope(
-      args.envelopeCanonical,
+      envelopeCanonical,
       pinned.recipientMailboxNormalized,
       pinned.targetMinorUnits,
     );
@@ -2096,7 +2318,7 @@ export const dispatchApprovedDraft = f1Action({
       negotiationId: pinned.negotiationId,
       requestId: args.requestId,
       inboxId: args.inboxId,
-      envelopeCanonical: args.envelopeCanonical,
+      envelopeCanonical,
       identity,
     });
     if (!("status" in prior)) return deniedResult(prior.code, prior.message);
@@ -2150,7 +2372,7 @@ export const dispatchApprovedDraft = f1Action({
       organizationId: pinned.organizationId,
       projectId: pinned.projectId,
       identity,
-      envelopeCanonical: args.envelopeCanonical,
+      envelopeCanonical,
     });
     if (!capacity.ok) return deniedResult(capacity.code, capacity.message);
 
@@ -2185,7 +2407,7 @@ export const dispatchApprovedDraft = f1Action({
       return deniedResult(fenced.code, fenced.message);
     }
 
-    const envelopeValue = JSON.parse(args.envelopeCanonical) as Record<string, unknown>;
+    const envelopeValue = JSON.parse(envelopeCanonical) as Record<string, unknown>;
     const hash = payloadHash(envelopeValue);
     const key = requestKey(String(pinned.organizationId), NEGOTIATION_OPERATION_KIND, args.requestId);
     const created = await ctx.runMutation(createOperationRef, {
@@ -2194,7 +2416,7 @@ export const dispatchApprovedDraft = f1Action({
       projectId: pinned.projectId,
       kind: NEGOTIATION_OPERATION_KIND,
       requestId: args.requestId,
-      payloadJson: args.envelopeCanonical,
+      payloadJson: envelopeCanonical,
       grantId: capacity.grantId,
       reservationId: capacity.reservationId,
       negotiationId: pinned.negotiationId,
@@ -2447,7 +2669,7 @@ export const runNegotiationStep = f1Action({
     const dispatched = await ctx.runAction(dispatchDraftRef, {
       negotiationId: args.negotiationId,
       requestId: args.requestId,
-      envelopeCanonical: prepared.envelopeCanonical,
+      draftId: prepared.draftId,
       inboxId: args.inboxId,
       ...(args.requestText === undefined ? {} : { requestText: args.requestText }),
     });
