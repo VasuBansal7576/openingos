@@ -1,11 +1,12 @@
 import { expect, test } from "bun:test";
 import { Window as HappyWindow } from "happy-dom";
 import { act, createElement } from "react";
+import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { ConvexReactClient, type Watch } from "convex/react";
 import App from "../App";
 import { statusFromConnection, type BackendStatus } from "../backend-state";
-import { mountRootApplication, RootApplication } from "../main";
+import { AdapterAwareApp, mountRootApplication, RootApplication } from "../main";
 
 function renderPath(backendStatus: BackendStatus): string {
   return renderToStaticMarkup(createElement(App, { backendStatus }));
@@ -1080,6 +1081,210 @@ test("retry after a discovery denial clears the rejected session and recovers", 
     expect(harness.queryArgs.length).toBeGreaterThan(deniedAttempts);
     expect(harness.mutationCalls).toHaveLength(0);
     expect(harness.container.textContent).not.toContain("PROJECT STATE UNAVAILABLE");
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+type Deferred<T> = {
+  readonly promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (error: unknown) => void;
+};
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((innerResolve, innerReject) => {
+    resolve = innerResolve;
+    reject = innerReject;
+  });
+  return { promise, resolve, reject };
+}
+
+async function mountAdapterAwareEmptyHarness() {
+  const dom = new HappyWindow({ url: "https://openingos.test/" });
+  const previousWindow = globalThis.window;
+  const previousDocument = globalThis.document;
+  const previousNavigator = globalThis.navigator;
+  const actEnvironment = globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean };
+  const previousActEnvironment = actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+  const browserGlobals = globalThis as unknown as { window: unknown; document: unknown; navigator: unknown };
+  browserGlobals.window = dom as unknown as globalThis.Window;
+  browserGlobals.document = dom.document as unknown as globalThis.Document;
+  browserGlobals.navigator = dom.navigator as unknown as globalThis.Navigator;
+  actEnvironment.IS_REACT_ACT_ENVIRONMENT = true;
+
+  const discoverQueue: Deferred<string | null>[] = [];
+  const sampleCalls: { idempotencyKey: string }[] = [];
+  let discoverCalls = 0;
+  const makeAdapter = () => ({
+    load: async () => null,
+    subscribe: () => () => {},
+    act: async () => ({ ok: true }),
+    discoverProject: () => {
+      discoverCalls += 1;
+      const gate = deferred<string | null>();
+      discoverQueue.push(gate);
+      return gate.promise;
+    },
+    createSample: async (input: { idempotencyKey: string }) => {
+      sampleCalls.push(input);
+      return { ok: true, projectId: "project-sample-1", message: "Sample project created by the server." };
+    },
+  });
+
+  const happyContainer = dom.document.createElement("div");
+  dom.document.body.append(happyContainer);
+  const container = happyContainer as unknown as globalThis.Element;
+  const root = createRoot(container);
+  let adapter = makeAdapter();
+  const renderStatus = async (backendStatus: Exclude<BackendStatus, "unconfigured">, nextAdapter?: ReturnType<typeof makeAdapter>) => {
+    if (nextAdapter !== undefined) adapter = nextAdapter;
+    await act(async () => {
+      root.render(createElement(AdapterAwareApp, {
+        backendStatus,
+        onRetry: () => undefined,
+        workbenchAdapter: adapter,
+      }));
+    });
+  };
+  const cleanup = async () => {
+    await act(async () => {
+      root.unmount();
+    });
+    dom.close();
+    browserGlobals.window = previousWindow;
+    browserGlobals.document = previousDocument;
+    browserGlobals.navigator = previousNavigator;
+    if (previousActEnvironment === undefined) delete actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+    else actEnvironment.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment;
+  };
+  const clickDemo = async () => {
+    const button = Array.from(container.querySelectorAll("button")).find((candidate) =>
+      candidate.textContent?.includes("Try the Northside"),
+    );
+    if (button === undefined) throw new Error("Demo button not found");
+    await act(async () => {
+      (button as unknown as HTMLButtonElement).click();
+    });
+  };
+  const pressEscape = async () => {
+    await act(async () => {
+      container.dispatchEvent(
+        new dom.window.KeyboardEvent("keydown", { bubbles: true, key: "Escape" }) as unknown as globalThis.KeyboardEvent,
+      );
+    });
+  };
+  return { container, renderStatus, cleanup, clickDemo, pressEscape, discoverQueue, sampleCalls, makeAdapter, getDiscoverCalls: () => discoverCalls };
+}
+
+test("cached empty confirmation does not survive disconnect and reconnect pending", async () => {
+  const harness = await mountAdapterAwareEmptyHarness();
+  try {
+    // Success enables: empty discovery confirms the current epoch.
+    await harness.renderStatus("connected");
+    await act(async () => {
+      harness.discoverQueue[0]?.resolve(null);
+      await harness.discoverQueue[0]?.promise;
+    });
+    await waitForText(harness.container, "NO AUTHORIZED PROJECT");
+    await harness.clickDemo();
+    expect(harness.container.textContent).toContain("Open a controlled sample project.");
+    expect(harness.sampleCalls).toHaveLength(1);
+    await harness.pressEscape();
+
+    // Disconnect disables immediately: the demo stays explicitly unavailable
+    // with no new mutation.
+    await harness.renderStatus("reconnecting");
+    await waitForText(harness.container, "CONNECTION INTERRUPTED");
+    await harness.clickDemo();
+    expect(harness.container.textContent).toContain("The sample demo is not available in this build.");
+    expect(harness.sampleCalls).toHaveLength(1);
+    await harness.pressEscape();
+
+    // Reconnect with discovery pending remains blocked: a local-only session
+    // plus a pending server round-trip never authorizes a send.
+    await harness.renderStatus("connected");
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    });
+    expect(harness.container.textContent).not.toContain("PROJECT STATE UNAVAILABLE");
+    await harness.clickDemo();
+    expect(harness.container.textContent).toContain("The sample demo is not available in this build.");
+    expect(harness.sampleCalls).toHaveLength(1);
+    await harness.pressEscape();
+
+    // Rejection issues no mutation and stays retryable.
+    await act(async () => {
+      const pending = harness.discoverQueue[harness.discoverQueue.length - 1];
+      pending?.reject(new Error("Authorized projects could not be discovered (forged-identity: unauthenticated). Retry to re-establish the backend identity."));
+      await pending?.promise.catch(() => undefined);
+    });
+    await waitForText(harness.container, "PROJECT STATE UNAVAILABLE");
+    expect(harness.container.textContent).toContain("forged-identity");
+    expect(harness.container.textContent).not.toContain("NO AUTHORIZED PROJECT");
+    expect(
+      Array.from(harness.container.querySelectorAll("button")).some((button) =>
+        button.textContent?.includes("Retry project state"),
+      ),
+    ).toBe(true);
+    await harness.clickDemo();
+    expect(harness.container.textContent).toContain("The sample demo is not available in this build.");
+    expect(harness.sampleCalls).toHaveLength(1);
+    await harness.pressEscape();
+
+    // Fresh confirmation re-enables: a new adapter generation plus a fresh
+    // empty discovery restores the demo mutation.
+    const freshAdapter = harness.makeAdapter();
+    await harness.renderStatus("connected", freshAdapter);
+    await act(async () => {
+      const pending = harness.discoverQueue[harness.discoverQueue.length - 1];
+      pending?.resolve(null);
+      await pending?.promise;
+    });
+    await waitForText(harness.container, "NO AUTHORIZED PROJECT");
+    await harness.clickDemo();
+    expect(harness.container.textContent).toContain("Open a controlled sample project.");
+    expect(harness.sampleCalls).toHaveLength(2);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("an older discovery success cannot re-enable creation after disconnect", async () => {
+  const harness = await mountAdapterAwareEmptyHarness();
+  try {
+    await harness.renderStatus("connected");
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+    expect(harness.discoverQueue).toHaveLength(1);
+    const stale = harness.discoverQueue[0];
+    if (stale === undefined) throw new Error("Initial discovery was never dispatched");
+
+    // Disconnect while the first discovery is still pending.
+    await harness.renderStatus("reconnecting");
+    await waitForText(harness.container, "CONNECTION INTERRUPTED");
+
+    // The stale success resolves after disconnect: it belongs to the older
+    // epoch and must not confirm creation.
+    await act(async () => {
+      stale.resolve(null);
+      await stale.promise;
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+
+    // Reconnect dispatches a fresh pending discovery that also stays blocked.
+    await harness.renderStatus("connected");
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    });
+    await harness.clickDemo();
+    expect(harness.container.textContent).toContain("The sample demo is not available in this build.");
+    expect(harness.sampleCalls).toHaveLength(0);
   } finally {
     await harness.cleanup();
   }
