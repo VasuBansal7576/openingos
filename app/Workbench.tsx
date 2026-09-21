@@ -7,6 +7,9 @@ import type {
   WorkbenchAsset,
   WorkbenchEvidence,
   WorkbenchImpact,
+  WorkbenchIntakeInput,
+  WorkbenchIntakeMode,
+  WorkbenchIntakeResult,
   WorkbenchLoadState,
   WorkbenchOffer,
   WorkbenchQuote,
@@ -31,7 +34,10 @@ export interface WorkbenchViewProps {
   readonly onRetry?: (() => void) | undefined;
   readonly onAction?: ((action: WorkbenchAction) => Promise<WorkbenchActionResult> | WorkbenchActionResult) | undefined;
   readonly onLoadMore?: (() => void) | undefined;
+  readonly onIntake?: ((input: WorkbenchIntakeInput) => Promise<WorkbenchIntakeResult>) | undefined;
 }
+
+export type WorkbenchIntakeHandler = NonNullable<WorkbenchViewProps["onIntake"]>;
 
 function Icon({ name, size = 18 }: { readonly name: string; readonly size?: number }) {
   const paths: Record<string, string> = {
@@ -894,7 +900,452 @@ function EquipmentView({ snapshot, onAction, onMessage }: { readonly snapshot: W
   );
 }
 
-export default function WorkbenchView({ loadState, onRetry, onAction, onLoadMore }: WorkbenchViewProps) {
+function createIntakeKey(): string {
+  try {
+    if (typeof globalThis.crypto?.randomUUID === "function") return globalThis.crypto.randomUUID();
+  } catch {
+    // Fall through to a local opaque key in runtimes without Web Crypto.
+  }
+  return `intake-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+const INTAKE_MODES: readonly { readonly value: WorkbenchIntakeMode; readonly title: string; readonly detail: string }[] = [
+  { value: "opening", title: "Plan an opening", detail: "Location, budget, and deadline for a new counter." },
+  { value: "quoteComparison", title: "Compare quotes", detail: "Bring existing offers for one requirement." },
+  { value: "equipment", title: "Equipment case", detail: "A service issue on installed equipment." },
+];
+
+function intakeFingerprint(values: {
+  readonly mode: WorkbenchIntakeMode;
+  readonly projectName: string;
+  readonly workspaceKind: string;
+  readonly region: string;
+  readonly currency: string;
+  readonly needBy: string;
+  readonly budget: string;
+  readonly detailTitle: string;
+  readonly detailCategory: string;
+  readonly detailSummary: string;
+  readonly urgency: string;
+}): string {
+  return JSON.stringify(values);
+}
+
+/**
+ * P-01 connected intake inside the purchasing-desk visual system. The form
+ * collects only the immediately relevant minimum facts for the chosen
+ * entry point and submits once through the real Convex intake mutation.
+ * No vendors, prices, quotes, or provider outcomes are invented here.
+ */
+interface IntakeFormValues {
+  readonly projectName: string;
+  readonly workspaceKind: string;
+  readonly region: string;
+  readonly currency: string;
+  readonly needBy: string;
+  readonly budget: string;
+  readonly detailTitle: string;
+  readonly detailCategory: string;
+  readonly detailSummary: string;
+  readonly urgency: string;
+}
+
+function readIntakeForm(form: HTMLFormElement | null): IntakeFormValues {
+  const empty: IntakeFormValues = {
+    projectName: "",
+    workspaceKind: "private",
+    region: "",
+    currency: "",
+    needBy: "",
+    budget: "",
+    detailTitle: "",
+    detailCategory: "",
+    detailSummary: "",
+    urgency: "normal",
+  };
+  if (form === null) return empty;
+  // Read named controls directly: this is the same DOM state the browser
+  // submits and avoids coupling the submit path to a FormData global. The
+  // duck-typed value check keeps this runnable wherever the DOM interfaces
+  // are not installed as globals (component code never assumes them).
+  const text = (name: string): string => {
+    const control = form.querySelector(`[name="${name}"]`);
+    if (control !== null && "value" in control && typeof control.value === "string") {
+      return control.value;
+    }
+    return "";
+  };
+  return {
+    projectName: text("projectName"),
+    workspaceKind: text("workspaceKind"),
+    region: text("region"),
+    currency: text("currency"),
+    needBy: text("needBy"),
+    budget: text("budget"),
+    detailTitle: text("detailTitle"),
+    detailCategory: text("detailCategory"),
+    detailSummary: text("detailSummary"),
+    urgency: text("urgency"),
+  };
+}
+
+export function WorkbenchIntakeView({ onIntake }: { readonly onIntake: WorkbenchIntakeHandler }) {
+  const [mode, setMode] = useState<WorkbenchIntakeMode>("opening");
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [idempotencyKey, setIdempotencyKey] = useState<string | null>(null);
+  const [submittedFingerprint, setSubmittedFingerprint] = useState<string | null>(null);
+  const submittingRef = useRef(false);
+  const formRef = useRef<HTMLFormElement | null>(null);
+  const idPrefix = useId().replace(/:/g, "");
+  const errorId = `${idPrefix}-intake-error`;
+  const noticeId = `${idPrefix}-intake-notice`;
+
+  // Fields stay uncontrolled so entered values survive re-renders from
+  // validation, recoverable failure, and pending states without a
+  // framework round-trip per keystroke.
+  const fingerprintFor = (values: IntakeFormValues): string =>
+    intakeFingerprint({ mode, ...values });
+
+  const noteMutation = (): void => {
+    // A changed payload after a submission needs a fresh key so the server
+    // never confuses an edited retry with a changed-key conflict replay.
+    const form = formRef.current;
+    if (form === null || submittedFingerprint === null) return;
+    if (fingerprintFor(readIntakeForm(form)) !== submittedFingerprint) {
+      setSubmittedFingerprint(null);
+      setIdempotencyKey(null);
+    }
+  };
+
+  const validateValues = (values: IntakeFormValues): string | null => {
+    if (values.projectName.trim().length === 0) return "Name the project before starting intake.";
+    if (values.projectName.trim().length > 100) return "Keep the project name within 100 characters.";
+    if (mode === "opening" && values.region.trim().length === 0) return "Add the city or region for this opening.";
+    if (values.region.trim().length > 128) return "Keep the region within 128 characters.";
+    if (values.currency.trim().length > 0 && !/^[A-Za-z]{3}$/.test(values.currency.trim())) {
+      return "Use a three-letter reporting currency such as EUR.";
+    }
+    if (values.budget.trim().length > 0 && !/^\d+(?:\.\d{1,2})?$/.test(values.budget.trim())) {
+      return "Enter the budget as whole euros and cents, for example 45000 or 45000.50.";
+    }
+    if (values.needBy.trim().length > 0 && Number.isNaN(Date.parse(values.needBy))) {
+      return "Enter a valid needed-by date or leave it empty.";
+    }
+    if (mode === "quoteComparison" && values.detailTitle.trim().length === 0) {
+      return "Describe the requirement these quotes cover.";
+    }
+    if (mode === "equipment" && values.detailTitle.trim().length === 0) {
+      return "Label the equipment this case concerns.";
+    }
+    if (mode === "equipment" && values.detailSummary.trim().length === 0) {
+      return "Describe the service issue before opening the case.";
+    }
+    if (values.detailTitle.trim().length > 256) return "Keep the subject within 256 characters.";
+    if (values.detailCategory.trim().length > 128) return "Keep the category within 128 characters.";
+    if (values.detailSummary.trim().length > 800 && mode === "equipment") {
+      return "Keep the issue summary within 800 characters.";
+    }
+    if (values.detailSummary.trim().length > 2000) return "Keep the notes within 2000 characters.";
+    return null;
+  };
+
+  const submit = async (event?: { preventDefault: () => void; currentTarget?: HTMLFormElement | null }): Promise<void> => {
+    event?.preventDefault();
+    if (pending || submittingRef.current) return;
+    const form = event?.currentTarget ?? formRef.current;
+    const values = readIntakeForm(form);
+    const invalid = validateValues(values);
+    if (invalid !== null) {
+      setError(invalid);
+      setNotice(null);
+      return;
+    }
+    const currentFingerprint = fingerprintFor(values);
+    if (submittedFingerprint !== null && currentFingerprint !== submittedFingerprint) {
+      setSubmittedFingerprint(null);
+      setIdempotencyKey(null);
+    }
+    const key = (submittedFingerprint !== null && currentFingerprint === submittedFingerprint && idempotencyKey !== null)
+      ? idempotencyKey
+      : createIntakeKey();
+    submittingRef.current = true;
+    setIdempotencyKey(key);
+    setSubmittedFingerprint(currentFingerprint);
+    setError(null);
+    setNotice(null);
+    setPending(true);
+    try {
+      const trimmedCurrency = values.currency.trim();
+      const budgetMinorUnits = values.budget.trim().length === 0
+        ? undefined
+        : Math.round(Number.parseFloat(values.budget.trim()) * 100);
+      const needByAt = values.needBy.trim().length === 0 ? undefined : Date.parse(values.needBy);
+      const workspaceKind = values.workspaceKind === "guest" ? "guest" as const : "private" as const;
+      const urgency = values.urgency === "urgent" || values.urgency === "high" || values.urgency === "low"
+        ? values.urgency
+        : "normal" as const;
+      const input: WorkbenchIntakeInput = {
+        mode,
+        projectName: values.projectName.trim(),
+        workspaceKind,
+        ...(values.region.trim().length === 0 ? {} : { region: values.region.trim() }),
+        ...(trimmedCurrency.length === 0 ? {} : { currency: trimmedCurrency.toUpperCase() }),
+        ...(needByAt === undefined || Number.isNaN(needByAt) ? {} : { needByAt }),
+        ...(budgetMinorUnits === undefined || !Number.isSafeInteger(budgetMinorUnits) || budgetMinorUnits < 0
+          ? {}
+          : { budgetMinorUnits }),
+        ...(values.detailTitle.trim().length === 0 ? {} : { detailTitle: values.detailTitle.trim() }),
+        ...(values.detailCategory.trim().length === 0 ? {} : { detailCategory: values.detailCategory.trim() }),
+        ...(values.detailSummary.trim().length === 0 ? {} : { detailSummary: values.detailSummary.trim() }),
+        ...(mode === "equipment" ? { urgency } : {}),
+        idempotencyKey: key,
+      };
+      const result = await onIntake(input);
+      if (!result.ok) {
+        // Recoverable failure: uncontrolled fields keep their DOM values in
+        // place under the same key so an unchanged retry replays
+        // idempotently.
+        setError(result.message ?? "The server did not create this workspace.");
+        return;
+      }
+      setNotice("Workspace created. Loading the persisted project.");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "The server did not create this workspace.");
+    } finally {
+      submittingRef.current = false;
+      setPending(false);
+    }
+  };
+
+  return (
+    <div className="wb-app wb-connection-app">
+      <Header activeTab="project" project={{ name: "New project intake", region: null, currency: null }} onTabChange={() => undefined} onOpenAssistant={() => undefined} disabled />
+      <main id="workbench-main" className="wb-page wb-intake-page" tabIndex={-1}>
+        <PageHeading
+          eyebrow="OPENINGOS / NEW PROJECT INTAKE"
+          title="Start with the job at hand."
+          description="Choose one entry point and share only the facts needed to open a real workspace. Nothing is invented while the server record is created."
+        />
+        <div className="wb-intake-layout">
+          <section className="wb-intake-paper" aria-labelledby={`${idPrefix}-intake-title`}>
+            <div className="wb-connection-paper-head">
+              <span className="wb-connection-dot wb-connection-dot-pending" aria-hidden="true" />
+              <span className="wb-eyebrow">SERVER WORKSPACE · NO SAMPLE DATA</span>
+              <span className="wb-paper-version">P-01<br />INTAKE</span>
+            </div>
+            <h2 id={`${idPrefix}-intake-title`}>Open a workspace</h2>
+            <p className="wb-intake-lede">One submission creates one persisted project under your identity. Research, outreach, and spend start later under their own approvals.</p>
+            <form
+              className="wb-intake-form"
+              ref={formRef}
+              onSubmit={(formEvent) => { void submit(formEvent); }}
+              onChange={noteMutation}
+              onInput={noteMutation}
+              aria-busy={pending}
+            >
+              <fieldset className="wb-intake-modes" disabled={pending}>
+                <legend>Entry point</legend>
+                {INTAKE_MODES.map((entry) => (
+                  <label key={entry.value} className={mode === entry.value ? "wb-intake-mode active" : "wb-intake-mode"}>
+                    <input
+                      type="radio"
+                      name={`${idPrefix}-intake-mode`}
+                      value={entry.value}
+                      defaultChecked={mode === entry.value}
+                      onChange={() => setMode(entry.value)}
+                    />
+                    <span><strong>{entry.title}</strong><small>{entry.detail}</small></span>
+                  </label>
+                ))}
+              </fieldset>
+              <div className="wb-intake-grid">
+                <div className="wb-form-field">
+                  <label htmlFor={`${idPrefix}-project-name`}>Project name</label>
+                  <input
+                    id={`${idPrefix}-project-name`}
+                    name="projectName"
+                    defaultValue=""
+                    maxLength={100}
+                    placeholder="Northside café opening"
+                    disabled={pending}
+                    autoComplete="off"
+                  />
+                </div>
+                <div className="wb-form-field">
+                  <label htmlFor={`${idPrefix}-workspace-kind`}>Workspace</label>
+                  <select
+                    id={`${idPrefix}-workspace-kind`}
+                    name="workspaceKind"
+                    defaultValue="private"
+                    disabled={pending}
+                  >
+                    <option value="private">Private project</option>
+                    <option value="guest">Guest evaluation</option>
+                  </select>
+                </div>
+                {mode === "opening" ? (
+                  <div className="wb-form-field">
+                    <label htmlFor={`${idPrefix}-region`}>City or region</label>
+                    <input
+                      id={`${idPrefix}-region`}
+                      name="region"
+                      defaultValue=""
+                      maxLength={128}
+                      placeholder="Amsterdam, Netherlands"
+                      disabled={pending}
+                      autoComplete="off"
+                    />
+                  </div>
+                ) : null}
+                {mode === "opening" || mode === "quoteComparison" ? (
+                  <div className="wb-form-field">
+                    <label htmlFor={`${idPrefix}-currency`}>Reporting currency</label>
+                    <input
+                      id={`${idPrefix}-currency`}
+                      name="currency"
+                      defaultValue="EUR"
+                      maxLength={3}
+                      placeholder="EUR"
+                      disabled={pending}
+                      autoComplete="off"
+                    />
+                  </div>
+                ) : null}
+                {mode === "opening" ? (
+                  <>
+                    <div className="wb-form-field">
+                      <label htmlFor={`${idPrefix}-need-by`}>Needed by (optional)</label>
+                      <input
+                        id={`${idPrefix}-need-by`}
+                        name="needBy"
+                        type="date"
+                        defaultValue=""
+                        disabled={pending}
+                      />
+                    </div>
+                    <div className="wb-form-field">
+                      <label htmlFor={`${idPrefix}-budget`}>Equipment budget in euros (optional)</label>
+                      <input
+                        id={`${idPrefix}-budget`}
+                        name="budget"
+                        defaultValue=""
+                        inputMode="decimal"
+                        placeholder="45000"
+                        disabled={pending}
+                        autoComplete="off"
+                      />
+                    </div>
+                  </>
+                ) : null}
+                {mode === "quoteComparison" ? (
+                  <>
+                    <div className="wb-form-field">
+                      <label htmlFor={`${idPrefix}-detail-title`}>Requirement subject</label>
+                      <input
+                        id={`${idPrefix}-detail-title`}
+                        name="detailTitle"
+                        defaultValue=""
+                        maxLength={256}
+                        placeholder="Two-group espresso machine"
+                        disabled={pending}
+                        autoComplete="off"
+                      />
+                    </div>
+                    <div className="wb-form-field">
+                      <label htmlFor={`${idPrefix}-detail-category`}>Category (optional)</label>
+                      <input
+                        id={`${idPrefix}-detail-category`}
+                        name="detailCategory"
+                        defaultValue=""
+                        maxLength={128}
+                        placeholder="espresso"
+                        disabled={pending}
+                        autoComplete="off"
+                      />
+                    </div>
+                    <div className="wb-form-field wb-form-field-full">
+                      <label htmlFor={`${idPrefix}-detail-summary`}>Notes on the offers (optional)</label>
+                      <textarea
+                        id={`${idPrefix}-detail-summary`}
+                        name="detailSummary"
+                        defaultValue=""
+                        maxLength={2000}
+                        rows={3}
+                        placeholder="What arrived so far, and what is still missing"
+                        disabled={pending}
+                      />
+                    </div>
+                  </>
+                ) : null}
+                {mode === "equipment" ? (
+                  <>
+                    <div className="wb-form-field">
+                      <label htmlFor={`${idPrefix}-equipment-label`}>Equipment label</label>
+                      <input
+                        id={`${idPrefix}-equipment-label`}
+                        name="detailTitle"
+                        defaultValue=""
+                        maxLength={256}
+                        placeholder="Atlas grinder"
+                        disabled={pending}
+                        autoComplete="off"
+                      />
+                    </div>
+                    <div className="wb-form-field">
+                      <label htmlFor={`${idPrefix}-urgency`}>Urgency</label>
+                      <select
+                        id={`${idPrefix}-urgency`}
+                        name="urgency"
+                        defaultValue="normal"
+                        disabled={pending}
+                      >
+                        <option value="urgent">Urgent</option>
+                        <option value="high">High</option>
+                        <option value="normal">Normal</option>
+                        <option value="low">Low</option>
+                      </select>
+                    </div>
+                    <div className="wb-form-field wb-form-field-full">
+                      <label htmlFor={`${idPrefix}-issue-summary`}>What needs attention?</label>
+                      <textarea
+                        id={`${idPrefix}-issue-summary`}
+                        name="detailSummary"
+                        defaultValue=""
+                        maxLength={800}
+                        rows={4}
+                        placeholder="Describe the service issue"
+                        disabled={pending}
+                      />
+                      <span className="wb-character-count">800 characters maximum</span>
+                    </div>
+                  </>
+                ) : null}
+              </div>
+              {error !== null ? <p className="wb-form-error" id={errorId} role="alert">{error}</p> : null}
+              {notice !== null ? <p className="wb-form-notice" id={noticeId} role="status">{notice}</p> : null}
+              <div className="wb-intake-actions">
+                <ActionButton kind="primary" type="submit" disabled={pending}>
+                  {pending ? "Creating workspace…" : "Create workspace"}
+                </ActionButton>
+                <p className="wb-micro"><Icon name="lock" size={12} /> One submission writes one workspace under your signed-in identity. Duplicate clicks share a single submission.</p>
+              </div>
+            </form>
+          </section>
+          <aside className="wb-connection-note" aria-label="What happens next">
+            <span className="wb-eyebrow">WHAT HAPPENS NEXT</span>
+            <h2>The workbench fills from server truth.</h2>
+            <p>Once the workspace exists, this same desk loads its persisted project, requirements, and history. Research, quotes, and outreach start from there under their own approvals.</p>
+            <div className="wb-honesty-card"><Icon name="lock" size={18} /><div><strong>Private and fail-closed</strong><p>Missing details block the submission instead of inventing vendors, prices, or provider success.</p></div></div>
+          </aside>
+        </div>
+      </main>
+    </div>
+  );
+}
+
+export default function WorkbenchView({ loadState, onRetry, onAction, onLoadMore, onIntake }: WorkbenchViewProps) {
   const [activeTab, setActiveTab] = useState<Tab>("project");
   const [assistantOpen, setAssistantOpen] = useState(false);
   const [selectedOffer, setSelectedOffer] = useState<WorkbenchOffer | null>(null);
@@ -903,6 +1354,9 @@ export default function WorkbenchView({ loadState, onRetry, onAction, onLoadMore
   const snapshot = loadState.state === "ready" ? loadState.snapshot : "lastKnown" in loadState ? loadState.lastKnown : undefined;
   const connectedAction = loadState.state === "ready" ? onAction : undefined;
   if (!snapshot) {
+    if (loadState.state === "empty" && onIntake !== undefined) {
+      return <WorkbenchIntakeView onIntake={onIntake} />;
+    }
     const message = loadState.state === "empty"
       ? `${loadState.message} No vendors, quotes or provider outcomes are shown until server state is available.`
       : loadState.state === "error"

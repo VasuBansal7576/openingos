@@ -56,7 +56,7 @@ async function scheduleTemporaryExpiry(
   });
 }
 
-async function recordCurrentAuthority(
+export async function recordCurrentAuthority(
   ctx: F1MutationCtx,
   organizationId: Id<"organizations">,
   projectId: Id<"projects"> | undefined,

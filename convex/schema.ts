@@ -1315,6 +1315,23 @@ export default defineSchema({
     .index("by_project_and_key", ["projectId", "idempotencyKey"])
     .index("by_requirement", ["requirementId"])
     .index("by_assessment", ["assessmentId"]),
+
+  /**
+   * P-01 intake idempotency (PRD 10). One row per caller identity and
+   * client-supplied key binds the exact normalized intake payload to the
+   * created organization/project. Exact replay returns the stored
+   * workspace; a reused key with different normalized fields conflicts
+   * whole before any write. The compound index scopes the lookup to the
+   * caller's own identity, so no existence oracle leaks across tenants.
+   */
+  intakeRequests: defineTable({
+    identity: v.string(),
+    idempotencyKey: v.string(),
+    normalizedPayload: v.string(),
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    createdAt: v.number(),
+  }).index("by_identity_and_key", ["identity", "idempotencyKey"]),
 });
 
 export { moneyValidator, evidenceRefValidator };

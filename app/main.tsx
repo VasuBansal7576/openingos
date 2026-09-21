@@ -9,6 +9,8 @@ import {
   parseWorkbenchSnapshot,
   type WorkbenchActionResult,
   type WorkbenchActivityItem,
+  type WorkbenchIntakeInput,
+  type WorkbenchIntakeResult,
   type WorkbenchLoadState,
   type WorkbenchServerAdapter,
   type WorkbenchSnapshot,
@@ -315,11 +317,34 @@ export function AdapterAwareApp({
     });
   };
 
+  const handleIntake = async (input: WorkbenchIntakeInput): Promise<WorkbenchIntakeResult> => {
+    if (backendStatusRef.current !== "connected") {
+      return { ok: false, message: "Intake waits for a live backend connection. Nothing was sent." };
+    }
+    if (workbenchAdapter?.createIntake === undefined) {
+      return { ok: false, message: "No server intake route is configured. Nothing was sent." };
+    }
+    try {
+      const result = await workbenchAdapter.createIntake(input);
+      if (result.ok && result.projectId !== undefined) {
+        setResolvedProjectId(result.projectId);
+      } else if (!result.ok) {
+        setActionError(result.message ?? "The server did not create this workspace.");
+      }
+      return result;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "The server did not create this workspace.";
+      setActionError(message);
+      return { ok: false, message };
+    }
+  };
+
   const connectedLoadMore = workbench?.state === "ready" && backendStatus === "connected" ? handleLoadMore : undefined;
+  const connectedIntake = workbench?.state === "empty" && backendStatus === "connected" ? handleIntake : undefined;
   const appWorkbench = backendStatus === "reconnecting" && workbench?.state === "ready"
     ? { state: "reconnecting" as const, lastKnown: workbench.snapshot }
     : workbench;
-  return <><App backendStatus={backendStatus} onRetry={onRetry} workbench={appWorkbench} onAction={handleAction} onLoadMore={connectedLoadMore} />{actionError ? <span className="wb-visually-hidden" role="alert">{actionError}</span> : null}</>;
+  return <><App backendStatus={backendStatus} onRetry={onRetry} workbench={appWorkbench} onAction={handleAction} onLoadMore={connectedLoadMore} onIntake={connectedIntake} />{actionError ? <span className="wb-visually-hidden" role="alert">{actionError}</span> : null}</>;
 }
 
 function normaliseProjectId(value: string | undefined): string | undefined {
