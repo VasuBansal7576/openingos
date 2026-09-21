@@ -26,6 +26,7 @@ import type { Id } from "../_generated/dataModel.js";
 import schema from "../schema.js";
 import * as memberships from "../access/memberships.js";
 import * as imports from "./handlers.js";
+import { promotedRequirementKey } from "./equipmentCsv.js";
 
 type ConvexTest = TestConvex<typeof schema>;
 
@@ -492,6 +493,106 @@ test("malformed and oversized documents are denied with zero records created", a
   expect(await tableCount(t, "evidence")).toBe(0);
 });
 
+test("BOM imports keep a lossless source: identical retry replays and review promotes", async () => {
+  const t = convexTest(schema, modules);
+  const { organizationId, projectId } = await setupProject(t);
+  const bomCsv = "﻿" + VALID_CSV;
+  const submitted = await submitCsv(t, OWNER, organizationId, projectId, bomCsv, "bom-key");
+  expect(submitted.ok).toBe(true);
+  if (!submitted.ok) return;
+  expect(submitted.validCount).toBe(3);
+  expect(submitted.deduplicated).toBe(false);
+
+  const retry = await submitCsv(t, OWNER, organizationId, projectId, bomCsv, "bom-key");
+  expect(retry.ok).toBe(true);
+  if (!retry.ok) return;
+  expect(retry.deduplicated).toBe(true);
+  expect(retry.evidenceId).toBe(submitted.evidenceId);
+  expect(retry.rows).toEqual(submitted.rows);
+
+  // Review re-hashes the stored source: the BOM must survive roundtrip.
+  const key = submitted.rows[0]?.rowKey;
+  if (key === undefined) throw new Error("missing row key");
+  const review = await t.withIdentity(OWNER).mutation(reviewRef, {
+    organizationId,
+    projectId,
+    evidenceId: submitted.evidenceId,
+    expectedContentHash: submitted.contentHash,
+    selectedRowKeys: [key],
+  });
+  expect(review.ok).toBe(true);
+  if (!review.ok) return;
+  expect(review.promotedCount).toBe(1);
+});
+
+test("a key first seen on the byte-dedupe path is durably bound and conflicts on changed reuse", async () => {
+  const t = convexTest(schema, modules);
+  const { organizationId, projectId } = await setupProject(t);
+  const first = await submitCsv(t, OWNER, organizationId, projectId, VALID_CSV, "key-one");
+  if (!first.ok) throw new Error("submit failed");
+  const dedupe = await submitCsv(t, OWNER, organizationId, projectId, VALID_CSV, "key-two");
+  expect(dedupe.ok).toBe(true);
+  if (!dedupe.ok) return;
+  expect(dedupe.deduplicated).toBe(true);
+  expect(await tableCount(t, "evidence")).toBe(1);
+  expect(await tableCount(t, "files")).toBe(1);
+
+  // The same key with changed payload now conflicts with zero new records.
+  const changed = VALID_CSV.replace("Grinder", "Blender");
+  const conflict = await submitCsv(t, OWNER, organizationId, projectId, changed, "key-two");
+  expect(conflict.ok).toBe(false);
+  if (!conflict.ok) expect(conflict.code).toBe("duplicate-conflict");
+  expect(await tableCount(t, "evidence")).toBe(1);
+  expect(await tableCount(t, "files")).toBe(1);
+  expect(await tableCount(t, "requirements")).toBe(0);
+});
+
+test("a promotion collision denies the entire review with zero partial writes", async () => {
+  const t = convexTest(schema, modules);
+  const { organizationId, projectId } = await setupProject(t);
+  const submitted = await submitCsv(t, OWNER, organizationId, projectId);
+  if (!submitted.ok) throw new Error("submit failed");
+  const validKeys = submitted.rows
+    .filter((row) => row.status === "valid")
+    .map((row) => row.rowKey)
+    .filter((key) => key !== undefined);
+  expect(validKeys).toHaveLength(3);
+
+  // A conflicting requirement already occupies row 3's deterministic key.
+  const collisionKey = promotedRequirementKey(submitted.contentHash, 3);
+  await t.run(async (ctx) => {
+    await ctx.db.insert("requirements", {
+      organizationId,
+      projectId,
+      key: collisionKey,
+      title: "A different requirement entirely",
+      category: "kitchen",
+      quantity: "9",
+      unit: "box",
+      priority: "P2",
+      state: "draft",
+      fulfillment: "notOrdered",
+      version: 1,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+  });
+
+  const eventsBefore = await tableCount(t, "projectEvents");
+  const review = await t.withIdentity(OWNER).mutation(reviewRef, {
+    organizationId,
+    projectId,
+    evidenceId: submitted.evidenceId,
+    expectedContentHash: submitted.contentHash,
+    selectedRowKeys: validKeys,
+  });
+  expect(review.ok).toBe(false);
+  if (!review.ok) expect(review.code).toBe("duplicate-conflict");
+  // The earlier rows in the same selection were never written.
+  expect(await tableCount(t, "requirements")).toBe(1);
+  expect(await tableCount(t, "projectEvents")).toBe(eventsBefore);
+});
+
 test("attachment ingestion records metadata with review-required status and never synthesizes a quote", async () => {
   const t = convexTest(schema, modules);
   const { organizationId, projectId } = await setupProject(t);
@@ -516,7 +617,10 @@ test("attachment ingestion records metadata with review-required status and neve
     expect(evidence.executionMode).toBe("recorded");
     // Bytes/storage/extraction are unavailable: recorded honestly.
     expect(evidence.completeness).toBe("unavailable");
-    expect(evidence.protectedSourceText).toBeUndefined();
+    // The canonical normalized metadata is the protected source record.
+    expect(evidence.protectedSourceText).toBe(
+      '{"contentType":"application/pdf","fileName":"supplier-quote.pdf","sizeBytes":12345}',
+    );
     const file = await ctx.db.get(result.fileId);
     if (file === null) throw new Error("missing file");
     expect(file.sizeBytes).toBe(12_345);
@@ -558,4 +662,63 @@ test("attachment ingestion records metadata with review-required status and neve
   });
   expect(changed.ok).toBe(false);
   if (!changed.ok) expect(changed.code).toBe("duplicate-conflict");
+
+  // Identical metadata under a new key deduplicates and binds the new key.
+  const metadataDedupe = await t.withIdentity(OWNER).mutation(attachmentRef, {
+    organizationId,
+    projectId,
+    idempotencyKey: "attachment-key-2",
+    fileName: "supplier-quote.pdf",
+    contentType: "application/pdf",
+    sizeBytes: 12_345,
+  });
+  expect(metadataDedupe.ok).toBe(true);
+  if (!metadataDedupe.ok) return;
+  expect(metadataDedupe.deduplicated).toBe(true);
+  expect(metadataDedupe.evidenceId).toBe(result.evidenceId);
+  expect(await tableCount(t, "evidence")).toBe(1);
+
+  // The newly bound key now conflicts on changed metadata.
+  const reboundConflict = await t.withIdentity(OWNER).mutation(attachmentRef, {
+    organizationId,
+    projectId,
+    idempotencyKey: "attachment-key-2",
+    fileName: "other.pdf",
+    contentType: "application/pdf",
+    sizeBytes: 12_345,
+  });
+  expect(reboundConflict.ok).toBe(false);
+  if (!reboundConflict.ok) expect(reboundConflict.code).toBe("duplicate-conflict");
+});
+
+test("attachment replay revalidates the stored metadata against its recorded hash", async () => {
+  const t = convexTest(schema, modules);
+  const { organizationId, projectId } = await setupProject(t);
+  const created = await t.withIdentity(OWNER).mutation(attachmentRef, {
+    organizationId,
+    projectId,
+    idempotencyKey: "attachment-key-tamper",
+    fileName: "manual.pdf",
+    contentType: "application/pdf",
+    sizeBytes: 42,
+  });
+  expect(created.ok).toBe(true);
+  if (!created.ok) return;
+
+  await t.run(async (ctx) => {
+    await ctx.db.patch("evidence", created.evidenceId, {
+      protectedSourceText: '{"fileName":"manual.pdf","contentType":"application/pdf","sizeBytes":43}',
+    });
+  });
+
+  const replay = await t.withIdentity(OWNER).mutation(attachmentRef, {
+    organizationId,
+    projectId,
+    idempotencyKey: "attachment-key-tamper",
+    fileName: "manual.pdf",
+    contentType: "application/pdf",
+    sizeBytes: 42,
+  });
+  expect(replay.ok).toBe(false);
+  if (!replay.ok) expect(replay.code).toBe("invalid-payload");
 });

@@ -55,6 +55,7 @@ import {
   parseEquipmentCsv,
   promotedRequirementKey,
   validateDraftRowForPromotion,
+  type EquipmentCsvDraftRow,
   type EquipmentCsvParseOutcome,
 } from "./equipmentCsv.js";
 
@@ -99,6 +100,33 @@ function normalizeImportIdempotencyKey(raw: string): AuthorityResult<string> {
 }
 
 const eventKindForImport = (key: string): string => `imports.equipmentCsv:${key}`;
+const eventKindForAttachment = (key: string): string => `imports.attachment:${key}`;
+
+/**
+ * Durable key binding: every accepted import key is bound to the exact
+ * source content hash through one exact indexed projectEvents row, so a
+ * later changed payload under the same key always conflicts — including
+ * keys that were first seen on the dedupe path.
+ */
+async function bindImportKey(
+  ctx: F1MutationCtx,
+  organizationId: Id<"organizations">,
+  projectId: Id<"projects">,
+  eventKind: string,
+  sourceId: string,
+  identity: string,
+  contentHash: string,
+  now: number,
+): Promise<void> {
+  await ctx.db.insert("projectEvents", {
+    organizationId,
+    projectId,
+    kind: eventKind,
+    actor: identity,
+    evidenceRefs: [{ sourceId, version: "1", locator: contentHash }],
+    createdAt: now,
+  });
+}
 
 type ParsedPlan = Extract<EquipmentCsvParseOutcome, { ok: true }>["plan"];
 
@@ -286,9 +314,21 @@ export const submitEquipmentCsv = f1Mutation({
     }
 
     // 2. Identical source bytes in the same project deduplicate to the
-    // original import regardless of the caller's key.
+    // original import regardless of the caller's key. The new key is
+    // still durably bound to the same source hash, so a later changed
+    // payload under that key conflicts.
     const byteDedupe = await replayOriginalResult(ctx, args.projectId, contentHash);
     if (byteDedupe !== null) {
+      await bindImportKey(
+        ctx,
+        args.organizationId,
+        args.projectId,
+        eventKindForImport(key.value),
+        "imports.equipmentCsv",
+        access.value.identity,
+        contentHash,
+        now,
+      );
       return {
         ok: true as const,
         evidenceId: byteDedupe.evidenceId,
@@ -330,14 +370,16 @@ export const submitEquipmentCsv = f1Mutation({
       sizeBytes: bytes.length,
       contentType: "text/csv",
     });
-    await ctx.db.insert("projectEvents", {
-      organizationId: args.organizationId,
-      projectId: args.projectId,
-      kind: eventKindForImport(key.value),
-      actor: access.value.identity,
-      evidenceRefs: [{ sourceId: "imports.equipmentCsv", version: "1", locator: contentHash }],
-      createdAt: now,
-    });
+    await bindImportKey(
+      ctx,
+      args.organizationId,
+      args.projectId,
+      eventKindForImport(key.value),
+      "imports.equipmentCsv",
+      access.value.identity,
+      contentHash,
+      now,
+    );
 
     const summary = summarizePlan(parsed.plan, contentHash);
     return {
@@ -365,11 +407,58 @@ const reviewResultValidator = v.union(
 );
 
 /**
+ * An exact-match requirement for a promoted row: every promoted field,
+ * the promoted state, and the tenant binding must match, otherwise the
+ * key is occupied by a conflicting row and the review denies entirely.
+ */
+function promotedRowMatches(
+  existing: {
+    organizationId: Id<"organizations">;
+    projectId: Id<"projects">;
+    state: string;
+    fulfillment: string;
+    title: string;
+    category: string;
+    quantity: string;
+    unit: string;
+    priority: string;
+    budgetMinorUnits?: number;
+    currency?: string;
+    needByAt?: number;
+    hardConstraints?: string;
+    responsible?: string;
+  },
+  organizationId: Id<"organizations">,
+  projectId: Id<"projects">,
+  row: EquipmentCsvDraftRow,
+): boolean {
+  return (
+    existing.organizationId === organizationId &&
+    existing.projectId === projectId &&
+    existing.state === "draft" &&
+    existing.fulfillment === "notOrdered" &&
+    existing.title === row.title &&
+    existing.category === row.category &&
+    existing.quantity === row.quantity &&
+    existing.unit === row.unit &&
+    existing.priority === row.priority &&
+    (existing.budgetMinorUnits ?? undefined) === row.budgetMinorUnits &&
+    (existing.currency ?? undefined) === row.currency &&
+    (existing.needByAt ?? undefined) === row.needByAt &&
+    (existing.hardConstraints ?? undefined) === row.hardConstraints &&
+    (existing.responsible ?? undefined) === row.responsible
+  );
+}
+
+/**
  * Separate explicit review action: re-reads the exact source identity and
- * version/currentness, requires contributor-or-stronger authority, and
- * promotes only explicitly selected valid rows to draft requirements.
- * Invalid/unreadable rows are never promotable, promotion is idempotent,
- * and rows are never approved by this action.
+ * version/currentness, requires contributor-or-stronger authority plus the
+ * shipped record-change capability, and promotes only explicitly selected
+ * valid rows to draft requirements. Every selected row is prefetched and
+ * validated BEFORE the first write: an exact existing draft deduplicates,
+ * any occupied conflicting key denies the entire review with zero partial
+ * requirements and no review event. Invalid/unreadable rows are never
+ * promotable, promotion is idempotent, and rows are never approved here.
  */
 export const reviewEquipmentCsv = f1Mutation({
   args: {
@@ -388,6 +477,10 @@ export const reviewEquipmentCsv = f1Mutation({
     const now = Date.now();
     const access = await checkProjectAccess(ctx, identity, args.organizationId, args.projectId, "contributor", now);
     if (!access.ok) return { ok: false as const, code: access.code, message: access.message };
+    const capability = requireCapability("evidence.record", access.value);
+    if (!capability.ok) {
+      return { ok: false as const, code: capability.code, message: capability.message };
+    }
     if (args.selectedRowKeys.length > IMPORT_MAX_SELECTED_ROWS) {
       return {
         ok: false as const,
@@ -451,9 +544,16 @@ export const reviewEquipmentCsv = f1Mutation({
       }
     }
 
-    const requirementIds: Id<"requirements">[] = [];
-    let promotedCount = 0;
-    let alreadyPromotedCount = 0;
+    // Full preflight before the first write: every selected row is
+    // validated and reconciled against any existing occupant of its
+    // deterministic key, so a later collision can never leave an earlier
+    // write behind.
+    interface PreflightRow {
+      readonly rowIndex: number;
+      readonly row: EquipmentCsvDraftRow;
+      readonly existingRequirementId?: Id<"requirements">;
+    }
+    const preflight: PreflightRow[] = [];
     for (const entry of parsed.plan.rows) {
       if (entry.status !== "valid") continue;
       const rowKey = equipmentCsvRowKey(args.expectedContentHash, entry.rowIndex);
@@ -473,14 +573,34 @@ export const reviewEquipmentCsv = f1Mutation({
         .withIndex("by_project_and_key", (q) => q.eq("projectId", args.projectId).eq("key", key))
         .unique();
       if (existing !== null) {
-        alreadyPromotedCount += 1;
-        requirementIds.push(existing._id);
+        if (!promotedRowMatches(existing, args.organizationId, args.projectId, row)) {
+          return {
+            ok: false as const,
+            code: "duplicate-conflict",
+            message: `requirement key ${key} is occupied by a conflicting requirement; the review was denied with zero changes`,
+          };
+        }
+        preflight.push({ rowIndex: entry.rowIndex, row, existingRequirementId: existing._id });
         continue;
       }
+      preflight.push({ rowIndex: entry.rowIndex, row });
+    }
+
+    const requirementIds: Id<"requirements">[] = [];
+    let promotedCount = 0;
+    let alreadyPromotedCount = 0;
+    for (const entry of preflight) {
+      if (entry.existingRequirementId !== undefined) {
+        alreadyPromotedCount += 1;
+        requirementIds.push(entry.existingRequirementId);
+        continue;
+      }
+      const row = entry.row;
+      promotedCount += 1;
       const requirementId = await ctx.db.insert("requirements", {
         organizationId: args.organizationId,
         projectId: args.projectId,
-        key,
+        key: promotedRequirementKey(args.expectedContentHash, entry.rowIndex),
         title: row.title,
         category: row.category,
         quantity: row.quantity,
@@ -497,7 +617,6 @@ export const reviewEquipmentCsv = f1Mutation({
         createdAt: now,
         updatedAt: now,
       });
-      promotedCount += 1;
       requirementIds.push(requirementId);
     }
 
@@ -505,14 +624,16 @@ export const reviewEquipmentCsv = f1Mutation({
     // side-effect free. Nothing here approves or creates sourcing,
     // quote, selection, approval, order, or financial records.
     if (promotedCount > 0) {
-      await ctx.db.insert("projectEvents", {
-        organizationId: args.organizationId,
-        projectId: args.projectId,
-        kind: "imports.equipmentCsv.reviewed",
-        actor: identity,
-        evidenceRefs: [{ sourceId: "imports.equipmentCsv", version: "1", locator: args.expectedContentHash }],
-        createdAt: Date.now(),
-      });
+      await bindImportKey(
+        ctx,
+        args.organizationId,
+        args.projectId,
+        "imports.equipmentCsv.reviewed",
+        "imports.equipmentCsv",
+        identity,
+        args.expectedContentHash,
+        Date.now(),
+      );
     }
     return { ok: true as const, promotedCount, alreadyPromotedCount, requirementIds };
   },
@@ -530,11 +651,18 @@ const attachmentResultValidator = v.union(
 );
 
 /**
- * Quote/manual attachment ingestion: records source evidence plus file
+ * Quote/manual attachment ingestion: records the canonical normalized
+ * attachment metadata as protected source evidence (hashed), plus file
  * metadata and a durable review-required extraction status. Bytes,
  * storage, and provider extraction are unavailable in this boundary, so
  * completeness is honestly "unavailable", no storageRef is written, and
  * no quote or extraction success is ever synthesized.
+ *
+ * Idempotency: the key event `imports.attachment:<key>` binds each
+ * accepted key to the exact metadata hash before any replay — same key
+ * with changed metadata conflicts, identical replay revalidates the
+ * stored metadata hash and exact file metadata, and identical metadata
+ * under a new key deduplicates only after that new key is bound too.
  */
 export const recordAttachment = f1Mutation({
   args: {
@@ -570,62 +698,74 @@ export const recordAttachment = f1Mutation({
       }
     }
 
-    const metadataFingerprint = sha256HexSync(
-      encoder.encode(canonicalJson({
-        fileName: fileName ?? null,
-        contentType: args.contentType ?? null,
-        sizeBytes: args.sizeBytes ?? null,
-      })),
-    ).slice(0, 16);
-    // Attachment identity binds the idempotency key; the locator carries
-    // the metadata fingerprint so changed metadata under the same key
-    // conflicts while an identical retry replays.
-    const contentHash = sha256HexSync(
-      encoder.encode(canonicalJson({ kind: "imports.quoteAttachment:v1", idempotencyKey: key.value })),
-    );
-    const locator = `attachment/key/${key.value}/fp/${metadataFingerprint}`;
-    const existing = await ctx.db
-      .query("evidence")
-      .withIndex("by_project_and_contentHash", (q) =>
-        q.eq("projectId", args.projectId).eq("contentHash", contentHash),
+    // The canonical normalized metadata IS the recorded source: it is
+    // persisted as protected source evidence and hashed exactly.
+    const metadataCanonical = canonicalJson({
+      fileName: fileName ?? null,
+      contentType: args.contentType ?? null,
+      sizeBytes: args.sizeBytes ?? null,
+    });
+    const contentHash = sha256HexSync(encoder.encode(metadataCanonical));
+    const now = Date.now();
+
+    // 1. Key binding first: one exact indexed event per key.
+    const priorEvent = await ctx.db
+      .query("projectEvents")
+      .withIndex("by_project_and_kind", (q) =>
+        q.eq("projectId", args.projectId).eq("kind", eventKindForAttachment(key.value)),
       )
-      .filter((q) => q.eq(q.field("sourceKind"), ATTACHMENT_SOURCE_KIND))
       .first();
-    if (existing !== null) {
-      if (existing.locator !== locator) {
+    if (priorEvent !== null) {
+      const boundHash = priorEvent.evidenceRefs?.[0]?.locator;
+      if (boundHash !== contentHash) {
         return {
           ok: false as const,
           code: "duplicate-conflict",
           message: "idempotency key was already used for different attachment metadata",
         };
       }
-      const file = await ctx.db
-        .query("files")
-        .withIndex("by_evidence", (q) => q.eq("evidenceId", existing._id))
-        .first();
-      if (file === null) {
-        return { ok: false as const, code: "invalid-payload", message: "attachment file record is missing" };
-      }
-      return {
-        ok: true as const,
-        evidenceId: existing._id,
-        fileId: file._id,
-        deduplicated: true,
-        extractionStatus: "reviewRequired" as const,
-      };
+      const replay = await replayAttachment(ctx, args.projectId, contentHash, {
+        fileName,
+        contentType: args.contentType,
+        sizeBytes: args.sizeBytes,
+      });
+      return replay === null
+        ? { ok: false as const, code: "invalid-payload", message: "stored attachment metadata does not match its content hash" }
+        : { ...replay, deduplicated: true };
     }
 
-    const now = Date.now();
+    // 2. Identical metadata in the same project deduplicates; the new key
+    // is bound to the same metadata hash first.
+    const metadataDedupe = await replayAttachment(ctx, args.projectId, contentHash, {
+      fileName,
+      contentType: args.contentType,
+      sizeBytes: args.sizeBytes,
+    });
+    if (metadataDedupe !== null) {
+      await bindImportKey(
+        ctx,
+        args.organizationId,
+        args.projectId,
+        eventKindForAttachment(key.value),
+        "imports.quoteAttachment",
+        access.value.identity,
+        contentHash,
+        now,
+      );
+      return { ...metadataDedupe, deduplicated: true };
+    }
+
     const evidenceId = await ctx.db.insert("evidence", {
       organizationId: args.organizationId,
       projectId: args.projectId,
       sourceKind: ATTACHMENT_SOURCE_KIND,
       capturedAt: now,
       contentHash,
+      protectedSourceText: metadataCanonical,
       completeness: "unavailable",
       counterpartyRole: "userImport",
       executionMode: "recorded",
-      locator,
+      locator: `attachment/key/${key.value}`,
     });
     const fileId = await ctx.db.insert("files", {
       organizationId: args.organizationId,
@@ -634,12 +774,24 @@ export const recordAttachment = f1Mutation({
       ...(args.sizeBytes === undefined ? {} : { sizeBytes: args.sizeBytes }),
       ...(args.contentType === undefined ? {} : { contentType: args.contentType }),
     });
+    await bindImportKey(
+      ctx,
+      args.organizationId,
+      args.projectId,
+      eventKindForAttachment(key.value),
+      "imports.quoteAttachment",
+      access.value.identity,
+      contentHash,
+      now,
+    );
+    // Durable review-required extraction status marker for fresh
+    // attachments; replay and dedupe paths add no duplicate marker.
     await ctx.db.insert("projectEvents", {
       organizationId: args.organizationId,
       projectId: args.projectId,
       kind: "imports.attachment.reviewRequired",
       actor: access.value.identity,
-      evidenceRefs: [{ sourceId: "imports.quoteAttachment", version: "1", locator: evidenceId }],
+      evidenceRefs: [{ sourceId: "imports.quoteAttachment", version: "1", locator: contentHash }],
       createdAt: now,
     });
     return {
@@ -651,3 +803,46 @@ export const recordAttachment = f1Mutation({
     };
   },
 });
+
+/**
+ * Re-derive an original attachment result from the durable record,
+ * revalidating the stored metadata hash and the exact file metadata.
+ */
+async function replayAttachment(
+  ctx: F1MutationCtx,
+  projectId: Id<"projects">,
+  contentHash: string,
+  metadata: {
+    readonly fileName?: string | undefined;
+    readonly contentType?: string | undefined;
+    readonly sizeBytes?: number | undefined;
+  },
+): Promise<{
+  ok: true;
+  evidenceId: Id<"evidence">;
+  fileId: Id<"files">;
+  extractionStatus: "reviewRequired";
+} | null> {
+  const evidence = await ctx.db
+    .query("evidence")
+    .withIndex("by_project_and_contentHash", (q) =>
+      q.eq("projectId", projectId).eq("contentHash", contentHash),
+    )
+    .filter((q) => q.eq(q.field("sourceKind"), ATTACHMENT_SOURCE_KIND))
+    .first();
+  if (evidence === null || evidence.protectedSourceText === undefined) return null;
+  if (sha256HexSync(encoder.encode(evidence.protectedSourceText)) !== evidence.contentHash) return null;
+  const file = await ctx.db
+    .query("files")
+    .withIndex("by_evidence", (q) => q.eq("evidenceId", evidence._id))
+    .first();
+  if (file === null) return null;
+  if ((file.sizeBytes ?? undefined) !== metadata.sizeBytes) return null;
+  if ((file.contentType ?? undefined) !== metadata.contentType) return null;
+  return {
+    ok: true as const,
+    evidenceId: evidence._id,
+    fileId: file._id,
+    extractionStatus: "reviewRequired" as const,
+  };
+}

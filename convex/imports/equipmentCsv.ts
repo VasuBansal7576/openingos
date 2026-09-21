@@ -160,10 +160,13 @@ function cellError(column: string | undefined, message: string): EquipmentCsvCel
 }
 
 /**
- * Strict UTF-8 decode with the documented BOM policy: a single leading
- * UTF-8 BOM is stripped before decoding; anything else is preserved and
- * validated as ordinary content. Invalid UTF-8 sequences reject the whole
- * input — partial decoding would silently corrupt source bytes.
+ * Strict UTF-8 decode of the exact source bytes. The returned text is a
+ * lossless representation: re-encoding it yields byte-identical source
+ * bytes, including an allowed leading UTF-8 BOM, so the recorded
+ * `contentHash` stays verifiable from the stored source. The BOM is a
+ * parsing concern only — `parseEquipmentCsv` strips one leading BOM to
+ * produce the normalized parse view. Invalid UTF-8 sequences reject the
+ * whole input; partial decoding would silently corrupt source bytes.
  */
 export function decodeEquipmentCsvBytes(
   bytes: Uint8Array,
@@ -172,12 +175,11 @@ export function decodeEquipmentCsvBytes(
   if (bytes.length > IMPORT_MAX_BYTES) {
     return invalid(`csv input exceeds the ${IMPORT_MAX_BYTES}-byte import bound`);
   }
-  const withoutBom = bytes.length >= 3 &&
-      bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf
-    ? bytes.subarray(3)
-    : bytes;
   try {
-    const text = new TextDecoder("utf-8", { fatal: true }).decode(withoutBom);
+    // `ignoreBOM: true` preserves a leading BOM in the decoded output
+    // (it is not interpreted as a byte-order mark), keeping the text a
+    // lossless stand-in for the source bytes.
+    const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
     return { ok: true, text };
   } catch {
     return invalid("csv input is not valid UTF-8");
@@ -509,12 +511,18 @@ function parseRow(
  * invalid rows carry row-specific errors and are never silently dropped.
  */
 export function parseEquipmentCsv(text: string): EquipmentCsvParseOutcome {
-  const split = splitCsvRecords(text);
+  // Documented BOM policy: exactly one leading UTF-8 BOM is stripped for
+  // the parse view; the lossless stored source keeps it.
+  const withoutBom = text.startsWith("﻿") ? text.slice(1) : text;
+  const split = splitCsvRecords(withoutBom);
   if (!("records" in split)) return split;
 
   const headerRecord = split.records[0];
   if (headerRecord === undefined) {
     return invalid("csv input has no header row");
+  }
+  if (split.malformedRows.some((malformed) => malformed.rowNumber === headerRecord.rowNumber)) {
+    return invalid("malformed quoting in the header row");
   }
   const headerCells = headerRecord.cells;
   const columnIndex = new Map<string, number>();

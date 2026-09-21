@@ -120,13 +120,25 @@ describe("E7 valid template parsing and deterministic normalization", () => {
 });
 
 describe("E7 encoding and BOM policy", () => {
-  test("a single leading UTF-8 BOM is stripped (documented policy)", () => {
+  test("a single leading UTF-8 BOM is kept in the lossless source and stripped for parsing", () => {
     const withBom = new Uint8Array([0xef, 0xbb, 0xbf, ...bytesOf(csv(validRow()))]);
     const decoded = decodeEquipmentCsvBytes(withBom);
     if (!decoded.ok) throw new Error("decode failed");
-    expect(decoded.text.startsWith(HEADER)).toBe(true);
+    // Lossless: re-encoding the decoded text reproduces the exact bytes.
+    expect(Array.from(encoder.encode(decoded.text))).toEqual(Array.from(withBom));
+    // The parse view strips the BOM.
     const parsed = parseEquipmentCsv(decoded.text);
     expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.plan.validCount).toBe(1);
+    expect(parsed.plan.rows[0]?.status).toBe("valid");
+  });
+
+  test("parsed text with a literal BOM character parses with the BOM stripped", () => {
+    const parsed = parseEquipmentCsv("﻿" + csv(validRow()));
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.plan.validCount).toBe(1);
   });
 
   test("invalid UTF-8 bytes reject the whole input", () => {
@@ -161,6 +173,12 @@ describe("E7 header contract", () => {
     const parsed = parseEquipmentCsv(text);
     expect(parsed.ok).toBe(false);
     if (!parsed.ok) expect(parsed.message).toContain("unknown header");
+  });
+
+  test("malformed quoting in the header row is rejected", () => {
+    const parsed = parseEquipmentCsv(`ti"tle,category,quantity,unit,priority,budgetMinorUnits,currency,needByAt,hardConstraints,responsible\nA,kitchen,1,piece,P0,,,,,\n`);
+    expect(parsed.ok).toBe(false);
+    if (!parsed.ok) expect(parsed.message).toContain("malformed quoting in the header");
   });
 
   test("a document without a header row is rejected", () => {
