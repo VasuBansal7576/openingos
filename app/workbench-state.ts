@@ -314,10 +314,37 @@ export interface WorkbenchActionResult {
   readonly message?: string;
 }
 
+/** P-01 intake modes: opening, quote comparison, or equipment case. */
+export type WorkbenchIntakeMode = "opening" | "quoteComparison" | "equipment";
+
+export type WorkbenchIntakeUrgency = "urgent" | "high" | "normal" | "low";
+
+export interface WorkbenchIntakeInput {
+  readonly mode: WorkbenchIntakeMode;
+  readonly projectName: string;
+  readonly workspaceKind: "guest" | "private";
+  readonly region?: string;
+  readonly currency?: string;
+  readonly needByAt?: number;
+  readonly budgetMinorUnits?: number;
+  readonly detailTitle?: string;
+  readonly detailCategory?: string;
+  readonly detailSummary?: string;
+  readonly urgency?: WorkbenchIntakeUrgency;
+  readonly idempotencyKey: string;
+}
+
+export interface WorkbenchIntakeResult {
+  readonly ok: boolean;
+  readonly projectId?: string;
+  readonly message?: string;
+}
+
 export interface WorkbenchServerAdapter {
   readonly load: (projectId: string, cursor?: string | null) => Promise<unknown>;
   readonly subscribe?: (projectId: string, onSnapshot: (snapshot: unknown) => void, onError: (error: unknown) => void) => (() => void);
   readonly act: (action: WorkbenchAction) => Promise<WorkbenchActionResult>;
+  readonly createIntake?: (input: WorkbenchIntakeInput) => Promise<WorkbenchIntakeResult>;
 }
 
 export function formatMoney(minorUnits: number | null, currency: string | null, unknownLabel = "Unknown"): string {

@@ -2,7 +2,7 @@ import type { BackendStatus } from "./backend-state";
 import WorkbenchView, { WorkbenchUnavailableView, type WorkbenchViewProps } from "./Workbench";
 import type { WorkbenchLoadState } from "./workbench-state";
 
-export interface AppProps extends Pick<WorkbenchViewProps, "onAction" | "onLoadMore"> {
+export interface AppProps extends Pick<WorkbenchViewProps, "onAction" | "onLoadMore" | "onIntake"> {
   readonly backendStatus?: BackendStatus;
   readonly onRetry?: () => void;
   readonly workbench?: WorkbenchLoadState | undefined;
@@ -70,9 +70,13 @@ function WorkbenchConnectionStatus({ status, onRetry }: { readonly status: Backe
   return <WorkbenchUnavailableView {...copy} onRetry={copy.action !== undefined ? onRetry : undefined} />;
 }
 
-export default function App({ backendStatus = "unconfigured", onRetry, workbench, onAction, onLoadMore }: AppProps) {
+export default function App({ backendStatus = "unconfigured", onRetry, workbench, onAction, onLoadMore, onIntake }: AppProps) {
   if (workbench !== undefined && (backendStatus === "connected" || backendStatus === "reconnecting")) {
-    return <WorkbenchView loadState={workbench} onRetry={onRetry} onAction={onAction} onLoadMore={onLoadMore} />;
+    // Intake is offered only on a live connected empty state through the
+    // real adapter route. Every unconfigured, unverified, authenticating,
+    // or unavailable state stays honest and offers no mutation.
+    const connectedIntake = workbench.state === "empty" && backendStatus === "connected" ? onIntake : undefined;
+    return <WorkbenchView loadState={workbench} onRetry={onRetry} onAction={onAction} onLoadMore={onLoadMore} onIntake={connectedIntake} />;
   }
   return <WorkbenchConnectionStatus status={backendStatus} onRetry={onRetry} />;
 }

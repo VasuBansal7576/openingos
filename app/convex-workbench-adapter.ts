@@ -7,6 +7,8 @@ import {
   parseWorkbenchSnapshot,
   type WorkbenchAction,
   type WorkbenchActionResult,
+  type WorkbenchIntakeInput,
+  type WorkbenchIntakeResult,
   type WorkbenchServerAdapter,
   type WorkbenchSnapshot,
 } from "./workbench-state";
@@ -76,6 +78,21 @@ type W1OpenServiceCaseArgs = Record<string, unknown> & {
   readonly idempotencyKey: string;
 };
 
+type W1CreateIntakeArgs = Record<string, unknown> & {
+  readonly idempotencyKey: string;
+  readonly mode: "opening" | "quoteComparison" | "equipment";
+  readonly projectName: string;
+  readonly workspaceKind?: "guest" | "private";
+  readonly region?: string;
+  readonly currency?: string;
+  readonly needByAt?: number;
+  readonly budgetMinorUnits?: number;
+  readonly detailTitle?: string;
+  readonly detailCategory?: string;
+  readonly detailSummary?: string;
+  readonly urgency?: "urgent" | "high" | "normal" | "low";
+};
+
 type W1PublicApi = {
   readonly "workbench/projection": {
     readonly listAccessibleProjects: FunctionReference<
@@ -100,6 +117,9 @@ type W1PublicApi = {
   readonly "domain/impact": {
     readonly decideSubstituteProposal: FunctionReference<"mutation", "public", W1DecideSubstituteProposalArgs, unknown>;
   };
+  readonly "domain/intake": {
+    readonly createWorkspace: FunctionReference<"mutation", "public", W1CreateIntakeArgs, unknown>;
+  };
 };
 
 /**
@@ -121,6 +141,8 @@ const fulfillmentApi = (api as unknown as W1PublicApi)["domain/fulfillment"];
 const openServiceCaseReference = fulfillmentApi.openServiceCase;
 const impactApi = (api as unknown as W1PublicApi)["domain/impact"];
 const decideSubstituteProposalReference = impactApi.decideSubstituteProposal;
+const intakeApi = (api as unknown as W1PublicApi)["domain/intake"];
+const createWorkspaceReference = intakeApi.createWorkspace;
 
 const WORKBENCH_PROJECTION_LIMIT = 12;
 const PROJECT_DISCOVERY_LIMIT = 1;
@@ -132,6 +154,17 @@ export type ConvexWorkbenchClient = Pick<ConvexReactClient, "query" | "watchQuer
 export interface ConvexWorkbenchAdapter extends WorkbenchServerAdapter {
   readonly discoverProject: () => Promise<string | null>;
   readonly dispose: () => void;
+  readonly createIntake: (input: WorkbenchIntakeInput) => Promise<WorkbenchIntakeResult>;
+}
+
+/** Browser-safe intake key: one stable opaque key per logical submission. */
+export function createIntakeIdempotencyKey(): string {
+  try {
+    if (typeof globalThis.crypto?.randomUUID === "function") return globalThis.crypto.randomUUID();
+  } catch {
+    // Fall through to a local opaque key in runtimes without Web Crypto.
+  }
+  return `intake-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
 type WorkbenchWatch = Watch<unknown>;
@@ -797,5 +830,53 @@ export function createConvexWorkbenchAdapter(client: ConvexWorkbenchClient): Con
     return { ok: false, message: ACTION_UNAVAILABLE };
   };
 
-  return { load, subscribe, act, discoverProject, dispose };
+  const createIntake = async (input: WorkbenchIntakeInput): Promise<WorkbenchIntakeResult> => {
+    if (disposed) return { ok: false, message: "The workbench connection is no longer active. Nothing was sent." };
+    if (!isOneOf(input.mode, ["opening", "quoteComparison", "equipment"] as const)) {
+      return { ok: false, message: "Choose opening, quote comparison, or equipment case. Nothing was sent." };
+    }
+    const projectName = input.projectName.trim();
+    const idempotencyKey = input.idempotencyKey.trim();
+    if (projectName.length === 0 || idempotencyKey.length === 0) {
+      return { ok: false, message: "A project name and submission key are required. Nothing was sent." };
+    }
+    const key = `intake:${idempotencyKey}`;
+    if (inFlightMutations.has(key)) return { ok: false, message: ACTION_ALREADY_IN_FLIGHT };
+    inFlightMutations.add(key);
+    try {
+      const args: W1CreateIntakeArgs = {
+        idempotencyKey,
+        mode: input.mode,
+        projectName,
+        ...(input.workspaceKind === undefined ? {} : { workspaceKind: input.workspaceKind }),
+        ...(input.region === undefined ? {} : { region: input.region }),
+        ...(input.currency === undefined ? {} : { currency: input.currency }),
+        ...(input.needByAt === undefined ? {} : { needByAt: input.needByAt }),
+        ...(input.budgetMinorUnits === undefined ? {} : { budgetMinorUnits: input.budgetMinorUnits }),
+        ...(input.detailTitle === undefined ? {} : { detailTitle: input.detailTitle }),
+        ...(input.detailCategory === undefined ? {} : { detailCategory: input.detailCategory }),
+        ...(input.detailSummary === undefined ? {} : { detailSummary: input.detailSummary }),
+        ...(input.urgency === undefined ? {} : { urgency: input.urgency }),
+      };
+      const result = await client.mutation(createWorkspaceReference, args);
+      const failure = mutationFailure(result, "The server did not create this workspace.");
+      if (failure !== null) return failure;
+      const projectId = isRecord(result) ? requiredString(result.projectId) : null;
+      if (projectId === null) return { ok: false, message: "The server did not return a valid workspace." };
+      try {
+        await load(projectId);
+      } catch {
+        // The workspace exists server-side; projection refresh failure is
+        // reported but the creation result still carries the project id so
+        // the caller can subscribe to it.
+      }
+      return { ok: true, projectId, message: "Workspace created by the server." };
+    } catch (error) {
+      return { ok: false, message: error instanceof Error ? error.message : "The server did not create this workspace." };
+    } finally {
+      inFlightMutations.delete(key);
+    }
+  };
+
+  return { load, subscribe, act, discoverProject, dispose, createIntake };
 }
