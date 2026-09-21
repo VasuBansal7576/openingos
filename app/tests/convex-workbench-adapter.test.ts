@@ -1211,3 +1211,57 @@ test("exposes an opaque browser safe sample key without client identifiers", asy
   expect(first).toMatch(/^[A-Za-z0-9:_-]{8,160}$/);
   expect(second).toMatch(/^[A-Za-z0-9:_-]{8,160}$/);
 });
+
+test("a server discovery denial rejects as a recoverable error, never an empty workspace", async () => {
+  const queryArgs: unknown[] = [];
+  const adapter = createConvexWorkbenchAdapter({
+    query: async (_reference: unknown, args: unknown) => {
+      queryArgs.push(args);
+      return { ok: false, code: "forged-identity", message: "unauthenticated" };
+    },
+    watchQuery: () => controlledWatch(() => projection()).watch,
+  } as unknown as ConvexWorkbenchClient);
+
+  await expect(adapter.discoverProject()).rejects.toThrow(
+    "Authorized projects could not be discovered (forged-identity: unauthenticated). Retry to re-establish the backend identity.",
+  );
+  expect(queryArgs).toEqual([{ limit: 1 }]);
+});
+
+test("a denial on a later discovery page rejects instead of hiding behind pagination", async () => {
+  const pages: unknown[] = [
+    { ok: true, projects: [], continueCursor: "project-cursor-1", isDone: false },
+    { ok: false, code: "forged-identity", message: "unauthenticated" },
+  ];
+  const adapter = createConvexWorkbenchAdapter({
+    query: async () => pages.shift() ?? null,
+    watchQuery: () => controlledWatch(() => projection()).watch,
+  } as unknown as ConvexWorkbenchClient);
+
+  await expect(adapter.discoverProject()).rejects.toThrow(/could not be discovered.*forged-identity/);
+});
+
+test("retry after a discovery denial succeeds once the server confirms the identity", async () => {
+  const pages: unknown[] = [
+    { ok: false, code: "forged-identity", message: "unauthenticated" },
+    accessibleProjects("project-recovered"),
+  ];
+  const adapter = createConvexWorkbenchAdapter({
+    query: async () => pages.shift() ?? null,
+    watchQuery: () => controlledWatch(() => projection()).watch,
+  } as unknown as ConvexWorkbenchClient);
+
+  await expect(adapter.discoverProject()).rejects.toThrow(/Retry to re-establish the backend identity/);
+  await expect(adapter.discoverProject()).resolves.toBe("project-recovered");
+});
+
+test("a denied projection load throws instead of returning an empty projection", async () => {
+  const adapter = createConvexWorkbenchAdapter({
+    query: async () => ({ ok: false, code: "forged-identity", message: "unauthenticated" }),
+    watchQuery: () => controlledWatch(() => projection()).watch,
+  } as unknown as ConvexWorkbenchClient);
+
+  await expect(adapter.load("project-1")).rejects.toThrow(
+    "The project projection could not be read (forged-identity: unauthenticated). Retry to re-establish the backend identity.",
+  );
+});
