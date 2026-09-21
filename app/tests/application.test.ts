@@ -42,11 +42,15 @@ describe("application foundation", () => {
     expect(narrowCss).toContain(".wb-nav button { min-width: 0; flex: 1 1 20%;");
   });
 
-  test("application CI includes the focused workbench and Jev suites with native runners", async () => {
+  test("application CI includes the focused workbench, intake, and Jev suites with native runners", async () => {
     const packageJson = await Bun.file(new URL("../../package.json", import.meta.url)).text();
     const workflow = await Bun.file(new URL("../../.github/workflows/application-ci.yml", import.meta.url)).text();
 
-    expect(packageJson).toContain('"test:app": "bun test app/tests/application.test.ts app/tests/workbench.test.ts app/tests/convex-workbench-adapter.test.ts && bunx vitest run convex/models/jev.test.ts --environment edge-runtime"');
+    expect(packageJson).toContain("app/tests/workbench.test.ts");
+    expect(packageJson).toContain("app/tests/convex-workbench-adapter.test.ts");
+    expect(packageJson).toContain("app/tests/intake.test.ts");
+    expect(packageJson).toContain("convex/domain/intake.direct.test.ts");
+    expect(packageJson).toContain("bunx vitest run convex/models/jev.test.ts --environment edge-runtime");
     expect(packageJson).toContain('"test": "bun run test:repository && bun run test:proofs && bun run test:evals && bun run test:f1 && bun run test:browser && bun run test:app && bun test convex/communication/contracts.test.ts && bun run test:direct"');
     expect(workflow).toContain("- run: bun run test\n");
   });
