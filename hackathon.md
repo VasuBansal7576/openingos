@@ -562,8 +562,34 @@ Both strict TypeScript checks and the production Vite build pass.
 Controlled Chrome QA at 1440 × 1200 and exact 390 × 844 covers same-state comparison with the selected prototype, loading, empty, explicit error, retry-to-ready, populated sample, Project and Suppliers navigation, dialog background inertness, Escape close, focus restoration and bounded no-send feedback with no runtime exception or page overflow.
 The sample state was generated through the real sample mutation and projection path, but this remains controlled local evidence.
 
-Completed E13, E15, E17 and E18 task worktrees were verified remotely preserved and removed non-forcibly.
-E16 remains temporarily only for final QA artifact cleanup and will be removed after the combined handoff is settled.
+Completed E13, E15, E16, E17 and E18 task worktrees were verified remotely preserved and removed non-forcibly.
 Greptile remains unavailable because its connected plan reports the 50-credit limit exhausted, and Devin's green status explicitly says its review was skipped because the trial expired.
 A fresh separate GPT-6 Astra fixed-head review and latest-head combined CI remain mandatory before merge.
 No hosted Convex deployment, live provider call, owner-mailbox exchange, genuine supplier response, public origin, purchase, realized saving or commercial outcome was observed.
+
+### 2026-09-22 - six-finding Astra repair checkpoint
+
+The separate GPT-6 Astra xhigh review of exact PR #14 head `7019827` returned `CHANGES REQUIRED` with six actionable findings across negotiation authority, application authentication, negotiation workload evidence, spend state and older-order impact.
+Three supervised OpenCode Muse Spark 1.3 Free workers at high effort owned exclusive negotiation, auth and money/impact packages.
+GLM 5.3 Flash was attempted first for an implementation worker but the connected account returned insufficient balance before task work, so no result was attributed to it.
+
+Combined code checkpoint `e40da16` closes the six controlled defects.
+Prepared negotiation drafts now bind project, negotiation, quote, conversation, reply, round, move and payload exactly before a first dispatch.
+An opaque draft-ID approval action resolves the protected envelope server-side and issues the exact send grant without returning the owner mailbox, canonical payload or raw draft text.
+Negotiation model workloads now carry bounded current quote terms, permissible mandate context and the latest reply instead of fixed missing-term text.
+The application waits for server-confirmed authentication before discovery or creation, preserves server denials as retryable errors and clears a rejected session before retry.
+Usage metrics report paid cash separately from settled acquisition cost, with refunds and credits reducing only their matching state.
+Impact assessment walks bounded quote ancestry and selection history so an order on an older affected selection remains visible after a newer selection exists.
+
+Coordinator review rejected the first negotiation handoff because its read-only approval preview still depended on a pre-existing exact grant whose private payload a browser could not supply.
+The owner repaired the root cause and added a controlled end-to-end authority regression that starts without a send grant, prepares a draft, approves by draft ID, creates the public job and reservation, then dispatches once.
+Cross-project, stale, tampered and out-of-bound approvals create no grant.
+
+The complete local matrix passes at `e40da16`: 23 repository tests, 77 proof tests, 15 evaluation tests, 342 F1 tests, 155 browser-executor tests, 152 application tests, 18 application Jev tests, 32 communication-contract tests and 554 direct Convex tests.
+Both strict TypeScript checks and the production Vite build pass.
+The new spend regression is registered in the normal direct-test command, so GitHub application CI will execute it.
+All three repair branches were pushed, integrated and independently rerun before their terminals were closed and E19, E20 and E21 were removed through Orca.
+
+This checkpoint is controlled evidence only.
+No live provider call, owner-mailbox exchange, hosted Convex deployment, public site, genuine supplier reply, purchase, realized saving or commercial outcome was observed.
+PR #14 still requires latest-head GitHub CI and a fresh separate GPT-6 Astra verdict on the same fixed commit before merge.
