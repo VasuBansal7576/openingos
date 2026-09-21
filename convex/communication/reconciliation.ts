@@ -246,32 +246,43 @@ export const reconcile = internalAction({
       return { ok: false as const, code: "recipient-mismatch", message: "reconciliation recipient is not the configured owner mailbox" };
     }
     let admissionFailure: { readonly ok: false; readonly code: string; readonly message: string } | undefined;
+    const readTokens: string[] = [];
     const baseUrl = env.AGENTMAIL_BASE_URL ?? DEFAULT_AGENTMAIL_BASE_URL;
     const result = await reconcileAgentMailOnce({
       inboxId: args.inboxId,
       operationLabel: operationLabel(String(args.operationId)),
       ...(baseUrl === undefined ? {} : { baseUrl }),
       admitRead: async (read) => {
-        const admitted: LocalMutationReturn<typeof attempts.reconcileAfterCrash> = await ctx.runMutation(crashRef, {
-          operationId: args.operationId,
-          mode: "admitRead",
-          attemptToken: args.attemptToken,
-          readNumber: read,
-        });
-        if (!admitted.ok) {
-          admissionFailure = admitted;
-          return false;
+        for (let candidate = read; candidate <= MAX_RECONCILIATION_READS; candidate += 1) {
+          const admitted: LocalMutationReturn<typeof attempts.reconcileAfterCrash> = await ctx.runMutation(crashRef, {
+            operationId: args.operationId,
+            mode: "admitRead",
+            attemptToken: args.attemptToken,
+            readNumber: candidate,
+          });
+          if (!admitted.ok) {
+            // Another action may have allocated this slot while this action
+            // was waiting on the mutation. Skip only that occupied slot and
+            // ask the ledger for the next global slot. All other denials
+            // stop before any provider GET.
+            if (admitted.code === "already-claimed") continue;
+            admissionFailure = admitted;
+            return false;
+          }
+          if (!("snapshot" in admitted)) {
+            admissionFailure = { ok: false, code: "outcome-unknown", message: "reconciliation snapshot proof is unavailable" };
+            return false;
+          }
+          readTokens.push(admitted.readToken);
+          const admittedRecipients = typeof admitted.snapshot.to === "string" ? [admitted.snapshot.to] : admitted.snapshot.to;
+          if (admittedRecipients.length !== 1 || normalizeMailbox(admittedRecipients[0] ?? "") !== normalizeMailbox(owner)) {
+            admissionFailure = { ok: false, code: "recipient-mismatch", message: "reconciliation recipient is not the configured owner mailbox" };
+            return false;
+          }
+          return { allowed: true as const, snapshot: admitted.snapshot };
         }
-        if (!("snapshot" in admitted)) {
-          admissionFailure = { ok: false, code: "outcome-unknown", message: "reconciliation snapshot proof is unavailable" };
-          return false;
-        }
-        const admittedRecipients = typeof admitted.snapshot.to === "string" ? [admitted.snapshot.to] : admitted.snapshot.to;
-        if (admittedRecipients.length !== 1 || normalizeMailbox(admittedRecipients[0] ?? "") !== normalizeMailbox(owner)) {
-          admissionFailure = { ok: false, code: "recipient-mismatch", message: "reconciliation recipient is not the configured owner mailbox" };
-          return false;
-        }
-        return { allowed: true as const, snapshot: admitted.snapshot };
+        admissionFailure = { ok: false, code: "already-claimed", message: "reconciliation read budget is already allocated" };
+        return false;
       },
       fetchImpl: async (input, init) => {
         const headers = new Headers(init?.headers);
@@ -279,12 +290,13 @@ export const reconcile = internalAction({
         return await fetch(input, { ...init, headers });
       },
     });
-    if (admissionFailure !== undefined && result.reads === 0) return admissionFailure;
+    if (admissionFailure !== undefined && result.reads === 0 && readTokens.length === 0) return admissionFailure;
     const finished: LocalMutationReturn<typeof attempts.reconcileAfterCrash> = await ctx.runMutation(crashRef, {
       operationId: args.operationId,
       mode: "finishReads",
       attemptToken: args.attemptToken,
-      reads: result.reads,
+      reads: readTokens.length,
+      readTokens,
       outcome: result.outcome.kind === "confirmed" ? "confirmed" : "unknown",
       detail: result.outcome.kind === "confirmed" ? "provider snapshot matched" : `provider reconciliation ${result.outcome.reason}`,
     });
@@ -304,7 +316,6 @@ export const reconcile = internalAction({
         providerMessageId: late.ok ? result.outcome.message.messageId : null,
       };
     }
-    await ctx.runMutation(crashRef, { operationId: args.operationId });
     return { ok: true as const, outcome: "unknown" as const, reads: result.reads, providerMessageId: null };
   },
 });

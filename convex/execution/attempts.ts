@@ -375,7 +375,10 @@ async function admitReconciliationRead(
     return { ok: false as const, code: "already-claimed", message: "reconciliation read token is already bound" };
   }
   if (existingRows[0] !== undefined) {
-    return { ok: true as const, allowed: true as const, snapshot, readToken };
+    // A read token is a single-use global allocation, not an action-local
+    // cache key. A repeated action must move to another bounded slot (and
+    // pay for that fresh provider GET) rather than reusing this token.
+    return { ok: false as const, code: "already-claimed", message: "reconciliation read token was already used" };
   }
   const held = reservation.reservedMicroUsd + reservation.unresolvedMicroUsd;
   if (!Number.isSafeInteger(held) || held < pricing.readCostMicroUsd) {
@@ -423,12 +426,20 @@ async function finishReconciliationReads(
     readonly operationId: Id<"operations">;
     readonly attemptToken: string;
     readonly reads: number;
+    readonly readTokens: readonly string[];
     readonly outcome: "confirmed" | "unknown";
     readonly detail: string;
   },
 ) {
   if (!Number.isSafeInteger(args.reads) || args.reads < 0 || args.reads > MAX_RECONCILIATION_READS) {
     return { ok: false as const, code: "invalid-payload", message: "reconciliation read count is outside the bounded retry policy" };
+  }
+  if (
+    args.readTokens.length !== args.reads ||
+    args.readTokens.length > MAX_RECONCILIATION_READS ||
+    new Set(args.readTokens).size !== args.readTokens.length
+  ) {
+    return { ok: false as const, code: "invalid-payload", message: "reconciliation read tokens do not match the bounded read count" };
   }
   if (args.outcome === "confirmed" && args.reads === 0) {
     return { ok: false as const, code: "outcome-unknown", message: "confirmed reconciliation requires an admitted provider read" };
@@ -442,13 +453,28 @@ async function finishReconciliationReads(
     .withIndex("by_operation", (q) => q.eq("operationId", args.operationId))
     .take(MAX_RECONCILIATION_READS + 2);
   const prefix = `${RECONCILIATION_RETRY_OWNER}:${args.attemptToken}:`;
+  for (const token of args.readTokens) {
+    if (!token.startsWith(prefix)) {
+      return { ok: false as const, code: "invalid-payload", message: "reconciliation read token is not bound to this attempt" };
+    }
+  }
+  const allocatedRows = args.readTokens.map((token) => rows.find((candidate) => candidate.token === token));
+  if (allocatedRows.some((row) => row === undefined || row.state !== "dispatching")) {
+    return { ok: false as const, code: "outcome-unknown", message: "reconciliation read allocation is unavailable" };
+  }
   const state = args.outcome === "confirmed" ? "observedSuccess" as const : "outcomeUnknown" as const;
   let finished = 0;
-  for (const row of rows) {
-    if (row.token.startsWith(prefix) && row.state === "dispatching") {
-      await ctx.db.patch(row._id, { state, observedAt: Date.now(), detail: args.detail });
-      finished += 1;
-    }
+  for (const row of allocatedRows) {
+    if (row === undefined) continue;
+    await ctx.db.patch(row._id, { state, observedAt: Date.now(), detail: args.detail });
+    finished += 1;
+  }
+  if (args.outcome === "unknown" && operation.state === "dispatching") {
+    // Only the exact reads admitted by this action are finalized above. The
+    // operation may have other reads in flight under a concurrent action, so
+    // do not use the broad crash-reconciliation path here and relabel those
+    // other attempts prematurely.
+    await ctx.db.patch(operation._id, { state: "outcomeUnknown", updatedAt: Date.now() });
   }
   if (args.outcome === "confirmed" && finished === 0) {
     return { ok: false as const, code: "outcome-unknown", message: "confirmed reconciliation has no admitted read" };
@@ -557,6 +583,7 @@ const reconcileAfterCrashArgsValidator = v.object({
   attemptToken: v.optional(v.string()),
   readNumber: v.optional(v.number()),
   reads: v.optional(v.number()),
+  readTokens: v.optional(v.array(v.string())),
   outcome: v.optional(v.union(v.literal("confirmed"), v.literal("unknown"))),
   detail: v.optional(v.string()),
 });
@@ -586,6 +613,7 @@ export const reconcileAfterCrash = f1InternalMutation({
       if (
         args.attemptToken === undefined ||
         args.reads === undefined ||
+        args.readTokens === undefined ||
         args.outcome === undefined ||
         args.detail === undefined
       ) {
@@ -595,6 +623,7 @@ export const reconcileAfterCrash = f1InternalMutation({
         operationId: args.operationId,
         attemptToken: args.attemptToken,
         reads: args.reads,
+        readTokens: args.readTokens,
         outcome: args.outcome,
         detail: args.detail,
       });

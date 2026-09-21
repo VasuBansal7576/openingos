@@ -903,6 +903,11 @@ export default defineSchema({
     providerIds: v.optional(v.string()),
     capturedAt: v.number(),
     contentHash: v.string(),
+    // Protected source bytes stay linked to the immutable content hash. UI
+    // projections expose only bounded, redacted excerpts from productEvidence;
+    // these fields are never part of a public projection or guest download.
+    protectedSourceText: v.optional(v.string()),
+    protectedSourceHtml: v.optional(v.string()),
     completeness: v.union(
       v.literal("complete"),
       v.literal("partial"),

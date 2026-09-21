@@ -53,6 +53,13 @@ const THREAD_BINDING_RESOLVE_LIMIT = 64;
 // its application outcome are preserved, never deleted. Leftovers stay
 // waitingForBinding for the next trigger.
 const WAITING_REPLAY_LIMIT = 8;
+// A binding can uncover a backlog larger than one bounded pass. Continuations
+// are deliberately finite so malformed or permanently blocked rows cannot
+// create an autonomous hot loop. Continuations are scheduled as separate
+// transactions, and any remainder stays explicitly waiting after the finite
+// chain ends.
+const WAITING_REPLAY_MAX_CONTINUATIONS = 8;
+const WAITING_REPLAY_CONTINUATION_DELAY_MS = 0;
 
 // Durable retained inbound snapshot cap (Greptile r4058523016 repair).
 // Bodies at or below this bound are preserved byte-exact in the waiting row
@@ -95,7 +102,7 @@ const advanceMigrationRef = makeFunctionReference<
 >("communication/callbacks:advanceThreadMigration");
 const replayWaitingSelfRef = makeFunctionReference<
   "mutation",
-  { threadId: string; inboxId: string },
+  { threadId: string; inboxId: string; continuation?: number },
   | { ok: true; replayed: number; stillWaiting: number }
   | CommunicationDenial
 >("communication/callbacks:replayWaitingInbound");
@@ -827,6 +834,11 @@ async function ingestBoundMessage(
     providerIds: JSON.stringify({ messageId: parsed.messageId, threadId: parsed.threadId, inboxId: parsed.inboxId }),
     capturedAt: parsed.timestamp,
     contentHash,
+    // Keep the exact provider body in protected application storage. The
+    // immutable hash links these bytes to the redacted product excerpt below;
+    // no public projection returns these fields.
+    protectedSourceText: parsed.text,
+    protectedSourceHtml: parsed.html,
     completeness,
     counterpartyRole: "ownerStandIn",
     // Controlled demo evidence, never genuine vendor evidence: the content
@@ -975,7 +987,7 @@ async function replayWaitingForThread(
   ctx: F1MutationCtx,
   threadId: string,
   inboxId: string,
-): Promise<{ readonly replayed: number; readonly stillWaiting: number }> {
+): Promise<{ readonly replayed: number; readonly stillWaiting: number; readonly hasOverflow: boolean }> {
   // Fair-progress repair (Greptile r4058523015 follow-up). One bounded
   // take ordered by least-recently-attempted through the exact waiting-set
   // index: rows never evaluated sort first, so untouched replies always
@@ -1080,7 +1092,7 @@ async function replayWaitingForThread(
   // The extra row is only an overflow detector: it stays untouched (and
   // therefore first) for the next trigger, so no evaluated row can hide it.
   if (rows.length > WAITING_REPLAY_LIMIT) stillWaiting += rows.length - WAITING_REPLAY_LIMIT;
-  return { replayed, stillWaiting };
+  return { replayed, stillWaiting, hasOverflow: rows.length > WAITING_REPLAY_LIMIT };
 }
 
 /**
@@ -1169,7 +1181,7 @@ export const ingestMessage = f1InternalMutation({
  * evidence snapshot and one extraction input per source and version.
  */
 export const replayWaitingInbound = f1InternalMutation({
-  args: { threadId: v.string(), inboxId: v.string() },
+  args: { threadId: v.string(), inboxId: v.string(), continuation: v.optional(v.number()) },
   returns: v.union(
     v.object({ ok: v.literal(true), replayed: v.number(), stillWaiting: v.number() }),
     denialValidator,
@@ -1180,7 +1192,26 @@ export const replayWaitingInbound = f1InternalMutation({
     if (threadId === undefined || inboxId === undefined) {
       return denial("invalid-payload", "thread and inbox identifiers are required");
     }
+    const continuation = args.continuation ?? 0;
+    if (
+      !Number.isSafeInteger(continuation) ||
+      continuation < 0 ||
+      continuation > WAITING_REPLAY_MAX_CONTINUATIONS
+    ) {
+      return denial("invalid-payload", "replay continuation is outside the bounded policy");
+    }
     const result = await replayWaitingForThread(ctx, threadId, inboxId);
+    if (
+      result.hasOverflow &&
+      result.stillWaiting > 0 &&
+      continuation < WAITING_REPLAY_MAX_CONTINUATIONS
+    ) {
+      await ctx.scheduler.runAfter(WAITING_REPLAY_CONTINUATION_DELAY_MS, replayWaitingSelfRef, {
+        threadId,
+        inboxId,
+        continuation: continuation + 1,
+      });
+    }
     return { ok: true as const, replayed: result.replayed, stillWaiting: result.stillWaiting };
   },
 });
