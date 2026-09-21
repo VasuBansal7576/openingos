@@ -453,3 +453,16 @@ The E12 worker owns only new `convex/negotiation/**` files and must reuse the ac
 Greptile remains unavailable because its connected trial reports the 50-credit limit exhausted; that quota notice is not code-review approval, so the ready child PRs remain unmerged pending an explicitly resolved review gate and fixed-head Astra review.
 All cited evidence is controlled local or CI execution.
 No hosted Convex deployment, live provider call, owner-mailbox exchange, genuine supplier response, public origin, purchase, realized saving or commercial outcome was observed.
+
+### 2026-09-21 - E11 integration, shared-budget repair and supervised cleanup checkpoint
+
+E11 is repaired and remotely preserved at `662b7c9`; its focused 27-test suite and 333-test direct matrix pass, PR #7 has all nine exact-head checks green, and PR #14 carries the exact E11 history at `787c815` with 439 direct tests, strict TypeScript, production build and all nine exact-head checks green.
+The two posted Devin findings on PR #14 now have exact-head test and controlled-browser evidence replies.
+PR #14 is still not accepted: the selected purchasing-desk fidelity rebuild remains active, and GitHub reports a base conflict with the earlier generic U1 UI that will be resolved only after the fidelity branch lands without removing E8 behavior tests.
+Ready PR #15 at `71c7a69` contains the first production negotiation orchestrator, but Devin identified five substantive lifecycle and concurrency defects; a verified OpenCode Muse Spark 1.3 Contributor high repair dispatch owns those findings, so the green initial CI is not treated as acceptance.
+Ready PR #16 at cleaned head `dc08600` removes the impossible per-model basis demand from the shared organization budget while retaining exact per-reservation basis fences; five controlled multi-model regressions and all 18 exact-head checks pass.
+The analogous reconciliation check in `convex/execution/attempts.ts` remains under a separate verified OpenCode GLM-5.3-Flash high package before PR #16 or E12 can be accepted.
+Completed E2, E5, E7, E9, E10, U1 and E11 task worktrees were verified clean and remotely preserved, then removed through Orca without forced branch deletion; active E6, E8, E12 and budget-repair worktrees remain.
+Greptile still supplies quota notices only, which are recorded as a review blocker rather than approval.
+All cited browser, model and provider evidence is controlled.
+No hosted Convex deployment, live provider call, owner-mailbox exchange, genuine supplier response, public origin, purchase, realized saving or commercial outcome was observed.
