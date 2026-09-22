@@ -17,7 +17,7 @@ import { checkProjectAccess, denialValidator, identityOf } from "../access/check
 import {
   ensureGlobalAllowance,
   getGlobalAllowance,
-  settleGlobalReservation,
+  attributedGlobalExposure,
   tryDebitGlobalForReservation,
 } from "./allowance.js";
 import {
@@ -413,6 +413,15 @@ export const reserveServerRead = f1InternalMutation({
  * outcome retains the used portion as unresolved because a read that may
  * have executed must never be freed as if it cost nothing, and no actual
  * spend number is ever invented. The run always closes.
+ *
+ * The deployment aggregate mirrors the exact retained/released split —
+ * never the whole hold: the attributed reserved hold closes, exactly
+ * `retain` moves to unresolved, and the released remainder simply leaves
+ * reserved. A zero-read settlement (`readsUsed=0`) therefore releases the
+ * full hold globally and retains nothing. Every denial precedes every
+ * write: budget, aggregate, and reservation patches all happen after the
+ * last possible denial, so a denied settlement commits no partial debit
+ * on any ledger.
  */
 export const settleServerRead = f1InternalMutation({
   args: {
@@ -456,23 +465,51 @@ export const settleServerRead = f1InternalMutation({
     if (budget === null || budget.organizationId !== args.organizationId) {
       return { ok: false as const, code: "allowance-exhausted", message: "reconciliation budget is unavailable" };
     }
+    // Global pre-validation before any write. An attributed reserved hold
+    // larger than the settling amount would free another tenant's
+    // exposure, and an aggregate that cannot cover the attributed hold is
+    // genuine drift: both fail closed here, before the org ledger moves.
+    // Legacy deployments without a global row keep org-only accounting.
+    const global = await getGlobalAllowance(ctx);
+    const attribution = attributedGlobalExposure(reservation, global);
+    if (global !== null) {
+      if (attribution.reserved > amount) {
+        return { ok: false as const, code: "allowance-exhausted", message: "deployment allowance ledger drift: attributed hold exceeds the settling reservation" };
+      }
+      if (global.reservedMicroUsd < attribution.reserved) {
+        return { ok: false as const, code: "allowance-exhausted", message: "deployment allowance ledger drift: global reserved cannot cover settlement" };
+      }
+    }
     await ctx.db.patch(reservation.budgetId, {
       reservedMicroUsd: Math.max(0, budget.reservedMicroUsd - amount),
       unresolvedMicroUsd: budget.unresolvedMicroUsd + retain,
       updatedAt: now,
     });
-    // Global mirror moves only this reservation's attributed hold (see
-    // `attributedGlobalHold`): never another tenant's exposure.
-    await settleGlobalReservation(
-      ctx,
-      args.mode === "release" ? "release" : "retainUnknown",
-      reservation,
-    );
+    // Exact split mirror: close only this reservation's attributed
+    // reserved hold (see `attributedGlobalExposure`) — never another
+    // tenant's exposure — and move exactly the retained split into
+    // unresolved. The released remainder simply leaves reserved.
+    if (global !== null && (attribution.reserved > 0 || retain > 0)) {
+      await ctx.db.patch(global._id, {
+        reservedMicroUsd: global.reservedMicroUsd - attribution.reserved,
+        unresolvedMicroUsd: global.unresolvedMicroUsd + retain,
+        updatedAt: now,
+      });
+    }
     await ctx.db.patch(reservation._id, {
       reservedMicroUsd: 0,
       unresolvedMicroUsd: reservation.unresolvedMicroUsd + retain,
       state: "closed",
       updatedAt: now,
+      // Pin the exact remainder of both attribution legs in the same
+      // mutation: the reserved hold fully closes here, while the retained
+      // split joins the reservation's unresolved attribution.
+      ...(global === null
+        ? {}
+        : {
+          globalReservedMicroUsd: 0,
+          globalUnresolvedMicroUsd: attribution.unresolved + retain,
+        }),
     });
     return { ok: true as const, retainedMicroUsd: retain, releasedMicroUsd: released };
   },

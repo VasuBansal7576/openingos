@@ -974,6 +974,14 @@ export default defineSchema({
     // settle exactly this amount — never an unproven share of another
     // tenant's hold. Optional so historical rows stay readable.
     globalReservedMicroUsd: v.optional(v.number()),
+    // Unresolved-leg attribution for the same aggregate. Retained unknown
+    // exposure and reconciliation reads move global unresolved exposure only
+    // through this marker: a read spends another tenant's unresolved hold
+    // never. Rows that never funded the aggregate carry no marker (or an
+    // explicit zero) and settle org-side only. Optional so historical rows
+    // stay readable; pre-global legacy rows fall back to their current
+    // unresolved amount by singleton age.
+    globalUnresolvedMicroUsd: v.optional(v.number()),
   })
     .index("by_job", ["jobId"])
     .index("by_budget", ["budgetId"]),
