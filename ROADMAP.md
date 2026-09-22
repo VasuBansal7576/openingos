@@ -46,11 +46,13 @@ This file supplies order, not duplicate contracts or a running automation.
    The UI rendered 10 live provider results with unknown quote totals, unknown fit and service coverage, no realized saving, no order and no email.
    These are live research pages, not verified suppliers, leases, quotes, purchases or commercial outcomes.
    The Netherlands/EUR benchmark remains separately incomplete.
-   - [ ] A separate GPT-6 Astra review of `44e7361` ran 235 focused passing tests plus typecheck and exact-head CI inspection, corroborated the real dev data, and returned `CHANGES REQUIRED` with seven blockers.
+   - [x] A separate GPT-6 Astra review of `44e7361` ran 235 focused passing tests plus typecheck and exact-head CI inspection, corroborated the real dev data, and returned `CHANGES REQUIRED` with seven blockers.
    The blockers are cross-org allowance multiplication, unrelated-brief admission, stale requirement dispatch, punctuation/replay conflict, research pages labeled suppliers/quotes, terminal replay misreported as failure, and dispatch suite omitted from CI.
-   OpenCode repair PRs #30 and #31 are delivered and individually green.
+   - [x] OpenCode repair PR #30 head `6024328`, PR #31 head `c1fdf54` and source-visibility PR #34 head `e8ceb0b` are delivered, mergeable and green on every agreed application and repository check.
+   Coordinator review rejected two superficially green allowance repairs before integration: one could release another organization's aggregate hold, and one could commit an org-budget debit before returning a global denial.
+   The repaired combined local line through `2e80cc8` plus the source-only evidence filter at `11ae05c` passes the complete local suite, both strict TypeScript checks and the production build.
    None of the seven blockers is accepted until the combined fixed commit passes its own CI and a fresh Astra review.
-   - [ ] Greptile review is unavailable because the 50-credit trial is exhausted, and Devin review was skipped because its trial expired.
+   - [x] Greptile review is unavailable because the 50-credit trial is exhausted, and Devin review was skipped because its trial expired.
    Neither is represented as approval.
 7. [ ] **Publication and closeout.** Hand the tested pushed revision to ChatGPT Sites for owner-authorized publication with public access.
    Verify the final public origin, hosted integrations and anonymous evaluator path; then update README and the build log.
@@ -171,7 +173,8 @@ This file supplies order, not duplicate contracts or a running automation.
 - [x] Record that no `OPENAI_API_KEY` is available, that a ChatGPT/Codex subscription or Luna coding model is not an application API key, and that S-21/D-12 and dependent live model work remain blocked.
 - [x] Record that the Firecrawl app allowance is hard bounded at 100000 micro-USD with no paid overage authorized.
 - [x] Inspect the populated state, empty state, keyboard tab order and partial Recovery state in a dev browser at desktop and 390x844 widths; the partial Recovery experience is incomplete.
-- [ ] Obtain a separate Astra ACCEPT on the combined fixed line after the seven blockers are repaired; PRs #30 and #31 are delivered and individually green, but the current accepted verdict remains `CHANGES REQUIRED` on `44e7361`.
+- [x] Deliver mergeable, exact-head-green repair PRs #30 at `6024328`, #31 at `c1fdf54` and #34 at `e8ceb0b`; coordinator review additionally proves legacy global-hold attribution and reconciliation-denial atomicity before accepting the backend branch.
+- [ ] Push the complete combined repair line, pass its exact-head GitHub checks and obtain a separate Astra ACCEPT; the current independent verdict remains `CHANGES REQUIRED` on earlier commit `35ad542` after five further findings were routed and repaired.
 
 The completed money and Jev proof wave contains controlled proofs only, reviewed at `595d30c` with no actionable findings remaining.
 Luna owned `proofs/money/**`; Muse Spark owned `proofs/jev/**`; Astra owned shared tooling, integration and progress files.

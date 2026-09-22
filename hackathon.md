@@ -674,3 +674,17 @@ Neither is represented as approval.
 This checkpoint changes documentation only: `ROADMAP.md`, `README.md`, `docs/verification/evidence-matrix.md` and this log.
 No code, workflow, package file, ADR or generated file was edited.
 No provider was called, no email was sent, no secret was accessed and nothing was deployed.
+
+### 2026-09-22 - second live-research repair wave
+
+A separate GPT-6 Astra review rejected combined checkpoint `35ad542` with five actionable findings: metadata could admit an unrelated brief, cancellation could release another organization's deployment hold, punctuation variants could conflict on replay, source-only research evidence was hidden, and partial recovery copy invented a retry or missing response.
+
+OpenCode Muse Spark high workers delivered repair PR #30 at `6024328`, PR #31 at `c1fdf54` and PR #34 at `e8ceb0b`.
+All three exact heads are mergeable and pass every agreed application and repository check.
+Coordinator review rejected two intermediate allowance fixes before integration because one could strand a valid pre-global hold or release another tenant's hold, and a later version could debit the organization budget before returning a deployment-level denial.
+The final regression proves the old code fails at the intended global-attribution branch and that the repaired denial leaves the organization budget, reservation, deployment aggregate and attempt set unchanged.
+
+The combined local line through `2e80cc8`, together with source filter checkpoint `11ae05c`, passes `bun run test` with 601 direct Convex tests, both strict TypeScript checks and the production Vite build.
+Research-source projection now exposes only unpromoted Firecrawl evidence and does not relabel owner-email evidence as web research.
+No provider was called, no email was sent, no secret was accessed and nothing was deployed in this repair wave.
+The complete combined revision still requires a push, exact-head GitHub CI and a fresh separate Astra verdict before merge.

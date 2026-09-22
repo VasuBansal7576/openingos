@@ -19,7 +19,10 @@ Jev credential and model access was verified earlier, but this SF run did not ex
 No `OPENAI_API_KEY` is available, so S-21/D-12 and dependent live model work remain blocked.
 The Firecrawl app allowance is hard bounded at 100000 micro-USD with no paid overage authorized.
 A separate GPT-6 Astra review of `44e7361` returned `CHANGES REQUIRED` with seven blockers.
-OpenCode repair PRs #30 and #31 are delivered and individually green, but none of the seven blockers is accepted until the combined fixed commit passes its own CI and a fresh Astra review.
+OpenCode repair PR #30 head `6024328`, PR #31 head `c1fdf54` and source-visibility PR #34 head `e8ceb0b` are delivered, mergeable and green on every agreed application and repository check.
+A later independent review of combined checkpoint `35ad542` found five remaining defects in scope admission, aggregate-hold attribution, punctuation replay, source-only visibility and recovery copy.
+Those findings are repaired on the current combined local line through `2e80cc8` and source filter checkpoint `11ae05c`, where the complete local suite, both strict TypeScript checks and production build pass.
+They are not accepted until that complete combined revision is pushed, passes exact-head CI and receives a fresh Astra review.
 Greptile review is unavailable because the 50-credit trial is exhausted, and Devin review was skipped because its trial expired.
 ChatGPT Sites public origin and production Convex deployment remain incomplete, so published-origin outcomes remain unverified.
 
