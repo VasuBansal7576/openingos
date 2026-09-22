@@ -68,9 +68,10 @@ async function settleReservation(
         updatedAt: now,
       });
     }
-    // Mirror the same leg to the deployment aggregate in the same mutation
-    // so org and global ledgers stay paired across spend/release/unknown.
-    await settleGlobalReservation(ctx, mode, amount);
+    // Mirror only this reservation's attributed global hold in the same
+    // mutation (zero for legacy unattributed rows): never another tenant's
+    // exposure. The strict primitive fails closed on genuine drift.
+    await settleGlobalReservation(ctx, mode, reservation.globalReservedMicroUsd ?? 0);
   }
   if (mode === "spend") {
     await ctx.db.patch(reservation._id, {
@@ -407,10 +408,19 @@ async function admitReconciliationRead(
     updatedAt: Date.now(),
   });
   // Mirror the read cost to the deployment aggregate when present. Legacy
-  // fixtures without a global row keep org-only accounting. Strict: fail
-  // closed on global drift instead of clamping with Math.max.
+  // fixtures without a global row keep org-only accounting. The global
+  // reserved leg moves only this reservation's attributed hold: a
+  // reservation that never funded the aggregate (attribution zero) cannot
+  // admit a read against another tenant's hold, and fails closed here.
+  // Attribution decrements in lockstep with the reservation so a later
+  // settlement moves exactly the remainder. The unresolved leg stays an
+  // aggregate-level coverage check that fails closed on insufficiency.
   const global = await getGlobalAllowance(ctx);
+  const globalAttributed = reservation.globalReservedMicroUsd ?? 0;
   if (global !== null) {
+    if (globalAttributed < fromReserved) {
+      return { ok: false as const, code: "allowance-exhausted", message: "deployment reconciliation budget is not attributed to this reservation" };
+    }
     if (global.reservedMicroUsd < fromReserved || global.unresolvedMicroUsd < fromUnknown) {
       return { ok: false as const, code: "allowance-exhausted", message: "deployment reconciliation budget is exhausted" };
     }
@@ -425,6 +435,7 @@ async function admitReconciliationRead(
     reservedMicroUsd: reservation.reservedMicroUsd - fromReserved,
     unresolvedMicroUsd: reservation.unresolvedMicroUsd - fromUnknown,
     spentMicroUsd: reservation.spentMicroUsd + pricing.readCostMicroUsd,
+    ...(global === null ? {} : { globalReservedMicroUsd: globalAttributed - fromReserved }),
     updatedAt: Date.now(),
   });
   await ctx.db.insert("attempts", {

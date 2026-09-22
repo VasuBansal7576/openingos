@@ -967,6 +967,13 @@ export default defineSchema({
     pricingBasis: v.string(),
     state: v.union(v.literal("open"), v.literal("paused"), v.literal("closed")),
     updatedAt: v.number(),
+    // Deployment-aggregate attribution (backend authority repair). The exact
+    // micro-USD hold this reservation placed on the global
+    // `deploymentAllowances` ledger at creation. Absent on legacy rows,
+    // which hold nothing globally. Cancellation and settlement release or
+    // settle exactly this amount — never an unproven share of another
+    // tenant's hold. Optional so historical rows stay readable.
+    globalReservedMicroUsd: v.optional(v.number()),
   })
     .index("by_job", ["jobId"])
     .index("by_budget", ["budgetId"]),

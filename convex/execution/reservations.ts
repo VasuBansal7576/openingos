@@ -15,11 +15,9 @@ import type { Id } from "../_generated/dataModel.js";
 import { f1InternalMutation, f1Mutation, f1Query, type F1MutationCtx } from "../server.js";
 import { checkProjectAccess, denialValidator, identityOf } from "../access/checks.js";
 import {
-  GLOBAL_ALLOWANCE_KEY,
-  RESEARCH_GLOBAL_HARD_CEILING_MICRO_USD,
+  ensureGlobalAllowance,
   getGlobalAllowance,
   settleGlobalReservation,
-  sumLegacyPartitionCommitment,
   tryDebitGlobalForReservation,
 } from "./allowance.js";
 import {
@@ -159,20 +157,8 @@ export const reserve = f1Mutation({
     // Migration invariant: a first global row created after legacy org
     // ledgers already carry spend seeds from their bounded sum instead of
     // zero, so observed spend is not forgotten and re-spendable.
-    let global = await getGlobalAllowance(ctx);
-    if (global === null) {
-      const seed = await sumLegacyPartitionCommitment(ctx);
-      await ctx.db.insert("deploymentAllowances", {
-        key: GLOBAL_ALLOWANCE_KEY,
-        ceilingMicroUsd: Math.min(budget.ceilingMicroUsd, RESEARCH_GLOBAL_HARD_CEILING_MICRO_USD),
-        reservedMicroUsd: seed.reservedMicroUsd,
-        spentMicroUsd: seed.spentMicroUsd,
-        unresolvedMicroUsd: seed.unresolvedMicroUsd,
-        pricingBasis: budget.pricingBasis,
-        updatedAt: now,
-      });
-      global = await getGlobalAllowance(ctx);
-    }
+    await ensureGlobalAllowance(ctx, budget.ceilingMicroUsd, budget.pricingBasis);
+    const global = await getGlobalAllowance(ctx);
     if (global === null) {
       return { ok: false as const, code: "allowance-exhausted", message: "deployment allowance is unavailable" };
     }
@@ -197,6 +183,10 @@ export const reserve = f1Mutation({
       pricingBasis: args.pricingBasis,
       state: "open",
       updatedAt: now,
+      // Global attribution: this row's exact hold on the deployment
+      // aggregate, debited above in the same mutation. Cancellation and
+      // settlement release exactly this amount — never another tenant's.
+      globalReservedMicroUsd: args.amountMicroUsd,
     });
     await ctx.db.patch(budget._id, {
       reservedMicroUsd: budget.reservedMicroUsd + args.amountMicroUsd,
@@ -383,16 +373,7 @@ export const reserveServerRead = f1InternalMutation({
     // aggregate, so seed it from the bounded partition sum (same migration
     // invariant as the user-identity reserve) instead of failing closed.
     if ((await getGlobalAllowance(ctx)) === null) {
-      const seed = await sumLegacyPartitionCommitment(ctx);
-      await ctx.db.insert("deploymentAllowances", {
-        key: GLOBAL_ALLOWANCE_KEY,
-        ceilingMicroUsd: Math.min(budget.ceilingMicroUsd, RESEARCH_GLOBAL_HARD_CEILING_MICRO_USD),
-        reservedMicroUsd: seed.reservedMicroUsd,
-        spentMicroUsd: seed.spentMicroUsd,
-        unresolvedMicroUsd: seed.unresolvedMicroUsd,
-        pricingBasis: budget.pricingBasis,
-        updatedAt: now,
-      });
+      await ensureGlobalAllowance(ctx, budget.ceilingMicroUsd, budget.pricingBasis);
     }
     const globalAdmitted = await tryDebitGlobalForReservation(ctx, args.amountMicroUsd);
     if (!globalAdmitted) {
@@ -414,6 +395,9 @@ export const reserveServerRead = f1InternalMutation({
       pricingBasis: args.pricingBasis,
       state: "open",
       updatedAt: now,
+      // Global attribution: this row's exact hold on the deployment
+      // aggregate, debited above in the same mutation.
+      globalReservedMicroUsd: args.amountMicroUsd,
     });
     await ctx.db.patch(budget._id, {
       reservedMicroUsd: budget.reservedMicroUsd + args.amountMicroUsd,
@@ -477,7 +461,13 @@ export const settleServerRead = f1InternalMutation({
       unresolvedMicroUsd: budget.unresolvedMicroUsd + retain,
       updatedAt: now,
     });
-    await settleGlobalReservation(ctx, args.mode === "release" ? "release" : "retainUnknown", amount);
+    // Global mirror moves only this reservation's attributed hold (zero
+    // for legacy unattributed rows): never another tenant's exposure.
+    await settleGlobalReservation(
+      ctx,
+      args.mode === "release" ? "release" : "retainUnknown",
+      reservation.globalReservedMicroUsd ?? 0,
+    );
     await ctx.db.patch(reservation._id, {
       reservedMicroUsd: 0,
       unresolvedMicroUsd: reservation.unresolvedMicroUsd + retain,
