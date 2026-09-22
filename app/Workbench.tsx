@@ -1164,9 +1164,6 @@ export function WorkbenchIntakeView({ onIntake, onBack }: { readonly onIntake: W
     if (mode === "opening" && values.detailSummary.trim().length === 0) {
       return "Describe the opening brief before creating the workspace.";
     }
-    if (mode === "opening" && values.detailSummary.trim().length < 10) {
-      return "Give the opening brief enough detail to plan from — scope, place, and budget range in at least a short sentence.";
-    }
     if (mode === "quoteComparison" && values.detailTitle.trim().length === 0) {
       return "Describe the requirement these quotes cover.";
     }

@@ -2857,6 +2857,28 @@ test("an empty opening brief blocks submission without reaching intake", async (
   }
 });
 
+test("a short non-whitespace opening brief is accepted and preserved exactly", async () => {
+  const seen: import("../workbench-state").WorkbenchIntakeInput[] = [];
+  const mounted = await mountIntakeView(async (input) => {
+    seen.push(input);
+    return { ok: true, projectId: "project-short-brief" };
+  });
+  try {
+    const set = (label: string, value: string) => {
+      (intakeField(mounted.container, mounted.dom, label) as unknown as HTMLInputElement).value = value;
+    };
+    set("Project name", "Harbor coffee opening");
+    set("City or region", "San Francisco, USA");
+    set("Opening brief", "  Café?  ");
+    await submitMountedIntake(mounted.container, mounted.dom);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({ mode: "opening", detailSummary: "Café?" });
+    expect(mounted.container.textContent).toContain("Workspace created. Loading the persisted project.");
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
 test("exact opening detail values and a USD ceiling reach intake once", async () => {
   const seen: import("../workbench-state").WorkbenchIntakeInput[] = [];
   const mounted = await mountIntakeView(async (input) => {
