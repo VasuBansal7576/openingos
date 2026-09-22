@@ -62,12 +62,11 @@ type W1CancelJobArgs = Record<string, unknown> & {
   readonly reason: string;
 };
 
-type W1StartJobArgs = Record<string, unknown> & {
+type W1RequestBoundedResearchArgs = Record<string, unknown> & {
   readonly organizationId: Id<"organizations">;
   readonly projectId: Id<"projects">;
-  readonly text: string;
-  readonly operationId: "research.collect";
-  readonly kind: "research";
+  readonly requirementId: Id<"requirements">;
+  readonly requirementVersion: number;
   readonly idempotencyKey: string;
 };
 
@@ -115,7 +114,9 @@ type W1PublicApi = {
   };
   readonly "execution/jobs": {
     readonly cancel: FunctionReference<"mutation", "public", W1CancelJobArgs, unknown>;
-    readonly start: FunctionReference<"mutation", "public", W1StartJobArgs, unknown>;
+  };
+  readonly "research/collection": {
+    readonly requestBoundedResearch: FunctionReference<"mutation", "public", W1RequestBoundedResearchArgs, unknown>;
   };
   readonly "domain/fulfillment": {
     readonly openServiceCase: FunctionReference<"mutation", "public", W1OpenServiceCaseArgs, unknown>;
@@ -145,7 +146,8 @@ const recordSelectionReference = decisionsApi.recordSelection;
 const decideApprovalReference = decisionsApi.decideApproval;
 const jobsApi = (api as unknown as W1PublicApi)["execution/jobs"];
 const cancelJobReference = jobsApi.cancel;
-const startJobReference = jobsApi.start;
+const researchApi = (api as unknown as W1PublicApi)["research/collection"];
+const requestBoundedResearchReference = researchApi.requestBoundedResearch;
 const fulfillmentApi = (api as unknown as W1PublicApi)["domain/fulfillment"];
 const openServiceCaseReference = fulfillmentApi.openServiceCase;
 const impactApi = (api as unknown as W1PublicApi)["domain/impact"];
@@ -830,17 +832,23 @@ export function createConvexWorkbenchAdapter(client: ConvexWorkbenchClient): Con
         requirement.title.trim().length === 0 ||
         requirement.category.trim().length === 0 ||
         requirement.quantity.trim().length === 0 ||
-        requirement.unit.trim().length === 0
+        requirement.unit.trim().length === 0 ||
+        !Number.isSafeInteger(requirement.version) ||
+        requirement.version < 0
       ) {
         return { ok: false, message: "The current requirement is incomplete, so research was not started." };
       }
-      const text = `Research suppliers for purchasing requirement ${requirement.key}: ${requirement.title} (${requirement.category}).`;
-      const args: W1StartJobArgs = {
+      // One explicit click admits and schedules one bounded Firecrawl search
+      // for the exact validated requirement above. The server re-enforces
+      // owner/approver authority, the research.collect capability, the exact
+      // project/requirement binding, and the shared provider allowance; the
+      // idempotency key makes an exact replay return the original job with
+      // no second provider call.
+      const args: W1RequestBoundedResearchArgs = {
         organizationId,
         projectId,
-        text,
-        operationId: "research.collect",
-        kind: "research",
+        requirementId: requirement.id as Id<"requirements">,
+        requirementVersion: requirement.version,
         idempotencyKey: researchStartIdempotencyKey(
           current.project.id,
           requirement.id,
@@ -852,14 +860,20 @@ export function createConvexWorkbenchAdapter(client: ConvexWorkbenchClient): Con
       const mutationGeneration = readVersions.get(projectId) ?? 0;
       let settlement: MutationSettlement = "uncertain";
       try {
-        const result = await client.mutation(startJobReference, args);
+        const result = await client.mutation(requestBoundedResearchReference, args);
         settlement = mutationSettlement(result);
         const failure = mutationFailure(result, "The server did not queue research.");
         if (failure !== null) return failure;
-        if (!isRecord(result) || result.state !== "queued") {
+        if (!isRecord(result) || typeof result.state !== "string") {
           return { ok: false, message: "The server did not return a queued research state." };
         }
-        return { ok: true, message: "Research queued by the server; provider outcome is still pending." };
+        if (result.state === "queued") {
+          return { ok: true, message: "Research queued by the server; provider outcome is still pending." };
+        }
+        if (result.state === "pausedBudget") {
+          return { ok: true, message: "Research admitted but paused by the server: provider allowance exhausted. Completed evidence remains visible." };
+        }
+        return { ok: false, message: "The server did not return a queued research state." };
       } catch (error) {
         return { ok: false, message: error instanceof Error ? error.message : "The server did not queue research." };
       } finally {

@@ -29,10 +29,18 @@ import * as attempts from "../execution/attempts.js";
 import * as jobs from "../execution/jobs.js";
 import * as operations from "../execution/operations.js";
 import * as reservations from "../execution/reservations.js";
-import { checkProjectAccess, denialValidator, identityOf } from "../access/checks.js";
+import { checkProjectAccess, denialValidator, identityOf, requireCapability } from "../access/checks.js";
+import { ensureSharedBudget, RESEARCH_ALLOWANCE_PRICING_BASIS } from "../execution/allowance.js";
+import {
+  REQUIREMENT_INPUT_VERSION_KEY,
+  formatRequirementInputVersion,
+  requirementBindingOf,
+} from "../execution/requirementBinding.js";
+import { classifyOpeningBriefForResearch, hasSupportedSupplierEvidence } from "./researchScope.js";
 import { components } from "../models/components.js";
 import type { ComponentApi } from "@firecrawl/firecrawl-convex/_generated/component.js";
-import { canonicalJson, requestKey } from "../shared/hashing.js";
+import { canonicalJson, payloadHash, requestKey } from "../shared/hashing.js";
+import { sha256HexOfCanonical } from "../shared/sha256.js";
 import { provenanceLabel } from "../shared/provenance.js";
 import { MAX_OPERATIONS_PER_JOB } from "../shared/scope.js";
 import {
@@ -312,6 +320,77 @@ function queryFromPayload(payload: string): string | undefined {
 
 function canonicalResearchPayload(query: string): string {
   return canonicalJson({ query });
+}
+
+/**
+ * Scope-safe research query derivation.
+ *
+ * The F1 scope contract (shared/scope) admits only classifier-supported
+ * segments into the bound grant/operation payload: every clause needs a
+ * purchasing-research anchor, and order/purchase verbs ("buy", "purchase",
+ * "pay", ...) are refused as unshipped purchase authority. A verbatim brief
+ * such as "rent a place and buy everything needed" would therefore lose its
+ * region and scope clauses at admission, and the provider would search a
+ * generic query instead of the user's request. The authoritative
+ * requirement keeps the exact brief; this builder derives a single query
+ * clause that preserves the user's region and scope words: line breaks,
+ * tabs, semicolons, and periods used as clause separators become commas
+ * (they are clause boundaries, never decimal points inside numbers),
+ * refused order/purchase verbs become the collection verb "source", and the
+ * "supplier equipment scope" prefix keeps the clause admissible even when
+ * the brief carries no anchor of its own. Anchor nouns already present in
+ * the title, category, or brief ("supplier", "equipment", "budget") ride
+ * along untouched.
+ *
+ * Canonical and deterministic: the same requirement always yields the same
+ * query, so an identical replay deduplicates instead of conflicting, and
+  * punctuation variants (periods, semicolons, exclamation/question marks,
+  * newlines) preserve the same location, rental, sourcing, and budget
+  * constraints.
+  */
+function scopeSafeQueryText(value: string): string {
+  const withCommas = value
+    .replace(/[\r\n\t]+/g, ", ")
+    .replace(/;/g, ",")
+    // Exclamation and question marks are clause separators exactly like
+    // semicolons: without this mapping a `!`-separated brief would split
+    // into bare clauses downstream, dropping constraints and breaking
+    // identical replay. They never occur inside numeric quantities.
+    .replace(/[!?]+/g, ",")
+    // Period clause boundaries become commas, but a period between two
+    // digits is a decimal quantity (2.5 kg) and is preserved.
+    .replace(/\./g, (match, offset: number, full: string) => {
+      const prev = full[offset - 1];
+      const next = full[offset + 1];
+      const prevIsDigit = prev !== undefined && /[0-9]/.test(prev);
+      const nextIsDigit = next !== undefined && /[0-9]/.test(next);
+      return prevIsDigit && nextIsDigit ? match : ",";
+    })
+    .replace(
+      /\b(buy|buys|buying|purchase|purchases|purchasing|pay|pays|paying|paid|finance|finances|financing|sign|signs|signing)\b/gi,
+      "source",
+    );
+  return withCommas.replace(/\s{2,}/g, " ").trim().replace(/^[,\s]+|[,\s]+$/g, "");
+}
+
+/**
+ * The Firecrawl intent is derived from the authoritative requirement,
+ * including its hard constraints (region plus the exact opening brief):
+ * without them the provider would search a generic query instead of the
+ * user's request. The grant canonical payload binds to this exact intent.
+ */
+function boundedResearchIntent(requirement: {
+  readonly key: string;
+  readonly title: string;
+  readonly category: string;
+  readonly hardConstraints?: string;
+}): string {
+  const base =
+    `Research suppliers for purchasing requirement ${scopeSafeQueryText(requirement.key)}: ` +
+    `${scopeSafeQueryText(requirement.title)} (${scopeSafeQueryText(requirement.category)})`;
+  const constraints = scopeSafeQueryText(requirement.hardConstraints ?? "");
+  if (constraints.length === 0) return `${base}.`;
+  return `${base}, supplier equipment scope: ${constraints}.`;
 }
 
 /**
@@ -763,8 +842,31 @@ export const applyOutcome = f1InternalMutation({
     ) {
       return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
     }
-    const stale = canonicalJson(operation.inputVersions) !== canonicalJson(grant.inputVersions);
+    const grantStale = canonicalJson(operation.inputVersions) !== canonicalJson(grant.inputVersions);
     const requirementId = await requirementForOperation(ctx, operation.organizationId, operation.projectId, operation);
+    // Late-obsolete check: a requirement edit after the claim leaves the
+    // bound revision behind. Late results stay stale evidence and never
+    // update the current projection (no new vendor/candidate below).
+    let requirementStale = false;
+    {
+      const bound = requirementBindingOf(operation.inputVersions as Record<string, string>);
+      if (bound !== null) {
+        const live = await ctx.db.get(bound.requirementId as Id<"requirements">);
+        if (
+          live === null ||
+          live.organizationId !== operation.organizationId ||
+          live.projectId !== operation.projectId ||
+          live.version !== bound.version
+        ) {
+          requirementStale = true;
+        }
+      }
+    }
+    const stale = grantStale || requirementStale;
+    // Stale evidence still preserves the immutable source rows below, but
+    // skips vendor/candidate promotion so the current projection keeps its
+    // current requirement basis.
+    const promoteCandidates = !requirementStale;
     const records = args.outcome.records.slice(0, MAX_PROVIDER_RECORDS);
     for (const record of records) {
       const markerKey = `${sourceKey(operation.projectId, record)}|sourceSnapshot`;
@@ -800,9 +902,19 @@ export const applyOutcome = f1InternalMutation({
         ...(record.sourceUrl === undefined ? {} : { locator: record.sourceUrl }),
       };
       let candidateId: Id<"candidates"> | undefined;
-      if (requirementId !== undefined && (record.productModel !== undefined || record.title !== undefined)) {
-        const vendorName = record.vendorName ?? parseSourceHost(record.sourceUrl);
-        if (vendorName !== undefined) {
+      // Source non-promotion: arbitrary titled URLs (discussion threads,
+      // civic pages, informational articles) stay as research source
+      // records until supported supplier/product evidence exists. Promotion
+      // needs an explicit product model, an explicit vendor, and a price
+      // claim; title/hostname fallbacks never qualify. Stale late results
+      // never promote either, so the current projection keeps its basis.
+      if (
+        promoteCandidates &&
+        requirementId !== undefined &&
+        hasSupportedSupplierEvidence(record)
+      ) {
+        const vendorName = record.vendorName as string;
+        {
           const vendorRows = await ctx.db
             .query("vendors")
             .withIndex("by_organization_and_name", (q) =>
@@ -819,7 +931,7 @@ export const applyOutcome = f1InternalMutation({
                   regions: [],
                   createdAt: now,
                 });
-          const productModel = record.productModel ?? record.title ?? "Unknown model";
+          const productModel = record.productModel as string;
           const variant = record.variant ?? "Unknown variant";
           const variantKey = record.variantKey ?? `unknown|${record.contentHash}`;
           const requirement = await ctx.db.get(requirementId);
@@ -1463,6 +1575,222 @@ export const requestGrantedResearch = f1Mutation({
       incompleteCount: 0,
       controlled: false,
     };
+  },
+});
+
+const requestGrantedResearchSelfRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof requestGrantedResearch>,
+  MutationReturn<typeof requestGrantedResearch>
+>("research/collection:requestGrantedResearch");
+
+/**
+ * One-click bounded Firecrawl search for the one current requirement.
+ *
+ * This is the production-safe path behind the workbench's "Start bounded
+ * research" action. One explicit call atomically and idempotently admits and
+ * schedules exactly one bounded `search` collection for the exact
+ * project/requirement binding it names:
+ *
+ * - Authority: authenticated owner/approver project role plus the enabled
+ *   `research.collect` capability. Contributors, viewers, and foreign
+ *   identities are denied with zero new effect.
+ * - Binding: the requirement must belong to the same organization/project,
+ *   stay in a current (non-terminal) state, and carry the exact version the
+ *   caller validated. A cross-project requirement or a changed version is
+ *   denied before any grant, job, reservation, operation, or provider call.
+ * - Allowance: the shared organization ledger is admitted (and initialized
+ *   once from the server-only allowance) before any grant exists. A missing
+ *   or invalid allowance fails with no grant, job, reservation, operation,
+ *   or provider call.
+ * - Effect: a finite grant (exactly one maximum Firecrawl call) is issued
+ *   and the existing `requestGrantedResearch` contract performs the
+ *   reservation, operation creation, and internal-action scheduling, so no
+ *   reservation, claim, spend, retry, or provenance fence is bypassed.
+ * - Idempotency: an exact replay of the idempotency key returns the original
+ *   job and operation with no second grant, job, reservation, operation, or
+ *   provider call. The same key with a different payload or target
+ *   conflicts instead of replaying.
+ */
+export const requestBoundedResearch = f1Mutation({
+  args: {
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    requirementId: v.id("requirements"),
+    requirementVersion: v.number(),
+    idempotencyKey: v.string(),
+  },
+  returns: researchResultValidator,
+  handler: async (ctx, args) => {
+    const identity = await identityOf(ctx);
+    if (identity === null) {
+      return { ok: false as const, code: "forged-identity", message: "unauthenticated" };
+    }
+    if (!/^[A-Za-z0-9:_-]{8,128}$/.test(args.idempotencyKey)) {
+      return { ok: false as const, code: "invalid-payload", message: "idempotencyKey must be 8-128 chars of A-Za-z0-9:_-" };
+    }
+    if (!Number.isSafeInteger(args.requirementVersion) || args.requirementVersion < 0) {
+      return { ok: false as const, code: "invalid-payload", message: "requirementVersion must be a non-negative safe integer" };
+    }
+    const now = Date.now();
+    const project = await ctx.db.get(args.projectId);
+    if (project === null || project.organizationId !== args.organizationId) {
+      return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
+    }
+    const access = await checkProjectAccess(
+      ctx,
+      identity,
+      args.organizationId,
+      args.projectId,
+      "approver",
+      now,
+    );
+    if (!access.ok) return { ok: false as const, code: access.code, message: access.message };
+    const capability = requireCapability("research.collect", access.value);
+    if (!capability.ok) {
+      return { ok: false as const, code: capability.code, message: capability.message };
+    }
+    const requirement = await ctx.db.get(args.requirementId);
+    if (
+      requirement === null ||
+      requirement.organizationId !== args.organizationId ||
+      requirement.projectId !== args.projectId
+    ) {
+      return { ok: false as const, code: "denied-project", message: "requirement is not in this project" };
+    }
+    if (requirement.state === "selected" || requirement.state === "fulfilled" || requirement.state === "cancelled") {
+      return { ok: false as const, code: "stale-requirement", message: "requirement is no longer current; research was not started" };
+    }
+    if (requirement.version !== args.requirementVersion) {
+      return { ok: false as const, code: "changed-requirement", message: "requirement changed since this research was prepared; renewed authority required" };
+    }
+    if (
+      requirement.key.trim().length === 0 ||
+      requirement.title.trim().length === 0 ||
+      requirement.category.trim().length === 0
+    ) {
+      return { ok: false as const, code: "invalid-payload", message: "the current requirement is incomplete, so research was not started" };
+    }
+    // Classify the actual user scope BEFORE adding supplier search wording.
+    // Unrelated briefs (homework, vacations, general browsing) refuse here
+    // with zero grant/job/reservation/operation/schedule/provider effects.
+    // Only the stored brief itself is classified: title, category, and key
+    // metadata may carry allowlisted words (such as "equipment") and must
+    // never launder an unrelated brief into authority. Requirements without
+    // a stored brief (legacy/test fixtures) fall back to title/category.
+    // Supported coffee-shop openings, real-estate/rent research, and bounded
+    // equipment sourcing proceed as research.collect only; no purchase or
+    // send operation exists in this path.
+    const briefText =
+      requirement.hardConstraints ?? `${requirement.title}\n${requirement.category}`;
+    const briefVerdict = classifyOpeningBriefForResearch(briefText);
+    if (briefVerdict.verdict === "unavailableRefused") {
+      return { ok: false as const, code: "unavailable-capability", message: briefVerdict.reason };
+    }
+    if (briefVerdict.verdict === "unrelatedRefused") {
+      return { ok: false as const, code: "unrelated-refusal", message: briefVerdict.reason };
+    }
+    // One canonical validated research objective for admission, stored
+    // payload, dispatch, and replay. Deterministic in the requirement, so an
+    // identical replay deduplicates instead of conflicting, and punctuation
+    // variants (periods, semicolons, newlines) preserve the same location,
+    // rental, sourcing, and budget constraints while order verbs stay
+    // rewritten to bounded sourcing (never purchase execution).
+    const researchIntent = boundedResearchIntent(requirement);
+    const operationPayload = canonicalResearchPayload(researchIntent);
+    const requestedTarget = { mode: "search" } as const;
+    const targetCheck = validateCollectionTarget(requestedTarget.mode, undefined);
+    if (!targetCheck.ok) {
+      return { ok: false as const, code: targetCheck.code, message: targetCheck.message };
+    }
+    // Exact replay returns the original job and operation before any grant
+    // is issued, so a double-click or reload mints no second effect. A
+    // stored row with a different payload or target conflicts instead.
+    const replay = await lookupProjectRequest(
+      ctx,
+      args.organizationId,
+      args.projectId,
+      args.idempotencyKey,
+      requestedTarget,
+    );
+    if (!replay.ok) return replay;
+    if (replay.sibling !== null) {
+      if (replay.sibling.normalizedPayload !== operationPayload) {
+        return { ok: false as const, code: "duplicate-conflict", message: "requestId reused with a different research payload" };
+      }
+      if (!collectionTargetMatches(replay.sibling.binding, requestedTarget)) {
+        return { ok: false as const, code: "duplicate-conflict", message: "requestId reused with a different research payload" };
+      }
+      const existingJob = await ctx.db.get(replay.sibling.jobId);
+      if (
+        existingJob === null ||
+        existingJob.organizationId !== args.organizationId ||
+        existingJob.projectId !== args.projectId
+      ) {
+        return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
+      }
+      return {
+        ok: true as const,
+        jobId: replay.sibling.jobId,
+        operationId: replay.sibling.operationId,
+        state: existingJob.state,
+        requestCount: 0,
+        incompleteCount: 0,
+        controlled: false,
+      };
+    }
+    // The shared ledger must exist (or be initialized once from the
+    // server-only allowance) before any grant, job, or reservation exists.
+    const allowance = await ensureSharedBudget(ctx, args.organizationId, {
+      minimumMicroUsd: FIRECRAWL_CALL_MAX_COST_MICRO_USD,
+      pricingBasis: RESEARCH_ALLOWANCE_PRICING_BASIS,
+    });
+    if (!allowance.ok) return allowance;
+    const recipient = await ctx.db
+      .query("recipientConfigs")
+      .withIndex("by_active", (q) => q.eq("active", true))
+      .unique();
+    // One finite grant: exactly one maximum Firecrawl call, bound to the
+    // exact project/requirement authority the checks above established.
+    // The grant carries the current requirement revision plus every
+    // material input version; jobs and operations copy it verbatim, and the
+    // atomic claim rejects stale authorization after a requirement edit.
+    const grantId = await ctx.db.insert("grants", {
+      organizationId: args.organizationId,
+      projectId: args.projectId,
+      operations: ["research.collect"],
+      communicationProfile: "ownerRoleplay",
+      recipientConfigVersion: recipient?.version ?? 0,
+      inputVersions: {
+        [REQUIREMENT_INPUT_VERSION_KEY]: formatRequirementInputVersion(
+          args.requirementId,
+          args.requirementVersion,
+        ),
+      },
+      canonicalPayload: operationPayload,
+      payloadHash: payloadHash({ query: researchIntent }),
+      payloadSha256: await sha256HexOfCanonical(operationPayload),
+      workflowAuthorities: [
+        { operationId: "research.collect", projectId: args.projectId, requirementId: args.requirementId },
+      ],
+      costCeilingMicroUsd: FIRECRAWL_CALL_MAX_COST_MICRO_USD,
+      roundLimit: 3,
+      expiresAt: now + 900_000,
+      revocationVersion: 1,
+      status: "active",
+      createdAt: now,
+    });
+    // The existing grant-bound contract performs the job admission,
+    // bounded reservation, operation creation, and internal-action
+    // scheduling, so this path cannot bypass any of those fences.
+    return await ctx.runMutation(requestGrantedResearchSelfRef, {
+      projectId: args.projectId,
+      requirementId: args.requirementId,
+      researchIntent,
+      requestId: args.idempotencyKey,
+      grantId,
+      mode: "search",
+    });
   },
 });
 

@@ -34,6 +34,7 @@ import {
 } from "../access/checks.js";
 import { recordCurrentAuthority } from "../access/memberships.js";
 import { canonicalJson } from "../shared/hashing.js";
+import { classifyOpeningBriefForResearch } from "../research/researchScope.js";
 import {
   normalizeBoundedText,
   normalizeRequirementDate,
@@ -206,6 +207,7 @@ function normalizeIntake(raw: {
   }
   if (raw.mode === "opening") {
     if (region === undefined) throw new Error("region required for an opening");
+    if (detailSummary === undefined) throw new Error("opening brief required for an opening");
   }
   if (raw.mode === "quoteComparison") {
     if (detailTitle === undefined) throw new Error("quote subject required for a quote comparison");
@@ -318,15 +320,22 @@ interface IntakeRecords {
 
 function recordsFor(input: NormalizedIntake): IntakeRecords {
   if (input.mode === "opening") {
+    // The opening brief is required (see normalizeIntake) and is preserved
+    // verbatim-trimmed alongside the region: the research intent is derived
+    // from this authoritative requirement, so dropping either would send a
+    // generic query instead of the user's request. Supplied title/category
+    // win; the generic labels remain only as fallbacks.
+    const brief = input.detailSummary ?? "";
     return {
       requirementKey: "opening-scope",
-      requirementTitle: "Opening purchasing scope",
-      requirementCategory: "equipment",
+      requirementTitle: input.detailTitle ?? "Opening purchasing scope",
+      requirementCategory: input.detailCategory ?? "equipment",
       requirementUnit: "scope",
       requirementPriority: "P0",
-      requirementHardConstraints: input.region === undefined
-        ? undefined
-        : `Primary region: ${input.region}`,
+      requirementHardConstraints:
+        input.region === undefined
+          ? `Opening brief: ${brief}`
+          : `Primary region: ${input.region}\nOpening brief: ${brief}`,
     };
   }
   if (input.mode === "quoteComparison") {
@@ -416,6 +425,21 @@ export const createWorkspace = f1Mutation({
       );
     }
     const normalizedPayload = normalizedPayloadOf(input);
+
+    // Scope gate (D-17): classify the actual user opening brief/scope
+    // before any workspace effect. Clearly unrelated briefs (homework,
+    // vacations, general browsing) refuse with zero writes; supported
+    // coffee-shop openings, real-estate/rent research, and bounded
+    // equipment sourcing proceed. Only the brief itself is classified:
+    // title, category, and region metadata may carry allowlisted words and
+    // must never launder an unrelated brief into a workspace. Other modes
+    // keep their structural validation only.
+    if (input.mode === "opening") {
+      const scopeVerdict = classifyOpeningBriefForResearch(input.detailSummary ?? "");
+      if (scopeVerdict.verdict !== "supported") {
+        return deny("unrelated-refusal", scopeVerdict.reason);
+      }
+    }
 
     const replay = await ctx.db
       .query("intakeRequests")

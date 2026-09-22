@@ -1582,7 +1582,7 @@ describe("C1 Greptile P1 replay/scale repairs (r4058523015/r4058523016/r40585230
     const marker = await f.t.run(async (ctx) => {
       const rows = await ctx.db
         .query("processedEvents")
-        .withIndex("by_provider_environment_and_provider_message_and_thread_and_inbox", (q) =>
+        .withIndex("by_provider_environment_message_thread_inbox", (q) =>
           q
             .eq("provider", "agentmail-inbound")
             .eq("environment", "live")
@@ -2859,7 +2859,7 @@ describe("C1 Greptile P1 replay/scale repairs (r4058523015/r4058523016/r40585230
       await f.t.run(async (ctx) => {
         const rows = await ctx.db
           .query("processedEvents")
-          .withIndex("by_provider_environment_and_provider_message_and_thread_and_inbox", (q) =>
+          .withIndex("by_provider_environment_message_thread_inbox", (q) =>
             q
               .eq("provider", "agentmail-inbound")
               .eq("environment", "live")
@@ -2889,7 +2889,7 @@ describe("C1 Greptile P1 replay/scale repairs (r4058523015/r4058523016/r40585230
       await f.t.run(async (ctx) => {
         const rows = await ctx.db
           .query("processedEvents")
-          .withIndex("by_provider_environment_and_provider_message_and_thread_and_inbox", (q) =>
+          .withIndex("by_provider_environment_message_thread_inbox", (q) =>
             q
               .eq("provider", "agentmail-inbound")
               .eq("environment", "live")
@@ -3012,7 +3012,7 @@ describe("C1 Greptile P1 replay/scale repairs (r4058523015/r4058523016/r40585230
     const migrated = await f.t.run(async (ctx) =>
       await ctx.db
         .query("processedEvents")
-        .withIndex("by_provider_environment_and_provider_message_and_thread_and_inbox", (q) =>
+        .withIndex("by_provider_environment_message_thread_inbox", (q) =>
           q
             .eq("provider", "agentmail-binding")
             .eq("environment", "live")
@@ -3179,7 +3179,7 @@ describe("C1 Greptile P1 replay/scale repairs (r4058523015/r4058523016/r40585230
     const blocked = await f.t.run(async (ctx) =>
       await ctx.db
         .query("processedEvents")
-        .withIndex("by_provider_environment_and_provider_message_and_thread_and_inbox", (q) =>
+        .withIndex("by_provider_environment_message_thread_inbox", (q) =>
           q
             .eq("provider", "agentmail-inbound")
             .eq("environment", "live")

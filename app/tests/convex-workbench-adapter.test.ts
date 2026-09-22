@@ -453,14 +453,14 @@ test("cancels only a projected cancellable job", async () => {
   expect(calls).toHaveLength(2);
 });
 
-test("starts only one supported purchasing research brief and reports queued backend state", async () => {
+test("starts one bounded research dispatch and reports queued backend state", async () => {
   const calls: MutationCall[] = [];
   const controls = controlledWatch(() => actionProjection());
   const adapter = createConvexWorkbenchAdapter(actionClient(
     actionProjection(),
     controls.watch,
     calls,
-    { ok: true, jobId: "job-2", state: "queued", supportedSegment: "research suppliers", refusedSegments: [] },
+    { ok: true, jobId: "job-2", operationId: "operation-2", state: "queued", requestCount: 0, incompleteCount: 0, controlled: false },
   ));
 
   await adapter.load("project-1");
@@ -470,16 +470,54 @@ test("starts only one supported purchasing research brief and reports queued bac
     message: "Research queued by the server; provider outcome is still pending.",
   });
   expect(calls).toHaveLength(1);
-  expect(getFunctionName(calls[0]?.reference as FunctionReference<"mutation">)).toBe("execution/jobs:start");
+  expect(getFunctionName(calls[0]?.reference as FunctionReference<"mutation">)).toBe("research/collection:requestBoundedResearch");
   expect(calls[0]?.args).toEqual({
     organizationId: "organization-1",
     projectId: "project-1",
-    text: "Research suppliers for purchasing requirement REQ-1: Two-group espresso machine (equipment).",
-    operationId: "research.collect",
-    kind: "research",
+    requirementId: "requirement-1",
+    requirementVersion: 4,
     idempotencyKey: researchStartIdempotencyKey("project-1", "requirement-1", 4),
   });
   expect(result.message).not.toContain("provider succeeded");
+});
+
+test("reports an allowance-paused dispatch honestly without claiming provider work", async () => {
+  const calls: MutationCall[] = [];
+  const controls = controlledWatch(() => actionProjection());
+  const adapter = createConvexWorkbenchAdapter(actionClient(
+    actionProjection(),
+    controls.watch,
+    calls,
+    { ok: true, jobId: "job-2", operationId: null, state: "pausedBudget", requestCount: 0, incompleteCount: 0, controlled: false, recovery: "increase-provider-allowance-or-resume" },
+  ));
+
+  await adapter.load("project-1");
+  const result = await adapter.act({ type: "startResearch", projectId: "project-1" });
+  expect(result).toEqual({
+    ok: true,
+    message: "Research admitted but paused by the server: provider allowance exhausted. Completed evidence remains visible.",
+  });
+  expect(calls).toHaveLength(1);
+  expect(getFunctionName(calls[0]?.reference as FunctionReference<"mutation">)).toBe("research/collection:requestBoundedResearch");
+  expect(result.message).not.toContain("provider succeeded");
+});
+
+test("surfaces a bounded-research denial without inventing a queued state", async () => {
+  const calls: MutationCall[] = [];
+  const controls = controlledWatch(() => actionProjection());
+  const adapter = createConvexWorkbenchAdapter(actionClient(
+    actionProjection(),
+    controls.watch,
+    calls,
+    { ok: false, code: "allowance-exhausted", message: "provider allowance is not configured for this deployment" },
+  ));
+
+  await adapter.load("project-1");
+  await expect(adapter.act({ type: "startResearch", projectId: "project-1" })).resolves.toEqual({
+    ok: false,
+    message: "provider allowance is not configured for this deployment",
+  });
+  expect(calls).toHaveLength(1);
 });
 
 test("research start payload and key are stable across separate adapter instances", async () => {

@@ -629,3 +629,16 @@ No actionable finding remained in the assigned follow-up scope.
 This checkpoint is controlled evidence only.
 No hosted Convex deployment, live provider call, owner-mailbox exchange, genuine supplier response, public origin, purchase, realized saving or commercial outcome was observed.
 Greptile remains unavailable because its connected trial reports the 50-credit limit exhausted, and Devin's expired-trial skip is not treated as review approval.
+
+### 2026-09-22 - reviewed integration merged to main
+
+PR #14 passed all nine required checks on exact documentation head `d2d76c1`, remained conflict-free and mergeable, and entered the integration branch as merge commit `6768aa7`.
+The merge commit's Git tree exactly matched the separately accepted `d2d76c1` tree, and the GPT-6 Astra xhigh reviewer explicitly carried its acceptance to that exact merge SHA.
+GitHub consequently marked child PRs #7 through #13 merged through their shared integration base.
+
+PR #2 then passed the same nine exact-head checks at `6768aa7`, remained conflict-free and mergeable, and entered `main` as `1b350ed`.
+The `main` merge commit's Git tree again exactly matched the accepted tree.
+All nine push checks passed on `main`: delivery guard, workbench artifact tests, application typecheck, build, tests, provider contracts and user path, plus foundation typecheck and contract tests.
+
+No branch was force-pushed or remotely deleted.
+No hosted Convex deployment, live provider call, owner-mailbox exchange, genuine supplier response, public origin, purchase, realized saving or commercial outcome was observed.

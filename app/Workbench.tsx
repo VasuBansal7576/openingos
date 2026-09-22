@@ -1006,7 +1006,7 @@ function createIntakeKey(): string {
 }
 
 const INTAKE_MODES: readonly { readonly value: WorkbenchIntakeMode; readonly title: string; readonly detail: string }[] = [
-  { value: "opening", title: "Plan an opening", detail: "Location, budget, and deadline for a new counter." },
+  { value: "opening", title: "Plan an opening", detail: "Opening brief, budget ceiling, and deadline for a new location." },
   { value: "quoteComparison", title: "Compare quotes", detail: "Bring existing offers for one requirement." },
   { value: "equipment", title: "Equipment case", detail: "A service issue on installed equipment." },
 ];
@@ -1039,11 +1039,11 @@ function intakeFingerprint(values: {
 function parseIntakeBudgetMinorUnits(text: string): number | null {
   const match = /^(\d+)(?:\.(\d{1,2}))?$/.exec(text.trim());
   if (!match) return null;
-  const euros = match[1]!;
+  const whole = match[1]!;
   const cents = (match[2] ?? "").padEnd(2, "0");
   let minor: bigint;
   try {
-    minor = BigInt(euros) * 100n + BigInt(cents);
+    minor = BigInt(whole) * 100n + BigInt(cents);
   } catch {
     return null;
   }
@@ -1145,11 +1145,11 @@ export function WorkbenchIntakeView({ onIntake, onBack }: { readonly onIntake: W
     if (mode === "opening" && values.region.trim().length === 0) return "Add the city or region for this opening.";
     if (values.region.trim().length > 128) return "Keep the region within 128 characters.";
     if (values.currency.trim().length > 0 && !/^[A-Za-z]{3}$/.test(values.currency.trim())) {
-      return "Use a three-letter reporting currency such as EUR.";
+      return "Use a three-letter reporting currency such as USD.";
     }
     if (values.budget.trim().length > 0) {
       if (!/^\d+(?:\.\d{1,2})?$/.test(values.budget.trim())) {
-        return "Enter the budget as whole euros and cents, for example 45000 or 45000.50.";
+        return "Enter the budget ceiling as a number with up to two decimals, for example 45000 or 45000.50.";
       }
       // Exact decimal-string parsing (no floating-point multiplication); an
       // unsafe magnitude fails closed here so the submission below can never
@@ -1160,6 +1160,9 @@ export function WorkbenchIntakeView({ onIntake, onBack }: { readonly onIntake: W
     }
     if (values.needBy.trim().length > 0 && Number.isNaN(Date.parse(values.needBy))) {
       return "Enter a valid needed-by date or leave it empty.";
+    }
+    if (mode === "opening" && values.detailSummary.trim().length === 0) {
+      return "Describe the opening brief before creating the workspace.";
     }
     if (mode === "quoteComparison" && values.detailTitle.trim().length === 0) {
       return "Describe the requirement these quotes cover.";
@@ -1363,16 +1366,57 @@ export function WorkbenchIntakeView({ onIntake, onBack }: { readonly onIntake: W
                       />
                     </div>
                     <div className="wb-form-field">
-                      <label htmlFor={`${idPrefix}-budget`}>Equipment budget in euros (optional)</label>
+                      <label htmlFor={`${idPrefix}-budget`}>Budget upper limit in reporting currency (optional)</label>
                       <input
                         id={`${idPrefix}-budget`}
                         name="budget"
                         defaultValue=""
                         inputMode="decimal"
-                        placeholder="45000"
+                        placeholder="500000"
+                        disabled={pending}
+                        autoComplete="off"
+                        aria-describedby={`${idPrefix}-budget-help`}
+                      />
+                      <span className="wb-field-help" id={`${idPrefix}-budget-help`}>A single allocation ceiling in the reporting currency above. Put any range or lower bound in the opening brief below.</span>
+                    </div>
+                    <div className="wb-form-field">
+                      <label htmlFor={`${idPrefix}-opening-title`}>Opening title (optional)</label>
+                      <input
+                        id={`${idPrefix}-opening-title`}
+                        name="detailTitle"
+                        defaultValue=""
+                        maxLength={256}
+                        placeholder="San Francisco coffee shop opening"
                         disabled={pending}
                         autoComplete="off"
                       />
+                    </div>
+                    <div className="wb-form-field">
+                      <label htmlFor={`${idPrefix}-opening-category`}>Opening category (optional)</label>
+                      <input
+                        id={`${idPrefix}-opening-category`}
+                        name="detailCategory"
+                        defaultValue=""
+                        maxLength={128}
+                        placeholder="café opening"
+                        disabled={pending}
+                        autoComplete="off"
+                      />
+                    </div>
+                    <div className="wb-form-field wb-form-field-full">
+                      <label htmlFor={`${idPrefix}-opening-brief`}>Opening brief</label>
+                      <textarea
+                        id={`${idPrefix}-opening-brief`}
+                        name="detailSummary"
+                        defaultValue=""
+                        maxLength={2000}
+                        rows={5}
+                        placeholder="Open a coffee shop in San Francisco; rent a place and buy everything needed; budget USD 250,000-500,000"
+                        disabled={pending}
+                        aria-describedby={`${idPrefix}-opening-brief-help`}
+                      />
+                      <span className="wb-field-help" id={`${idPrefix}-opening-brief-help`}>Describe the scope, place, and budget range in your own words. The brief is kept exactly as entered.</span>
+                      <span className="wb-character-count">2000 characters maximum</span>
                     </div>
                   </>
                 ) : null}

@@ -23,6 +23,7 @@ import {
   MAX_OPERATIONS_PER_JOB,
 } from "../shared/scope.js";
 import { checkProjectAccess, denialValidator, identityOf } from "../access/checks.js";
+import { getGlobalAllowance, settleGlobalReservation, attributedGlobalHold } from "./allowance.js";
 import {
   MAX_RECONCILIATION_READS,
   RECONCILIATION_RETRY_OWNER,
@@ -67,6 +68,10 @@ async function settleReservation(
         updatedAt: now,
       });
     }
+    // Mirror only this reservation's attributed global hold in the same
+    // mutation (see `attributedGlobalHold`): never another tenant's
+    // exposure. The strict primitive fails closed on genuine drift.
+    await settleGlobalReservation(ctx, mode, reservation);
   }
   if (mode === "spend") {
     await ctx.db.patch(reservation._id, {
@@ -396,16 +401,45 @@ async function admitReconciliationRead(
   }
   const fromReserved = Math.min(reservation.reservedMicroUsd, pricing.readCostMicroUsd);
   const fromUnknown = pricing.readCostMicroUsd - fromReserved;
+  // Atomicity: every denial precedes every write. The deployment-aggregate
+  // checks below run BEFORE the org-budget patch, so a global denial can
+  // never commit a partial org-side debit. Legacy fixtures without a
+  // global row keep org-only accounting. The global reserved leg moves
+  // only this reservation's attributed hold (see `attributedGlobalHold`):
+  // a reservation that never funded the aggregate cannot admit a read
+  // against another tenant's hold, and fails closed here. Attribution
+  // decrements in lockstep with the reservation so a later settlement
+  // moves exactly the remainder. The unresolved leg stays an
+  // aggregate-level coverage check that fails closed on insufficiency.
+  const global = await getGlobalAllowance(ctx);
+  const globalAttributed = attributedGlobalHold(reservation, global);
+  if (global !== null) {
+    if (globalAttributed < fromReserved) {
+      return { ok: false as const, code: "allowance-exhausted", message: "deployment reconciliation budget is not attributed to this reservation" };
+    }
+    if (global.reservedMicroUsd < fromReserved || global.unresolvedMicroUsd < fromUnknown) {
+      return { ok: false as const, code: "allowance-exhausted", message: "deployment reconciliation budget is exhausted" };
+    }
+  }
   await ctx.db.patch(reservation.budgetId, {
     reservedMicroUsd: budget.reservedMicroUsd - fromReserved,
     unresolvedMicroUsd: budget.unresolvedMicroUsd - fromUnknown,
     spentMicroUsd: budget.spentMicroUsd + pricing.readCostMicroUsd,
     updatedAt: Date.now(),
   });
+  if (global !== null) {
+    await ctx.db.patch(global._id, {
+      reservedMicroUsd: global.reservedMicroUsd - fromReserved,
+      unresolvedMicroUsd: global.unresolvedMicroUsd - fromUnknown,
+      spentMicroUsd: global.spentMicroUsd + pricing.readCostMicroUsd,
+      updatedAt: Date.now(),
+    });
+  }
   await ctx.db.patch(reservation._id, {
     reservedMicroUsd: reservation.reservedMicroUsd - fromReserved,
     unresolvedMicroUsd: reservation.unresolvedMicroUsd - fromUnknown,
     spentMicroUsd: reservation.spentMicroUsd + pricing.readCostMicroUsd,
+    ...(global === null ? {} : { globalReservedMicroUsd: globalAttributed - fromReserved }),
     updatedAt: Date.now(),
   });
   await ctx.db.insert("attempts", {

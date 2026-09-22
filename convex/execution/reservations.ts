@@ -15,6 +15,12 @@ import type { Id } from "../_generated/dataModel.js";
 import { f1InternalMutation, f1Mutation, f1Query, type F1MutationCtx } from "../server.js";
 import { checkProjectAccess, denialValidator, identityOf } from "../access/checks.js";
 import {
+  ensureGlobalAllowance,
+  getGlobalAllowance,
+  settleGlobalReservation,
+  tryDebitGlobalForReservation,
+} from "./allowance.js";
+import {
   MAX_RECONCILIATION_READS,
   parseReconciliationPricingBasis,
 } from "../communication/contracts.js";
@@ -144,6 +150,28 @@ export const reserve = f1Mutation({
         message: "shared allowance cannot cover another full reservation",
       };
     }
+    // Deployment aggregate: the sum across organizations is globally
+    // bounded. Ensure the singleton exists (legacy rows inserted it), then
+    // debit it in the SAME mutation before touching the org ledger, so a
+    // concurrent organization serializes on the global row via OCC.
+    // Migration invariant: a first global row created after legacy org
+    // ledgers already carry spend seeds from their bounded sum instead of
+    // zero, so observed spend is not forgotten and re-spendable.
+    await ensureGlobalAllowance(ctx, budget.ceilingMicroUsd, budget.pricingBasis);
+    const global = await getGlobalAllowance(ctx);
+    if (global === null) {
+      return { ok: false as const, code: "allowance-exhausted", message: "deployment allowance is unavailable" };
+    }
+    const globalCommitted =
+      global.reservedMicroUsd + global.spentMicroUsd + global.unresolvedMicroUsd;
+    if (globalCommitted + args.amountMicroUsd > global.ceilingMicroUsd) {
+      await ctx.db.patch(args.jobId, { state: "pausedBudget", updatedAt: now });
+      return {
+        ok: false as const,
+        code: "allowance-exhausted",
+        message: "deployment allowance cannot cover another full reservation",
+      };
+    }
     const reservationId = await ctx.db.insert("reservations", {
       organizationId: args.organizationId,
       jobId: args.jobId,
@@ -155,9 +183,17 @@ export const reserve = f1Mutation({
       pricingBasis: args.pricingBasis,
       state: "open",
       updatedAt: now,
+      // Global attribution: this row's exact hold on the deployment
+      // aggregate, debited above in the same mutation. Cancellation and
+      // settlement release exactly this amount — never another tenant's.
+      globalReservedMicroUsd: args.amountMicroUsd,
     });
     await ctx.db.patch(budget._id, {
       reservedMicroUsd: budget.reservedMicroUsd + args.amountMicroUsd,
+      updatedAt: now,
+    });
+    await ctx.db.patch(global._id, {
+      reservedMicroUsd: global.reservedMicroUsd + args.amountMicroUsd,
       updatedAt: now,
     });
     return { ok: true as const, reservationId };
@@ -333,6 +369,21 @@ export const reserveServerRead = f1InternalMutation({
         message: "shared allowance cannot cover another full reservation",
       };
     }
+    // Legacy bridge: server-read recovery fixtures predate the deployment
+    // aggregate, so seed it from the bounded partition sum (same migration
+    // invariant as the user-identity reserve) instead of failing closed.
+    if ((await getGlobalAllowance(ctx)) === null) {
+      await ensureGlobalAllowance(ctx, budget.ceilingMicroUsd, budget.pricingBasis);
+    }
+    const globalAdmitted = await tryDebitGlobalForReservation(ctx, args.amountMicroUsd);
+    if (!globalAdmitted) {
+      await ctx.db.patch(args.jobId, { state: "pausedBudget", updatedAt: now });
+      return {
+        ok: false as const,
+        code: "allowance-exhausted",
+        message: "deployment allowance cannot cover another full reservation",
+      };
+    }
     const reservationId = await ctx.db.insert("reservations", {
       organizationId: args.organizationId,
       jobId: args.jobId,
@@ -344,6 +395,9 @@ export const reserveServerRead = f1InternalMutation({
       pricingBasis: args.pricingBasis,
       state: "open",
       updatedAt: now,
+      // Global attribution: this row's exact hold on the deployment
+      // aggregate, debited above in the same mutation.
+      globalReservedMicroUsd: args.amountMicroUsd,
     });
     await ctx.db.patch(budget._id, {
       reservedMicroUsd: budget.reservedMicroUsd + args.amountMicroUsd,
@@ -407,6 +461,13 @@ export const settleServerRead = f1InternalMutation({
       unresolvedMicroUsd: budget.unresolvedMicroUsd + retain,
       updatedAt: now,
     });
+    // Global mirror moves only this reservation's attributed hold (see
+    // `attributedGlobalHold`): never another tenant's exposure.
+    await settleGlobalReservation(
+      ctx,
+      args.mode === "release" ? "release" : "retainUnknown",
+      reservation,
+    );
     await ctx.db.patch(reservation._id, {
       reservedMicroUsd: 0,
       unresolvedMicroUsd: reservation.unresolvedMicroUsd + retain,

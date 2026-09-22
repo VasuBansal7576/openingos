@@ -42,6 +42,7 @@ import {
 } from "../shared/scope.js";
 import { COMMUNICATION_PROFILE_OWNER_ROLEPLAY } from "../shared/provenance.js";
 import { checkProjectAccess, denialValidator, identityOf, requireCapability } from "../access/checks.js";
+import { requirementBindingOf } from "./requirementBinding.js";
 
 const BLOCKED_CHANNEL_KINDS = [
   "submitContactForm",
@@ -1245,6 +1246,26 @@ export const claim = f1InternalMutation({
       !inputVersionsEqual(job.inputVersions, grant.inputVersions)
     ) {
       return { ok: false as const, code: "stale-input-version", message: "prepared inputs no longer match the current grant" };
+    }
+    // Astra repair: the bound requirement revision must still be current.
+    // Grant/job/operation equality alone cannot see a requirement edit that
+    // happened after the grant was issued, so compare the bound revision
+    // against the live requirement row atomically inside this claim. A
+    // late edit rejects the stale authorization with zero provider effect;
+    // legacy rows without the binding stay claimable exactly as before.
+    {
+      const bound = requirementBindingOf(operation.inputVersions as Record<string, string>);
+      if (bound !== null) {
+        const liveRequirement = await ctx.db.get(bound.requirementId as Id<"requirements">);
+        if (
+          liveRequirement === null ||
+          liveRequirement.organizationId !== operation.organizationId ||
+          liveRequirement.projectId !== operation.projectId ||
+          liveRequirement.version !== bound.version
+        ) {
+          return { ok: false as const, code: "stale-input-version", message: "requirement changed since this operation was prepared; renewed authority required" };
+        }
+      }
     }
     // The grant cost ceiling binds the claim grant-wide (F1R-01): the
     // running reservation total across every job bound to this grant
