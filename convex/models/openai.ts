@@ -36,15 +36,23 @@ export const OPENAI_DEFAULT_TIMEOUT_MS = 20_000 as const;
 export const OPENAI_MAX_TIMEOUT_MS = 600_000 as const;
 
 /**
- * Owner-configured transport endpoint. Only absolute https:// overrides are
- * honored; anything else fails closed to the pinned OpenAI origin so a bad
- * value cannot redirect workload data to a plaintext or non-HTTPS target.
+ * Owner-configured transport endpoint. Unset means the pinned OpenAI origin.
+ * A present-but-invalid override (non-https, oversized) refuses the dispatch
+ * rather than falling back, so a bad value can never redirect the workload
+ * or its bearer credential to an unintended target.
  */
-export function openAIEndpoint(): string {
-  const override = env[OPENAI_ENDPOINT_ENV]?.trim();
-  return override !== undefined && override.length > 0 && override.length <= 2_048 && override.startsWith("https://")
-    ? override
-    : OPENAI_ENDPOINT;
+export function openAIEndpoint():
+  | { readonly ok: true; readonly endpoint: string }
+  | { readonly ok: false } {
+  const override = env[OPENAI_ENDPOINT_ENV];
+  if (override === undefined || override.trim().length === 0) {
+    return { ok: true, endpoint: OPENAI_ENDPOINT };
+  }
+  const trimmed = override.trim();
+  if (trimmed.length <= 2_048 && trimmed.startsWith("https://")) {
+    return { ok: true, endpoint: trimmed };
+  }
+  return { ok: false };
 }
 
 /**
@@ -1026,6 +1034,10 @@ export async function runOpenAIWorkload(options: OpenAIWorkloadOptions): Promise
   if (new TextEncoder().encode(body).byteLength > OPENAI_MAX_REQUEST_BYTES) {
     return rejectedResult(inputVersion, "request-too-large", null, Date.now() - started);
   }
+  const endpoint = openAIEndpoint();
+  if (!endpoint.ok) {
+    return rejectedResult(inputVersion, "invalid-endpoint-config", null, Date.now() - started);
+  }
   if (isAborted(options.signal)) return staleResult(inputVersion, "cancelled-before-start", 0);
   const beforeStart = await currentFence(options, inputVersion);
   if (!beforeStart.ok) return staleResult(inputVersion, beforeStart.reason, 0);
@@ -1047,7 +1059,7 @@ export async function runOpenAIWorkload(options: OpenAIWorkloadOptions): Promise
   const timeoutId = setTimeout(() => resolveTimeout?.(), Math.max(0, deadline - Date.now()));
   let response: Response;
   try {
-    const pending = options.fetchImpl(openAIEndpoint(), {
+    const pending = options.fetchImpl(endpoint.endpoint, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${options.apiKey}`,
