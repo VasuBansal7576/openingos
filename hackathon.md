@@ -12,7 +12,7 @@
 - **Auth:** Convex Auth foundation only; no hosted guest/private isolation proof
 - **AI models:** controlled Jev `jev-1.13.0` adapter tests only; no live application inference
 - **Started:** 2026-09-19T09:46:19Z
-- **Last updated:** 2026-09-21T17:35:55Z
+- **Last updated:** 2026-09-22T00:00:00Z
 
 ## Log
 
@@ -642,3 +642,49 @@ All nine push checks passed on `main`: delivery guard, workbench artifact tests,
 
 No branch was force-pushed or remotely deleted.
 No hosted Convex deployment, live provider call, owner-mailbox exchange, genuine supplier response, public origin, purchase, realized saving or commercial outcome was observed.
+
+### 2026-09-22 - live-evidence documentation checkpoint at 44e7361
+
+PR #27 at head `728fc19`, PR #28 at head `46a7450` and PR #29 at head `8f2deb31263a5bb715f1f248bcee2e3a1c3a6ed5` merged into integration at merge commit `44e73618beb562a198c1eeafcfd045ff42ea928c`.
+Exact-head CI was green on the merged PR heads.
+Dev Convex deployment `polite-minnow-494` was updated with `npx convex dev --once` and reported Convex functions ready.
+This is dev evidence only, not production and not a public origin.
+A fresh anonymous real app intake on dev persisted the exact owner scenario: San Francisco Coffee Shop Opening, San Francisco CA, USD, upper budget USD 500000, title San Francisco coffee shop real estate and equipment, category coffee shop opening, and brief Open a coffee shop in San Francisco, rent a place and buy everything needed for the coffee shop, budget USD 250,000-500,000.
+One bounded live Firecrawl request actually ran on dev.
+The persisted operation and attempt are `observedSuccess` and the job is partial.
+The UI rendered 10 live provider results with unknown quote totals, unknown fit and service coverage, no realized saving, no order and no email.
+These are live research pages, not verified suppliers, leases, quotes, purchases or commercial outcomes.
+The Netherlands/EUR benchmark remains separately incomplete.
+The AgentMail dev webhook is configured for only `message.received` and an inbox scope, but no email send/reply round trip was observed.
+Jev credential and model access was verified earlier, but this SF run did not exercise the complete Jev/OpenAI chain.
+No `OPENAI_API_KEY` is available.
+A ChatGPT/Codex subscription or Luna coding model is not an application API key.
+S-21/D-12 and dependent live model work remain blocked.
+The Firecrawl app allowance is hard bounded at 100000 micro-USD and no paid overage is authorized.
+ChatGPT Sites public origin and production Convex deployment remain incomplete.
+No hosted success is claimed.
+Desktop and 390x844 dev browser inspection covered the populated SF state, the empty state, keyboard tab order and the partial Recovery state.
+The partial Recovery experience is incomplete.
+A separate GPT-6 Astra review of `44e7361` ran 235 focused passing tests plus typecheck and exact-head CI inspection, corroborated the real dev data, and returned `CHANGES REQUIRED` with seven blockers.
+The blockers are cross-org allowance multiplication, unrelated-brief admission, stale requirement dispatch, punctuation/replay conflict, research pages labeled suppliers/quotes, terminal replay misreported as failure, and dispatch suite omitted from CI.
+OpenCode repair PRs #30 and #31 are delivered and individually green.
+None of the seven blockers is accepted until the combined fixed commit passes its own CI and a fresh Astra review.
+Greptile review is unavailable because the 50-credit trial is exhausted, and Devin review was skipped because its trial expired.
+Neither is represented as approval.
+This checkpoint changes documentation only: `ROADMAP.md`, `README.md`, `docs/verification/evidence-matrix.md` and this log.
+No code, workflow, package file, ADR or generated file was edited.
+No provider was called, no email was sent, no secret was accessed and nothing was deployed.
+
+### 2026-09-22 - second live-research repair wave
+
+A separate GPT-6 Astra review rejected combined checkpoint `35ad542` with five actionable findings: metadata could admit an unrelated brief, cancellation could release another organization's deployment hold, punctuation variants could conflict on replay, source-only research evidence was hidden, and partial recovery copy invented a retry or missing response.
+
+OpenCode Muse Spark high workers delivered repair PR #30 at `6024328`, PR #31 at `c1fdf54` and PR #34 at `e8ceb0b`.
+All three exact heads are mergeable and pass every agreed application and repository check.
+Coordinator review rejected two intermediate allowance fixes before integration because one could strand a valid pre-global hold or release another tenant's hold, and a later version could debit the organization budget before returning a deployment-level denial.
+The final regression proves the old code fails at the intended global-attribution branch and that the repaired denial leaves the organization budget, reservation, deployment aggregate and attempt set unchanged.
+
+The combined local line through `2e80cc8`, together with source filter checkpoint `11ae05c`, passes `bun run test` with 601 direct Convex tests, both strict TypeScript checks and the production Vite build.
+Research-source projection now exposes only unpromoted Firecrawl evidence and does not relabel owner-email evidence as web research.
+No provider was called, no email was sent, no secret was accessed and nothing was deployed in this repair wave.
+The complete combined revision still requires a push, exact-head GitHub CI and a fresh separate Astra verdict before merge.

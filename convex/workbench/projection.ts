@@ -37,6 +37,8 @@ const MAX_QUOTE_LINES = 64;
 const MAX_QUOTE_CHARGES = 64;
 const MAX_QUOTE_EVIDENCE_REFS = 128;
 export const MAX_JOBS = 12;
+export const MAX_RESEARCH_SOURCES = 12;
+export const MAX_MISSING_FACTS_PER_SOURCE = 8;
 export const MAX_OPERATIONS_PER_JOB = 8;
 export const MAX_ATTEMPTS_PER_OPERATION = 4;
 export const MAX_ATTEMPTS_PER_JOB = MAX_OPERATIONS_PER_JOB * MAX_ATTEMPTS_PER_OPERATION;
@@ -270,6 +272,27 @@ const candidateValidator = v.object({
   provenance: provenanceValidator,
 });
 
+/**
+ * Astra F4 source-only research visibility. A collected source that carries
+ * no supported supplier/product/price facts persists `evidence` plus
+ * source-scoped `productEvidence` but correctly creates no vendor, candidate,
+ * or quote. Such rows must stay visible as research sources — URL,
+ * capture/completeness, provenance, and the explicit missing commercial
+ * facts — without ever being represented as a supplier, product, quote,
+ * offer, or realized saving. Only evidence rows no projected candidate
+ * quote cites are listed here, so a source that did become an offer is
+ * never double-represented.
+ */
+const researchSourceValidator = v.object({
+  id: v.id("evidence"),
+  sourceKind: v.string(),
+  sourceUrl: v.optional(v.string()),
+  capturedAt: v.number(),
+  completeness: v.string(),
+  missingFacts: v.array(v.string()),
+  provenance: provenanceValidator,
+});
+
 const attemptValidator = v.object({
   state: v.string(),
   createdAt: v.number(),
@@ -451,6 +474,8 @@ const projectionValidator = v.object({
   requirementsTruncated: v.boolean(),
   candidates: v.array(candidateValidator),
   candidatesTruncated: v.boolean(),
+  researchSources: v.array(researchSourceValidator),
+  researchSourcesTruncated: v.boolean(),
   jobs: v.array(jobValidator),
   jobsTruncated: v.boolean(),
   decisions: v.array(decisionValidator),
@@ -854,6 +879,96 @@ function redactedSnapshot(row: {
   };
   if (!ownerAuthored && row.sourceUrl?.startsWith("https://") === true) value.sourceUrl = row.sourceUrl;
   return value;
+}
+
+type ResearchSourceView = {
+  readonly id: Id<"evidence">;
+  readonly sourceKind: string;
+  readonly sourceUrl?: string;
+  readonly capturedAt: number;
+  readonly completeness: string;
+  readonly missingFacts: string[];
+  readonly provenance: ProvenanceView;
+};
+
+/**
+ * Astra F4 source-only research visibility (P-03/P-04, D-01/D-04).
+ *
+ * Projects the bounded authorized `evidence` rows that no projected
+ * candidate quote cites, newest first. Each entry carries the redacted
+ * source identity (https URL only, owner-authored URLs withheld exactly
+ * like every other public evidence projection), capture time,
+ * completeness, and provenance, plus the explicit missing commercial
+ * facts recorded alongside that source: the `missing:*` productEvidence
+ * rows collection writes under the same source-scoped idempotency key
+ * (`<projectId>|<contentHash>|source|missing:<fact>`). The content hash
+ * itself is join material only and never leaves the backend.
+ *
+ * Nothing here invents a supplier, product, quote, offer, or saving: the
+ * entry has no vendor, no model, no totals, and no comparison verdict.
+ */
+async function readResearchSources(
+  ctx: import("../server.js").F1QueryCtx,
+  organizationId: Id<"organizations">,
+  projectId: Id<"projects">,
+  snapshots: readonly {
+    readonly _id: Id<"evidence">;
+    readonly organizationId: Id<"organizations">;
+    readonly projectId: Id<"projects">;
+    readonly sourceKind: string;
+    readonly sourceUrl?: string;
+    readonly capturedAt: number;
+    readonly contentHash: string;
+    readonly completeness: "complete" | "partial" | "unavailable";
+    readonly counterpartyRole: string;
+    readonly executionMode: "live" | "recorded" | "fixture";
+  }[],
+  referencedEvidenceIds: ReadonlySet<Id<"evidence">>,
+): Promise<{ readonly researchSources: ResearchSourceView[]; readonly researchSourcesTruncated: boolean }> {
+  const unreferenced = snapshots.filter(
+    (row) =>
+      row.organizationId === organizationId &&
+      row.projectId === projectId &&
+      row.sourceKind.startsWith("firecrawl.") &&
+      !referencedEvidenceIds.has(row._id),
+  );
+  const claimPage = await ctx.db
+    .query("productEvidence")
+    .withIndex("by_project", (q) => q.eq("projectId", projectId))
+    .order("desc")
+    .take(MAX_RESEARCH_SOURCES * (MAX_MISSING_FACTS_PER_SOURCE + 1));
+  const claims = claimPage.filter(
+    (row) => row.organizationId === organizationId && row.projectId === projectId,
+  );
+  const researchSources: ResearchSourceView[] = [];
+  for (const row of unreferenced.slice(0, MAX_RESEARCH_SOURCES)) {
+    const prefix = `${projectId}|${row.contentHash}|source|missing:`;
+    const facts: string[] = [];
+    for (const claim of claims) {
+      if (!claim.idempotencyKey.startsWith(prefix)) continue;
+      const fact = claim.idempotencyKey.slice(prefix.length);
+      if (fact.length === 0 || fact.length > 64 || facts.includes(fact)) continue;
+      facts.push(fact);
+      if (facts.length >= MAX_MISSING_FACTS_PER_SOURCE) break;
+    }
+    facts.sort();
+    const ownerAuthored = row.counterpartyRole === "ownerStandIn";
+    researchSources.push({
+      id: row._id,
+      sourceKind: row.sourceKind,
+      ...(!ownerAuthored && row.sourceUrl?.startsWith("https://") === true
+        ? { sourceUrl: row.sourceUrl }
+        : {}),
+      capturedAt: row.capturedAt,
+      completeness: row.completeness,
+      missingFacts: facts,
+      provenance: provenanceFor({ counterpartyRole: row.counterpartyRole, executionMode: row.executionMode }),
+    });
+  }
+  return {
+    researchSources,
+    researchSourcesTruncated: unreferenced.length > MAX_RESEARCH_SOURCES,
+  };
 }
 
 /** Build a safe project summary. */
@@ -1579,6 +1694,7 @@ export const getProjection = f1Query({
       .take(MAX_EVIDENCE_SNAPSHOTS);
     const provenanceEntries: ProvenanceView[] = [];
     const comparableOffers: ComparableOffer[] = [];
+    const referencedEvidenceIds = new Set<Id<"evidence">>();
     for (const candidate of candidateRows) {
       const requirementRow = await ctx.db.get(candidate.requirementId);
       if (
@@ -1624,7 +1740,9 @@ export const getProjection = f1Query({
             row.organizationId === project.organizationId &&
             row.projectId === args.projectId,
           );
-          return snapshot === undefined ? [] : [redactedSnapshot(snapshot)];
+          if (snapshot === undefined) return [];
+          referencedEvidenceIds.add(snapshot._id);
+          return [redactedSnapshot(snapshot)];
         });
       const visibleEvidence = [...evidence, ...quoteEvidence];
       const entries: ProvenanceView[] = [
@@ -1789,6 +1907,13 @@ export const getProjection = f1Query({
     );
     const summary = await readProjectSummary(ctx, project);
     const comparisonsByCandidate = pairwiseOfferComparisons(comparableOffers);
+    const { researchSources, researchSourcesTruncated } = await readResearchSources(
+      ctx,
+      project.organizationId,
+      args.projectId,
+      sourceEvidenceRows,
+      referencedEvidenceIds,
+    );
     return {
       ok: true as const,
       project: summary,
@@ -1800,6 +1925,8 @@ export const getProjection = f1Query({
         comparisons: comparisonsByCandidate.get(candidate.id) ?? [],
       })),
       candidatesTruncated: candidatesPage.length > Math.min(pageSize, MAX_CANDIDATES),
+      researchSources,
+      researchSourcesTruncated,
       jobs,
       jobsTruncated: jobsPage.length > Math.min(pageSize, MAX_JOBS),
       decisions,

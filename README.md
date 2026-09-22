@@ -8,8 +8,23 @@ The planned product connects requirements, source evidence, quote versions, appr
 This repository contains the agreed PRD, accepted controlled architecture contracts, the React/Convex purchasing application, controlled Jev and browser-executor modules, delivery tooling and the selected clickable design reference.
 Combined code checkpoint `e40da16` integrates authenticated isolated intake and sample projects, source-backed purchasing records, comparisons, owner-only communication boundaries, negotiation, recovery, equipment history and the production workbench UI.
 Its complete controlled local matrix, strict typechecks, production build and desktop/mobile browser QA pass.
-The six findings from the latest independent Astra review are repaired locally; latest-head GitHub CI and a fresh independent Astra verdict remain merge gates.
-There is no hosted Convex deployment, live provider run or public site yet, so external-provider and published-origin outcomes remain unverified.
+The six findings from the earlier independent Astra review were repaired in the prior checkpoint.
+The later seven-finding review described below remains the current integration gate.
+PR #27 (`728fc19`), PR #28 (`46a7450`) and PR #29 (`8f2deb31263a5bb715f1f248bcee2e3a1c3a6ed5`) merged into integration at `44e73618beb562a198c1eeafcfd045ff42ea928c` with exact-head CI green.
+Dev Convex deployment `polite-minnow-494` was updated with `npx convex dev --once` and reported Convex functions ready; this is dev, not production or a public origin.
+A fresh anonymous real app intake on dev persisted the exact San Francisco coffee shop owner scenario, and one bounded live Firecrawl request reached `observedSuccess` with a partial job showing 10 live provider results with unknown quote totals, unknown fit/service coverage, no realized saving, no order and no email.
+These are live research pages, not verified suppliers, leases, quotes, purchases or commercial outcomes.
+The AgentMail dev webhook covers only `message.received` with an inbox scope, and no email send/reply round trip was observed.
+Jev credential and model access was verified earlier, but this SF run did not exercise the complete Jev/OpenAI chain.
+No `OPENAI_API_KEY` is available, so S-21/D-12 and dependent live model work remain blocked.
+The Firecrawl app allowance is hard bounded at 100000 micro-USD with no paid overage authorized.
+A separate GPT-6 Astra review of `44e7361` returned `CHANGES REQUIRED` with seven blockers.
+OpenCode repair PR #30 head `6024328`, PR #31 head `c1fdf54` and source-visibility PR #34 head `e8ceb0b` are delivered, mergeable and green on every agreed application and repository check.
+A later independent review of combined checkpoint `35ad542` found five remaining defects in scope admission, aggregate-hold attribution, punctuation replay, source-only visibility and recovery copy.
+Those findings are repaired on the current combined local line through `2e80cc8` and source filter checkpoint `11ae05c`, where the complete local suite, both strict TypeScript checks and production build pass.
+They are not accepted until that complete combined revision is pushed, passes exact-head CI and receives a fresh Astra review.
+Greptile review is unavailable because the 50-credit trial is exhausted, and Devin review was skipped because its trial expired.
+ChatGPT Sites public origin and production Convex deployment remain incomplete, so published-origin outcomes remain unverified.
 
 Open [the standalone purchasing workbench](design/purchasing-workbench.html) in a browser to inspect the selected flow.
 Its images, fonts and fixture runtime are embedded.

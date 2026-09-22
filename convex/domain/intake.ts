@@ -34,6 +34,7 @@ import {
 } from "../access/checks.js";
 import { recordCurrentAuthority } from "../access/memberships.js";
 import { canonicalJson } from "../shared/hashing.js";
+import { classifyOpeningBriefForResearch } from "../research/researchScope.js";
 import {
   normalizeBoundedText,
   normalizeRequirementDate,
@@ -424,6 +425,21 @@ export const createWorkspace = f1Mutation({
       );
     }
     const normalizedPayload = normalizedPayloadOf(input);
+
+    // Scope gate (D-17): classify the actual user opening brief/scope
+    // before any workspace effect. Clearly unrelated briefs (homework,
+    // vacations, general browsing) refuse with zero writes; supported
+    // coffee-shop openings, real-estate/rent research, and bounded
+    // equipment sourcing proceed. Only the brief itself is classified:
+    // title, category, and region metadata may carry allowlisted words and
+    // must never launder an unrelated brief into a workspace. Other modes
+    // keep their structural validation only.
+    if (input.mode === "opening") {
+      const scopeVerdict = classifyOpeningBriefForResearch(input.detailSummary ?? "");
+      if (scopeVerdict.verdict !== "supported") {
+        return deny("unrelated-refusal", scopeVerdict.reason);
+      }
+    }
 
     const replay = await ctx.db
       .query("intakeRequests")

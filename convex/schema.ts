@@ -770,6 +770,28 @@ export default defineSchema({
     updatedAt: v.number(),
   }).index("by_organization", ["organizationId"]),
 
+  /**
+   * Deployment-wide Firecrawl allowance aggregate (Astra authority repair).
+   *
+   * One row per deployment/provider-account key bounds the SUM of all
+   * organization `providerBudgets` reservations. Per-org rows remain as
+   * accounting partitions, but they are never independent funds: every
+   * reservation debits both the org ledger and this global ledger in the
+   * same mutation, so two concurrent organizations cannot each spend the
+   * full configured allowance. The global ceiling is the configured
+   * 100,000 micro-USD app allowance hard cap. Table carries no
+   * organization/project so no tenant read can enumerate another tenant.
+   */
+  deploymentAllowances: defineTable({
+    key: v.string(),
+    ceilingMicroUsd: v.number(),
+    reservedMicroUsd: v.number(),
+    spentMicroUsd: v.number(),
+    unresolvedMicroUsd: v.number(),
+    pricingBasis: v.string(),
+    updatedAt: v.number(),
+  }).index("by_key", ["key"]),
+
   grants: defineTable({
     organizationId: v.id("organizations"),
     projectId: v.id("projects"),
@@ -945,6 +967,21 @@ export default defineSchema({
     pricingBasis: v.string(),
     state: v.union(v.literal("open"), v.literal("paused"), v.literal("closed")),
     updatedAt: v.number(),
+    // Deployment-aggregate attribution (backend authority repair). The exact
+    // micro-USD hold this reservation placed on the global
+    // `deploymentAllowances` ledger at creation. Absent on legacy rows,
+    // which hold nothing globally. Cancellation and settlement release or
+    // settle exactly this amount — never an unproven share of another
+    // tenant's hold. Optional so historical rows stay readable.
+    globalReservedMicroUsd: v.optional(v.number()),
+    // Unresolved-leg attribution for the same aggregate. Retained unknown
+    // exposure and reconciliation reads move global unresolved exposure only
+    // through this marker: a read spends another tenant's unresolved hold
+    // never. Rows that never funded the aggregate carry no marker (or an
+    // explicit zero) and settle org-side only. Optional so historical rows
+    // stay readable; pre-global legacy rows fall back to their current
+    // unresolved amount by singleton age.
+    globalUnresolvedMicroUsd: v.optional(v.number()),
   })
     .index("by_job", ["jobId"])
     .index("by_budget", ["budgetId"]),
