@@ -578,4 +578,69 @@ describe("unresolved attribution across the deployment aggregate", () => {
       attempts: 1,
     });
   });
+
+  test("a post-global unbound settlement never touches another tenant's aggregate", async () => {
+    const t = convexTest(schema, modules);
+    // The aggregate belongs entirely to another tenant.
+    const globalId = await insertGlobal(t, { reserved: 50, spent: 10, unresolved: 50 });
+    await waitPastGlobalCreation(t, globalId);
+    const scope = await createScope(t, "Unbound settle");
+    const budgetId = await insertBudget(t, scope.organizationId, { reserved: 14, spent: 0, unresolved: 0 });
+    // Post-global row without markers: never funded the aggregate.
+    const reservationId = await insertReservation(t, scope, budgetId, { reserved: 14, spent: 0, unresolved: 0 });
+
+    const settled = await t.mutation(settleServerReadRef, {
+      reservationId,
+      organizationId: scope.organizationId,
+      jobId: scope.jobId,
+      readsUsed: 1,
+      mode: "retainUnknown",
+    });
+    // Org-only accounting still settles exactly...
+    expect(settled).toEqual({ ok: true, retainedMicroUsd: 7, releasedMicroUsd: 7 });
+    // ...while the foreign aggregate is byte-identical and the row gains
+    // no global marker for exposure it never owned.
+    expect(await snapshot(t, budgetId, reservationId, globalId)).toEqual({
+      budget: { reserved: 0, spent: 0, unresolved: 7 },
+      reservation: { reserved: 0, spent: 0, unresolved: 7, reservedMarker: null, unresolvedMarker: null, state: "closed" },
+      global: { reserved: 50, spent: 10, unresolved: 50 },
+      attempts: 0,
+    });
+  });
+
+  test("a partially attributed settlement moves only owned exposure globally", async () => {
+    const t = convexTest(schema, modules);
+    const globalId = await insertGlobal(t, { reserved: 20, spent: 0, unresolved: 1 });
+    await waitPastGlobalCreation(t, globalId);
+    const scope = await createScope(t, "Partial marker settle");
+    const budgetId = await insertBudget(t, scope.organizationId, { reserved: 14, spent: 0, unresolved: 3 });
+    // Only 5 of the 14 settling micro-USD are owned globally; 2 more sit
+    // in the row's unresolved attribution.
+    const reservationId = await insertReservation(
+      t,
+      scope,
+      budgetId,
+      { reserved: 14, spent: 0, unresolved: 3 },
+      { reserved: 5, unresolved: 2 },
+    );
+
+    const settled = await t.mutation(settleServerReadRef, {
+      reservationId,
+      organizationId: scope.organizationId,
+      jobId: scope.jobId,
+      readsUsed: 1,
+      mode: "retainUnknown",
+    });
+    expect(settled).toEqual({ ok: true, retainedMicroUsd: 7, releasedMicroUsd: 7 });
+
+    // Org settles the full split; the aggregate closes only the owned 5
+    // and retains only that owned 5 into unresolved. The 2 unowned
+    // retained micro-USD stay org-side and never invent global exposure.
+    expect(await snapshot(t, budgetId, reservationId, globalId)).toEqual({
+      budget: { reserved: 0, spent: 0, unresolved: 10 },
+      reservation: { reserved: 0, spent: 0, unresolved: 10, reservedMarker: 0, unresolvedMarker: 7, state: "closed" },
+      global: { reserved: 15, spent: 0, unresolved: 6 },
+      attempts: 0,
+    });
+  });
 });

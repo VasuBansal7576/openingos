@@ -415,13 +415,16 @@ export const reserveServerRead = f1InternalMutation({
  * spend number is ever invented. The run always closes.
  *
  * The deployment aggregate mirrors the exact retained/released split —
- * never the whole hold: the attributed reserved hold closes, exactly
- * `retain` moves to unresolved, and the released remainder simply leaves
- * reserved. A zero-read settlement (`readsUsed=0`) therefore releases the
- * full hold globally and retains nothing. Every denial precedes every
- * write: budget, aggregate, and reservation patches all happen after the
- * last possible denial, so a denied settlement commits no partial debit
- * on any ledger.
+ * never the whole hold: the owned attributed reserved hold closes, at
+ * most that owned hold moves to unresolved, and the released remainder
+ * simply leaves reserved. Retain beyond owned reserved attribution is
+ * org-only: a post-global unbound (or partially attributed) reservation
+ * can never invent global unresolved exposure or consume another
+ * tenant's capacity. A zero-read settlement (`readsUsed=0`) therefore
+ * releases the full hold globally and retains nothing. Every denial
+ * precedes every write: budget, aggregate, and reservation patches all
+ * happen after the last possible denial, so a denied settlement commits
+ * no partial debit on any ledger.
  */
 export const settleServerRead = f1InternalMutation({
   args: {
@@ -485,14 +488,17 @@ export const settleServerRead = f1InternalMutation({
       unresolvedMicroUsd: budget.unresolvedMicroUsd + retain,
       updatedAt: now,
     });
-    // Exact split mirror: close only this reservation's attributed
-    // reserved hold (see `attributedGlobalExposure`) — never another
-    // tenant's exposure — and move exactly the retained split into
-    // unresolved. The released remainder simply leaves reserved.
-    if (global !== null && (attribution.reserved > 0 || retain > 0)) {
+    // Exact owned-attribution mirror: close only this reservation's owned
+    // attributed reserved hold (see `attributedGlobalExposure`) — never
+    // another tenant's exposure — and move into unresolved at most that
+    // owned hold. Retain beyond owned attribution settles org-side only
+    // and never reaches the aggregate.
+    const ownedClose = Math.min(attribution.reserved, amount);
+    const globalRetain = Math.min(retain, ownedClose);
+    if (global !== null && ownedClose > 0) {
       await ctx.db.patch(global._id, {
-        reservedMicroUsd: global.reservedMicroUsd - attribution.reserved,
-        unresolvedMicroUsd: global.unresolvedMicroUsd + retain,
+        reservedMicroUsd: global.reservedMicroUsd - ownedClose,
+        unresolvedMicroUsd: global.unresolvedMicroUsd + globalRetain,
         updatedAt: now,
       });
     }
@@ -502,13 +508,15 @@ export const settleServerRead = f1InternalMutation({
       state: "closed",
       updatedAt: now,
       // Pin the exact remainder of both attribution legs in the same
-      // mutation: the reserved hold fully closes here, while the retained
-      // split joins the reservation's unresolved attribution.
-      ...(global === null
+      // mutation: the owned reserved hold fully closes here, while the
+      // globally retained split joins the reservation's unresolved
+      // attribution. A fully unbound reservation stays unmarked: it gains
+      // no global marker for exposure it never owned.
+      ...(global === null || (attribution.reserved <= 0 && attribution.unresolved <= 0)
         ? {}
         : {
           globalReservedMicroUsd: 0,
-          globalUnresolvedMicroUsd: attribution.unresolved + retain,
+          globalUnresolvedMicroUsd: attribution.unresolved + globalRetain,
         }),
     });
     return { ok: true as const, retainedMicroUsd: retain, releasedMicroUsd: released };
