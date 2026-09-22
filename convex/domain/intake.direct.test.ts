@@ -224,7 +224,7 @@ async function readProjectGrant(
   return await t.run(async (ctx) => {
     const membership = await ctx.db
       .query("memberships")
-      .withIndex("by_organization_and_identity_and_project_and_status_and_role_and_expires_at", (q) =>
+      .withIndex("by_organization_identity_project_status_role_expires_at", (q) =>
         q
           .eq("organizationId", organizationId)
           .eq("identity", identity)
@@ -535,7 +535,7 @@ describe("F6 temporary organization reuse preserves the authority horizon", () =
       membershipId: (await t.run(async (ctx) => {
         const row = await ctx.db
           .query("memberships")
-          .withIndex("by_organization_and_identity_and_project_and_status_and_role_and_expires_at", (q) =>
+          .withIndex("by_organization_identity_project_status_role_expires_at", (q) =>
             q
               .eq("organizationId", seeded.organizationId)
               .eq("identity", OWNER.tokenIdentifier)
@@ -552,7 +552,7 @@ describe("F6 temporary organization reuse preserves the authority horizon", () =
     const orgRows = await t.run(async (ctx) =>
       ctx.db
         .query("membershipAuthorities")
-        .withIndex("by_organization_and_identity_and_scope_and_role_and_authority_until", (q) =>
+        .withIndex("by_organization_identity_scope_role_authority_until", (q) =>
           q
             .eq("organizationId", seeded.organizationId)
             .eq("identity", OWNER.tokenIdentifier)

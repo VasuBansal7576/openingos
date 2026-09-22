@@ -706,7 +706,7 @@ export const recordProviderBinding = f1InternalMutation({
     let applied = false;
     const indexedCallbacks = await ctx.db
       .query("processedEvents")
-      .withIndex("by_provider_environment_and_provider_message_and_thread_and_inbox", (q) =>
+      .withIndex("by_provider_environment_message_thread_inbox", (q) =>
         q
           .eq("provider", "agentmail-callback")
           .eq("environment", "live")
