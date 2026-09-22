@@ -653,4 +653,132 @@ describe("requestBoundedResearch one-click dispatch", () => {
     // Only the first admitted call reached the provider.
     expect(calls).toHaveLength(1);
   });
+
+  test("opening research intent carries the exact region and brief from the requirement", async () => {
+    const t = init();
+    const fixture = await createDispatchFixture(t);
+    process.env[RESEARCH_ALLOWANCE_ENV_VAR] = ALLOWANCE;
+    // The authoritative requirement as the fixed intake now persists it for
+    // the live browser case: exact title, category, region, and brief.
+    const brief =
+      "Open a coffee shop in San Francisco; rent a place and buy everything needed for the coffee shop; budget USD 250,000-500,000.";
+    const openingRequirementId = await t.run(async (ctx) => {
+      const now = Date.now();
+      return await ctx.db.insert("requirements", {
+        organizationId: fixture.organizationId,
+        projectId: fixture.projectId,
+        key: "opening-scope",
+        title: "San Francisco coffee shop real estate and equipment",
+        category: "coffee shop opening",
+        quantity: "1",
+        unit: "scope",
+        priority: "P0",
+        state: "draft",
+        fulfillment: "notOrdered",
+        version: 1,
+        currency: "USD",
+        budgetMinorUnits: 50_000_000,
+        hardConstraints: `Primary region: San Francisco, CA\nOpening brief: ${brief}`,
+        createdAt: now,
+        updatedAt: now,
+      });
+    });
+    const calls: string[] = [];
+    const bodies: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: unknown, init?: { body?: unknown }) => {
+        calls.push(String(url));
+        bodies.push(typeof init?.body === "string" ? init.body : JSON.stringify(init?.body ?? null));
+        return new Response(completeSearchResponse("https://supplier.example.test/machine"), {
+          status: 200,
+        });
+      }),
+    );
+    const result = await t.withIdentity(OWNER).mutation(requestBoundedResearchRef, {
+      organizationId: fixture.organizationId,
+      projectId: fixture.projectId,
+      requirementId: openingRequirementId,
+      requirementVersion: 1,
+      idempotencyKey: "bounded-opening-brief-1",
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok || result.operationId === null) throw new Error("opening dispatch failed");
+    // The bound intent (idempotency/canonical payload) carries the exact
+    // region and brief rather than a generic scope sentence.
+    const stored = await t.run(async (ctx) => {
+      const operation = await ctx.db.get(result.operationId as Id<"operations">);
+      const grant = operation === null ? null : await ctx.db.get(operation.grantId);
+      return { payload: operation?.normalizedPayload ?? null, grantPayload: grant?.canonicalPayload ?? null };
+    });
+    for (const payload of [stored.payload, stored.grantPayload]) {
+      expect(payload).not.toBeNull();
+      for (const fragment of [
+        "San Francisco",
+        "rent",
+        "everything needed",
+        "USD 250,000-500,000",
+        "coffee shop opening",
+      ]) {
+        expect(payload).toContain(fragment);
+      }
+    }
+    await t.finishAllScheduledFunctions(() => {});
+    // Exactly one provider call for the one scheduled action.
+    expect(calls).toHaveLength(1);
+    expect(bodies.join(" ")).toContain("San Francisco");
+    const rows = await t.run(async (ctx) => ({
+      job: await ctx.db.get(result.jobId),
+      operation: await ctx.db.get(result.operationId as Id<"operations">),
+    }));
+    expect(rows.job?.state).toBe("completed");
+    expect(rows.operation?.state).toBe("observedSuccess");
+    // Exact replay reuses the original job and operation: still one call.
+    const replay = await t.withIdentity(OWNER).mutation(requestBoundedResearchRef, {
+      organizationId: fixture.organizationId,
+      projectId: fixture.projectId,
+      requirementId: openingRequirementId,
+      requirementVersion: 1,
+      idempotencyKey: "bounded-opening-brief-1",
+    });
+    expect(replay.ok).toBe(true);
+    if (!replay.ok || replay.operationId === null) throw new Error("opening replay failed");
+    expect(replay.jobId).toBe(result.jobId);
+    expect(replay.operationId).toBe(result.operationId);
+    await t.finishAllScheduledFunctions(() => {});
+    expect(calls).toHaveLength(1);
+  });
+
+  test("opening dispatch keeps the denial fences with zero new effect", async () => {
+    const t = init();
+    const fixture = await createDispatchFixture(t);
+    process.env[RESEARCH_ALLOWANCE_ENV_VAR] = ALLOWANCE;
+    const granted = await t.withIdentity(OWNER).mutation(grantProjectAccessRef, {
+      organizationId: fixture.organizationId,
+      projectId: fixture.projectId,
+      targetIdentity: VIEWER.tokenIdentifier,
+      role: "viewer",
+    });
+    if (!granted.ok) throw new Error(`viewer grant failed: ${granted.message}`);
+    const dispatch = {
+      organizationId: fixture.organizationId,
+      projectId: fixture.projectId,
+      requirementId: fixture.requirementId,
+      requirementVersion: fixture.requirementVersion,
+      idempotencyKey: "bounded-opening-brief-1",
+    };
+    const viewerResult = await t.withIdentity(VIEWER).mutation(requestBoundedResearchRef, dispatch);
+    expect(viewerResult.ok).toBe(false);
+    const unauthenticated = await t.mutation(requestBoundedResearchRef, dispatch);
+    expect(unauthenticated).toMatchObject({ ok: false, code: "forged-identity" });
+    expect(await countDispatchEffects(t, fixture.organizationId, fixture.projectId)).toEqual({
+      jobs: 0,
+      operations: 0,
+      reservations: 0,
+      grants: 0,
+      evidence: 0,
+      budgetCeiling: null,
+      budgetReserved: null,
+    });
+  });
 });

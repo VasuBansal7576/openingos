@@ -317,6 +317,57 @@ function canonicalResearchPayload(query: string): string {
 }
 
 /**
+ * Scope-safe research query derivation.
+ *
+ * The F1 scope contract (shared/scope) admits only classifier-supported
+ * segments into the bound grant/operation payload: every clause needs a
+ * purchasing-research anchor, and order/purchase verbs ("buy", "purchase",
+ * "pay", ...) are refused as unshipped purchase authority. A verbatim brief
+ * such as "rent a place and buy everything needed" would therefore lose its
+ * region and scope clauses at admission, and the provider would search a
+ * generic query instead of the user's request. The authoritative
+ * requirement keeps the exact brief; this builder derives a single query
+ * clause that preserves the user's region and scope words: line breaks and
+ * semicolons become commas (they are clause boundaries), refused
+ * order/purchase verbs become the collection verb "source", and the
+ * "supplier equipment scope" prefix keeps the clause admissible even when
+ * the brief carries no anchor of its own. Anchor nouns already present in
+ * the title, category, or brief ("supplier", "equipment", "budget") ride
+ * along untouched.
+ */
+function scopeSafeQueryText(value: string): string {
+  return value
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/;/g, ",")
+    .replace(
+      /\b(buy|buys|buying|purchase|purchases|purchasing|pay|pays|paying|paid|finance|finances|financing|sign|signs|signing)\b/gi,
+      "source",
+    )
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+/**
+ * The Firecrawl intent is derived from the authoritative requirement,
+ * including its hard constraints (region plus the exact opening brief):
+ * without them the provider would search a generic query instead of the
+ * user's request. The grant canonical payload binds to this exact intent.
+ */
+function boundedResearchIntent(requirement: {
+  readonly key: string;
+  readonly title: string;
+  readonly category: string;
+  readonly hardConstraints?: string;
+}): string {
+  const base =
+    `Research suppliers for purchasing requirement ${scopeSafeQueryText(requirement.key)}: ` +
+    `${scopeSafeQueryText(requirement.title)} (${scopeSafeQueryText(requirement.category)})`;
+  const constraints = scopeSafeQueryText(requirement.hardConstraints ?? "");
+  if (constraints.length === 0) return `${base}.`;
+  return `${base}, supplier equipment scope: ${constraints}.`;
+}
+
+/**
  * F03 collection-target binding.
  *
  * The shared operation payload shape is frozen to exactly `{query}` by the
@@ -1561,8 +1612,7 @@ export const requestBoundedResearch = f1Mutation({
     ) {
       return { ok: false as const, code: "invalid-payload", message: "the current requirement is incomplete, so research was not started" };
     }
-    const researchIntent =
-      `Research suppliers for purchasing requirement ${requirement.key}: ${requirement.title} (${requirement.category}).`;
+    const researchIntent = boundedResearchIntent(requirement);
     const operationPayload = canonicalResearchPayload(researchIntent);
     const requestedTarget = { mode: "search" } as const;
     const targetCheck = validateCollectionTarget(requestedTarget.mode, undefined);

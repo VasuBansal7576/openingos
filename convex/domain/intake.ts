@@ -206,6 +206,7 @@ function normalizeIntake(raw: {
   }
   if (raw.mode === "opening") {
     if (region === undefined) throw new Error("region required for an opening");
+    if (detailSummary === undefined) throw new Error("opening brief required for an opening");
   }
   if (raw.mode === "quoteComparison") {
     if (detailTitle === undefined) throw new Error("quote subject required for a quote comparison");
@@ -318,15 +319,22 @@ interface IntakeRecords {
 
 function recordsFor(input: NormalizedIntake): IntakeRecords {
   if (input.mode === "opening") {
+    // The opening brief is required (see normalizeIntake) and is preserved
+    // verbatim-trimmed alongside the region: the research intent is derived
+    // from this authoritative requirement, so dropping either would send a
+    // generic query instead of the user's request. Supplied title/category
+    // win; the generic labels remain only as fallbacks.
+    const brief = input.detailSummary ?? "";
     return {
       requirementKey: "opening-scope",
-      requirementTitle: "Opening purchasing scope",
-      requirementCategory: "equipment",
+      requirementTitle: input.detailTitle ?? "Opening purchasing scope",
+      requirementCategory: input.detailCategory ?? "equipment",
       requirementUnit: "scope",
       requirementPriority: "P0",
-      requirementHardConstraints: input.region === undefined
-        ? undefined
-        : `Primary region: ${input.region}`,
+      requirementHardConstraints:
+        input.region === undefined
+          ? `Opening brief: ${brief}`
+          : `Primary region: ${input.region}\nOpening brief: ${brief}`,
     };
   }
   if (input.mode === "quoteComparison") {
