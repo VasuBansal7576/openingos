@@ -934,4 +934,182 @@ describe("cancellation releases the global allowance (PR-33 blocker 3)", () => {
     expect(fifthReserved.ok).toBe(true);
     expect((await globalCommitted(t)).committed).toBe(25000);
   });
+
+  test("cancelling an unbound legacy row cannot decrement another org's aggregate", async () => {
+    // Attribution counterexample: org A holds a legacy reservation inserted
+    // directly AFTER the global aggregate already belongs to org B's
+    // attributed holds. Cancelling A must free A's org ledger only; the
+    // deployment aggregate keeps B's exact 100,000. A repeat cancel is a
+    // no-op on both ledgers, and cancelling B afterwards frees its own
+    // exact amounts.
+    const t = init();
+    const orgB = await createOrgProjectRequirement(t, OWNER_B, "Misattr B");
+    await t.run(async (ctx) => {
+      await ctx.db.insert("providerBudgets", {
+        organizationId: orgB.organizationId,
+        ceilingMicroUsd: 100000,
+        reservedMicroUsd: 0,
+        spentMicroUsd: 0,
+        unresolvedMicroUsd: 0,
+        pricingBasis: "controlled-misattr",
+        updatedAt: Date.now(),
+      });
+    });
+    const asB = t.withIdentity(OWNER_B);
+    const query = "Research suppliers for the espresso machine";
+    const grantB = await asB.mutation(issueGrantRef, {
+      organizationId: orgB.organizationId,
+      projectId: orgB.projectId,
+      operations: ["research.collect"],
+      communicationProfile: "ownerRoleplay",
+      recipientConfigVersion: 0,
+      inputVersions: { brief: "misattr-v1" },
+      payloadJson: canonicalJson({ query }),
+      costCeilingMicroUsd: 100000,
+      roundLimit: 8,
+      expiresAt: Date.now() + 60 * 60 * 1000,
+    });
+    if (!grantB.ok) throw new Error(`grant B setup failed: ${grantB.message}`);
+    const jobIdsB: Id<"jobs">[] = [];
+    for (let index = 1; index <= 4; index += 1) {
+      const started = await asB.mutation(startJobRef, {
+        organizationId: orgB.organizationId,
+        projectId: orgB.projectId,
+        text: query,
+        operationId: "research.collect",
+        kind: "research",
+        grantId: grantB.grantId,
+      });
+      if (!started.ok) throw new Error(`job B start failed: ${started.message}`);
+      const reserved = await asB.mutation(reserveRef, {
+        jobId: started.jobId,
+        organizationId: orgB.organizationId,
+        projectId: orgB.projectId,
+        amountMicroUsd: 25000,
+        pricingBasis: "controlled-misattr",
+      });
+      if (!reserved.ok) throw new Error(`reservation B failed: ${reserved.message}`);
+      const created = await asB.mutation(createOperationRef, {
+        jobId: started.jobId,
+        organizationId: orgB.organizationId,
+        projectId: orgB.projectId,
+        kind: "research.collect",
+        requestId: `misattr-b-${index}`,
+        payloadJson: canonicalJson({ query }),
+        grantId: grantB.grantId,
+        reservationId: reserved.reservationId,
+      });
+      if (!created.ok) throw new Error(`operation B creation failed: ${created.message}`);
+      jobIdsB.push(started.jobId);
+    }
+    expect((await globalCommitted(t)).committed).toBe(100000);
+
+    // Org A's legacy row arrives after the aggregate is fully attributed to
+    // B: inserted directly, so it carries no global attribution marker.
+    const orgA = await createOrgProjectRequirement(t, OWNER_A, "Misattr A");
+    const asA = t.withIdentity(OWNER_A);
+    const grantA = await asA.mutation(issueGrantRef, {
+      organizationId: orgA.organizationId,
+      projectId: orgA.projectId,
+      operations: ["research.collect"],
+      communicationProfile: "ownerRoleplay",
+      recipientConfigVersion: 0,
+      inputVersions: { brief: "misattr-v1" },
+      payloadJson: canonicalJson({ query }),
+      costCeilingMicroUsd: 100000,
+      roundLimit: 8,
+      expiresAt: Date.now() + 60 * 60 * 1000,
+    });
+    if (!grantA.ok) throw new Error(`grant A setup failed: ${grantA.message}`);
+    const startedA = await asA.mutation(startJobRef, {
+      organizationId: orgA.organizationId,
+      projectId: orgA.projectId,
+      text: query,
+      operationId: "research.collect",
+      kind: "research",
+      grantId: grantA.grantId,
+    });
+    if (!startedA.ok) throw new Error(`job A start failed: ${startedA.message}`);
+    const now = Date.now();
+    const idsA = await t.run(async (ctx) => {
+      const budgetId = await ctx.db.insert("providerBudgets", {
+        organizationId: orgA.organizationId,
+        ceilingMicroUsd: 100000,
+        reservedMicroUsd: 25000,
+        spentMicroUsd: 0,
+        unresolvedMicroUsd: 0,
+        pricingBasis: "controlled-misattr-legacy",
+        updatedAt: now,
+      });
+      const reservationId = await ctx.db.insert("reservations", {
+        organizationId: orgA.organizationId,
+        jobId: startedA.jobId,
+        budgetId,
+        ceilingMicroUsd: 100000,
+        reservedMicroUsd: 25000,
+        spentMicroUsd: 0,
+        unresolvedMicroUsd: 0,
+        pricingBasis: "controlled-misattr-legacy",
+        state: "open",
+        updatedAt: now,
+      });
+      const operationId = await ctx.db.insert("operations", {
+        organizationId: orgA.organizationId,
+        projectId: orgA.projectId,
+        jobId: startedA.jobId,
+        kind: "research.collect",
+        requestId: "misattr-a-1",
+        requestKey: `misattr-a-key-${now}`,
+        normalizedPayload: canonicalJson({ query }),
+        normalizedPayloadHash: "controlled-misattr",
+        inputVersions: { brief: "misattr-v1" },
+        grantId: grantA.grantId,
+        grantVersion: 1,
+        state: "prepared",
+        reservationId,
+        createdAt: now,
+        updatedAt: now,
+      });
+      return { budgetId, reservationId, operationId };
+    });
+    // Sanity: the legacy row truly carries no global attribution.
+    const legacyAttr = await t.run(async (ctx) => {
+      const row = await ctx.db.get(idsA.reservationId);
+      return row?.globalReservedMicroUsd ?? null;
+    });
+    expect(legacyAttr).toBeNull();
+
+    const cancelledA = await asA.mutation(cancelJobRef, {
+      jobId: startedA.jobId,
+      reason: "cancel unbound legacy reservation",
+    });
+    expect(cancelledA.ok).toBe(true);
+    // A's org ledger is freed, but B's aggregate is untouched.
+    const afterA = await t.run(async (ctx) => ({
+      budgetA: await ctx.db.get(idsA.budgetId).then((b) => b?.reservedMicroUsd ?? null),
+      budgetB: await ctx.db
+        .query("providerBudgets")
+        .withIndex("by_organization", (q) => q.eq("organizationId", orgB.organizationId))
+        .unique()
+        .then((b) => b?.reservedMicroUsd ?? null),
+    }));
+    expect(afterA.budgetA).toBe(0);
+    expect(afterA.budgetB).toBe(100000);
+    expect((await globalCommitted(t)).committed).toBe(100000);
+
+    // Repeat cancel is idempotent on both ledgers.
+    const repeatA = await asA.mutation(cancelJobRef, {
+      jobId: startedA.jobId,
+      reason: "repeat cancel",
+    });
+    expect(repeatA.ok).toBe(true);
+    expect((await globalCommitted(t)).committed).toBe(100000);
+
+    // Cancelling B frees exactly its own attributed amounts.
+    for (const jobId of jobIdsB) {
+      const cancelled = await asB.mutation(cancelJobRef, { jobId, reason: "release B" });
+      expect(cancelled.ok).toBe(true);
+    }
+    expect((await globalCommitted(t)).committed).toBe(0);
+  });
 });

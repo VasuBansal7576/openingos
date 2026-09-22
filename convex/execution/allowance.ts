@@ -216,17 +216,22 @@ export async function tryDebitGlobalForReservation(
 
 /**
  * Mirror one settlement leg to the global aggregate. Called in the same
- * mutation as the org settlement so ledgers stay paired. Strict: when the
- * global row exists but its reserved balance cannot cover the mirrored
- * amount, the mutation throws (fail closed) instead of clamping with
- * Math.max and silently masking ledger drift. Legacy deployments without a
- * global row keep org-only accounting.
+ * mutation as the org settlement so ledgers stay paired. `amountMicroUsd`
+ * must be the acting reservation's own attributed hold
+ * (`globalReservedMicroUsd`, zero for legacy unattributed rows): the
+ * aggregate moves only exposure actually attributed to that reservation,
+ * never an unproven share of another tenant's hold. A zero attribution is
+ * a no-op. Strict: when the global row exists but its reserved balance
+ * cannot cover an attributed amount, the mutation throws (fail closed)
+ * instead of clamping with Math.max and silently masking ledger drift.
+ * Legacy deployments without a global row keep org-only accounting.
  */
 export async function settleGlobalReservation(
   ctx: F1MutationCtx,
   mode: "spend" | "release" | "retainUnknown",
   amountMicroUsd: number,
 ): Promise<void> {
+  if (amountMicroUsd <= 0) return;
   const global = await getGlobalAllowance(ctx);
   if (global === null) return;
   if (global.reservedMicroUsd < amountMicroUsd) {

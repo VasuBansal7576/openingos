@@ -176,6 +176,7 @@ type CancellationReservation = {
   readonly reservedMicroUsd: number;
   readonly spentMicroUsd: number;
   readonly unresolvedMicroUsd: number;
+  readonly globalReservedMicroUsd?: number;
   readonly state: string;
 };
 
@@ -321,17 +322,20 @@ async function releaseUnusedReservation(
     return;
   }
   const released = reservation.reservedMicroUsd;
-  // The deployment aggregate mirrors the same release in the same
-  // mutation — but only the portion it actually holds. Reservations placed
-  // through `reserve` debited both ledgers atomically, so cancellation
-  // frees both. Legacy reservations inserted directly (oversized fixtures,
-  // manual seeds) never debited the aggregate; releasing only the covered
-  // portion keeps the aggregate exact without manufacturing capacity it
-  // never held, and the aggregate never goes negative. Deployments without
-  // a global row (legacy fixtures) keep org-only accounting.
+  // The deployment aggregate releases exactly this reservation's
+  // attributed hold in the same mutation — never an unproven share of
+  // another tenant's hold. Reservations placed through `reserve` carry
+  // their exact attribution; legacy rows without one hold nothing globally
+  // and release org-side only, while seeded legacy commitments stay safely
+  // held in the aggregate. An attributed amount the aggregate cannot cover
+  // is genuine drift: leave both holds visible instead of freeing one side.
+  // Deployments without a global row (legacy fixtures) keep org-only
+  // accounting.
+  const attributed = reservation.globalReservedMicroUsd ?? 0;
   const global = await getGlobalAllowance(ctx);
-  const globalCovered =
-    global === null ? 0 : Math.min(released, global.reservedMicroUsd);
+  if (global !== null && global.reservedMicroUsd < attributed) {
+    return;
+  }
   await ctx.db.patch(reservation._id, {
     reservedMicroUsd: 0,
     state: "closed",
@@ -341,9 +345,9 @@ async function releaseUnusedReservation(
     reservedMicroUsd: budget.reservedMicroUsd - released,
     updatedAt: now,
   });
-  if (global !== null && globalCovered > 0) {
+  if (global !== null && attributed > 0) {
     await ctx.db.patch(global._id, {
-      reservedMicroUsd: global.reservedMicroUsd - globalCovered,
+      reservedMicroUsd: global.reservedMicroUsd - attributed,
       updatedAt: now,
     });
   }
