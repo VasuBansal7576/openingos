@@ -344,13 +344,19 @@ function canonicalResearchPayload(query: string): string {
  *
  * Canonical and deterministic: the same requirement always yields the same
  * query, so an identical replay deduplicates instead of conflicting, and
- * punctuation variants (periods, semicolons, newlines) preserve the same
- * location, rental, sourcing, and budget constraints.
- */
+  * punctuation variants (periods, semicolons, exclamation/question marks,
+  * newlines) preserve the same location, rental, sourcing, and budget
+  * constraints.
+  */
 function scopeSafeQueryText(value: string): string {
   const withCommas = value
     .replace(/[\r\n\t]+/g, ", ")
     .replace(/;/g, ",")
+    // Exclamation and question marks are clause separators exactly like
+    // semicolons: without this mapping a `!`-separated brief would split
+    // into bare clauses downstream, dropping constraints and breaking
+    // identical replay. They never occur inside numeric quantities.
+    .replace(/[!?]+/g, ",")
     // Period clause boundaries become commas, but a period between two
     // digits is a decimal quantity (2.5 kg) and is preserved.
     .replace(/\./g, (match, offset: number, full: string) => {
@@ -1668,16 +1674,16 @@ export const requestBoundedResearch = f1Mutation({
     // Classify the actual user scope BEFORE adding supplier search wording.
     // Unrelated briefs (homework, vacations, general browsing) refuse here
     // with zero grant/job/reservation/operation/schedule/provider effects.
+    // Only the stored brief itself is classified: title, category, and key
+    // metadata may carry allowlisted words (such as "equipment") and must
+    // never launder an unrelated brief into authority. Requirements without
+    // a stored brief (legacy/test fixtures) fall back to title/category.
     // Supported coffee-shop openings, real-estate/rent research, and bounded
     // equipment sourcing proceed as research.collect only; no purchase or
     // send operation exists in this path.
-    const rawScopeText = [
-      requirement.hardConstraints ?? "",
-      requirement.title,
-      requirement.category,
-      requirement.key,
-    ].join("\n");
-    const briefVerdict = classifyOpeningBriefForResearch(rawScopeText);
+    const briefText =
+      requirement.hardConstraints ?? `${requirement.title}\n${requirement.category}`;
+    const briefVerdict = classifyOpeningBriefForResearch(briefText);
     if (briefVerdict.verdict === "unavailableRefused") {
       return { ok: false as const, code: "unavailable-capability", message: briefVerdict.reason };
     }
