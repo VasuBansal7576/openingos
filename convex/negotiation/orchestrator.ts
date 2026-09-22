@@ -66,7 +66,6 @@ import {
   checkNegotiationBounds,
   checkNegotiationFences,
   NEGOTIATION_MAX_DRAFT_BYTES,
-  NEGOTIATION_OPENAI_MODEL,
   NEGOTIATION_OPERATION_KIND,
   NEGOTIATION_SUBJECT,
   selectNegotiationMove,
@@ -90,7 +89,7 @@ import {
 } from "../access/checks.js";
 import { classifyScope, lookupCapability } from "../shared/scope.js";
 import { JEV_PINNED_MODEL } from "../../proofs/jev/jev-boundary.js";
-import { OPENAI_PINNED_MODEL } from "../models/openai.js";
+import { openAIPinnedModel } from "../models/openai.js";
 import type * as jev from "../models/jev.js";
 import type * as openai from "../models/openai.js";
 import type * as send from "../communication/send.js";
@@ -2542,7 +2541,7 @@ function mapDraftToInjected(
       ok: true,
       value: {
         outcome: "stale",
-        model: NEGOTIATION_OPENAI_MODEL,
+        model: openAIPinnedModel(),
         inputVersion,
         currentInputVersion,
       },
@@ -2551,7 +2550,7 @@ function mapDraftToInjected(
   if (outcome === "stale" || outcome === "unavailable" || outcome === "rejected") {
     return {
       ok: true,
-      value: { outcome, model: NEGOTIATION_OPENAI_MODEL, inputVersion, currentInputVersion },
+      value: { outcome, model: openAIPinnedModel(), inputVersion, currentInputVersion },
     };
   }
   if (outcome !== "completed") {
@@ -2593,7 +2592,7 @@ function mapDraftToInjected(
         ok: true,
         value: {
           outcome: "stale",
-          model: NEGOTIATION_OPENAI_MODEL,
+          model: openAIPinnedModel(),
           inputVersion,
           currentInputVersion,
         },
@@ -2924,7 +2923,7 @@ export const prepareNegotiationDraft = f1Action({
         redactedPreview: "waiting — no supplier-visible text prepared",
       };
     }
-    if (draftValue.model !== NEGOTIATION_OPENAI_MODEL || draftValue.model !== OPENAI_PINNED_MODEL) {
+    if (draftValue.model !== openAIPinnedModel()) {
       return deniedResult("draft-malformed", "draft is not from the pinned drafting model");
     }
     if (draftValue.draftKind !== move) {

@@ -29,7 +29,40 @@ import { isExpired } from "../shared/time.js";
 export const OPENAI_ENDPOINT = "https://api.openai.com/v1/responses" as const;
 export const OPENAI_PINNED_MODEL = "gpt-5.4-mini-2026-03-17" as const;
 export const OPENAI_API_KEY_ENV = "OPENAI_API_KEY" as const;
+export const OPENAI_ENDPOINT_ENV = "OPENAI_ENDPOINT" as const;
+export const OPENAI_MODEL_ENV = "OPENAI_MODEL" as const;
+export const OPENAI_TIMEOUT_MS_ENV = "OPENAI_TIMEOUT_MS" as const;
 export const OPENAI_DEFAULT_TIMEOUT_MS = 20_000 as const;
+export const OPENAI_MAX_TIMEOUT_MS = 600_000 as const;
+
+/**
+ * Owner-configured transport endpoint. Only absolute https:// overrides are
+ * honored; anything else fails closed to the pinned OpenAI origin so a bad
+ * value cannot redirect workload data to a plaintext or non-HTTPS target.
+ */
+export function openAIEndpoint(): string {
+  const override = env[OPENAI_ENDPOINT_ENV]?.trim();
+  return override !== undefined && override.length > 0 && override.length <= 2_048 && override.startsWith("https://")
+    ? override
+    : OPENAI_ENDPOINT;
+}
+
+/**
+ * Owner-configured model identity recorded on outcomes and echoed back by the
+ * transport. The response parser requires the provider to echo this exact
+ * value, so a mislabeled proxy fails closed with model-mismatch.
+ */
+export function openAIPinnedModel(): string {
+  const override = env[OPENAI_MODEL_ENV]?.trim();
+  return override !== undefined && override.length > 0 && override.length <= 256
+    ? override
+    : OPENAI_PINNED_MODEL;
+}
+
+/** Owner-configured transport timeout for slower upstreams; bounded and optional. */
+export function openAITimeoutMs(): number | undefined {
+  return readPositiveSafeInteger(env[OPENAI_TIMEOUT_MS_ENV], OPENAI_MAX_TIMEOUT_MS) ?? undefined;
+}
 export const OPENAI_MAX_RESPONSE_BYTES = 256 * 1024;
 export const OPENAI_MAX_SOURCE_BYTES = 48 * 1024;
 export const OPENAI_MAX_REQUEST_BYTES = 512 * 1024;
@@ -134,7 +167,7 @@ export interface OpenAIUsage {
 export type OpenAIOutcome =
   | {
       readonly outcome: "completed";
-      readonly model: typeof OPENAI_PINNED_MODEL;
+      readonly model: string;
       readonly output: OpenAIOutput;
       readonly usage: OpenAIUsage;
       readonly latencyMs: number;
@@ -256,7 +289,7 @@ function reservationPricingBasis(
     inputTokenBound: OPENAI_INPUT_TOKEN_BOUND_VERSION,
     maxInputTokens,
     maxOutputTokens,
-    model: OPENAI_PINNED_MODEL,
+    model: openAIPinnedModel(),
     outputMicroUsdPerMillion,
     provider: "openai",
     version: pricingVersion,
@@ -596,7 +629,7 @@ function prepareOpenAIRequest(
     schema: OUTPUT_SCHEMA,
   };
   const request = {
-    model: OPENAI_PINNED_MODEL,
+    model: openAIPinnedModel(),
     input: requestInputText,
     store: false as const,
     tools: [] as const,
@@ -902,7 +935,7 @@ function parseResponsesPayload(payload: unknown, workload: ParsedWorkload, polic
   | Invalid {
   if (!isPlainRecord(payload)) return { ok: false, reason: "response-shape" };
   if (payload["status"] !== "completed") return { ok: false, reason: "status-not-completed" };
-  if (payload["model"] !== OPENAI_PINNED_MODEL) return { ok: false, reason: "model-mismatch" };
+  if (payload["model"] !== openAIPinnedModel()) return { ok: false, reason: "model-mismatch" };
   const output = payload["output"];
   if (!Array.isArray(output) || output.length !== 1) return { ok: false, reason: "output-shape" };
   const message = output[0];
@@ -1014,7 +1047,7 @@ export async function runOpenAIWorkload(options: OpenAIWorkloadOptions): Promise
   const timeoutId = setTimeout(() => resolveTimeout?.(), Math.max(0, deadline - Date.now()));
   let response: Response;
   try {
-    const pending = options.fetchImpl(OPENAI_ENDPOINT, {
+    const pending = options.fetchImpl(openAIEndpoint(), {
       method: "POST",
       headers: {
         Authorization: `Bearer ${options.apiKey}`,
@@ -1067,7 +1100,7 @@ export async function runOpenAIWorkload(options: OpenAIWorkloadOptions): Promise
   if (!afterAttempt.ok) return staleResult(inputVersion, afterAttempt.reason, 1);
   return {
     outcome: "completed",
-    model: OPENAI_PINNED_MODEL,
+    model: openAIPinnedModel(),
     output: parsed.value.output,
     usage: parsed.value.usage,
     latencyMs: Date.now() - started,
@@ -1400,7 +1433,7 @@ const workloadValidator = v.union(
 const resultValidator = v.union(
   v.object({
     outcome: v.literal("completed"),
-    model: v.literal(OPENAI_PINNED_MODEL),
+    model: v.string(),
     output: outputValidator,
     usage: v.object({ input_tokens: v.number(), output_tokens: v.number() }),
     latencyMs: v.number(),
@@ -1498,12 +1531,14 @@ export const generate = internalAction({
       identity: args.identity,
     });
     if (!claim.ok) return claim;
+    const transportTimeoutMs = openAITimeoutMs();
     const result = await runOpenAIWorkload({
       apiKey,
       workload: workload.value,
       inputVersion: args.inputVersion,
       pricing: pricing.policy,
       fetchImpl: fetch,
+      ...(transportTimeoutMs === undefined ? {} : { timeoutMs: transportTimeoutMs }),
       beforeAttempt: async () => {
         const fence = await ctx.runQuery(attemptFenceRef, {
           operationId: args.operationId,
