@@ -241,6 +241,7 @@ describe("P-01 intake user path", () => {
       expect(seen).toHaveLength(0);
 
       setValue(mounted.dom, mounted.field("City or region"), "Amsterdam, Netherlands");
+      setValue(mounted.dom, mounted.field("Opening brief"), "Open a coffee shop in Amsterdam; rent a place and buy everything needed.");
       await mounted.submit();
       expect(seen).toHaveLength(1);
       expect(seen[0]).toMatchObject({
@@ -306,6 +307,7 @@ describe("P-01 intake user path", () => {
     try {
       setValue(mounted.dom, mounted.field("Project name"), "Northside café");
       setValue(mounted.dom, mounted.field("City or region"), "Amsterdam");
+      setValue(mounted.dom, mounted.field("Opening brief"), "Open a coffee shop in Amsterdam; rent a place and buy everything needed.");
       const button = Array.from(mounted.container.querySelectorAll("button")).find((candidate) =>
         candidate.textContent?.includes("Create workspace"),
       );
@@ -351,6 +353,7 @@ describe("P-01 intake user path", () => {
     try {
       setValue(mounted.dom, mounted.field("Project name"), "Keyboard café");
       setValue(mounted.dom, mounted.field("City or region"), "Utrecht");
+      setValue(mounted.dom, mounted.field("Opening brief"), "Open a coffee shop in Utrecht; rent a place and buy everything needed.");
       const form = mounted.container.querySelector("form");
       if (!(form instanceof mounted.dom.window.HTMLFormElement)) throw new Error("Intake form not found");
       const intakeForm = form as unknown as HTMLFormElement;
@@ -377,6 +380,7 @@ describe("P-01 intake user path", () => {
     try {
       setValue(mounted.dom, mounted.field("Project name"), "Northside café");
       setValue(mounted.dom, mounted.field("City or region"), "Amsterdam");
+      setValue(mounted.dom, mounted.field("Opening brief"), "Open a coffee shop in Amsterdam; rent a place and buy everything needed.");
       await mounted.submit();
       expect(keys).toHaveLength(1);
       expect(mounted.container.textContent).toContain("Controlled intake failure.");

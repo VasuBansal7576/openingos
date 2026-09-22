@@ -2062,16 +2062,19 @@ async function mountIntakeView(
 async function submitIntakeBudget(
   container: HTMLElement,
   dom: HappyWindow,
-  values: { readonly projectName: string; readonly region: string; readonly budget: string },
+  values: { readonly projectName: string; readonly region: string; readonly budget: string; readonly brief?: string },
 ): Promise<void> {
   const set = (name: string, value: string) => {
     const control = container.querySelector(`[name="${name}"]`);
-    if (!(control instanceof dom.window.HTMLInputElement)) throw new Error(`Control not found: ${name}`);
+    if (!(control instanceof dom.window.HTMLInputElement) && !(control instanceof dom.window.HTMLTextAreaElement)) {
+      throw new Error(`Control not found: ${name}`);
+    }
     (control as unknown as HTMLInputElement).value = value;
   };
   set("projectName", values.projectName);
   set("region", values.region);
   set("budget", values.budget);
+  set("detailSummary", values.brief ?? "Open a coffee shop in Amsterdam; rent a place and buy everything needed.");
   const button = Array.from(container.querySelectorAll("button")).find((candidate) =>
     candidate.textContent?.includes("Create workspace"),
   );
@@ -2117,7 +2120,7 @@ test("an over-precision intake budget is rejected before the intake route", asyn
       budget: "45000.555",
     });
     expect(seen).toHaveLength(0);
-    expect(mounted.container.textContent).toContain("whole euros and cents");
+    expect(mounted.container.textContent).toContain("up to two decimals");
   } finally {
     await mounted.cleanup();
   }
@@ -2606,7 +2609,7 @@ test("unsafe, malformed, and ambiguous budgets never reach the intake route", as
       });
       expect(seen).toHaveLength(0);
       const text = mounted.container.textContent ?? "";
-      expect(text.includes("whole euros and cents") || text.includes("too large to record safely")).toBe(true);
+      expect(text.includes("up to two decimals") || text.includes("too large to record safely")).toBe(true);
     } finally {
       await mounted.cleanup();
     }
@@ -2761,5 +2764,174 @@ test("narrow CSS hides no honest project, scope, or quote state from the markup"
     "No order is placed.",
   ]) {
     expect(html).toContain(fact);
+  }
+});
+
+// -- Opening brief intake (P-01 opening mode) ---------------------------------
+
+function intakeField(
+  container: HTMLElement,
+  dom: HappyWindow,
+  label: string,
+): HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement {
+  const match = Array.from(container.querySelectorAll("label")).find(
+    (candidate) => candidate.textContent === label,
+  );
+  if (match === undefined || match.htmlFor.length === 0) throw new Error(`Label not found: ${label}`);
+  const control = container.querySelector(`#${match.htmlFor}`);
+  if (
+    !(control instanceof dom.window.HTMLInputElement) &&
+    !(control instanceof dom.window.HTMLTextAreaElement) &&
+    !(control instanceof dom.window.HTMLSelectElement)
+  ) {
+    throw new Error(`Control not found for label: ${label}`);
+  }
+  return control as unknown as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
+}
+
+async function submitMountedIntake(container: HTMLElement, dom: HappyWindow): Promise<void> {
+  const button = Array.from(container.querySelectorAll("button")).find((candidate) =>
+    candidate.textContent?.includes("Create workspace"),
+  );
+  if (!(button instanceof dom.window.HTMLButtonElement)) throw new Error("Submit button not found");
+  await act(async () => {
+    (button as unknown as HTMLButtonElement).click();
+  });
+}
+
+async function switchIntakeMode(container: HTMLElement, dom: HappyWindow, mode: string): Promise<void> {
+  const radio = container.querySelector(`input[type="radio"][value="${mode}"]`);
+  if (!(radio instanceof dom.window.HTMLInputElement)) throw new Error(`Intake mode radio not found: ${mode}`);
+  await act(async () => {
+    (radio as unknown as HTMLInputElement).click();
+  });
+}
+
+function hasIntakeLabel(container: HTMLElement, label: string): boolean {
+  return Array.from(container.querySelectorAll("label")).some(
+    (candidate) => candidate.textContent === label,
+  );
+}
+
+test("opening mode exposes the brief, title, category, and a currency-neutral ceiling", async () => {
+  const mounted = await mountIntakeView(async () => ({ ok: true, projectId: "project-labels" }));
+  try {
+    const brief = intakeField(mounted.container, mounted.dom, "Opening brief");
+    expect(brief.tagName.toLowerCase()).toBe("textarea");
+    expect(brief.closest(".wb-form-field")?.classList.contains("wb-form-field-full")).toBe(true);
+    expect((brief as unknown as HTMLTextAreaElement).placeholder).toContain("San Francisco");
+    intakeField(mounted.container, mounted.dom, "Opening title (optional)");
+    intakeField(mounted.container, mounted.dom, "Opening category (optional)");
+    intakeField(mounted.container, mounted.dom, "Budget upper limit in reporting currency (optional)");
+    const text = mounted.container.textContent ?? "";
+    expect(text.toLowerCase()).not.toContain("euro");
+    expect(text).toContain("2000 characters maximum");
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("an empty opening brief blocks submission without reaching intake", async () => {
+  const seen: import("../workbench-state").WorkbenchIntakeInput[] = [];
+  const mounted = await mountIntakeView(async (input) => {
+    seen.push(input);
+    return { ok: true, projectId: "project-blocked" };
+  });
+  try {
+    const set = (label: string, value: string) => {
+      (intakeField(mounted.container, mounted.dom, label) as unknown as HTMLInputElement).value = value;
+    };
+    set("Project name", "Harbor coffee opening");
+    set("City or region", "San Francisco, USA");
+    await submitMountedIntake(mounted.container, mounted.dom);
+    expect(seen).toHaveLength(0);
+    expect(mounted.container.textContent).toContain("opening brief");
+    expect((intakeField(mounted.container, mounted.dom, "Project name") as unknown as HTMLInputElement).value).toBe("Harbor coffee opening");
+
+    set("Opening brief", "   ");
+    await submitMountedIntake(mounted.container, mounted.dom);
+    expect(seen).toHaveLength(0);
+    expect(mounted.container.textContent).toContain("opening brief");
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("exact opening detail values and a USD ceiling reach intake once", async () => {
+  const seen: import("../workbench-state").WorkbenchIntakeInput[] = [];
+  const mounted = await mountIntakeView(async (input) => {
+    seen.push(input);
+    return { ok: true, projectId: "project-opening-brief" };
+  });
+  try {
+    const set = (label: string, value: string) => {
+      (intakeField(mounted.container, mounted.dom, label) as unknown as HTMLInputElement).value = value;
+    };
+    set("Project name", "Harbor coffee opening");
+    set("City or region", "San Francisco, USA");
+    set("Reporting currency", "USD");
+    set("Budget upper limit in reporting currency (optional)", "500000");
+    set("Opening title (optional)", "San Francisco coffee shop");
+    set("Opening category (optional)", "café opening");
+    set(
+      "Opening brief",
+      "  Open a coffee shop in San Francisco; rent a place and buy everything needed; budget USD 250,000-500,000  ",
+    );
+    await submitMountedIntake(mounted.container, mounted.dom);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toEqual({
+      mode: "opening",
+      projectName: "Harbor coffee opening",
+      workspaceKind: "private",
+      region: "San Francisco, USA",
+      currency: "USD",
+      budgetMinorUnits: 50000000,
+      detailTitle: "San Francisco coffee shop",
+      detailCategory: "café opening",
+      detailSummary: "Open a coffee shop in San Francisco; rent a place and buy everything needed; budget USD 250,000-500,000",
+      idempotencyKey: expect.any(String),
+    });
+    expect(mounted.container.textContent).toContain("Workspace created. Loading the persisted project.");
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("quote and equipment modes keep their own fields without the opening brief", async () => {
+  const seen: import("../workbench-state").WorkbenchIntakeInput[] = [];
+  const mounted = await mountIntakeView(async (input) => {
+    seen.push(input);
+    return { ok: true, projectId: "project-other-modes" };
+  });
+  try {
+    const set = (label: string, value: string) => {
+      (intakeField(mounted.container, mounted.dom, label) as unknown as HTMLInputElement).value = value;
+    };
+    await switchIntakeMode(mounted.container, mounted.dom, "quoteComparison");
+    expect(mounted.container.textContent).toContain("Requirement subject");
+    expect(hasIntakeLabel(mounted.container, "Opening brief")).toBe(false);
+    set("Project name", "Quote review");
+    set("Requirement subject", "Two-group espresso machine");
+    await submitMountedIntake(mounted.container, mounted.dom);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({ mode: "quoteComparison", detailTitle: "Two-group espresso machine" });
+    expect("detailSummary" in seen[0]!).toBe(false);
+
+    await switchIntakeMode(mounted.container, mounted.dom, "equipment");
+    expect(mounted.container.textContent).toContain("Equipment label");
+    expect(mounted.container.textContent).toContain("What needs attention?");
+    expect(hasIntakeLabel(mounted.container, "Opening brief")).toBe(false);
+    set("Project name", "Bar service");
+    set("Equipment label", "Atlas grinder");
+    set("What needs attention?", "Burrs need replacement.");
+    await submitMountedIntake(mounted.container, mounted.dom);
+    expect(seen).toHaveLength(2);
+    expect(seen[1]).toMatchObject({
+      mode: "equipment",
+      detailTitle: "Atlas grinder",
+      detailSummary: "Burrs need replacement.",
+    });
+  } finally {
+    await mounted.cleanup();
   }
 });
