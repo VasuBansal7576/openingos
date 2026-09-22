@@ -29,10 +29,12 @@ import * as attempts from "../execution/attempts.js";
 import * as jobs from "../execution/jobs.js";
 import * as operations from "../execution/operations.js";
 import * as reservations from "../execution/reservations.js";
-import { checkProjectAccess, denialValidator, identityOf } from "../access/checks.js";
+import { checkProjectAccess, denialValidator, identityOf, requireCapability } from "../access/checks.js";
+import { ensureSharedBudget, RESEARCH_ALLOWANCE_PRICING_BASIS } from "../execution/allowance.js";
 import { components } from "../models/components.js";
 import type { ComponentApi } from "@firecrawl/firecrawl-convex/_generated/component.js";
-import { canonicalJson, requestKey } from "../shared/hashing.js";
+import { canonicalJson, payloadHash, requestKey } from "../shared/hashing.js";
+import { sha256HexOfCanonical } from "../shared/sha256.js";
 import { provenanceLabel } from "../shared/provenance.js";
 import { MAX_OPERATIONS_PER_JOB } from "../shared/scope.js";
 import {
@@ -1463,6 +1465,190 @@ export const requestGrantedResearch = f1Mutation({
       incompleteCount: 0,
       controlled: false,
     };
+  },
+});
+
+const requestGrantedResearchSelfRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof requestGrantedResearch>,
+  MutationReturn<typeof requestGrantedResearch>
+>("research/collection:requestGrantedResearch");
+
+/**
+ * One-click bounded Firecrawl search for the one current requirement.
+ *
+ * This is the production-safe path behind the workbench's "Start bounded
+ * research" action. One explicit call atomically and idempotently admits and
+ * schedules exactly one bounded `search` collection for the exact
+ * project/requirement binding it names:
+ *
+ * - Authority: authenticated owner/approver project role plus the enabled
+ *   `research.collect` capability. Contributors, viewers, and foreign
+ *   identities are denied with zero new effect.
+ * - Binding: the requirement must belong to the same organization/project,
+ *   stay in a current (non-terminal) state, and carry the exact version the
+ *   caller validated. A cross-project requirement or a changed version is
+ *   denied before any grant, job, reservation, operation, or provider call.
+ * - Allowance: the shared organization ledger is admitted (and initialized
+ *   once from the server-only allowance) before any grant exists. A missing
+ *   or invalid allowance fails with no grant, job, reservation, operation,
+ *   or provider call.
+ * - Effect: a finite grant (exactly one maximum Firecrawl call) is issued
+ *   and the existing `requestGrantedResearch` contract performs the
+ *   reservation, operation creation, and internal-action scheduling, so no
+ *   reservation, claim, spend, retry, or provenance fence is bypassed.
+ * - Idempotency: an exact replay of the idempotency key returns the original
+ *   job and operation with no second grant, job, reservation, operation, or
+ *   provider call. The same key with a different payload or target
+ *   conflicts instead of replaying.
+ */
+export const requestBoundedResearch = f1Mutation({
+  args: {
+    organizationId: v.id("organizations"),
+    projectId: v.id("projects"),
+    requirementId: v.id("requirements"),
+    requirementVersion: v.number(),
+    idempotencyKey: v.string(),
+  },
+  returns: researchResultValidator,
+  handler: async (ctx, args) => {
+    const identity = await identityOf(ctx);
+    if (identity === null) {
+      return { ok: false as const, code: "forged-identity", message: "unauthenticated" };
+    }
+    if (!/^[A-Za-z0-9:_-]{8,128}$/.test(args.idempotencyKey)) {
+      return { ok: false as const, code: "invalid-payload", message: "idempotencyKey must be 8-128 chars of A-Za-z0-9:_-" };
+    }
+    if (!Number.isSafeInteger(args.requirementVersion) || args.requirementVersion < 0) {
+      return { ok: false as const, code: "invalid-payload", message: "requirementVersion must be a non-negative safe integer" };
+    }
+    const now = Date.now();
+    const project = await ctx.db.get(args.projectId);
+    if (project === null || project.organizationId !== args.organizationId) {
+      return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
+    }
+    const access = await checkProjectAccess(
+      ctx,
+      identity,
+      args.organizationId,
+      args.projectId,
+      "approver",
+      now,
+    );
+    if (!access.ok) return { ok: false as const, code: access.code, message: access.message };
+    const capability = requireCapability("research.collect", access.value);
+    if (!capability.ok) {
+      return { ok: false as const, code: capability.code, message: capability.message };
+    }
+    const requirement = await ctx.db.get(args.requirementId);
+    if (
+      requirement === null ||
+      requirement.organizationId !== args.organizationId ||
+      requirement.projectId !== args.projectId
+    ) {
+      return { ok: false as const, code: "denied-project", message: "requirement is not in this project" };
+    }
+    if (requirement.state === "selected" || requirement.state === "fulfilled" || requirement.state === "cancelled") {
+      return { ok: false as const, code: "stale-requirement", message: "requirement is no longer current; research was not started" };
+    }
+    if (requirement.version !== args.requirementVersion) {
+      return { ok: false as const, code: "changed-requirement", message: "requirement changed since this research was prepared; renewed authority required" };
+    }
+    if (
+      requirement.key.trim().length === 0 ||
+      requirement.title.trim().length === 0 ||
+      requirement.category.trim().length === 0
+    ) {
+      return { ok: false as const, code: "invalid-payload", message: "the current requirement is incomplete, so research was not started" };
+    }
+    const researchIntent =
+      `Research suppliers for purchasing requirement ${requirement.key}: ${requirement.title} (${requirement.category}).`;
+    const operationPayload = canonicalResearchPayload(researchIntent);
+    const requestedTarget = { mode: "search" } as const;
+    const targetCheck = validateCollectionTarget(requestedTarget.mode, undefined);
+    if (!targetCheck.ok) {
+      return { ok: false as const, code: targetCheck.code, message: targetCheck.message };
+    }
+    // Exact replay returns the original job and operation before any grant
+    // is issued, so a double-click or reload mints no second effect. A
+    // stored row with a different payload or target conflicts instead.
+    const replay = await lookupProjectRequest(
+      ctx,
+      args.organizationId,
+      args.projectId,
+      args.idempotencyKey,
+      requestedTarget,
+    );
+    if (!replay.ok) return replay;
+    if (replay.sibling !== null) {
+      if (replay.sibling.normalizedPayload !== operationPayload) {
+        return { ok: false as const, code: "duplicate-conflict", message: "requestId reused with a different research payload" };
+      }
+      if (!collectionTargetMatches(replay.sibling.binding, requestedTarget)) {
+        return { ok: false as const, code: "duplicate-conflict", message: "requestId reused with a different research payload" };
+      }
+      const existingJob = await ctx.db.get(replay.sibling.jobId);
+      if (
+        existingJob === null ||
+        existingJob.organizationId !== args.organizationId ||
+        existingJob.projectId !== args.projectId
+      ) {
+        return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
+      }
+      return {
+        ok: true as const,
+        jobId: replay.sibling.jobId,
+        operationId: replay.sibling.operationId,
+        state: existingJob.state,
+        requestCount: 0,
+        incompleteCount: 0,
+        controlled: false,
+      };
+    }
+    // The shared ledger must exist (or be initialized once from the
+    // server-only allowance) before any grant, job, or reservation exists.
+    const allowance = await ensureSharedBudget(ctx, args.organizationId, {
+      minimumMicroUsd: FIRECRAWL_CALL_MAX_COST_MICRO_USD,
+      pricingBasis: RESEARCH_ALLOWANCE_PRICING_BASIS,
+    });
+    if (!allowance.ok) return allowance;
+    const recipient = await ctx.db
+      .query("recipientConfigs")
+      .withIndex("by_active", (q) => q.eq("active", true))
+      .unique();
+    // One finite grant: exactly one maximum Firecrawl call, bound to the
+    // exact project/requirement authority the checks above established.
+    const grantId = await ctx.db.insert("grants", {
+      organizationId: args.organizationId,
+      projectId: args.projectId,
+      operations: ["research.collect"],
+      communicationProfile: "ownerRoleplay",
+      recipientConfigVersion: recipient?.version ?? 0,
+      inputVersions: {},
+      canonicalPayload: operationPayload,
+      payloadHash: payloadHash({ query: researchIntent }),
+      payloadSha256: await sha256HexOfCanonical(operationPayload),
+      workflowAuthorities: [
+        { operationId: "research.collect", projectId: args.projectId, requirementId: args.requirementId },
+      ],
+      costCeilingMicroUsd: FIRECRAWL_CALL_MAX_COST_MICRO_USD,
+      roundLimit: 3,
+      expiresAt: now + 900_000,
+      revocationVersion: 1,
+      status: "active",
+      createdAt: now,
+    });
+    // The existing grant-bound contract performs the job admission,
+    // bounded reservation, operation creation, and internal-action
+    // scheduling, so this path cannot bypass any of those fences.
+    return await ctx.runMutation(requestGrantedResearchSelfRef, {
+      projectId: args.projectId,
+      requirementId: args.requirementId,
+      researchIntent,
+      requestId: args.idempotencyKey,
+      grantId,
+      mode: "search",
+    });
   },
 });
 
