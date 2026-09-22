@@ -28,13 +28,17 @@
  * budget" refuse: the first and third lack both intents, and the second
  * names equipment but carries no purchasing/opening action.
  *
- * Unrelated primary intent takes precedence over token coincidence: a
- * brief whose main verb is explaining, writing, or vacation-booking
- * refuses even when it also contains "source"/"equipment" tokens (for
- * example "Explain how to source coffee equipment analogies" or "Book a
- * vacation and source espresso equipment in Hawaii"). Source/equipment
- * words only count inside a purchasing/opening intent, never inside an
- * unrelated-activity wrapper.
+ * Unrelated primary intent is ordered, not matched anywhere: a brief
+ * whose first relevant action is explaining, writing, or
+ * vacation-booking refuses even when it also contains
+ * "source"/"equipment" tokens (for example "Explain how to source
+ * coffee equipment analogies" or "Book a vacation and source espresso
+ * equipment in Hawaii"). A supported purchasing/opening action that
+ * precedes a later unrelated segment keeps the supported segment
+ * available (D-17 separable mixed scope) so downstream canonicalization
+ * and refusal metadata can separate it. Source/equipment words only
+ * count inside a purchasing/opening intent, never as an unrelated
+ * wrapper's payload.
  *
  * Terse equipment labels (legacy/test fixtures such as "Two-group espresso
  * machine" with an equipment category and no stored brief) stay supported
@@ -86,6 +90,15 @@ function lowered(text: string): string {
  * Classify the raw user scope (brief + title + category + region) before
  * any "Research suppliers ..." wrapper is added. Returns supported only
  * for shipped purchasing workflows; otherwise refuses with zero effects.
+ *
+ * Primary-intent ordering (D-17 separable mixed scope): only the scope
+ * after a server-added "Opening brief:" label is ordered, so the label's
+ * own "opening" token can never launder an unrelated-first brief. Within
+ * that scope, an unrelated primary intent (explaining, writing,
+ * vacation-booking) refuses when it precedes any purchasing/opening
+ * action; a supported purchasing/opening action that comes first keeps
+ * the supported segment available so downstream canonicalization and
+ * refusal metadata can separate the mixed scope.
  */
 export function classifyOpeningBriefForResearch(text: string): BriefVerdict {
   const body = lowered(text);
@@ -98,23 +111,32 @@ export function classifyOpeningBriefForResearch(text: string): BriefVerdict {
       reason: "supplier-evidence-instructions-cannot-expand-capabilities",
     };
   }
-  // Unrelated primary intent takes precedence: explaining, writing, or
-  // vacation-booking wrappers refuse even when they also contain
-  // "source"/"equipment" tokens. Supported tokens only count inside a
-  // purchasing/opening intent, never inside unrelated activity.
-  if (UNRELATED_ACTIVITY_MARKERS.test(body)) {
+  // Order the user's scope, not the server-added wrapper labels: the
+  // dispatch hardConstraints prefix ("Primary region: ...\nOpening
+  // brief:") carries its own "opening" token which must not count as the
+  // user's primary intent.
+  const LABEL = "opening brief:";
+  const labelAt = body.lastIndexOf(LABEL);
+  const scope = labelAt >= 0 ? body.slice(labelAt + LABEL.length) : body;
+  const actionAt = ACTION_INTENT.exec(scope);
+  const unrelatedAt = UNRELATED_ACTIVITY_MARKERS.exec(scope);
+  // Unrelated-first refuses even when source/equipment tokens appear
+  // later ("Explain how to source coffee equipment analogies", "Book a
+  // vacation and source espresso equipment in Hawaii"). Supported-first
+  // stays supported so downstream mixed-scope handling can separate it.
+  if (unrelatedAt !== null && (actionAt === null || unrelatedAt.index < actionAt.index)) {
     return { verdict: "unrelatedRefused", reason: "request-is-not-an-allowlisted-openingos-workflow" };
   }
-  if (ACTION_INTENT.test(body) && SUPPORTED_OBJECT_INTENT.test(body)) {
+  if (actionAt !== null && SUPPORTED_OBJECT_INTENT.test(scope)) {
     return { verdict: "supported" };
   }
   // Narrow short-title path for legitimate terse purchasing labels
   // (legacy/test fixtures such as "Two-group espresso machine" plus an
-  // equipment category). Unrelated-activity markers already refused above,
+  // equipment category). Unrelated-first scopes already refused above,
   // so "coffee equipment analogies" and poem/vacation wording never ride
   // this path either.
-  if (TERSE_EQUIPMENT_OBJECT.test(body)) {
-    const words = body.split(/\s+/).filter((word) => word.length > 0);
+  if (TERSE_EQUIPMENT_OBJECT.test(scope)) {
+    const words = scope.split(/\s+/).filter((word) => word.length > 0);
     if (words.length <= TERSE_TITLE_MAX_WORDS) return { verdict: "supported" };
   }
   return { verdict: "unrelatedRefused", reason: "request-is-not-an-allowlisted-openingos-workflow" };

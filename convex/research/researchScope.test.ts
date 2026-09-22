@@ -100,6 +100,34 @@ describe("narrow semantic scope contract", () => {
     }
   });
 
+  test("supported-first mixed scope keeps the supported segment available", () => {
+    // D-17 separable mixed scope: a supported purchasing/opening action
+    // that precedes a later unrelated segment classifies supported so
+    // downstream canonicalization and refusal metadata can separate it.
+    for (const mixed of [
+      "Open a coffee shop in San Francisco and write a poem",
+      "Source espresso equipment and explain quantum entanglement",
+      "Open a coffee shop in San Francisco; rent a place and buy everything needed; write a poem about it",
+      `Primary region: San Francisco, CA\nOpening brief: Open a coffee shop in San Francisco and write a poem`,
+    ]) {
+      expect(verdict(mixed)).toBe("supported");
+    }
+  });
+
+  test("unrelated-first ordering refuses even with later source/equipment tokens", () => {
+    for (const wrapper of [
+      "Explain how to source coffee equipment analogies",
+      "Book a vacation and source espresso equipment in Hawaii",
+      // The server-added "Opening brief:" label carries its own
+      // "opening" token; ordering runs on the user scope after the
+      // label so it cannot launder an unrelated-first brief.
+      `Primary region: San Francisco, CA\nOpening brief: Explain how to source coffee equipment analogies`,
+      `Primary region: Hawaii\nOpening brief: Book a vacation and source espresso equipment in Hawaii`,
+    ]) {
+      expect(verdict(wrapper)).toBe("unrelatedRefused");
+    }
+  });
+
   test("bare nouns alone never authorize", () => {
     expect(verdict("coffee")).toBe("unrelatedRefused");
     expect(verdict("Netherlands")).toBe("unrelatedRefused");
