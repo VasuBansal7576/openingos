@@ -1395,12 +1395,14 @@ async function mountCreationEpochHarness() {
       (button as unknown as HTMLButtonElement).click();
     });
   };
-  const submitIntake = async (projectName: string, region: string) => {
+  const submitIntake = async (projectName: string, region: string, brief = "Open a coffee shop in Amsterdam; rent a place and buy everything needed.") => {
     const nameInput = container.querySelector('input[name="projectName"]') as unknown as HTMLInputElement | null;
     const regionInput = container.querySelector('input[name="region"]') as unknown as HTMLInputElement | null;
+    const briefInput = container.querySelector('textarea[name="detailSummary"]') as unknown as HTMLTextAreaElement | null;
     if (nameInput === null || regionInput === null) throw new Error("Intake form inputs not found");
     nameInput.value = projectName;
     regionInput.value = region;
+    if (briefInput !== null) briefInput.value = brief;
     const form = nameInput.closest("form");
     if (form === null) throw new Error("Intake form not found");
     await act(async () => {

@@ -430,6 +430,7 @@ h1, h2, h3, p { margin-top: 0; }
 .wb-form-field > input:focus-visible, .wb-form-field > select:focus-visible, .wb-form-field > textarea:focus-visible { border-color: #5d9a73; box-shadow: 0 0 0 3px #5d9a7330; }
 .wb-form-field > input:disabled, .wb-form-field > select:disabled, .wb-form-field > textarea:disabled { color: #728075; background: var(--wb-soft); }
 .wb-character-count { color: #728075; font-size: .58rem; text-align: right; }
+.wb-field-help { color: var(--wb-muted); font-size: .6rem; line-height: 1.55; }
 .wb-form-error { margin: 0; padding: .7rem .8rem; border-radius: .3rem; color: #8d492b; background: #fff1e8; font-size: .65rem; line-height: 1.5; }
 .wb-service-case-actions { display: flex; justify-content: flex-end; gap: .5rem; padding-top: .35rem; border-top: 1px solid #e6eee6; }
 .wb-toast { position: fixed; z-index: 25; right: 1.2rem; bottom: 1.2rem; display: flex; max-width: min(32rem, calc(100vw - 2.4rem)); align-items: flex-start; gap: .9rem; padding: .8rem 1rem; border: 1px solid #a8cec3; border-radius: .35rem; color: var(--wb-ink); background: #fff; box-shadow: 0 12px 35px #193b2f1f; font-size: .68rem; }
