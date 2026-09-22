@@ -28,6 +28,14 @@
  * budget" refuse: the first and third lack both intents, and the second
  * names equipment but carries no purchasing/opening action.
  *
+ * Unrelated primary intent takes precedence over token coincidence: a
+ * brief whose main verb is explaining, writing, or vacation-booking
+ * refuses even when it also contains "source"/"equipment" tokens (for
+ * example "Explain how to source coffee equipment analogies" or "Book a
+ * vacation and source espresso equipment in Hawaii"). Source/equipment
+ * words only count inside a purchasing/opening intent, never inside an
+ * unrelated-activity wrapper.
+ *
  * Terse equipment labels (legacy/test fixtures such as "Two-group espresso
  * machine" with an equipment category and no stored brief) stay supported
  * through a narrow short-title path: an espresso/grinder/equipment/
@@ -90,14 +98,22 @@ export function classifyOpeningBriefForResearch(text: string): BriefVerdict {
       reason: "supplier-evidence-instructions-cannot-expand-capabilities",
     };
   }
+  // Unrelated primary intent takes precedence: explaining, writing, or
+  // vacation-booking wrappers refuse even when they also contain
+  // "source"/"equipment" tokens. Supported tokens only count inside a
+  // purchasing/opening intent, never inside unrelated activity.
+  if (UNRELATED_ACTIVITY_MARKERS.test(body)) {
+    return { verdict: "unrelatedRefused", reason: "request-is-not-an-allowlisted-openingos-workflow" };
+  }
   if (ACTION_INTENT.test(body) && SUPPORTED_OBJECT_INTENT.test(body)) {
     return { verdict: "supported" };
   }
   // Narrow short-title path for legitimate terse purchasing labels
   // (legacy/test fixtures such as "Two-group espresso machine" plus an
-  // equipment category). Unrelated-activity markers never ride this path,
-  // so "coffee equipment analogies" and poem/vacation wording still refuse.
-  if (!UNRELATED_ACTIVITY_MARKERS.test(body) && TERSE_EQUIPMENT_OBJECT.test(body)) {
+  // equipment category). Unrelated-activity markers already refused above,
+  // so "coffee equipment analogies" and poem/vacation wording never ride
+  // this path either.
+  if (TERSE_EQUIPMENT_OBJECT.test(body)) {
     const words = body.split(/\s+/).filter((word) => word.length > 0);
     if (words.length <= TERSE_TITLE_MAX_WORDS) return { verdict: "supported" };
   }

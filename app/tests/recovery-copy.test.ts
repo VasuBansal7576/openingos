@@ -8,9 +8,10 @@ import { parseWorkbenchSnapshot, type WorkbenchActionResult } from "../workbench
 
 /**
  * Focused Recovery-copy test (Astra finding 4): a mounted Recovery tab for
- * a partial job whose only attempt is observedSuccess must describe the
- * observed partial/incomplete evidence without inventing a missing branch,
- * transport, retry, or schedule.
+ * a partial job whose only attempt is observedSuccess must state only
+ * observed projection facts — retained recorded evidence and no additional
+ * recorded outcome — without inferring a missing branch, scope, transport,
+ * retry, or schedule.
  */
 const partialProjection = {
   ok: true,
@@ -153,14 +154,15 @@ test("recovery renders observed partial evidence with no invented branch, transp
   try {
     await mounted.clickTab("Recovery");
     const text = mounted.container.textContent ?? "";
-    // Observed partial evidence is described honestly.
+    // Only observed projection facts are stated.
     expect(text).toContain("Partial provider outcome");
     expect(text).toContain("recorded evidence is retained");
-    expect(text).toContain("no recorded outcome in this projection");
+    expect(text).toContain("no additional outcome is recorded in this projection");
     expect(text).toContain("Retained in this projection: 1 of 1 visible results carry recorded evidence.");
     expect(text).toContain("none is scheduled here");
-    // No invented missing branch, transport, retry, or re-drive.
+    // No inferred missing branch/scope, transport, retry, or re-drive.
     expect(text).not.toContain("remaining branch");
+    expect(text).not.toContain("remaining scope");
     expect(text).not.toContain("did not report");
     expect(text).not.toContain("Retry bounded branch");
     expect(text).not.toContain("re-drives");
