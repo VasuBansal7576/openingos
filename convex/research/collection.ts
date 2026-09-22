@@ -31,6 +31,12 @@ import * as operations from "../execution/operations.js";
 import * as reservations from "../execution/reservations.js";
 import { checkProjectAccess, denialValidator, identityOf, requireCapability } from "../access/checks.js";
 import { ensureSharedBudget, RESEARCH_ALLOWANCE_PRICING_BASIS } from "../execution/allowance.js";
+import {
+  REQUIREMENT_INPUT_VERSION_KEY,
+  formatRequirementInputVersion,
+  requirementBindingOf,
+} from "../execution/requirementBinding.js";
+import { classifyOpeningBriefForResearch, hasSupportedSupplierEvidence } from "./researchScope.js";
 import { components } from "../models/components.js";
 import type { ComponentApi } from "@firecrawl/firecrawl-convex/_generated/component.js";
 import { canonicalJson, payloadHash, requestKey } from "../shared/hashing.js";
@@ -327,24 +333,38 @@ function canonicalResearchPayload(query: string): string {
  * region and scope clauses at admission, and the provider would search a
  * generic query instead of the user's request. The authoritative
  * requirement keeps the exact brief; this builder derives a single query
- * clause that preserves the user's region and scope words: line breaks and
- * semicolons become commas (they are clause boundaries), refused
- * order/purchase verbs become the collection verb "source", and the
+ * clause that preserves the user's region and scope words: line breaks,
+ * tabs, semicolons, and periods used as clause separators become commas
+ * (they are clause boundaries, never decimal points inside numbers),
+ * refused order/purchase verbs become the collection verb "source", and the
  * "supplier equipment scope" prefix keeps the clause admissible even when
  * the brief carries no anchor of its own. Anchor nouns already present in
  * the title, category, or brief ("supplier", "equipment", "budget") ride
  * along untouched.
+ *
+ * Canonical and deterministic: the same requirement always yields the same
+ * query, so an identical replay deduplicates instead of conflicting, and
+ * punctuation variants (periods, semicolons, newlines) preserve the same
+ * location, rental, sourcing, and budget constraints.
  */
 function scopeSafeQueryText(value: string): string {
-  return value
-    .replace(/[\r\n\t]+/g, " ")
+  const withCommas = value
+    .replace(/[\r\n\t]+/g, ", ")
     .replace(/;/g, ",")
+    // Period clause boundaries become commas, but a period between two
+    // digits is a decimal quantity (2.5 kg) and is preserved.
+    .replace(/\./g, (match, offset: number, full: string) => {
+      const prev = full[offset - 1];
+      const next = full[offset + 1];
+      const prevIsDigit = prev !== undefined && /[0-9]/.test(prev);
+      const nextIsDigit = next !== undefined && /[0-9]/.test(next);
+      return prevIsDigit && nextIsDigit ? match : ",";
+    })
     .replace(
       /\b(buy|buys|buying|purchase|purchases|purchasing|pay|pays|paying|paid|finance|finances|financing|sign|signs|signing)\b/gi,
       "source",
-    )
-    .replace(/\s{2,}/g, " ")
-    .trim();
+    );
+  return withCommas.replace(/\s{2,}/g, " ").trim().replace(/^[,\s]+|[,\s]+$/g, "");
 }
 
 /**
@@ -816,8 +836,31 @@ export const applyOutcome = f1InternalMutation({
     ) {
       return { ok: false as const, code: "denied-membership", message: "not authorized for this project" };
     }
-    const stale = canonicalJson(operation.inputVersions) !== canonicalJson(grant.inputVersions);
+    const grantStale = canonicalJson(operation.inputVersions) !== canonicalJson(grant.inputVersions);
     const requirementId = await requirementForOperation(ctx, operation.organizationId, operation.projectId, operation);
+    // Late-obsolete check: a requirement edit after the claim leaves the
+    // bound revision behind. Late results stay stale evidence and never
+    // update the current projection (no new vendor/candidate below).
+    let requirementStale = false;
+    {
+      const bound = requirementBindingOf(operation.inputVersions as Record<string, string>);
+      if (bound !== null) {
+        const live = await ctx.db.get(bound.requirementId as Id<"requirements">);
+        if (
+          live === null ||
+          live.organizationId !== operation.organizationId ||
+          live.projectId !== operation.projectId ||
+          live.version !== bound.version
+        ) {
+          requirementStale = true;
+        }
+      }
+    }
+    const stale = grantStale || requirementStale;
+    // Stale evidence still preserves the immutable source rows below, but
+    // skips vendor/candidate promotion so the current projection keeps its
+    // current requirement basis.
+    const promoteCandidates = !requirementStale;
     const records = args.outcome.records.slice(0, MAX_PROVIDER_RECORDS);
     for (const record of records) {
       const markerKey = `${sourceKey(operation.projectId, record)}|sourceSnapshot`;
@@ -853,9 +896,19 @@ export const applyOutcome = f1InternalMutation({
         ...(record.sourceUrl === undefined ? {} : { locator: record.sourceUrl }),
       };
       let candidateId: Id<"candidates"> | undefined;
-      if (requirementId !== undefined && (record.productModel !== undefined || record.title !== undefined)) {
-        const vendorName = record.vendorName ?? parseSourceHost(record.sourceUrl);
-        if (vendorName !== undefined) {
+      // Source non-promotion: arbitrary titled URLs (discussion threads,
+      // civic pages, informational articles) stay as research source
+      // records until supported supplier/product evidence exists. Promotion
+      // needs an explicit product model, an explicit vendor, and a price
+      // claim; title/hostname fallbacks never qualify. Stale late results
+      // never promote either, so the current projection keeps its basis.
+      if (
+        promoteCandidates &&
+        requirementId !== undefined &&
+        hasSupportedSupplierEvidence(record)
+      ) {
+        const vendorName = record.vendorName as string;
+        {
           const vendorRows = await ctx.db
             .query("vendors")
             .withIndex("by_organization_and_name", (q) =>
@@ -872,7 +925,7 @@ export const applyOutcome = f1InternalMutation({
                   regions: [],
                   createdAt: now,
                 });
-          const productModel = record.productModel ?? record.title ?? "Unknown model";
+          const productModel = record.productModel as string;
           const variant = record.variant ?? "Unknown variant";
           const variantKey = record.variantKey ?? `unknown|${record.contentHash}`;
           const requirement = await ctx.db.get(requirementId);
@@ -1612,6 +1665,31 @@ export const requestBoundedResearch = f1Mutation({
     ) {
       return { ok: false as const, code: "invalid-payload", message: "the current requirement is incomplete, so research was not started" };
     }
+    // Classify the actual user scope BEFORE adding supplier search wording.
+    // Unrelated briefs (homework, vacations, general browsing) refuse here
+    // with zero grant/job/reservation/operation/schedule/provider effects.
+    // Supported coffee-shop openings, real-estate/rent research, and bounded
+    // equipment sourcing proceed as research.collect only; no purchase or
+    // send operation exists in this path.
+    const rawScopeText = [
+      requirement.hardConstraints ?? "",
+      requirement.title,
+      requirement.category,
+      requirement.key,
+    ].join("\n");
+    const briefVerdict = classifyOpeningBriefForResearch(rawScopeText);
+    if (briefVerdict.verdict === "unavailableRefused") {
+      return { ok: false as const, code: "unavailable-capability", message: briefVerdict.reason };
+    }
+    if (briefVerdict.verdict === "unrelatedRefused") {
+      return { ok: false as const, code: "unrelated-refusal", message: briefVerdict.reason };
+    }
+    // One canonical validated research objective for admission, stored
+    // payload, dispatch, and replay. Deterministic in the requirement, so an
+    // identical replay deduplicates instead of conflicting, and punctuation
+    // variants (periods, semicolons, newlines) preserve the same location,
+    // rental, sourcing, and budget constraints while order verbs stay
+    // rewritten to bounded sourcing (never purchase execution).
     const researchIntent = boundedResearchIntent(requirement);
     const operationPayload = canonicalResearchPayload(researchIntent);
     const requestedTarget = { mode: "search" } as const;
@@ -1668,13 +1746,21 @@ export const requestBoundedResearch = f1Mutation({
       .unique();
     // One finite grant: exactly one maximum Firecrawl call, bound to the
     // exact project/requirement authority the checks above established.
+    // The grant carries the current requirement revision plus every
+    // material input version; jobs and operations copy it verbatim, and the
+    // atomic claim rejects stale authorization after a requirement edit.
     const grantId = await ctx.db.insert("grants", {
       organizationId: args.organizationId,
       projectId: args.projectId,
       operations: ["research.collect"],
       communicationProfile: "ownerRoleplay",
       recipientConfigVersion: recipient?.version ?? 0,
-      inputVersions: {},
+      inputVersions: {
+        [REQUIREMENT_INPUT_VERSION_KEY]: formatRequirementInputVersion(
+          args.requirementId,
+          args.requirementVersion,
+        ),
+      },
       canonicalPayload: operationPayload,
       payloadHash: payloadHash({ query: researchIntent }),
       payloadSha256: await sha256HexOfCanonical(operationPayload),

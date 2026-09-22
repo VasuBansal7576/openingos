@@ -27,6 +27,7 @@ const rawModules = import.meta.glob([
   "../purchasing/**/*.ts",
   "../shared/**/*.ts",
   "../workbench/**/*.ts",
+  "../research/researchScope.ts",
   "../server.ts",
   "../auth.ts",
   "../models/**/*.ts",
