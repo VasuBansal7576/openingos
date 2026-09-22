@@ -935,7 +935,174 @@ describe("cancellation releases the global allowance (PR-33 blocker 3)", () => {
     expect((await globalCommitted(t)).committed).toBe(25000);
   });
 
+  test("valid pre-global seeded legacy settles its exact exposure and frees capacity", async () => {
+    // Migration counterpart: org A's legacy reservation predates the
+    // singleton, so its exposure was included in the bounded-sum seed.
+    // Cancelling it must release exactly its 25,000 from the aggregate
+    // (no stranding), and a subsequent admission for the freed amount must
+    // succeed. Physical age (_creationTime), not the absent marker, proves
+    // the attribution.
+    const t = init();
+    const orgA = await createOrgProjectRequirement(t, OWNER_A, "Seeded legacy A");
+    const asA = t.withIdentity(OWNER_A);
+    const query = "Research suppliers for the espresso machine";
+    const grantA = await asA.mutation(issueGrantRef, {
+      organizationId: orgA.organizationId,
+      projectId: orgA.projectId,
+      operations: ["research.collect"],
+      communicationProfile: "ownerRoleplay",
+      recipientConfigVersion: 0,
+      inputVersions: { brief: "seeded-v1" },
+      payloadJson: canonicalJson({ query }),
+      costCeilingMicroUsd: 100000,
+      roundLimit: 8,
+      expiresAt: Date.now() + 60 * 60 * 1000,
+    });
+    if (!grantA.ok) throw new Error(`grant A setup failed: ${grantA.message}`);
+    const startedA = await asA.mutation(startJobRef, {
+      organizationId: orgA.organizationId,
+      projectId: orgA.projectId,
+      text: query,
+      operationId: "research.collect",
+      kind: "research",
+      grantId: grantA.grantId,
+    });
+    if (!startedA.ok) throw new Error(`job A start failed: ${startedA.message}`);
+    const now = Date.now();
+    const idsA = await t.run(async (ctx) => {
+      const budgetId = await ctx.db.insert("providerBudgets", {
+        organizationId: orgA.organizationId,
+        ceilingMicroUsd: 100000,
+        reservedMicroUsd: 25000,
+        spentMicroUsd: 0,
+        unresolvedMicroUsd: 0,
+        pricingBasis: "controlled-seeded-legacy",
+        updatedAt: now,
+      });
+      const reservationId = await ctx.db.insert("reservations", {
+        organizationId: orgA.organizationId,
+        jobId: startedA.jobId,
+        budgetId,
+        ceilingMicroUsd: 100000,
+        reservedMicroUsd: 25000,
+        spentMicroUsd: 0,
+        unresolvedMicroUsd: 0,
+        pricingBasis: "controlled-seeded-legacy",
+        state: "open",
+        updatedAt: now,
+      });
+      const operationId = await ctx.db.insert("operations", {
+        organizationId: orgA.organizationId,
+        projectId: orgA.projectId,
+        jobId: startedA.jobId,
+        kind: "research.collect",
+        requestId: "seeded-legacy-a-1",
+        requestKey: `seeded-legacy-a-key-${now}`,
+        normalizedPayload: canonicalJson({ query }),
+        normalizedPayloadHash: "controlled-seeded",
+        inputVersions: { brief: "seeded-v1" },
+        grantId: grantA.grantId,
+        grantVersion: 1,
+        state: "prepared",
+        reservationId,
+        createdAt: now,
+        updatedAt: now,
+      });
+      return { budgetId, reservationId, operationId };
+    });
+
+    // Org B's first reserve provisions the singleton afterwards: the seed
+    // absorbs A's pre-existing 25,000 plus B's own 25,000 debit.
+    const orgB = await createOrgProjectRequirement(t, OWNER_B, "Seeded legacy B");
+    await t.run(async (ctx) => {
+      await ctx.db.insert("providerBudgets", {
+        organizationId: orgB.organizationId,
+        ceilingMicroUsd: 100000,
+        reservedMicroUsd: 0,
+        spentMicroUsd: 0,
+        unresolvedMicroUsd: 0,
+        pricingBasis: "controlled-seeded-legacy",
+        updatedAt: Date.now(),
+      });
+    });
+    const asB = t.withIdentity(OWNER_B);
+    const grantB = await asB.mutation(issueGrantRef, {
+      organizationId: orgB.organizationId,
+      projectId: orgB.projectId,
+      operations: ["research.collect"],
+      communicationProfile: "ownerRoleplay",
+      recipientConfigVersion: 0,
+      inputVersions: { brief: "seeded-v1" },
+      payloadJson: canonicalJson({ query }),
+      costCeilingMicroUsd: 100000,
+      roundLimit: 8,
+      expiresAt: Date.now() + 60 * 60 * 1000,
+    });
+    if (!grantB.ok) throw new Error(`grant B setup failed: ${grantB.message}`);
+    const startedB = await asB.mutation(startJobRef, {
+      organizationId: orgB.organizationId,
+      projectId: orgB.projectId,
+      text: query,
+      operationId: "research.collect",
+      kind: "research",
+      grantId: grantB.grantId,
+    });
+    if (!startedB.ok) throw new Error(`job B start failed: ${startedB.message}`);
+    const reservedB = await asB.mutation(reserveRef, {
+      jobId: startedB.jobId,
+      organizationId: orgB.organizationId,
+      projectId: orgB.projectId,
+      amountMicroUsd: 25000,
+      pricingBasis: "controlled-seeded-legacy",
+    });
+    if (!reservedB.ok) throw new Error(`reservation B failed: ${reservedB.message}`);
+    expect((await globalCommitted(t)).committed).toBe(50000);
+
+    // The legacy row carries no marker, but it predates the singleton, so
+    // cancelling releases exactly its seeded 25,000 — nothing is stranded.
+    const legacyMarker = await t.run(async (ctx) => {
+      const row = await ctx.db.get(idsA.reservationId);
+      return row?.globalReservedMicroUsd ?? null;
+    });
+    expect(legacyMarker).toBeNull();
+    const cancelledA = await asA.mutation(cancelJobRef, {
+      jobId: startedA.jobId,
+      reason: "settle valid seeded legacy",
+    });
+    expect(cancelledA.ok).toBe(true);
+    const afterA = await t.run(async (ctx) => ({
+      budgetA: await ctx.db.get(idsA.budgetId).then((b) => b?.reservedMicroUsd ?? null),
+      operationA: await ctx.db.get(idsA.operationId).then((o) => o?.state ?? null),
+    }));
+    expect(afterA.budgetA).toBe(0);
+    expect(afterA.operationA).toBe("cancelled");
+    expect((await globalCommitted(t)).committed).toBe(25000);
+
+    // The freed capacity is reusable: a subsequent admission succeeds.
+    const readmit = await asA.mutation(startJobRef, {
+      organizationId: orgA.organizationId,
+      projectId: orgA.projectId,
+      text: query,
+      operationId: "research.collect",
+      kind: "research",
+      grantId: grantA.grantId,
+    });
+    if (!readmit.ok) throw new Error(`re-admission start failed: ${readmit.message}`);
+    const reReserved = await asA.mutation(reserveRef, {
+      jobId: readmit.jobId,
+      organizationId: orgA.organizationId,
+      projectId: orgA.projectId,
+      amountMicroUsd: 25000,
+      pricingBasis: "controlled-seeded-legacy",
+    });
+    expect(reReserved.ok).toBe(true);
+    expect((await globalCommitted(t)).committed).toBe(50000);
+  });
+
   test("cancelling an unbound legacy row cannot decrement another org's aggregate", async () => {
+    // Attribution counterexample: org A holds a legacy reservation inserted
+    // directly AFTER the global aggregate already belongs to org B's
+    // attributed holds. Cancelling A must free A's org ledger only; the
     // Attribution counterexample: org A holds a legacy reservation inserted
     // directly AFTER the global aggregate already belongs to org B's
     // attributed holds. Cancelling A must free A's org ledger only; the

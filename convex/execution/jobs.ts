@@ -40,7 +40,7 @@ import {
   type WorkflowAuthority,
 } from "../shared/scope.js";
 import { checkProjectAccess, denialValidator, identityOf, requireCapability } from "../access/checks.js";
-import { getGlobalAllowance } from "./allowance.js";
+import { attributedGlobalHold, getGlobalAllowance } from "./allowance.js";
 
 const jobKindValidator = v.union(
   v.literal("research"),
@@ -177,6 +177,7 @@ type CancellationReservation = {
   readonly spentMicroUsd: number;
   readonly unresolvedMicroUsd: number;
   readonly globalReservedMicroUsd?: number;
+  readonly _creationTime: number;
   readonly state: string;
 };
 
@@ -323,16 +324,17 @@ async function releaseUnusedReservation(
   }
   const released = reservation.reservedMicroUsd;
   // The deployment aggregate releases exactly this reservation's
-  // attributed hold in the same mutation — never an unproven share of
-  // another tenant's hold. Reservations placed through `reserve` carry
-  // their exact attribution; legacy rows without one hold nothing globally
-  // and release org-side only, while seeded legacy commitments stay safely
-  // held in the aggregate. An attributed amount the aggregate cannot cover
-  // is genuine drift: leave both holds visible instead of freeing one side.
-  // Deployments without a global row (legacy fixtures) keep org-only
-  // accounting.
-  const attributed = reservation.globalReservedMicroUsd ?? 0;
+  // attributed hold in the same mutation (see `attributedGlobalHold`) —
+  // never an unproven share of another tenant's hold. Reservations placed
+  // through `reserve` carry their exact marker; valid pre-global legacy
+  // rows are attributed by physical age against the singleton; post-global
+  // unbound rows hold nothing globally and release org-side only, while
+  // seeded legacy commitments stay safely held in the aggregate. An
+  // attributed amount the aggregate cannot cover is genuine drift: leave
+  // both holds visible instead of freeing one side. Deployments without a
+  // global row (legacy fixtures) keep org-only accounting.
   const global = await getGlobalAllowance(ctx);
+  const attributed = attributedGlobalHold(reservation, global);
   if (global !== null && global.reservedMicroUsd < attributed) {
     return;
   }

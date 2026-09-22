@@ -215,44 +215,83 @@ export async function tryDebitGlobalForReservation(
 }
 
 /**
+ * Exact global attribution for one reservation row.
+ *
+ * - Rows created through `reserve` carry their explicit
+ *   `globalReservedMicroUsd` marker: the hold placed on the aggregate in
+ *   the same mutation. That marker is authoritative.
+ * - Valid pre-global legacy rows predate the singleton
+ *   (`_creationTime <= global._creationTime`), so their exposure was
+ *   included in the bounded-sum seed. Their exact attributable hold is
+ *   their current org-side reserved amount: application paths only ever
+ *   decrease it after seeding (admits mirror globally in lockstep,
+ *   settlement and cancellation close the row), so it can never exceed
+ *   what was seeded.
+ * - Post-global rows without a marker were never seeded and never debited
+ *   the aggregate: attribution zero. Cancelling or settling them moves
+ *   org-side only and cannot decrement another tenant's hold.
+ *
+ * A null aggregate means no global accounting exists at all: zero.
+ */
+export function attributedGlobalHold(
+  reservation: {
+    readonly globalReservedMicroUsd?: number;
+    readonly reservedMicroUsd: number;
+    readonly _creationTime: number;
+  },
+  global: { readonly _creationTime: number } | null,
+): number {
+  if (global === null) return 0;
+  const explicit = reservation.globalReservedMicroUsd;
+  if (typeof explicit === "number") return explicit;
+  if (reservation._creationTime <= global._creationTime) {
+    return reservation.reservedMicroUsd;
+  }
+  return 0;
+}
+/**
  * Mirror one settlement leg to the global aggregate. Called in the same
- * mutation as the org settlement so ledgers stay paired. `amountMicroUsd`
- * must be the acting reservation's own attributed hold
- * (`globalReservedMicroUsd`, zero for legacy unattributed rows): the
- * aggregate moves only exposure actually attributed to that reservation,
- * never an unproven share of another tenant's hold. A zero attribution is
- * a no-op. Strict: when the global row exists but its reserved balance
- * cannot cover an attributed amount, the mutation throws (fail closed)
- * instead of clamping with Math.max and silently masking ledger drift.
- * Legacy deployments without a global row keep org-only accounting.
+ * mutation as the org settlement so ledgers stay paired. The moved amount
+ * is the acting reservation's own attribution (see
+ * `attributedGlobalHold`): the aggregate moves only exposure actually
+ * attributed to that reservation, never an unproven share of another
+ * tenant's hold. Unbound attributions are a no-op. Strict: an attributed
+ * amount the aggregate cannot cover is genuine drift, so the mutation
+ * throws (fail closed) instead of clamping with Math.max and silently
+ * masking it. Legacy deployments without a global row keep org-only
+ * accounting.
  */
 export async function settleGlobalReservation(
   ctx: F1MutationCtx,
   mode: "spend" | "release" | "retainUnknown",
-  amountMicroUsd: number,
+  reservation: {
+    readonly globalReservedMicroUsd?: number;
+    readonly reservedMicroUsd: number;
+    readonly _creationTime: number;
+  },
 ): Promise<void> {
-  if (amountMicroUsd <= 0) return;
   const global = await getGlobalAllowance(ctx);
-  if (global === null) return;
-  if (global.reservedMicroUsd < amountMicroUsd) {
+  const attributed = attributedGlobalHold(reservation, global);
+  if (attributed <= 0) return;
+  if (global === null || global.reservedMicroUsd < attributed) {
     throw new Error("deployment allowance ledger drift: global reserved cannot cover settlement");
   }
   const now = Date.now();
   if (mode === "spend") {
     await ctx.db.patch(global._id, {
-      reservedMicroUsd: global.reservedMicroUsd - amountMicroUsd,
-      spentMicroUsd: global.spentMicroUsd + amountMicroUsd,
+      reservedMicroUsd: global.reservedMicroUsd - attributed,
+      spentMicroUsd: global.spentMicroUsd + attributed,
       updatedAt: now,
     });
   } else if (mode === "retainUnknown") {
     await ctx.db.patch(global._id, {
-      reservedMicroUsd: global.reservedMicroUsd - amountMicroUsd,
-      unresolvedMicroUsd: global.unresolvedMicroUsd + amountMicroUsd,
+      reservedMicroUsd: global.reservedMicroUsd - attributed,
+      unresolvedMicroUsd: global.unresolvedMicroUsd + attributed,
       updatedAt: now,
     });
   } else {
     await ctx.db.patch(global._id, {
-      reservedMicroUsd: global.reservedMicroUsd - amountMicroUsd,
+      reservedMicroUsd: global.reservedMicroUsd - attributed,
       updatedAt: now,
     });
   }
