@@ -3074,3 +3074,103 @@ test("recovery states show retained evidence, honest next steps, and no fake ret
     await mounted.cleanup();
   }
 });
+
+/**
+ * Astra F4 source-only research visibility: a collected source with URL and
+ * page text but no extracted price stays visible in the authorized
+ * workbench while vendor, candidate, and quote counts remain zero. It is
+ * never rendered as a supplier, product, quote, offer, or realized saving.
+ */
+const SOURCE_ONLY_URL = "https://supplier.example.test/espresso-atlas-2g";
+
+function sourceOnlyProjection() {
+  return {
+    ...projection,
+    candidates: [],
+    researchSources: [{
+      id: "evidence-source-1",
+      sourceKind: "firecrawl.scrape",
+      sourceUrl: SOURCE_ONLY_URL,
+      capturedAt: Date.UTC(2026, 8, 21),
+      completeness: "partial",
+      missingFacts: ["price"],
+      provenance: { mode: "fixture", label: "Controlled fixture", ownerAuthoredTerms: false },
+    }],
+    researchSourcesTruncated: false,
+    provenance: { mode: "fixture", label: "Controlled fixture", ownerAuthoredTerms: false },
+  };
+}
+
+function unpublishedPriceProjection() {
+  return {
+    ...sourceOnlyProjection(),
+    candidates: [{
+      id: "candidate-unpublished-1",
+      requirementId: "requirement-w1-1",
+      productModel: "Atlas 2G",
+      variant: "two-group · 220V",
+      compatibility: "unknown",
+      conversationState: "draft",
+      vendor: { id: "vendor-unpublished-1", name: "Harbor Equipment", regions: ["NL"], serviceCoverage: "Netherlands on-site" },
+      latestValidQuote: null,
+      comparisons: [],
+      evidence: [],
+      provenance: { mode: "fixture", label: "Controlled fixture", ownerAuthoredTerms: false },
+    }],
+  };
+}
+
+test("renders a source-only result with URL and missing price while supplier counts stay zero", async () => {
+  const snapshot = parseWorkbenchSnapshot(sourceOnlyProjection(), projection.project.id);
+  if (snapshot === null) throw new Error("Source-only projection should parse");
+  expect(snapshot.offers).toHaveLength(0);
+  expect(snapshot.researchSources).toHaveLength(1);
+  const mounted = await mountE8Tab({ state: "ready", snapshot }, () => ({ ok: false, message: "controlled test refusal" }));
+  try {
+    const projectText = mounted.container.textContent ?? "";
+    expect(projectText).toContain("All 0 results · 1 source");
+    expect(projectText).toContain("No results have arrived");
+    expect(projectText).toContain(SOURCE_ONLY_URL);
+    expect(projectText).toContain("1 research source without a supplier");
+    expect(projectText).toContain("Still missing: Price");
+    expect(projectText).toContain("no vendor, quote, or saving was created");
+    expect(projectText).not.toContain("Harbor Equipment");
+    expect(projectText).not.toContain("Review quote");
+    await mounted.clickTab("Results");
+    const resultsText = mounted.container.textContent ?? "";
+    expect(resultsText).toContain("No suppliers yet");
+    expect(resultsText).toContain(SOURCE_ONLY_URL);
+    expect(resultsText).toContain("1 research source without a supplier");
+    expect(resultsText).toContain("they are never shown as suppliers, quotes, or savings");
+    expect(resultsText).not.toContain("Review quote");
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("renders an unpublished-price supplier with no total, no ranking, and no saving claim", async () => {
+  const snapshot = parseWorkbenchSnapshot(unpublishedPriceProjection(), projection.project.id);
+  if (snapshot === null) throw new Error("Unpublished-price projection should parse");
+  expect(snapshot.offers).toHaveLength(1);
+  expect(snapshot.offers[0]?.vendor?.name).toBe("Harbor Equipment");
+  expect(snapshot.offers[0]?.quote).toBeNull();
+  expect(snapshot.offers[0]?.comparisons).toHaveLength(0);
+  expect(snapshot.researchSources).toHaveLength(1);
+  const mounted = await mountE8Tab({ state: "ready", snapshot }, () => ({ ok: false, message: "controlled test refusal" }));
+  try {
+    const projectText = mounted.container.textContent ?? "";
+    expect(projectText).toContain("Harbor Equipment");
+    expect(projectText).toContain("Quote terms have not arrived.");
+    expect(projectText).toContain("Review unavailable");
+    expect(projectText).not.toContain("lower than");
+    expect(projectText).not.toContain("is ranked");
+    await mounted.clickTab("Results");
+    const resultsText = mounted.container.textContent ?? "";
+    expect(resultsText).toContain("Harbor Equipment");
+    expect(resultsText).toContain("Exact total unavailable");
+    expect(resultsText).toContain(SOURCE_ONLY_URL);
+    expect(resultsText).not.toContain("Review quote");
+  } finally {
+    await mounted.cleanup();
+  }
+});

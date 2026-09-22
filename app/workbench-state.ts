@@ -177,6 +177,25 @@ export interface WorkbenchEvidence {
   readonly sourceUrl: string | null;
 }
 
+/**
+ * Astra F4 source-only research source. A collected source that persisted
+ * evidence but correctly created no vendor, candidate, or quote stays
+ * visible here with its URL, capture/completeness, provenance, and the
+ * explicit missing commercial facts. It is never a supplier, product,
+ * quote, offer, or realized saving: it carries no vendor, no model, no
+ * totals, and no comparison verdict.
+ */
+export interface WorkbenchResearchSource {
+  readonly id: string;
+  readonly sourceKind: string;
+  readonly sourceUrl: string | null;
+  readonly capturedAt: number;
+  readonly completeness: string;
+  readonly missingFacts: readonly string[];
+  readonly provenance: ProvenanceMode;
+  readonly ownerAuthoredTerms: boolean;
+}
+
 export interface WorkbenchOffer {
   readonly id: string;
   readonly requirementId: string;
@@ -321,6 +340,8 @@ export interface WorkbenchSnapshot {
   readonly access: WorkbenchAccess;
   readonly requirements: readonly WorkbenchRequirement[];
   readonly offers: readonly WorkbenchOffer[];
+  /** Source-only research records: visible evidence with no supplier/quote attached. */
+  readonly researchSources: readonly WorkbenchResearchSource[];
   readonly jobs: readonly WorkbenchJob[];
   readonly decisions: readonly WorkbenchDecision[];
   readonly activity: WorkbenchActivityPage;
@@ -336,6 +357,7 @@ export interface WorkbenchSnapshot {
   readonly truncation: {
     readonly requirements: boolean;
     readonly offers: boolean;
+    readonly sources: boolean;
     readonly jobs: boolean;
     readonly decisions: boolean;
     readonly impacts: boolean;
@@ -551,8 +573,46 @@ function parseEvidence(value: unknown): WorkbenchEvidence | null {
   return { id, label: field, sourceKind, freshness: value.freshness, verification: value.verification, executionMode, counterpartyRole, origin: null, sourceUrl };
 }
 
-function chargeScopeLabel(value: unknown): string | null {
-  if (!isRecord(value) || !isOneOf(value.kind, ["quote", "line", "allocated"] as const)) return null;
+/**
+ * Astra F4 source-only research-source parser. A present block must be an
+ * array of well-formed source records or the payload fails closed; an
+ * absent block parses as empty for servers that predate the field. The
+ * record must never carry vendor, model, totals, or verdict fields — any
+ * such key means the row is not a source-only projection and rejects the
+ * payload instead of being displayed as a supplier or offer.
+ */
+function parseResearchSource(value: unknown): WorkbenchResearchSource | null {
+  if (!isRecord(value) || !hasOnlyKeys(value, ["id", "sourceKind", "sourceUrl", "capturedAt", "completeness", "missingFacts", "provenance"])) return null;
+  const id = requiredString(value.id);
+  const sourceKind = requiredString(value.sourceKind);
+  const sourceUrl = nullableString(value.sourceUrl);
+  const completeness = requiredString(value.completeness);
+  const provenance = parseProjectionProvenance(value.provenance);
+  if (
+    id === null ||
+    sourceKind === null ||
+    sourceUrl === undefined ||
+    completeness === null ||
+    !isFiniteNumber(value.capturedAt) ||
+    !Array.isArray(value.missingFacts) ||
+    !value.missingFacts.every((entry) => typeof entry === "string" && (entry as string).trim().length > 0 && (entry as string).length <= 64) ||
+    value.missingFacts.length > 8 ||
+    provenance === null
+  ) return null;
+  if (sourceUrl !== null && !sourceUrl.startsWith("https://")) return null;
+  return {
+    id,
+    sourceKind,
+    sourceUrl,
+    capturedAt: value.capturedAt,
+    completeness,
+    missingFacts: [...value.missingFacts] as readonly string[],
+    provenance: provenance.mode,
+    ownerAuthoredTerms: provenance.ownerAuthoredTerms,
+  };
+}
+
+function chargeScopeLabel(value: unknown): string | null {  if (!isRecord(value) || !isOneOf(value.kind, ["quote", "line", "allocated"] as const)) return null;
   if (value.kind === "quote") return "quote";
   const lineId = requiredString(value.lineId);
   if (lineId === null) return null;
@@ -1178,6 +1238,12 @@ export function parseWorkbenchSnapshot(value: unknown, expectedProjectId?: strin
   const rawImpactsTruncated = value.impactsTruncated === undefined ? false : value.impactsTruncated;
   const rawSubstitutesTruncated = value.substitutesTruncated === undefined ? false : value.substitutesTruncated;
   if (typeof rawImpactsTruncated !== "boolean" || typeof rawSubstitutesTruncated !== "boolean") return null;
+  // Astra F4: servers that predate research-source visibility omit the
+  // block, which parses as empty without inventing a source.
+  const rawResearchSources = value.researchSources === undefined ? [] : value.researchSources;
+  if (!Array.isArray(rawResearchSources)) return null;
+  const rawResearchSourcesTruncated = value.researchSourcesTruncated === undefined ? false : value.researchSourcesTruncated;
+  if (typeof rawResearchSourcesTruncated !== "boolean") return null;
   if (!isRecord(value.activity) || !Array.isArray(value.activity.page) || typeof value.activity.isDone !== "boolean") return null;
   const continueCursor = nullableString(value.activity.continueCursor);
   if (continueCursor === undefined) return null;
@@ -1185,6 +1251,7 @@ export function parseWorkbenchSnapshot(value: unknown, expectedProjectId?: strin
   if (equipment === null) return null;
   const requirements: WorkbenchRequirement[] = [];
   const offers: WorkbenchOffer[] = [];
+  const researchSources: WorkbenchResearchSource[] = [];
   const jobs: WorkbenchJob[] = [];
   const decisions: WorkbenchDecision[] = [];
   const activity: WorkbenchActivityItem[] = [];
@@ -1192,6 +1259,7 @@ export function parseWorkbenchSnapshot(value: unknown, expectedProjectId?: strin
   const substitutes: WorkbenchSubstitute[] = [];
   for (const entry of value.requirements) { const parsed = parseRequirement(entry); if (parsed === null) return null; requirements.push(parsed); }
   for (const entry of value.candidates) { const parsed = parseOffer(entry); if (parsed === null) return null; offers.push(parsed); }
+  for (const entry of rawResearchSources) { const parsed = parseResearchSource(entry); if (parsed === null) return null; researchSources.push(parsed); }
   for (const entry of value.jobs) { const parsed = parseJob(entry); if (parsed === null) return null; jobs.push(parsed); }
   for (const entry of value.decisions) { const parsed = parseDecision(entry); if (parsed === null) return null; decisions.push(parsed); }
   for (const entry of value.activity.page) { const parsed = parseActivityItem(entry); if (parsed === null) return null; activity.push(parsed); }
@@ -1215,6 +1283,7 @@ export function parseWorkbenchSnapshot(value: unknown, expectedProjectId?: strin
     access,
     requirements,
     offers,
+    researchSources,
     jobs,
     decisions,
     activity: { items: activity, continueCursor, isDone: value.activity.isDone },
@@ -1227,6 +1296,6 @@ export function parseWorkbenchSnapshot(value: unknown, expectedProjectId?: strin
     committedMinorUnits: null,
     paidMinorUnits: null,
     deliveredQuantityByRequirement: {},
-    truncation: { requirements: value.requirementsTruncated, offers: value.candidatesTruncated, jobs: value.jobsTruncated, decisions: value.decisionsTruncated, impacts: rawImpactsTruncated, substitutes: rawSubstitutesTruncated, equipment: equipment.assetsTruncated },
+    truncation: { requirements: value.requirementsTruncated, offers: value.candidatesTruncated, sources: rawResearchSourcesTruncated, jobs: value.jobsTruncated, decisions: value.decisionsTruncated, impacts: rawImpactsTruncated, substitutes: rawSubstitutesTruncated, equipment: equipment.assetsTruncated },
   };
 }

@@ -524,3 +524,58 @@ test("the normal application test command runs the parser regressions", () => {
   const command = packageJson.scripts?.["test:app"] ?? "";
   expect(command).toContain("app/tests/workbench-state.test.ts");
 });
+
+/**
+ * Astra F4 source-only research visibility: a collected source that
+ * persisted evidence but created no vendor, candidate, or quote parses as a
+ * research source with URL, capture/completeness, provenance, and explicit
+ * missing commercial facts — never as a supplier, quote, or comparison.
+ */
+
+function researchSource(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: "evidence-source-1",
+    sourceKind: "firecrawl.scrape",
+    sourceUrl: "https://supplier.example.test/espresso-atlas-2g",
+    capturedAt: 10,
+    completeness: "partial",
+    missingFacts: ["price"],
+    provenance: { mode: "fixture", label: "Controlled fixture", ownerAuthoredTerms: false },
+    ...overrides,
+  };
+}
+
+function parseWithSources(sources: unknown, truncated: unknown = false): WorkbenchSnapshot | null {
+  return parseWorkbenchSnapshot({ ...baseSnapshot([]), researchSources: sources, researchSourcesTruncated: truncated }, "project-1");
+}
+
+test("a source-only record parses with URL, capture, provenance, and missing price", () => {
+  const snapshot = parseWithSources([researchSource()]);
+  expect(snapshot).not.toBeNull();
+  expect(snapshot?.offers).toHaveLength(0);
+  expect(snapshot?.researchSources).toHaveLength(1);
+  expect(snapshot?.researchSources[0]?.sourceUrl).toBe("https://supplier.example.test/espresso-atlas-2g");
+  expect(snapshot?.researchSources[0]?.sourceKind).toBe("firecrawl.scrape");
+  expect(snapshot?.researchSources[0]?.capturedAt).toBe(10);
+  expect(snapshot?.researchSources[0]?.completeness).toBe("partial");
+  expect(snapshot?.researchSources[0]?.missingFacts).toEqual(["price"]);
+  expect(snapshot?.researchSources[0]?.provenance).toBe("fixture");
+  expect(snapshot?.researchSources[0]?.ownerAuthoredTerms).toBe(false);
+  expect(snapshot?.truncation.sources).toBe(false);
+});
+
+test("legacy payloads without research sources parse as empty without inventing one", () => {
+  const snapshot = parse([]);
+  expect(snapshot).not.toBeNull();
+  expect(snapshot?.researchSources).toEqual([]);
+  expect(snapshot?.truncation.sources).toBe(false);
+});
+
+test("a source carrying supplier-shaped keys rejects the whole payload", () => {
+  expect(parseWithSources([researchSource({ vendor: { id: "vendor-1", name: "Harbor" } })])).toBeNull();
+  expect(parseWithSources([researchSource({ productModel: "Atlas 2G" })])).toBeNull();
+  expect(parseWithSources([researchSource({ totalMinorUnits: 795000 })])).toBeNull();
+  expect(parseWithSources([researchSource({ sourceUrl: "http://supplier.example.test/plain" })])).toBeNull();
+  expect(parseWithSources([researchSource({ missingFacts: ["price", 7] })])).toBeNull();
+  expect(parseWithSources("not-a-list")).toBeNull();
+});
