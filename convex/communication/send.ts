@@ -248,7 +248,7 @@ export const prepareOutboundSnapshot = f1InternalMutation({
   args: { operationId: v.id("operations"), inboxId: v.string() },
   returns: snapshotResultValidator,
   handler: async (ctx, args) => {
-    if (!/^[A-Za-z0-9._:-]{1,160}$/.test(args.inboxId)) {
+    if (!/^[A-Za-z0-9._:@-]{1,160}$/.test(args.inboxId)) {
       return denial("invalid-payload", "provider inbox id is invalid");
     }
     const operation = await ctx.db.get(args.operationId);
@@ -1071,7 +1071,7 @@ export const recoverOversizedInbound = internalAction({
     if (threadId === undefined || inboxId === undefined || messageId === undefined) {
       return recoveryDenial("invalid-payload", "thread, inbox, and message identifiers are required");
     }
-    if (!/^[A-Za-z0-9._:-]{1,160}$/.test(inboxId)) {
+    if (!/^[A-Za-z0-9._:@-]{1,160}$/.test(inboxId)) {
       return recoveryDenial("invalid-payload", "provider inbox id is invalid");
     }
     // Zero-read configuration first: credentials and origin are validated

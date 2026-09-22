@@ -150,7 +150,7 @@ export const NEGOTIATION_ORCHESTRATOR_VERSION = "e12-negotiation-orchestrator-v1
  */
 const PENDING_SEND_GRANT = "send-grant-pending" as const;
 
-const INBOX_ID_PATTERN = /^[A-Za-z0-9._:-]{1,160}$/;
+const INBOX_ID_PATTERN = /^[A-Za-z0-9._:@-]{1,160}$/;
 
 /**
  * Bounded versioned quote-terms derivation (Astra repair: complete terms
