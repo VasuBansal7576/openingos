@@ -40,6 +40,7 @@ import {
   type WorkflowAuthority,
 } from "../shared/scope.js";
 import { checkProjectAccess, denialValidator, identityOf, requireCapability } from "../access/checks.js";
+import { getGlobalAllowance } from "./allowance.js";
 
 const jobKindValidator = v.union(
   v.literal("research"),
@@ -320,6 +321,17 @@ async function releaseUnusedReservation(
     return;
   }
   const released = reservation.reservedMicroUsd;
+  // The deployment aggregate mirrors the same release in the same
+  // mutation — but only the portion it actually holds. Reservations placed
+  // through `reserve` debited both ledgers atomically, so cancellation
+  // frees both. Legacy reservations inserted directly (oversized fixtures,
+  // manual seeds) never debited the aggregate; releasing only the covered
+  // portion keeps the aggregate exact without manufacturing capacity it
+  // never held, and the aggregate never goes negative. Deployments without
+  // a global row (legacy fixtures) keep org-only accounting.
+  const global = await getGlobalAllowance(ctx);
+  const globalCovered =
+    global === null ? 0 : Math.min(released, global.reservedMicroUsd);
   await ctx.db.patch(reservation._id, {
     reservedMicroUsd: 0,
     state: "closed",
@@ -329,6 +341,12 @@ async function releaseUnusedReservation(
     reservedMicroUsd: budget.reservedMicroUsd - released,
     updatedAt: now,
   });
+  if (global !== null && globalCovered > 0) {
+    await ctx.db.patch(global._id, {
+      reservedMicroUsd: global.reservedMicroUsd - globalCovered,
+      updatedAt: now,
+    });
+  }
 }
 
 async function processCancellationRows(

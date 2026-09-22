@@ -430,16 +430,12 @@ export const createWorkspace = f1Mutation({
     // before any workspace effect. Clearly unrelated briefs (homework,
     // vacations, general browsing) refuse with zero writes; supported
     // coffee-shop openings, real-estate/rent research, and bounded
-    // equipment sourcing proceed. Other modes keep their structural
-    // validation only.
+    // equipment sourcing proceed. Only the brief itself is classified:
+    // title, category, and region metadata may carry allowlisted words and
+    // must never launder an unrelated brief into a workspace. Other modes
+    // keep their structural validation only.
     if (input.mode === "opening") {
-      const scopeText = [
-        input.detailSummary ?? "",
-        input.detailTitle ?? "",
-        input.detailCategory ?? "",
-        input.region ?? "",
-      ].join("\n");
-      const scopeVerdict = classifyOpeningBriefForResearch(scopeText);
+      const scopeVerdict = classifyOpeningBriefForResearch(input.detailSummary ?? "");
       if (scopeVerdict.verdict !== "supported") {
         return deny("unrelated-refusal", scopeVerdict.reason);
       }

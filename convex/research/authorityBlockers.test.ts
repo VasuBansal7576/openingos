@@ -37,8 +37,13 @@ import {
 } from "convex/server";
 import schema from "../schema.js";
 import * as memberships from "../access/memberships.js";
+import * as grants from "../access/grants.js";
+import * as execJobs from "../execution/jobs.js";
+import * as reservations from "../execution/reservations.js";
+import * as operations from "../execution/operations.js";
 import * as intake from "../domain/intake.js";
 import * as research from "./collection.js";
+import { canonicalJson } from "../shared/hashing.js";
 import { RESEARCH_ALLOWANCE_ENV_VAR } from "../execution/allowance.js";
 import type { Id } from "../_generated/dataModel.js";
 
@@ -97,6 +102,36 @@ const executeRef = makeFunctionReference<
   ActionArgs<typeof research.execute>,
   ActionReturn<typeof research.execute>
 >("research/collection:execute");
+const cancelResearchRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof research.cancelResearch>,
+  MutationReturn<typeof research.cancelResearch>
+>("research/collection:cancelResearch");
+const issueGrantRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof grants.issue>,
+  MutationReturn<typeof grants.issue>
+>("access/grants:issue");
+const startJobRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof execJobs.start>,
+  MutationReturn<typeof execJobs.start>
+>("execution/jobs:start");
+const cancelJobRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof execJobs.cancel>,
+  MutationReturn<typeof execJobs.cancel>
+>("execution/jobs:cancel");
+const reserveRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof reservations.reserve>,
+  MutationReturn<typeof reservations.reserve>
+>("execution/reservations:reserve");
+const createOperationRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof operations.create>,
+  MutationReturn<typeof operations.create>
+>("execution/operations:create");
 
 const OWNER_A = { tokenIdentifier: "blockers-owner-a" };
 const OWNER_B = { tokenIdentifier: "blockers-owner-b" };
@@ -621,5 +656,282 @@ describe("research source non-promotion", () => {
     // Drain the twin scheduled by the dispatch itself; its claim is denied
     // against the already-resolved operation with no second provider call.
     await t.finishAllScheduledFunctions(() => {});
+  });
+});
+
+describe("brief-metadata bypass refusal (PR-33 blocker 1)", () => {
+  test("quantum brief with allowlisted title/category/key metadata still refuses dispatch", async () => {
+    const t = init();
+    process.env[RESEARCH_ALLOWANCE_ENV_VAR] = "100000";
+    const fixture = await createOrgProjectRequirement(t, OWNER_A, "Metadata bypass");
+    const calls: string[] = [];
+    stubSearchFetch(calls);
+    // The stored brief is unrelated even though every metadata field carries
+    // an allowlisted word (title, category, key all read as equipment).
+    const requirementId = await t.run(async (ctx) => {
+      const now = Date.now();
+      return await ctx.db.insert("requirements", {
+        organizationId: fixture.organizationId,
+        projectId: fixture.projectId,
+        key: "equipment-scope",
+        title: "Two-group espresso machine",
+        category: "equipment",
+        quantity: "1",
+        unit: "scope",
+        priority: "P0",
+        state: "approved",
+        fulfillment: "notOrdered",
+        version: 1,
+        hardConstraints: "Explain quantum entanglement",
+        createdAt: now,
+        updatedAt: now,
+      });
+    });
+    const before = await t.run(async (ctx) => ({
+      grants: (await ctx.db.query("grants").take(64)).length,
+      jobs: (
+        await ctx.db.query("jobs").withIndex("by_project", (q) => q.eq("projectId", fixture.projectId)).take(64)
+      ).length,
+      operations: (await ctx.db.query("operations").take(128)).filter((row) => row.projectId === fixture.projectId)
+        .length,
+    }));
+    const result = await t.withIdentity(OWNER_A).mutation(requestBoundedResearchRef, {
+      organizationId: fixture.organizationId,
+      projectId: fixture.projectId,
+      requirementId,
+      requirementVersion: 1,
+      idempotencyKey: "metadata-bypass-1",
+    });
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("metadata-laundered dispatch must refuse");
+    expect(result.code).toBe("unrelated-refusal");
+    const after = await t.run(async (ctx) => ({
+      grants: (await ctx.db.query("grants").take(64)).length,
+      jobs: (
+        await ctx.db.query("jobs").withIndex("by_project", (q) => q.eq("projectId", fixture.projectId)).take(64)
+      ).length,
+      operations: (await ctx.db.query("operations").take(128)).filter((row) => row.projectId === fixture.projectId)
+        .length,
+    }));
+    expect(after).toEqual(before);
+    await t.finishAllScheduledFunctions(() => {});
+    expect(calls).toHaveLength(0);
+  });
+
+  test("quantum brief with equipment category refuses guest intake", async () => {
+    const t = init();
+    const before = await t.run(async (ctx) => ({
+      projects: (await ctx.db.query("projects").take(32)).length,
+    }));
+    const result = await t.withIdentity(GUEST).mutation(createWorkspaceRef, {
+      idempotencyKey: "metadata-bypass-guest-1",
+      mode: "opening",
+      projectName: "Equipment review",
+      workspaceKind: "guest",
+      region: "Netherlands",
+      currency: "EUR",
+      detailCategory: "equipment",
+      detailSummary: "Explain quantum entanglement",
+    });
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("metadata-laundered intake must refuse");
+    expect(result.code).toBe("unrelated-refusal");
+    const after = await t.run(async (ctx) => ({
+      projects: (await ctx.db.query("projects").take(32)).length,
+    }));
+    expect(after).toEqual(before);
+  });
+});
+
+describe("exclamation-mark canonical objective (PR-33 blocker 2)", () => {
+  test("bang-separated constraints are preserved and identical replay deduplicates", async () => {
+    const t = init();
+    process.env[RESEARCH_ALLOWANCE_ENV_VAR] = "100000";
+    const fixture = await createOrgProjectRequirement(t, OWNER_A, "Bang punctuation");
+    const briefWithBangs =
+      "Open a coffee shop in San Francisco! Rent a place and buy everything needed! Budget USD 250,000-500,000!";
+    const requirementId = await t.run(async (ctx) => {
+      const now = Date.now();
+      return await ctx.db.insert("requirements", {
+        organizationId: fixture.organizationId,
+        projectId: fixture.projectId,
+        key: "opening-scope",
+        title: "San Francisco coffee shop real estate and equipment",
+        category: "coffee shop opening",
+        quantity: "1",
+        unit: "scope",
+        priority: "P0",
+        state: "approved",
+        fulfillment: "notOrdered",
+        version: 1,
+        currency: "USD",
+        budgetMinorUnits: 50_000_000,
+        hardConstraints: `Primary region: San Francisco, CA\nOpening brief: ${briefWithBangs}`,
+        createdAt: now,
+        updatedAt: now,
+      });
+    });
+    const calls: string[] = [];
+    const bodies: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: unknown, init?: { body?: unknown }) => {
+        calls.push(String(url));
+        bodies.push(typeof init?.body === "string" ? init.body : JSON.stringify(init?.body ?? null));
+        return new Response(completeSearchResponse("https://supplier.example.test/machine"), { status: 200 });
+      }),
+    );
+    const first = await t.withIdentity(OWNER_A).mutation(requestBoundedResearchRef, {
+      organizationId: fixture.organizationId,
+      projectId: fixture.projectId,
+      requirementId,
+      requirementVersion: 1,
+      idempotencyKey: "bang-replay-1",
+    });
+    expect(first.ok).toBe(true);
+    if (!first.ok || first.operationId === null) throw new Error("bang dispatch failed");
+    const stored = await t.run(async (ctx) => {
+      const operation = await ctx.db.get(first.operationId as Id<"operations">);
+      const grant = operation === null ? null : await ctx.db.get(operation.grantId);
+      return {
+        payload: operation?.normalizedPayload ?? null,
+        grantPayload: grant?.canonicalPayload ?? null,
+      };
+    });
+    // No clause may be dropped: location, rental, sourcing, and budget all
+    // survive the bang separators in both the grant and operation payloads.
+    for (const payload of [stored.payload, stored.grantPayload]) {
+      expect(payload).not.toBeNull();
+      const lowered = (payload ?? "").toLowerCase();
+      for (const fragment of ["san francisco", "rent", "everything needed", "usd 250,000-500,000"]) {
+        expect(lowered).toContain(fragment);
+      }
+      expect(lowered).not.toMatch(/\bbuy\b/);
+      expect(lowered).not.toMatch(/\bpurchase\b/);
+    }
+    await t.finishAllScheduledFunctions(() => {});
+    expect(calls).toHaveLength(1);
+    expect(bodies.join(" ")).toContain("San Francisco");
+    const replay = await t.withIdentity(OWNER_A).mutation(requestBoundedResearchRef, {
+      organizationId: fixture.organizationId,
+      projectId: fixture.projectId,
+      requirementId,
+      requirementVersion: 1,
+      idempotencyKey: "bang-replay-1",
+    });
+    expect(replay.ok).toBe(true);
+    if (!replay.ok || replay.operationId === null) throw new Error("bang replay failed");
+    expect(replay.jobId).toBe(first.jobId);
+    expect(replay.operationId).toBe(first.operationId);
+    await t.finishAllScheduledFunctions(() => {});
+    expect(calls).toHaveLength(1);
+  });
+});
+
+describe("cancellation releases the global allowance (PR-33 blocker 3)", () => {
+  test("four pre-claim cancellations free the deployment aggregate for the fifth reservation", async () => {
+    // Scheduler-free fixture (S-14 pattern): no transport is ever scheduled,
+    // so cancellation provably precedes any claim and no provider effect is
+    // possible. Four jobs each reserve the 25,000 maximum against one
+    // 100,000 grant; cancelling all four must release both ledgers.
+    const t = init();
+    const fixture = await createOrgProjectRequirement(t, OWNER_A, "Cancel releases global");
+    await t.run(async (ctx) => {
+      await ctx.db.insert("providerBudgets", {
+        organizationId: fixture.organizationId,
+        ceilingMicroUsd: 100000,
+        reservedMicroUsd: 0,
+        spentMicroUsd: 0,
+        unresolvedMicroUsd: 0,
+        pricingBasis: "controlled-cancel-release",
+        updatedAt: Date.now(),
+      });
+    });
+    const asOwner = t.withIdentity(OWNER_A);
+    const query = "Research suppliers for the espresso machine";
+    const grant = await asOwner.mutation(issueGrantRef, {
+      organizationId: fixture.organizationId,
+      projectId: fixture.projectId,
+      operations: ["research.collect"],
+      communicationProfile: "ownerRoleplay",
+      recipientConfigVersion: 0,
+      inputVersions: { brief: "cancel-v1" },
+      payloadJson: canonicalJson({ query }),
+      costCeilingMicroUsd: 100000,
+      roundLimit: 8,
+      expiresAt: Date.now() + 60 * 60 * 1000,
+    });
+    if (!grant.ok) throw new Error(`grant setup failed: ${grant.message}`);
+    const jobIds: Id<"jobs">[] = [];
+    for (let index = 1; index <= 4; index += 1) {
+      const started = await asOwner.mutation(startJobRef, {
+        organizationId: fixture.organizationId,
+        projectId: fixture.projectId,
+        text: query,
+        operationId: "research.collect",
+        kind: "research",
+        grantId: grant.grantId,
+      });
+      if (!started.ok) throw new Error(`job start failed: ${started.message}`);
+      const reserved = await asOwner.mutation(reserveRef, {
+        jobId: started.jobId,
+        organizationId: fixture.organizationId,
+        projectId: fixture.projectId,
+        amountMicroUsd: 25000,
+        pricingBasis: "controlled-cancel-release",
+      });
+      if (!reserved.ok) throw new Error(`reservation failed: ${reserved.message}`);
+      const created = await asOwner.mutation(createOperationRef, {
+        jobId: started.jobId,
+        organizationId: fixture.organizationId,
+        projectId: fixture.projectId,
+        kind: "research.collect",
+        requestId: `cancel-release-${index}`,
+        payloadJson: canonicalJson({ query }),
+        grantId: grant.grantId,
+        reservationId: reserved.reservationId,
+      });
+      if (!created.ok) throw new Error(`operation creation failed: ${created.message}`);
+      jobIds.push(started.jobId);
+    }
+    expect((await globalCommitted(t)).committed).toBe(100000);
+    for (const jobId of jobIds) {
+      const cancelled = await asOwner.mutation(cancelJobRef, {
+        jobId,
+        reason: "controlled pre-claim cancellation",
+      });
+      expect(cancelled.ok).toBe(true);
+    }
+    // Both ledgers are whole again with no spend, no unknowns, no attempts.
+    expect((await globalCommitted(t)).committed).toBe(0);
+    const ledgers = await t.run(async (ctx) => ({
+      budget: await ctx.db
+        .query("providerBudgets")
+        .withIndex("by_organization", (q) => q.eq("organizationId", fixture.organizationId))
+        .unique()
+        .then((b) => (b === null ? null : { reserved: b.reservedMicroUsd, spent: b.spentMicroUsd, unresolved: b.unresolvedMicroUsd })),
+      attempts: (await ctx.db.query("attempts").take(16)).length,
+    }));
+    expect(ledgers.budget).toEqual({ reserved: 0, spent: 0, unresolved: 0 });
+    expect(ledgers.attempts).toBe(0);
+    // The freed deployment aggregate admits the fifth full reservation.
+    const fifth = await asOwner.mutation(startJobRef, {
+      organizationId: fixture.organizationId,
+      projectId: fixture.projectId,
+      text: query,
+      operationId: "research.collect",
+      kind: "research",
+      grantId: grant.grantId,
+    });
+    if (!fifth.ok) throw new Error(`fifth job start failed: ${fifth.message}`);
+    const fifthReserved = await asOwner.mutation(reserveRef, {
+      jobId: fifth.jobId,
+      organizationId: fixture.organizationId,
+      projectId: fixture.projectId,
+      amountMicroUsd: 25000,
+      pricingBasis: "controlled-cancel-release",
+    });
+    expect(fifthReserved.ok).toBe(true);
+    expect((await globalCommitted(t)).committed).toBe(25000);
   });
 });
