@@ -1,4 +1,6 @@
 import { AgentMail, vEvent, type AgentMailComponent } from "@agentmail/convex";
+import { registerStaticRoutes } from "@convex-dev/static-hosting";
+import type { ComponentApi } from "@convex-dev/static-hosting/_generated/component";
 import { httpRouter, makeFunctionReference, type RegisteredMutation } from "convex/server";
 import { internal } from "./_generated/api";
 import { httpAction, internalMutation } from "./_generated/server";
@@ -62,5 +64,9 @@ http.route({
     return await agentmail.handleWebhook(mutationContext, request);
   }),
 });
+
+// Static SPA catch-all comes last: exact routes registered above win over it.
+// Same intentional untyped-component cast as `components.agentmail` above.
+registerStaticRoutes(http, components.staticHosting as unknown as ComponentApi);
 
 export default http;
