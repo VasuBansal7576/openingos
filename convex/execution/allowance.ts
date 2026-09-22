@@ -15,6 +15,16 @@
  *   over-cap allowance fails closed before any grant, job, reservation,
  *   operation, or provider call is created.
  *
+ * Deployment aggregate (Astra repair): per-org rows are accounting
+ * partitions only. One `deploymentAllowances` row with key
+ * `GLOBAL_ALLOWANCE_KEY` bounds the SUM of reservations across all
+ * organizations and guest sessions. New organizations never mint fresh
+ * spendable funds: every reservation debits both ledgers atomically in the
+ * same mutation (see reservations.ts / attempts.ts), so concurrent
+ * organizations serialize on the global row via Convex OCC and the loser
+ * fails closed with `allowance-exhausted`. The configured 100,000
+ * micro-USD app allowance is a hard global ceiling.
+ *
  * This module exposes no public Convex function: callers use the plain
  * `ensureSharedBudget` helper inside their own authorized mutation, so no
  * new API surface or browser-readable value is introduced.
@@ -29,6 +39,18 @@ export const RESEARCH_ALLOWANCE_ENV_VAR = "RESEARCH_PROVIDER_ALLOWANCE_MICRO_USD
 
 /** Hard cap for any freshly initialized ledger (10 USD in micro-USD). */
 export const RESEARCH_ALLOWANCE_MAX_MICRO_USD = 10_000_000 as const;
+
+/**
+ * Deployment-wide hard ceiling for the Firecrawl provider account
+ * (100,000 micro-USD = USD 0.10). The sum of reservations across every
+ * organization and guest session never exceeds this value, regardless of
+ * how many per-org ledger rows exist. The env value funds the global row;
+ * any env amount above this cap is clamped to it for global admission.
+ */
+export const RESEARCH_GLOBAL_HARD_CEILING_MICRO_USD = 100_000 as const;
+
+/** Singleton key for the deployment-wide Firecrawl allowance aggregate. */
+export const GLOBAL_ALLOWANCE_KEY = "firecrawl-shared-global-v1" as const;
 
 /** Ledger pricing-basis label for rows initialized through this module. */
 export const RESEARCH_ALLOWANCE_PRICING_BASIS = "research-shared-allowance-v1" as const;
@@ -82,11 +104,165 @@ export type EnsureSharedBudgetResult =
   | { readonly ok: true; readonly budgetId: Id<"providerBudgets">; readonly initialized: boolean }
   | { readonly ok: false; readonly code: "allowance-exhausted"; readonly message: string };
 
+/** Effective global ceiling: env-funded but never above the hard cap. */
+export function effectiveGlobalCeiling(envCeilingMicroUsd: number): number {
+  return Math.min(envCeilingMicroUsd, RESEARCH_GLOBAL_HARD_CEILING_MICRO_USD);
+}
+
+/**
+ * Bounded legacy-partition count for first-global-row migration. The
+ * migration reads at most this many per-org ledger rows in one bounded
+ * query; more partitions than this fail closed and require an explicit
+ * migration instead of a silent undercount.
+ */
+export const MAX_MIGRATION_ORG_PARTITIONS = 64 as const;
+
+/**
+ * Load or initialize the singleton deployment aggregate. Creation and the
+ * caller's subsequent org admission run in the same mutation, so concurrent
+ * organizations serialize on this row via OCC instead of each minting a
+ * full allowance. An existing row is never raised: a lower env value cannot
+ * refill spend, and a higher env value cannot exceed the first-written
+ * ceiling without an explicit migration.
+ *
+ * Migration invariant: when the global row is created after per-org
+ * ledgers already carry spend, the creation seeds the aggregate from the
+ * bounded sum of those legacy partitions instead of starting at zero.
+ * Starting at zero would permit extra spend beyond the stated app cap. The
+ * seed reads at most MAX_MIGRATION_ORG_PARTITIONS rows; a larger partition
+ * set fails closed (throws) rather than silently undercounting.
+ */
+export async function ensureGlobalAllowance(
+  ctx: F1MutationCtx,
+  ceilingMicroUsd: number,
+  pricingBasis: string,
+): Promise<Id<"deploymentAllowances">> {
+  const capped = Math.min(ceilingMicroUsd, RESEARCH_GLOBAL_HARD_CEILING_MICRO_USD);
+  const existing = await ctx.db
+    .query("deploymentAllowances")
+    .withIndex("by_key", (q) => q.eq("key", GLOBAL_ALLOWANCE_KEY))
+    .unique();
+  if (existing !== null) return existing._id;
+  const seed = await sumLegacyPartitionCommitment(ctx);
+  return await ctx.db.insert("deploymentAllowances", {
+    key: GLOBAL_ALLOWANCE_KEY,
+    ceilingMicroUsd: capped,
+    reservedMicroUsd: seed.reservedMicroUsd,
+    spentMicroUsd: seed.spentMicroUsd,
+    unresolvedMicroUsd: seed.unresolvedMicroUsd,
+    pricingBasis,
+    updatedAt: Date.now(),
+  });
+}
+
+/**
+ * Bounded sum of pre-existing per-org ledger commitments for global-row
+ * seeding. Reads at most MAX_MIGRATION_ORG_PARTITIONS + 1 rows; throws
+ * (fail closed) when more partitions exist than can be proven in one
+ * bounded read, instead of silently seeding an undercount.
+ */
+export async function sumLegacyPartitionCommitment(ctx: F1MutationCtx): Promise<{
+  readonly reservedMicroUsd: number;
+  readonly spentMicroUsd: number;
+  readonly unresolvedMicroUsd: number;
+}> {
+  const rows = await ctx.db.query("providerBudgets").take(MAX_MIGRATION_ORG_PARTITIONS + 1);
+  if (rows.length > MAX_MIGRATION_ORG_PARTITIONS) {
+    throw new Error(
+      "deployment allowance migration requires an explicit bounded migration: too many organization partitions",
+    );
+  }
+  let reservedMicroUsd = 0;
+  let spentMicroUsd = 0;
+  let unresolvedMicroUsd = 0;
+  for (const row of rows) {
+    reservedMicroUsd += row.reservedMicroUsd;
+    spentMicroUsd += row.spentMicroUsd;
+    unresolvedMicroUsd += row.unresolvedMicroUsd;
+  }
+  return { reservedMicroUsd, spentMicroUsd, unresolvedMicroUsd };
+}
+
+/** Read the deployment aggregate without creating it. */
+export async function getGlobalAllowance(ctx: F1MutationCtx) {
+  return await ctx.db
+    .query("deploymentAllowances")
+    .withIndex("by_key", (q) => q.eq("key", GLOBAL_ALLOWANCE_KEY))
+    .unique();
+}
+
+/**
+ * Atomically check-and-debit the global aggregate for one reservation.
+ * Must be called in the same mutation that debits the org ledger so the
+ * two can never drift. Returns false when the global hard ceiling cannot
+ * cover the amount; the caller then fails closed without touching the org
+ * ledger.
+ */
+export async function tryDebitGlobalForReservation(
+  ctx: F1MutationCtx,
+  amountMicroUsd: number,
+): Promise<boolean> {
+  const global = await getGlobalAllowance(ctx);
+  if (global === null) return false;
+  const committed =
+    global.reservedMicroUsd + global.spentMicroUsd + global.unresolvedMicroUsd;
+  if (committed + amountMicroUsd > global.ceilingMicroUsd) return false;
+  await ctx.db.patch(global._id, {
+    reservedMicroUsd: global.reservedMicroUsd + amountMicroUsd,
+    updatedAt: Date.now(),
+  });
+  return true;
+}
+
+/**
+ * Mirror one settlement leg to the global aggregate. Called in the same
+ * mutation as the org settlement so ledgers stay paired. Strict: when the
+ * global row exists but its reserved balance cannot cover the mirrored
+ * amount, the mutation throws (fail closed) instead of clamping with
+ * Math.max and silently masking ledger drift. Legacy deployments without a
+ * global row keep org-only accounting.
+ */
+export async function settleGlobalReservation(
+  ctx: F1MutationCtx,
+  mode: "spend" | "release" | "retainUnknown",
+  amountMicroUsd: number,
+): Promise<void> {
+  const global = await getGlobalAllowance(ctx);
+  if (global === null) return;
+  if (global.reservedMicroUsd < amountMicroUsd) {
+    throw new Error("deployment allowance ledger drift: global reserved cannot cover settlement");
+  }
+  const now = Date.now();
+  if (mode === "spend") {
+    await ctx.db.patch(global._id, {
+      reservedMicroUsd: global.reservedMicroUsd - amountMicroUsd,
+      spentMicroUsd: global.spentMicroUsd + amountMicroUsd,
+      updatedAt: now,
+    });
+  } else if (mode === "retainUnknown") {
+    await ctx.db.patch(global._id, {
+      reservedMicroUsd: global.reservedMicroUsd - amountMicroUsd,
+      unresolvedMicroUsd: global.unresolvedMicroUsd + amountMicroUsd,
+      updatedAt: now,
+    });
+  } else {
+    await ctx.db.patch(global._id, {
+      reservedMicroUsd: global.reservedMicroUsd - amountMicroUsd,
+      updatedAt: now,
+    });
+  }
+}
+
 /**
  * Admit the organization's shared ledger, initializing it once from the
  * server-only allowance when it does not exist yet. An existing row is
  * returned untouched: this helper never patches a ceiling, adds funds, or
  * changes the pricing basis, so a deployment cannot silently refill spend.
+ *
+ * The deployment aggregate is ensured first in the same transaction. The
+ * per-org row is an accounting partition, not independent funds: admission
+ * here creates the partition, but every later reservation still debits the
+ * global aggregate atomically, so N organizations share one hard ceiling.
  */
 export async function ensureSharedBudget(
   ctx: F1MutationCtx,
@@ -98,6 +274,7 @@ export async function ensureSharedBudget(
   }
   const parsed = parseResearchAllowance(env[RESEARCH_ALLOWANCE_ENV_VAR], assurance.minimumMicroUsd);
   if (!parsed.ok) return parsed;
+  await ensureGlobalAllowance(ctx, parsed.ceilingMicroUsd, assurance.pricingBasis);
   const existing = await ctx.db
     .query("providerBudgets")
     .withIndex("by_organization", (q) => q.eq("organizationId", organizationId))
@@ -108,7 +285,11 @@ export async function ensureSharedBudget(
   const now = Date.now();
   const budgetId = await ctx.db.insert("providerBudgets", {
     organizationId,
-    ceilingMicroUsd: parsed.ceilingMicroUsd,
+    // Partition display cap: never above the global hard ceiling, so a new
+    // organization row cannot suggest independent funds beyond the shared
+    // deployment aggregate. Spend authority still comes from the global
+    // check at reservation time.
+    ceilingMicroUsd: effectiveGlobalCeiling(parsed.ceilingMicroUsd),
     reservedMicroUsd: 0,
     spentMicroUsd: 0,
     unresolvedMicroUsd: 0,
