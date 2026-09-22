@@ -15,6 +15,14 @@ import type { Id } from "../_generated/dataModel.js";
 import { f1InternalMutation, f1Mutation, f1Query, type F1MutationCtx } from "../server.js";
 import { checkProjectAccess, denialValidator, identityOf } from "../access/checks.js";
 import {
+  GLOBAL_ALLOWANCE_KEY,
+  RESEARCH_GLOBAL_HARD_CEILING_MICRO_USD,
+  getGlobalAllowance,
+  settleGlobalReservation,
+  sumLegacyPartitionCommitment,
+  tryDebitGlobalForReservation,
+} from "./allowance.js";
+import {
   MAX_RECONCILIATION_READS,
   parseReconciliationPricingBasis,
 } from "../communication/contracts.js";
@@ -144,6 +152,40 @@ export const reserve = f1Mutation({
         message: "shared allowance cannot cover another full reservation",
       };
     }
+    // Deployment aggregate: the sum across organizations is globally
+    // bounded. Ensure the singleton exists (legacy rows inserted it), then
+    // debit it in the SAME mutation before touching the org ledger, so a
+    // concurrent organization serializes on the global row via OCC.
+    // Migration invariant: a first global row created after legacy org
+    // ledgers already carry spend seeds from their bounded sum instead of
+    // zero, so observed spend is not forgotten and re-spendable.
+    let global = await getGlobalAllowance(ctx);
+    if (global === null) {
+      const seed = await sumLegacyPartitionCommitment(ctx);
+      await ctx.db.insert("deploymentAllowances", {
+        key: GLOBAL_ALLOWANCE_KEY,
+        ceilingMicroUsd: Math.min(budget.ceilingMicroUsd, RESEARCH_GLOBAL_HARD_CEILING_MICRO_USD),
+        reservedMicroUsd: seed.reservedMicroUsd,
+        spentMicroUsd: seed.spentMicroUsd,
+        unresolvedMicroUsd: seed.unresolvedMicroUsd,
+        pricingBasis: budget.pricingBasis,
+        updatedAt: now,
+      });
+      global = await getGlobalAllowance(ctx);
+    }
+    if (global === null) {
+      return { ok: false as const, code: "allowance-exhausted", message: "deployment allowance is unavailable" };
+    }
+    const globalCommitted =
+      global.reservedMicroUsd + global.spentMicroUsd + global.unresolvedMicroUsd;
+    if (globalCommitted + args.amountMicroUsd > global.ceilingMicroUsd) {
+      await ctx.db.patch(args.jobId, { state: "pausedBudget", updatedAt: now });
+      return {
+        ok: false as const,
+        code: "allowance-exhausted",
+        message: "deployment allowance cannot cover another full reservation",
+      };
+    }
     const reservationId = await ctx.db.insert("reservations", {
       organizationId: args.organizationId,
       jobId: args.jobId,
@@ -158,6 +200,10 @@ export const reserve = f1Mutation({
     });
     await ctx.db.patch(budget._id, {
       reservedMicroUsd: budget.reservedMicroUsd + args.amountMicroUsd,
+      updatedAt: now,
+    });
+    await ctx.db.patch(global._id, {
+      reservedMicroUsd: global.reservedMicroUsd + args.amountMicroUsd,
       updatedAt: now,
     });
     return { ok: true as const, reservationId };
@@ -333,6 +379,30 @@ export const reserveServerRead = f1InternalMutation({
         message: "shared allowance cannot cover another full reservation",
       };
     }
+    // Legacy bridge: server-read recovery fixtures predate the deployment
+    // aggregate, so seed it from the bounded partition sum (same migration
+    // invariant as the user-identity reserve) instead of failing closed.
+    if ((await getGlobalAllowance(ctx)) === null) {
+      const seed = await sumLegacyPartitionCommitment(ctx);
+      await ctx.db.insert("deploymentAllowances", {
+        key: GLOBAL_ALLOWANCE_KEY,
+        ceilingMicroUsd: Math.min(budget.ceilingMicroUsd, RESEARCH_GLOBAL_HARD_CEILING_MICRO_USD),
+        reservedMicroUsd: seed.reservedMicroUsd,
+        spentMicroUsd: seed.spentMicroUsd,
+        unresolvedMicroUsd: seed.unresolvedMicroUsd,
+        pricingBasis: budget.pricingBasis,
+        updatedAt: now,
+      });
+    }
+    const globalAdmitted = await tryDebitGlobalForReservation(ctx, args.amountMicroUsd);
+    if (!globalAdmitted) {
+      await ctx.db.patch(args.jobId, { state: "pausedBudget", updatedAt: now });
+      return {
+        ok: false as const,
+        code: "allowance-exhausted",
+        message: "deployment allowance cannot cover another full reservation",
+      };
+    }
     const reservationId = await ctx.db.insert("reservations", {
       organizationId: args.organizationId,
       jobId: args.jobId,
@@ -407,6 +477,7 @@ export const settleServerRead = f1InternalMutation({
       unresolvedMicroUsd: budget.unresolvedMicroUsd + retain,
       updatedAt: now,
     });
+    await settleGlobalReservation(ctx, args.mode === "release" ? "release" : "retainUnknown", amount);
     await ctx.db.patch(reservation._id, {
       reservedMicroUsd: 0,
       unresolvedMicroUsd: reservation.unresolvedMicroUsd + retain,

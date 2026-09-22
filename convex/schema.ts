@@ -770,6 +770,28 @@ export default defineSchema({
     updatedAt: v.number(),
   }).index("by_organization", ["organizationId"]),
 
+  /**
+   * Deployment-wide Firecrawl allowance aggregate (Astra authority repair).
+   *
+   * One row per deployment/provider-account key bounds the SUM of all
+   * organization `providerBudgets` reservations. Per-org rows remain as
+   * accounting partitions, but they are never independent funds: every
+   * reservation debits both the org ledger and this global ledger in the
+   * same mutation, so two concurrent organizations cannot each spend the
+   * full configured allowance. The global ceiling is the configured
+   * 100,000 micro-USD app allowance hard cap. Table carries no
+   * organization/project so no tenant read can enumerate another tenant.
+   */
+  deploymentAllowances: defineTable({
+    key: v.string(),
+    ceilingMicroUsd: v.number(),
+    reservedMicroUsd: v.number(),
+    spentMicroUsd: v.number(),
+    unresolvedMicroUsd: v.number(),
+    pricingBasis: v.string(),
+    updatedAt: v.number(),
+  }).index("by_key", ["key"]),
+
   grants: defineTable({
     organizationId: v.id("organizations"),
     projectId: v.id("projects"),

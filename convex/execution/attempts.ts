@@ -23,6 +23,7 @@ import {
   MAX_OPERATIONS_PER_JOB,
 } from "../shared/scope.js";
 import { checkProjectAccess, denialValidator, identityOf } from "../access/checks.js";
+import { getGlobalAllowance, settleGlobalReservation } from "./allowance.js";
 import {
   MAX_RECONCILIATION_READS,
   RECONCILIATION_RETRY_OWNER,
@@ -67,6 +68,9 @@ async function settleReservation(
         updatedAt: now,
       });
     }
+    // Mirror the same leg to the deployment aggregate in the same mutation
+    // so org and global ledgers stay paired across spend/release/unknown.
+    await settleGlobalReservation(ctx, mode, amount);
   }
   if (mode === "spend") {
     await ctx.db.patch(reservation._id, {
@@ -402,6 +406,21 @@ async function admitReconciliationRead(
     spentMicroUsd: budget.spentMicroUsd + pricing.readCostMicroUsd,
     updatedAt: Date.now(),
   });
+  // Mirror the read cost to the deployment aggregate when present. Legacy
+  // fixtures without a global row keep org-only accounting. Strict: fail
+  // closed on global drift instead of clamping with Math.max.
+  const global = await getGlobalAllowance(ctx);
+  if (global !== null) {
+    if (global.reservedMicroUsd < fromReserved || global.unresolvedMicroUsd < fromUnknown) {
+      return { ok: false as const, code: "allowance-exhausted", message: "deployment reconciliation budget is exhausted" };
+    }
+    await ctx.db.patch(global._id, {
+      reservedMicroUsd: global.reservedMicroUsd - fromReserved,
+      unresolvedMicroUsd: global.unresolvedMicroUsd - fromUnknown,
+      spentMicroUsd: global.spentMicroUsd + pricing.readCostMicroUsd,
+      updatedAt: Date.now(),
+    });
+  }
   await ctx.db.patch(reservation._id, {
     reservedMicroUsd: reservation.reservedMicroUsd - fromReserved,
     unresolvedMicroUsd: reservation.unresolvedMicroUsd - fromUnknown,
