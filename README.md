@@ -8,7 +8,8 @@ The planned product connects requirements, source evidence, quote versions, appr
 This repository contains the agreed PRD, accepted controlled architecture contracts, the React/Convex purchasing application, controlled Jev and browser-executor modules, delivery tooling and the selected clickable design reference.
 Combined code checkpoint `e40da16` integrates authenticated isolated intake and sample projects, source-backed purchasing records, comparisons, owner-only communication boundaries, negotiation, recovery, equipment history and the production workbench UI.
 Its complete controlled local matrix, strict typechecks, production build and desktop/mobile browser QA pass.
-The six findings from the latest independent Astra review are repaired locally; latest-head GitHub CI and a fresh independent Astra verdict remain merge gates.
+The six findings from the earlier independent Astra review were repaired in the prior checkpoint.
+The later seven-finding review described below remains the current integration gate.
 PR #27 (`728fc19`), PR #28 (`46a7450`) and PR #29 (`8f2deb31263a5bb715f1f248bcee2e3a1c3a6ed5`) merged into integration at `44e73618beb562a198c1eeafcfd045ff42ea928c` with exact-head CI green.
 Dev Convex deployment `polite-minnow-494` was updated with `npx convex dev --once` and reported Convex functions ready; this is dev, not production or a public origin.
 A fresh anonymous real app intake on dev persisted the exact San Francisco coffee shop owner scenario, and one bounded live Firecrawl request reached `observedSuccess` with a partial job showing 10 live provider results with unknown quote totals, unknown fit/service coverage, no realized saving, no order and no email.
@@ -17,7 +18,8 @@ The AgentMail dev webhook covers only `message.received` with an inbox scope, an
 Jev credential and model access was verified earlier, but this SF run did not exercise the complete Jev/OpenAI chain.
 No `OPENAI_API_KEY` is available, so S-21/D-12 and dependent live model work remain blocked.
 The Firecrawl app allowance is hard bounded at 100000 micro-USD with no paid overage authorized.
-A separate GPT-6 Astra review of `44e7361` returned `CHANGES REQUIRED` with seven blockers, and two OpenCode repair packages are in progress; none of the blockers is marked fixed.
+A separate GPT-6 Astra review of `44e7361` returned `CHANGES REQUIRED` with seven blockers.
+OpenCode repair PRs #30 and #31 are delivered and individually green, but none of the seven blockers is accepted until the combined fixed commit passes its own CI and a fresh Astra review.
 Greptile review is unavailable because the 50-credit trial is exhausted, and Devin review was skipped because its trial expired.
 ChatGPT Sites public origin and production Convex deployment remain incomplete, so published-origin outcomes remain unverified.
 

@@ -48,7 +48,8 @@ This file supplies order, not duplicate contracts or a running automation.
    The Netherlands/EUR benchmark remains separately incomplete.
    - [ ] A separate GPT-6 Astra review of `44e7361` ran 235 focused passing tests plus typecheck and exact-head CI inspection, corroborated the real dev data, and returned `CHANGES REQUIRED` with seven blockers.
    The blockers are cross-org allowance multiplication, unrelated-brief admission, stale requirement dispatch, punctuation/replay conflict, research pages labeled suppliers/quotes, terminal replay misreported as failure, and dispatch suite omitted from CI.
-   Two OpenCode implementation packages are in progress; none of the seven blockers is marked fixed.
+   OpenCode repair PRs #30 and #31 are delivered and individually green.
+   None of the seven blockers is accepted until the combined fixed commit passes its own CI and a fresh Astra review.
    - [ ] Greptile review is unavailable because the 50-credit trial is exhausted, and Devin review was skipped because its trial expired.
    Neither is represented as approval.
 7. [ ] **Publication and closeout.** Hand the tested pushed revision to ChatGPT Sites for owner-authorized publication with public access.
@@ -170,7 +171,7 @@ This file supplies order, not duplicate contracts or a running automation.
 - [x] Record that no `OPENAI_API_KEY` is available, that a ChatGPT/Codex subscription or Luna coding model is not an application API key, and that S-21/D-12 and dependent live model work remain blocked.
 - [x] Record that the Firecrawl app allowance is hard bounded at 100000 micro-USD with no paid overage authorized.
 - [x] Inspect the populated state, empty state, keyboard tab order and partial Recovery state in a dev browser at desktop and 390x844 widths; the partial Recovery experience is incomplete.
-- [ ] Obtain a separate Astra ACCEPT on the `44e7361` line after the seven blockers are repaired; the current verdict is `CHANGES REQUIRED` and two OpenCode repair packages are in progress.
+- [ ] Obtain a separate Astra ACCEPT on the combined fixed line after the seven blockers are repaired; PRs #30 and #31 are delivered and individually green, but the current accepted verdict remains `CHANGES REQUIRED` on `44e7361`.
 
 The completed money and Jev proof wave contains controlled proofs only, reviewed at `595d30c` with no actionable findings remaining.
 Luna owned `proofs/money/**`; Muse Spark owned `proofs/jev/**`; Astra owned shared tooling, integration and progress files.

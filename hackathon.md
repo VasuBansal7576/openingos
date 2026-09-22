@@ -667,8 +667,8 @@ Desktop and 390x844 dev browser inspection covered the populated SF state, the e
 The partial Recovery experience is incomplete.
 A separate GPT-6 Astra review of `44e7361` ran 235 focused passing tests plus typecheck and exact-head CI inspection, corroborated the real dev data, and returned `CHANGES REQUIRED` with seven blockers.
 The blockers are cross-org allowance multiplication, unrelated-brief admission, stale requirement dispatch, punctuation/replay conflict, research pages labeled suppliers/quotes, terminal replay misreported as failure, and dispatch suite omitted from CI.
-Two OpenCode implementation packages are in progress.
-None of the seven blockers is marked fixed.
+OpenCode repair PRs #30 and #31 are delivered and individually green.
+None of the seven blockers is accepted until the combined fixed commit passes its own CI and a fresh Astra review.
 Greptile review is unavailable because the 50-credit trial is exhausted, and Devin review was skipped because its trial expired.
 Neither is represented as approval.
 This checkpoint changes documentation only: `ROADMAP.md`, `README.md`, `docs/verification/evidence-matrix.md` and this log.
