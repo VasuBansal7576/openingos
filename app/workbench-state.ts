@@ -467,6 +467,24 @@ export function formatStateLabel(value: string): string {
     .replace(/^./, (character) => character.toUpperCase());
 }
 
+/**
+ * Astra honesty gate: quote-review and selected-offer actions are available
+ * only for a current compatible quote from a real vendor with an exact
+ * applicable decision basis (the authoritative comparable total). A generic
+ * research lead — no vendor, no quote, an incompatible variant, a superseded
+ * version, or an incomplete total — stays inspectable through its accurately
+ * labeled source record, never through quote actions.
+ */
+export function hasCurrentReviewableQuote(offer: WorkbenchOffer): boolean {
+  return (
+    offer.vendor !== null &&
+    offer.compatibility === "pass" &&
+    offer.quote !== null &&
+    offer.quote.superseded === false &&
+    offer.quote.comparableTotalMinorUnits !== null
+  );
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }

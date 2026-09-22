@@ -1303,3 +1303,75 @@ test("a denied projection load throws instead of returning an empty projection",
     "The project projection could not be read (forged-identity: unauthenticated). Retry to re-establish the backend identity.",
   );
 });
+
+test("selection stays disabled without a current compatible quote with an exact total", async () => {
+  const loadAdapter = async (value: Record<string, unknown>, calls: MutationCall[], mutationResult: unknown) => {
+    const controls = controlledWatch(() => value);
+    const adapter = createConvexWorkbenchAdapter(actionClient(value, controls.watch, calls, mutationResult));
+    await adapter.load("project-1");
+    return adapter;
+  };
+  const base = actionProjection();
+  const candidate = (base.candidates as readonly Record<string, unknown>[])[0]!;
+
+  const incompatibleCalls: MutationCall[] = [];
+  const incompatible = await loadAdapter(
+    { ...base, candidates: [{ ...candidate, compatibility: "fail" }] },
+    incompatibleCalls,
+    { ok: true },
+  );
+  await expect(incompatible.act({ type: "selectOffer", projectId: "project-1", offerId: "candidate-1", quoteId: "quote-1", quoteVersion: "v1" })).resolves.toEqual({
+    ok: false,
+    message: "Selection needs a current compatible quote with an exact total. Nothing was sent.",
+  });
+  expect(incompatibleCalls).toHaveLength(0);
+
+  const quote = candidate.latestValidQuote as Record<string, unknown>;
+  const incompleteCalls: MutationCall[] = [];
+  const incomplete = await loadAdapter(
+    { ...base, candidates: [{ ...candidate, latestValidQuote: { ...quote, totalMinorUnits: 1590000, comparableTotalMinorUnits: null } }] },
+    incompleteCalls,
+    { ok: true },
+  );
+  await expect(incomplete.act({ type: "selectOffer", projectId: "project-1", offerId: "candidate-1", quoteId: "quote-1", quoteVersion: "v1" })).resolves.toEqual({
+    ok: false,
+    message: "Selection needs a current compatible quote with an exact total. Nothing was sent.",
+  });
+  expect(incompleteCalls).toHaveLength(0);
+
+  const vendorlessCalls: MutationCall[] = [];
+  const { vendor: _vendor, ...vendorless } = candidate;
+  const vendorlessAdapter = await loadAdapter(
+    { ...base, candidates: [vendorless] },
+    vendorlessCalls,
+    { ok: true },
+  );
+  await expect(vendorlessAdapter.act({ type: "selectOffer", projectId: "project-1", offerId: "candidate-1", quoteId: "quote-1", quoteVersion: "v1" })).resolves.toEqual({
+    ok: false,
+    message: "Selection needs a current compatible quote with an exact total. Nothing was sent.",
+  });
+  expect(vendorlessCalls).toHaveLength(0);
+});
+
+test("terminal replay states are successful existing-job results with no second request", async () => {
+  const states = ["running", "completed", "partial", "waitingForSupplier", "waitingForUser"] as const;
+  for (const state of states) {
+    const calls: MutationCall[] = [];
+    const controls = controlledWatch(() => actionProjection());
+    const adapter = createConvexWorkbenchAdapter(actionClient(
+      actionProjection(),
+      controls.watch,
+      calls,
+      { ok: true, jobId: "job-existing", operationId: "operation-existing", state, requestCount: 1, incompleteCount: 0, controlled: false },
+    ));
+    await adapter.load("project-1");
+    const result = await adapter.act({ type: "startResearch", projectId: "project-1" });
+    expect(result.ok).toBe(true);
+    expect(result.message).toContain("no second provider request was made");
+    expect(result.message).not.toContain("did not return a queued research state");
+    // The deterministic idempotency key means the replay reused the
+    // existing job: exactly one mutation, no follow-up provider call.
+    expect(calls).toHaveLength(1);
+    expect(getFunctionName(calls[0]?.reference as FunctionReference<"mutation">)).toBe("research/collection:requestBoundedResearch");
+  }
+});
