@@ -788,7 +788,7 @@ function InboxView({ snapshot, onAction, onMessage }: { readonly snapshot: Workb
  * fake recovery action.
  */
 function jobStateSummary(job: WorkbenchSnapshot["jobs"][number]): string {
-  if (job.state === "partial") return "Partial provider outcome: completed branches are kept and the remaining branch did not report.";
+  if (job.state === "partial") return "Partial provider outcome: recorded evidence is retained and the remaining scope has no recorded outcome in this projection.";
   if (job.state === "pausedBudget") return "Paused before spending provider allowance: no provider cost accrues while paused.";
   if (job.delivery === "unknown") return "Provider outcome unknown: the reservation is retained while reconciliation runs.";
   if (job.state === "failed") return "Ended without a usable provider outcome: completed evidence stays visible.";
