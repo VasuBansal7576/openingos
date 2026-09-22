@@ -261,6 +261,7 @@ function openingArgs(key: string) {
     workspaceKind: "private" as const,
     region: "Netherlands",
     currency: "EUR",
+    detailSummary: "Open a café on the Northside; rent a place and buy everything needed.",
   };
 }
 
@@ -364,6 +365,7 @@ describe("P-01 intake boundary", () => {
       workspaceKind: "private",
       region: "Netherlands",
       currency: "EUR",
+      detailSummary: "Open a second counter; rent a place and buy everything needed.",
     });
     if (!second.ok) throw new Error(`second intake failed: ${JSON.stringify(second)}`);
     expect(second.organizationId).toBe(first.organizationId);
@@ -387,6 +389,7 @@ describe("P-01 intake boundary", () => {
       workspaceKind: "guest",
       region: "Netherlands",
       currency: "EUR",
+      detailSummary: "Open a guest counter; rent a place and buy everything needed.",
     });
     if (!guest.ok) throw new Error(`guest intake failed: ${JSON.stringify(guest)}`);
     const guestView = await asOwner.query(getProjectionRef, { projectId: guest.projectId, limit: 1 });
@@ -400,6 +403,7 @@ describe("P-01 intake boundary", () => {
       workspaceKind: "guest",
       region: "Netherlands",
       currency: "EUR",
+      detailSummary: "Open a second guest counter; rent a place and buy everything needed.",
     });
     if (!secondGuest.ok) throw new Error(`second guest intake failed: ${JSON.stringify(secondGuest)}`);
     expect(secondGuest.organizationId).toBe(guest.organizationId);
@@ -420,6 +424,7 @@ describe("P-01 intake boundary", () => {
       projectName: "Broken café",
       workspaceKind: "private",
       currency: "EUR",
+      detailSummary: "Open a broken café; rent a place and buy everything needed.",
     });
     expect(denied.ok).toBe(false);
     if (denied.ok) throw new Error("opening without a region must fail");
@@ -485,6 +490,7 @@ describe("F6 temporary organization reuse preserves the authority horizon", () =
       workspaceKind: "private",
       region: "Netherlands",
       currency: "EUR",
+      detailSummary: "Open a temporary reuse counter; rent a place and buy everything needed.",
     });
     if (!result.ok) throw new Error(`intake failed: ${JSON.stringify(result)}`);
     expect(result.deduplicated).toBe(false);
@@ -509,6 +515,7 @@ describe("F6 temporary organization reuse preserves the authority horizon", () =
       workspaceKind: "private",
       region: "Netherlands",
       currency: "EUR",
+      detailSummary: "Open a temporary reuse counter; rent a place and buy everything needed.",
     });
     if (!replay.ok) throw new Error(`replay failed: ${JSON.stringify(replay)}`);
     expect(replay.deduplicated).toBe(true);
@@ -579,6 +586,7 @@ describe("F6 temporary organization reuse preserves the authority horizon", () =
       workspaceKind: "private",
       region: "Netherlands",
       currency: "EUR",
+      detailSummary: "Open a permanent coexistence counter; rent a place and buy everything needed.",
     });
     if (!result.ok) throw new Error(`intake failed: ${JSON.stringify(result)}`);
     // The strongest horizon is permanent, so the reuse is permanent even
@@ -598,6 +606,7 @@ describe("F6 temporary organization reuse preserves the authority horizon", () =
       workspaceKind: "private",
       region: "Netherlands",
       currency: "EUR",
+      detailSummary: "Open a permanent org counter; rent a place and buy everything needed.",
     });
     if (!second.ok) throw new Error(`second intake failed: ${JSON.stringify(second)}`);
     expect(second.organizationId).toBe(sameOrg.organizationId);
@@ -623,9 +632,118 @@ describe("F6 temporary organization reuse preserves the authority horizon", () =
       workspaceKind: "private",
       region: "Netherlands",
       currency: "EUR",
+      detailSummary: "Open another tenant workspace; rent a place and buy everything needed.",
     });
     if (!result.ok) throw new Error(`other tenant intake failed: ${JSON.stringify(result)}`);
     expect(result.organizationId).not.toBe(seeded.organizationId);
     expect(result.deduplicated).toBe(false);
+  });
+});
+
+describe("opening brief persistence (live browser defect)", () => {
+  const LIVE_SUMMARY =
+    "Open a coffee shop in San Francisco; rent a place and buy everything needed for the coffee shop; budget USD 250,000-500,000.";
+  const LIVE_TITLE = "San Francisco coffee shop real estate and equipment";
+  const LIVE_CATEGORY = "coffee shop opening";
+  const LIVE_REGION = "San Francisco, CA";
+
+  function liveOpeningArgs(key: string) {
+    return {
+      idempotencyKey: key,
+      mode: "opening" as const,
+      projectName: "San Francisco Coffee Shop Opening",
+      workspaceKind: "private" as const,
+      region: LIVE_REGION,
+      currency: "USD",
+      budgetMinorUnits: 50_000_000,
+      detailTitle: LIVE_TITLE,
+      detailCategory: LIVE_CATEGORY,
+      detailSummary: LIVE_SUMMARY,
+    };
+  }
+
+  test("opening persists the exact brief, title, category, region, and budget", async () => {
+    const t = createKit();
+    const asOwner = t.withIdentity(OWNER);
+    const result = await asOwner.mutation(createWorkspaceRef, liveOpeningArgs("live-opening-1"));
+    if (!result.ok) throw new Error(`live opening intake failed: ${JSON.stringify(result)}`);
+    expect(result.deduplicated).toBe(false);
+
+    const stored = await t.run(async (ctx) => {
+      const requirements = await ctx.db
+        .query("requirements")
+        .withIndex("by_organization_and_project", (q) =>
+          q.eq("organizationId", result.organizationId).eq("projectId", result.projectId),
+        )
+        .collect();
+      const project = await ctx.db.get(result.projectId);
+      return { requirements, project };
+    });
+    expect(stored.requirements).toHaveLength(1);
+    const requirement = stored.requirements[0];
+    expect(requirement?.key).toBe("opening-scope");
+    expect(requirement?.title).toBe(LIVE_TITLE);
+    expect(requirement?.category).toBe(LIVE_CATEGORY);
+    expect(requirement?.hardConstraints).toBe(
+      `Primary region: ${LIVE_REGION}\nOpening brief: ${LIVE_SUMMARY}`,
+    );
+    expect(requirement?.budgetMinorUnits).toBe(50_000_000);
+    expect(requirement?.currency).toBe("USD");
+    expect(stored.project?.currency).toBe("USD");
+    expect(stored.project?.budgetMinorUnits).toBe(50_000_000);
+  });
+
+  test("opening trims the brief and falls back only when title/category are absent", async () => {
+    const t = createKit();
+    const asOwner = t.withIdentity(OWNER);
+    const result = await asOwner.mutation(createWorkspaceRef, {
+      idempotencyKey: "live-opening-trim-1",
+      mode: "opening",
+      projectName: "San Francisco Coffee Shop Opening",
+      workspaceKind: "private",
+      region: LIVE_REGION,
+      currency: "USD",
+      budgetMinorUnits: 50_000_000,
+      detailSummary: `  ${LIVE_SUMMARY}  `,
+    });
+    if (!result.ok) throw new Error(`trimmed opening intake failed: ${JSON.stringify(result)}`);
+    const stored = await t.run(async (ctx) =>
+      ctx.db
+        .query("requirements")
+        .withIndex("by_organization_and_project", (q) =>
+          q.eq("organizationId", result.organizationId).eq("projectId", result.projectId),
+        )
+        .collect(),
+    );
+    expect(stored).toHaveLength(1);
+    expect(stored[0]?.title).toBe("Opening purchasing scope");
+    expect(stored[0]?.category).toBe("equipment");
+    expect(stored[0]?.hardConstraints).toBe(
+      `Primary region: ${LIVE_REGION}\nOpening brief: ${LIVE_SUMMARY}`,
+    );
+  });
+
+  test("missing, empty, and whitespace opening briefs deny with zero writes", async () => {
+    const t = createKit();
+    const asOwner = t.withIdentity(OWNER);
+    const before = await asOwner.query(listProjectsRef, { limit: 10 });
+    if (!before.ok) throw new Error(`listing failed: ${JSON.stringify(before)}`);
+    const base = liveOpeningArgs("live-opening-missing-1");
+    const { detailSummary: _omitted, ...withoutBrief } = base;
+    void _omitted;
+    const attempts = [
+      { key: "live-opening-missing-1", args: withoutBrief },
+      { key: "live-opening-empty-1", args: { ...base, idempotencyKey: "live-opening-empty-1", detailSummary: "" } },
+      { key: "live-opening-blank-1", args: { ...base, idempotencyKey: "live-opening-blank-1", detailSummary: "   " } },
+    ];
+    for (const attempt of attempts) {
+      const denied = await asOwner.mutation(createWorkspaceRef, attempt.args);
+      expect(denied.ok).toBe(false);
+      if (denied.ok) throw new Error(`brief-less opening must fail: ${attempt.key}`);
+      expect(denied.code).toBe("invalid-payload");
+    }
+    const after = await asOwner.query(listProjectsRef, { limit: 10 });
+    if (!after.ok) throw new Error(`listing failed: ${JSON.stringify(after)}`);
+    expect(after.projects).toHaveLength(before.projects.length);
   });
 });
