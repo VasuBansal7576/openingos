@@ -249,10 +249,67 @@ export function attributedGlobalHold(
   }
   return 0;
 }
+
+/**
+ * Exact unresolved-leg attribution for one reservation row.
+ *
+ * Mirrors `attributedGlobalHold` for the aggregate's unresolved exposure:
+ * an explicit `globalUnresolvedMicroUsd` marker is authoritative; a valid
+ * pre-global legacy row (no marker, created no later than the singleton)
+ * is attributed its current org-side unresolved amount; a post-global row
+ * without a marker never funded the aggregate and attributes zero.
+ *
+ * The legacy fallback is sound without inferring ownership from the
+ * aggregate balance: every production mutation that changes a
+ * reservation's unresolved amount moves the same delta on the aggregate
+ * in the same mutation (settlement retains, reads spend), and unbound
+ * post-global rows are excluded by age. Attribution therefore never
+ * exceeds what was seeded or moved in lockstep for that row.
+ *
+ * A null aggregate means no global accounting exists at all: zero.
+ */
+export function attributedGlobalUnresolved(
+  reservation: {
+    readonly globalUnresolvedMicroUsd?: number;
+    readonly unresolvedMicroUsd: number;
+    readonly _creationTime: number;
+  },
+  global: { readonly _creationTime: number } | null,
+): number {
+  if (global === null) return 0;
+  const explicit = reservation.globalUnresolvedMicroUsd;
+  if (typeof explicit === "number") return explicit;
+  if (reservation._creationTime <= global._creationTime) {
+    return reservation.unresolvedMicroUsd;
+  }
+  return 0;
+}
+
+/** Both aggregate legs attributed to one reservation row. */
+export interface GlobalAttribution {
+  readonly reserved: number;
+  readonly unresolved: number;
+}
+
+export function attributedGlobalExposure(
+  reservation: {
+    readonly globalReservedMicroUsd?: number;
+    readonly globalUnresolvedMicroUsd?: number;
+    readonly reservedMicroUsd: number;
+    readonly unresolvedMicroUsd: number;
+    readonly _creationTime: number;
+  },
+  global: { readonly _creationTime: number } | null,
+): GlobalAttribution {
+  return {
+    reserved: attributedGlobalHold(reservation, global),
+    unresolved: attributedGlobalUnresolved(reservation, global),
+  };
+}
 /**
  * Mirror one settlement leg to the global aggregate. Called in the same
  * mutation as the org settlement so ledgers stay paired. The moved amount
- * is the acting reservation's own attribution (see
+ * is the acting reservation's own reserved attribution (see
  * `attributedGlobalHold`): the aggregate moves only exposure actually
  * attributed to that reservation, never an unproven share of another
  * tenant's hold. Unbound attributions are a no-op. Strict: an attributed
@@ -260,20 +317,36 @@ export function attributedGlobalHold(
  * throws (fail closed) instead of clamping with Math.max and silently
  * masking it. Legacy deployments without a global row keep org-only
  * accounting.
+ *
+ * Returns the reservation's updated global markers so the caller can
+ * persist them on the reservation row in the same mutation and keep the
+ * per-reservation attribution exact across later reads and settlements,
+ * or null when no global move happened (no aggregate row, or a fully
+ * unbound reservation) so the caller leaves markers untouched.
  */
 export async function settleGlobalReservation(
   ctx: F1MutationCtx,
   mode: "spend" | "release" | "retainUnknown",
   reservation: {
     readonly globalReservedMicroUsd?: number;
+    readonly globalUnresolvedMicroUsd?: number;
     readonly reservedMicroUsd: number;
+    readonly unresolvedMicroUsd: number;
     readonly _creationTime: number;
   },
-): Promise<void> {
+): Promise<GlobalAttribution | null> {
   const global = await getGlobalAllowance(ctx);
+  if (global === null) return null;
   const attributed = attributedGlobalHold(reservation, global);
-  if (attributed <= 0) return;
-  if (global === null || global.reservedMicroUsd < attributed) {
+  const attributedUnresolved = attributedGlobalUnresolved(reservation, global);
+  if (attributed <= 0) {
+    // No reserved hold to move: a fully unbound reservation is a no-op,
+    // while a row that already carries unresolved attribution gets its
+    // markers pinned without touching the aggregate.
+    if (attributedUnresolved <= 0) return null;
+    return { reserved: 0, unresolved: attributedUnresolved };
+  }
+  if (global.reservedMicroUsd < attributed) {
     throw new Error("deployment allowance ledger drift: global reserved cannot cover settlement");
   }
   const now = Date.now();
@@ -283,17 +356,20 @@ export async function settleGlobalReservation(
       spentMicroUsd: global.spentMicroUsd + attributed,
       updatedAt: now,
     });
+    return { reserved: 0, unresolved: attributedUnresolved };
   } else if (mode === "retainUnknown") {
     await ctx.db.patch(global._id, {
       reservedMicroUsd: global.reservedMicroUsd - attributed,
       unresolvedMicroUsd: global.unresolvedMicroUsd + attributed,
       updatedAt: now,
     });
+    return { reserved: 0, unresolved: attributedUnresolved + attributed };
   } else {
     await ctx.db.patch(global._id, {
       reservedMicroUsd: global.reservedMicroUsd - attributed,
       updatedAt: now,
     });
+    return { reserved: 0, unresolved: attributedUnresolved };
   }
 }
 
