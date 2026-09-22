@@ -23,6 +23,7 @@ import {
   MAX_OPERATIONS_PER_JOB,
 } from "../shared/scope.js";
 import { checkProjectAccess, denialValidator, identityOf } from "../access/checks.js";
+import { getGlobalAllowance, settleGlobalReservation, attributedGlobalExposure } from "./allowance.js";
 import {
   MAX_RECONCILIATION_READS,
   RECONCILIATION_RETRY_OWNER,
@@ -48,6 +49,12 @@ async function settleReservation(
   if (reservation === null) return;
   const amount = reservation.reservedMicroUsd;
   const budget = await ctx.db.get(reservation.budgetId);
+  // The reservation's global markers are refreshed below from the same
+  // settlement that moves the aggregate, so per-reservation attribution
+  // stays exact across later reads and settlements. Null means no global
+  // move happened (no aggregate row, or a fully unbound reservation) and
+  // markers are left untouched.
+  let markerUpdate: { readonly reserved: number; readonly unresolved: number } | null = null;
   if (budget !== null) {
     if (mode === "spend") {
       await ctx.db.patch(reservation.budgetId, {
@@ -67,25 +74,39 @@ async function settleReservation(
         updatedAt: now,
       });
     }
+    // Mirror only this reservation's attributed global hold in the same
+    // mutation (see `attributedGlobalHold`): never another tenant's
+    // exposure. The strict primitive fails closed on genuine drift.
+    markerUpdate = await settleGlobalReservation(ctx, mode, reservation);
   }
+  const markerPatch =
+    markerUpdate === null
+      ? {}
+      : {
+        globalReservedMicroUsd: markerUpdate.reserved,
+        globalUnresolvedMicroUsd: markerUpdate.unresolved,
+      };
   if (mode === "spend") {
     await ctx.db.patch(reservation._id, {
       reservedMicroUsd: 0,
       spentMicroUsd: reservation.spentMicroUsd + amount,
       state: "closed",
       updatedAt: now,
+      ...markerPatch,
     });
   } else if (mode === "retainUnknown") {
     await ctx.db.patch(reservation._id, {
       reservedMicroUsd: 0,
       unresolvedMicroUsd: reservation.unresolvedMicroUsd + amount,
       updatedAt: now,
+      ...markerPatch,
     });
   } else {
     await ctx.db.patch(reservation._id, {
       reservedMicroUsd: 0,
       state: "closed",
       updatedAt: now,
+      ...markerPatch,
     });
   }
 }
@@ -396,16 +417,57 @@ async function admitReconciliationRead(
   }
   const fromReserved = Math.min(reservation.reservedMicroUsd, pricing.readCostMicroUsd);
   const fromUnknown = pricing.readCostMicroUsd - fromReserved;
+  // Atomicity: every denial precedes every write. The deployment-aggregate
+  // checks below run BEFORE the org-budget patch, so a global denial can
+  // never commit a partial org-side debit. Legacy fixtures without a
+  // global row keep org-only accounting. BOTH aggregate legs move only
+  // this reservation's attributed exposure (see
+  // `attributedGlobalExposure`): a reservation that never funded the
+  // aggregate cannot admit a read against another tenant's hold — reserved
+  // or unresolved — and fails closed here. In particular, an organization
+  // A read funded from A's unresolved exposure can never spend
+  // organization B's global unresolved exposure. Attribution decrements in
+  // lockstep with the reservation so a later settlement moves exactly the
+  // remainder. The unresolved leg stays an aggregate-level coverage check
+  // that fails closed on insufficiency.
+  const global = await getGlobalAllowance(ctx);
+  const globalAttribution = attributedGlobalExposure(reservation, global);
+  if (global !== null) {
+    if (globalAttribution.reserved < fromReserved) {
+      return { ok: false as const, code: "allowance-exhausted", message: "deployment reconciliation budget is not attributed to this reservation" };
+    }
+    if (globalAttribution.unresolved < fromUnknown) {
+      return { ok: false as const, code: "allowance-exhausted", message: "deployment reconciliation unresolved budget is not attributed to this reservation" };
+    }
+    if (global.reservedMicroUsd < fromReserved || global.unresolvedMicroUsd < fromUnknown) {
+      return { ok: false as const, code: "allowance-exhausted", message: "deployment reconciliation budget is exhausted" };
+    }
+  }
   await ctx.db.patch(reservation.budgetId, {
     reservedMicroUsd: budget.reservedMicroUsd - fromReserved,
     unresolvedMicroUsd: budget.unresolvedMicroUsd - fromUnknown,
     spentMicroUsd: budget.spentMicroUsd + pricing.readCostMicroUsd,
     updatedAt: Date.now(),
   });
+  if (global !== null) {
+    await ctx.db.patch(global._id, {
+      reservedMicroUsd: global.reservedMicroUsd - fromReserved,
+      unresolvedMicroUsd: global.unresolvedMicroUsd - fromUnknown,
+      spentMicroUsd: global.spentMicroUsd + pricing.readCostMicroUsd,
+      updatedAt: Date.now(),
+    });
+  }
   await ctx.db.patch(reservation._id, {
     reservedMicroUsd: reservation.reservedMicroUsd - fromReserved,
     unresolvedMicroUsd: reservation.unresolvedMicroUsd - fromUnknown,
     spentMicroUsd: reservation.spentMicroUsd + pricing.readCostMicroUsd,
+    // Pin both legs of the consumed attribution in the same mutation, so
+    // the next read or settlement moves exactly the remainder — never
+    // another tenant's exposure.
+    ...(global === null ? {} : {
+      globalReservedMicroUsd: globalAttribution.reserved - fromReserved,
+      globalUnresolvedMicroUsd: globalAttribution.unresolved - fromUnknown,
+    }),
     updatedAt: Date.now(),
   });
   await ctx.db.insert("attempts", {

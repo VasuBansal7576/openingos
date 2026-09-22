@@ -62,12 +62,11 @@ type W1CancelJobArgs = Record<string, unknown> & {
   readonly reason: string;
 };
 
-type W1StartJobArgs = Record<string, unknown> & {
+type W1RequestBoundedResearchArgs = Record<string, unknown> & {
   readonly organizationId: Id<"organizations">;
   readonly projectId: Id<"projects">;
-  readonly text: string;
-  readonly operationId: "research.collect";
-  readonly kind: "research";
+  readonly requirementId: Id<"requirements">;
+  readonly requirementVersion: number;
   readonly idempotencyKey: string;
 };
 
@@ -115,7 +114,9 @@ type W1PublicApi = {
   };
   readonly "execution/jobs": {
     readonly cancel: FunctionReference<"mutation", "public", W1CancelJobArgs, unknown>;
-    readonly start: FunctionReference<"mutation", "public", W1StartJobArgs, unknown>;
+  };
+  readonly "research/collection": {
+    readonly requestBoundedResearch: FunctionReference<"mutation", "public", W1RequestBoundedResearchArgs, unknown>;
   };
   readonly "domain/fulfillment": {
     readonly openServiceCase: FunctionReference<"mutation", "public", W1OpenServiceCaseArgs, unknown>;
@@ -145,7 +146,8 @@ const recordSelectionReference = decisionsApi.recordSelection;
 const decideApprovalReference = decisionsApi.decideApproval;
 const jobsApi = (api as unknown as W1PublicApi)["execution/jobs"];
 const cancelJobReference = jobsApi.cancel;
-const startJobReference = jobsApi.start;
+const researchApi = (api as unknown as W1PublicApi)["research/collection"];
+const requestBoundedResearchReference = researchApi.requestBoundedResearch;
 const fulfillmentApi = (api as unknown as W1PublicApi)["domain/fulfillment"];
 const openServiceCaseReference = fulfillmentApi.openServiceCase;
 const impactApi = (api as unknown as W1PublicApi)["domain/impact"];
@@ -248,6 +250,22 @@ const SAMPLE_IDEMPOTENCY_KEY_MAX_LENGTH = 128;
 const SERVICE_CASE_URGENCIES = ["urgent", "high", "normal", "low"] as const;
 
 const RESEARCH_COLLECT_OPERATION_ID = "research.collect" as const;
+
+/**
+ * Honest presentation for every backend ok:true research replay state. Each
+ * message names the actual existing-job state and states that no second
+ * provider request was made; only genuinely new queued work is described as
+ * a fresh queueing.
+ */
+const RESEARCH_REPLAY_MESSAGES: Readonly<Record<string, string>> = {
+  queued: "Research queued by the server; provider outcome is still pending.",
+  running: "Research is already running on the server; the existing job was kept and no second provider request was made.",
+  completed: "Research already completed on the server; the existing results stand and no second provider request was made.",
+  partial: "Research already returned partial results on the server; completed evidence remains visible and no second provider request was made.",
+  pausedBudget: "Research admitted but paused by the server: provider allowance exhausted. Completed evidence remains visible.",
+  waitingForSupplier: "Research is already waiting for the supplier on the server; the existing job was kept and no second provider request was made.",
+  waitingForUser: "Research is already waiting for user input on the server; the existing job was kept and no second provider request was made.",
+};
 
 /**
  * Deterministic browser-safe automatic-start key for one logical research
@@ -603,6 +621,12 @@ export function createConvexWorkbenchAdapter(client: ConvexWorkbenchClient): Con
       if (offer === undefined || offer.quote === null || offer.requirementId.trim().length === 0) {
         return { ok: false, message: ACTION_REQUIRES_CURRENT_PROJECTION };
       }
+      // Quote-review and selection actions stay disabled without a current
+      // compatible quote from a real vendor with an exact decision basis.
+      // An incomplete live source is inspectable, never selectable.
+      if (offer.vendor === null || offer.compatibility !== "pass" || offer.quote.comparableTotalMinorUnits === null) {
+        return { ok: false, message: "Selection needs a current compatible quote with an exact total. Nothing was sent." };
+      }
       const requirement = current.requirements.find((candidate) => candidate.id === offer.requirementId);
       if (
         requirement === undefined ||
@@ -830,17 +854,23 @@ export function createConvexWorkbenchAdapter(client: ConvexWorkbenchClient): Con
         requirement.title.trim().length === 0 ||
         requirement.category.trim().length === 0 ||
         requirement.quantity.trim().length === 0 ||
-        requirement.unit.trim().length === 0
+        requirement.unit.trim().length === 0 ||
+        !Number.isSafeInteger(requirement.version) ||
+        requirement.version < 0
       ) {
         return { ok: false, message: "The current requirement is incomplete, so research was not started." };
       }
-      const text = `Research suppliers for purchasing requirement ${requirement.key}: ${requirement.title} (${requirement.category}).`;
-      const args: W1StartJobArgs = {
+      // One explicit click admits and schedules one bounded Firecrawl search
+      // for the exact validated requirement above. The server re-enforces
+      // owner/approver authority, the research.collect capability, the exact
+      // project/requirement binding, and the shared provider allowance; the
+      // idempotency key makes an exact replay return the original job with
+      // no second provider call.
+      const args: W1RequestBoundedResearchArgs = {
         organizationId,
         projectId,
-        text,
-        operationId: "research.collect",
-        kind: "research",
+        requirementId: requirement.id as Id<"requirements">,
+        requirementVersion: requirement.version,
         idempotencyKey: researchStartIdempotencyKey(
           current.project.id,
           requirement.id,
@@ -852,14 +882,24 @@ export function createConvexWorkbenchAdapter(client: ConvexWorkbenchClient): Con
       const mutationGeneration = readVersions.get(projectId) ?? 0;
       let settlement: MutationSettlement = "uncertain";
       try {
-        const result = await client.mutation(startJobReference, args);
+        const result = await client.mutation(requestBoundedResearchReference, args);
         settlement = mutationSettlement(result);
         const failure = mutationFailure(result, "The server did not queue research.");
         if (failure !== null) return failure;
-        if (!isRecord(result) || result.state !== "queued") {
-          return { ok: false, message: "The server did not return a queued research state." };
+        if (!isRecord(result) || typeof result.state !== "string") {
+          return { ok: false, message: "The server did not return a research state." };
         }
-        return { ok: true, message: "Research queued by the server; provider outcome is still pending." };
+        // A backend ok:true is a successful existing-job result in every
+        // terminal replay state — queued, running, completed, partial, or
+        // pausedBudget — never a start failure. The deterministic
+        // idempotency key above means the replay issued no second provider
+        // request; the UI presents the actual honest state instead.
+        const replayMessage = RESEARCH_REPLAY_MESSAGES[result.state];
+        return {
+          ok: true,
+          message: replayMessage
+            ?? `Research replay returned the existing job in state ${result.state}; completed evidence remains visible and no second provider request was made.`,
+        };
       } catch (error) {
         return { ok: false, message: error instanceof Error ? error.message : "The server did not queue research." };
       } finally {

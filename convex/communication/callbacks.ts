@@ -366,7 +366,7 @@ async function operationForProviderMessage(
   if (expected === null) return null;
   const indexedRows: StoredBindingRow[] = await ctx.db
     .query("processedEvents")
-    .withIndex("by_provider_environment_and_provider_message_and_thread_and_inbox", (q) =>
+    .withIndex("by_provider_environment_message_thread_inbox", (q) =>
       q
         .eq("provider", "agentmail-binding")
         .eq("environment", "live")
@@ -1135,7 +1135,7 @@ export const ingestMessage = f1InternalMutation({
       // a different event id must not create a second waiting row.
       const retained = await ctx.db
         .query("processedEvents")
-        .withIndex("by_provider_environment_and_provider_message_and_thread_and_inbox", (q) =>
+        .withIndex("by_provider_environment_message_thread_inbox", (q) =>
           q
             .eq("provider", "agentmail-inbound")
             .eq("environment", "live")
@@ -1272,7 +1272,7 @@ export const resumeWaitingInbound = f1InternalMutation({
     const parsed = normalizedInboundMessage(parsedValue);
     const retained = await ctx.db
       .query("processedEvents")
-      .withIndex("by_provider_environment_and_provider_message_and_thread_and_inbox", (q) =>
+      .withIndex("by_provider_environment_message_thread_inbox", (q) =>
         q
           .eq("provider", "agentmail-inbound")
           .eq("environment", "live")
@@ -1365,7 +1365,7 @@ export const prepareOversizedRecovery = f1InternalMutation({
     }
     const retained = await ctx.db
       .query("processedEvents")
-      .withIndex("by_provider_environment_and_provider_message_and_thread_and_inbox", (q) =>
+      .withIndex("by_provider_environment_message_thread_inbox", (q) =>
         q
           .eq("provider", "agentmail-inbound")
           .eq("environment", "live")
@@ -1591,7 +1591,7 @@ export const claimRecoveryRead = f1InternalMutation({
     }
     const retained = await ctx.db
       .query("processedEvents")
-      .withIndex("by_provider_environment_and_provider_message_and_thread_and_inbox", (q) =>
+      .withIndex("by_provider_environment_message_thread_inbox", (q) =>
         q
           .eq("provider", "agentmail-inbound")
           .eq("environment", "live")
@@ -1694,7 +1694,7 @@ export const settleRecoveryRun = f1InternalMutation({
     }
     const retained = await ctx.db
       .query("processedEvents")
-      .withIndex("by_provider_environment_and_provider_message_and_thread_and_inbox", (q) =>
+      .withIndex("by_provider_environment_message_thread_inbox", (q) =>
         q
           .eq("provider", "agentmail-inbound")
           .eq("environment", "live")
@@ -1803,7 +1803,7 @@ export const watchdogRecoveryRun = f1InternalMutation({
     if (threadId !== undefined && inboxId !== undefined && messageId !== undefined) {
       const retained = await ctx.db
         .query("processedEvents")
-        .withIndex("by_provider_environment_and_provider_message_and_thread_and_inbox", (q) =>
+        .withIndex("by_provider_environment_message_thread_inbox", (q) =>
           q
             .eq("provider", "agentmail-inbound")
             .eq("environment", "live")

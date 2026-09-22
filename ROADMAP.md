@@ -38,9 +38,27 @@ This file supplies order, not duplicate contracts or a running automation.
 6. [ ] **V1, proof and review.** A separate Astra session reviews a fixed combined commit; implementation owners repair its findings.
    Prove all 52 P/H/D requirements, 24 S-cases and 7 J-cases, recording live versus controlled evidence and any unmet case.
    Exercise the real owner-email negotiation, Jev decisions, browser recovery, guest isolation and responsive UI; an early working path is not completion.
+   - [x] PR #27 head `728fc19`, PR #28 head `46a7450` and PR #29 head `8f2deb31263a5bb715f1f248bcee2e3a1c3a6ed5` merged into integration at merge commit `44e73618beb562a198c1eeafcfd045ff42ea928c`.
+   Exact-head CI was green on the merged PR heads.
+   - [x] Dev Convex deployment `polite-minnow-494` was updated with `npx convex dev --once` and reported Convex functions ready.
+   This is dev evidence only, not production and not a public origin.
+   - [x] One bounded live Firecrawl request ran against dev; the persisted operation and attempt are `observedSuccess` and the job is partial.
+   The UI rendered 10 live provider results with unknown quote totals, unknown fit and service coverage, no realized saving, no order and no email.
+   These are live research pages, not verified suppliers, leases, quotes, purchases or commercial outcomes.
+   The Netherlands/EUR benchmark remains separately incomplete.
+   - [x] A separate GPT-6 Astra review of `44e7361` ran 235 focused passing tests plus typecheck and exact-head CI inspection, corroborated the real dev data, and returned `CHANGES REQUIRED` with seven blockers.
+   The blockers are cross-org allowance multiplication, unrelated-brief admission, stale requirement dispatch, punctuation/replay conflict, research pages labeled suppliers/quotes, terminal replay misreported as failure, and dispatch suite omitted from CI.
+   - [x] OpenCode repair PR #30 head `6024328`, PR #31 head `c1fdf54` and source-visibility PR #34 head `e8ceb0b` are delivered, mergeable and green on every agreed application and repository check.
+   Coordinator review rejected two superficially green allowance repairs before integration: one could release another organization's aggregate hold, and one could commit an org-budget debit before returning a global denial.
+   The repaired combined local line through `2e80cc8` plus the source-only evidence filter at `11ae05c` passes the complete local suite, both strict TypeScript checks and the production build.
+   None of the seven blockers is accepted until the combined fixed commit passes its own CI and a fresh Astra review.
+   - [x] Greptile review is unavailable because the 50-credit trial is exhausted, and Devin review was skipped because its trial expired.
+   Neither is represented as approval.
 7. [ ] **Publication and closeout.** Hand the tested pushed revision to ChatGPT Sites for owner-authorized publication with public access.
    Verify the final public origin, hosted integrations and anonymous evaluator path; then update README and the build log.
    Give the owner the exact URL, commit and redacted evidence for their video, announcement and submission.
+   - [ ] ChatGPT Sites public origin and production Convex deployment remain incomplete.
+   No hosted success is claimed.
 
 ## Verified progress
 
@@ -134,7 +152,7 @@ This file supplies order, not duplicate contracts or a running automation.
 - [x] Obtain a fresh separate GPT-6 Astra fixed-head verdict at PR #14 head `1b2850c`; the result is `CHANGES REQUIRED` with six actionable findings and a complete 83-row audit.
 - [x] Obtain a separate GPT-6 Astra `ACCEPT` verdict on the final exact combined head before merge. After the six `7019827` findings were repaired, Astra found an oversized accepted-reply truncation and two remaining intake reconnect defects. Exact pushed PR #14 head `3fb685c` includes newest-marker recovery, dispatch-epoch fencing, removal of the adapter's eager stale projection load and reconnect-safe intake idempotency reconciliation. A separate GPT-6 Astra xhigh session accepted that exact clean head after 73 focused tests, four prior independent probes and two new fully mounted real-adapter probes; all evidence is controlled.
 - [ ] Fresh Greptile reviews are unavailable because the connected trial reports its 50-credit limit exhausted; prior actionable threads are resolved with exact commit evidence, but a skipped review is not treated as acceptance.
-- [ ] PRs #7 through #13 remain individually unmerged despite their code being present in the combined branch, because Greptile supplied only quota notices. Close through the fixed combined PR only after exact-head CI and fresh Astra acceptance.
+- [x] Merge PRs #7 through #13 through the fixed combined path only after exact-head CI and fresh Astra acceptance. GitHub marked all seven child PRs merged when accepted PR #14 entered their integration base at `6768aa7`; PR #2 then merged that identical reviewed tree to `main` at `1b350ed`, where all nine push checks passed.
 - [x] Deliver and integrate PR #19 at `13de40a` for accepted-prototype landing fidelity and PR #21 at `de78c48` for authenticated isolated sample guest projects. GitHub marked both merged when exact combined head `9957b2d` entered their base branch.
 - [x] Pass the complete local matrix at `9957b2d`: both strict TypeScript checks, production build, 23 repository tests, 77 proof tests, 15 evaluation tests, 342 F1 tests, 155 browser-executor tests, 117 application tests, 18 application Jev tests, 32 communication-contract tests and 527 direct Convex tests.
 - [x] Pass all 18 application and repository GitHub checks on exact PR #14 head `9957b2d`; GitHub reports the PR merge-clean. Greptile posted only its quota notice and Devin reports its review skipped, so the independent Astra gate remains open.
@@ -146,6 +164,17 @@ This file supplies order, not duplicate contracts or a running automation.
 - [x] Safely remove the completed E13, E15, E16, E17 and E18 task worktrees after clean-status and remote-preservation checks.
 - [x] Integrate the six repairs from Astra's rejection of `7019827` through code checkpoint `e40da16`: exact stored-draft and round authority, opaque draft-ID approval that issues the exact send grant, current quote and reply negotiation workloads, server-confirmed application authentication, separated paid-cash and settled-cost metrics, and lineage-independent placed-order impact. The complete local matrix, both strict TypeScript checks and production build pass with 554 direct Convex tests; all evidence is controlled.
 - [x] Close the three verified OpenCode Muse Spark high repair sessions and remove E19, E20 and E21 through Orca after their commits were pushed, integrated and independently rerun.
+- [x] Merge PR #27 (`728fc19`), PR #28 (`46a7450`) and PR #29 (`8f2deb31263a5bb715f1f248bcee2e3a1c3a6ed5`) into integration at `44e73618beb562a198c1eeafcfd045ff42ea928c` with exact-head CI green.
+- [x] Update dev Convex deployment `polite-minnow-494` with `npx convex dev --once` until Convex functions report ready; no production deployment or public origin is claimed.
+- [x] Persist a fresh anonymous real app intake on dev with the exact owner scenario: San Francisco Coffee Shop Opening, San Francisco CA, USD, upper budget USD 500000, title San Francisco coffee shop real estate and equipment, category coffee shop opening, and the stated brief.
+- [x] Run one bounded live Firecrawl request on dev to `observedSuccess` with a partial job; the UI shows 10 live provider results with unknown totals, unknown fit/service coverage, no saving, no order and no email.
+- [x] Configure the AgentMail dev webhook for only `message.received` with an inbox scope; no email send/reply round trip was observed.
+- [x] Record that Jev credential/model access was verified earlier while this SF run did not exercise the complete Jev/OpenAI chain.
+- [x] Record that no `OPENAI_API_KEY` is available, that a ChatGPT/Codex subscription or Luna coding model is not an application API key, and that S-21/D-12 and dependent live model work remain blocked.
+- [x] Record that the Firecrawl app allowance is hard bounded at 100000 micro-USD with no paid overage authorized.
+- [x] Inspect the populated state, empty state, keyboard tab order and partial Recovery state in a dev browser at desktop and 390x844 widths; the partial Recovery experience is incomplete.
+- [x] Deliver mergeable, exact-head-green repair PRs #30 at `6024328`, #31 at `c1fdf54` and #34 at `e8ceb0b`; coordinator review additionally proves legacy global-hold attribution and reconciliation-denial atomicity before accepting the backend branch.
+- [ ] Push the complete combined repair line, pass its exact-head GitHub checks and obtain a separate Astra ACCEPT; the current independent verdict remains `CHANGES REQUIRED` on earlier commit `35ad542` after five further findings were routed and repaired.
 
 The completed money and Jev proof wave contains controlled proofs only, reviewed at `595d30c` with no actionable findings remaining.
 Luna owned `proofs/money/**`; Muse Spark owned `proofs/jev/**`; Astra owned shared tooling, integration and progress files.

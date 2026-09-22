@@ -7,7 +7,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import App from "../App";
 import WorkbenchView from "../Workbench";
 import { AdapterAwareApp, appendWorkbenchActivity } from "../main";
-import { formatMoney, parseWorkbenchSnapshot, type WorkbenchAction, type WorkbenchActionResult } from "../workbench-state";
+import { formatMoney, hasCurrentReviewableQuote, parseWorkbenchSnapshot, type WorkbenchAction, type WorkbenchActionResult } from "../workbench-state";
 
 const projection = {
   ok: true,
@@ -388,7 +388,7 @@ async function mountSelectionFlow(
       }));
     });
     await act(async () => {
-      findButton("Review quote").click();
+      findButton("Review selected result").click();
     });
     return {
       container,
@@ -432,9 +432,19 @@ test("selection stays disabled without approval authority or an authoritative to
   }
   const incompleteQuote = await mountSelectionFlow(projection, true);
   try {
-    expect(incompleteQuote.findButton("Select exact quote").disabled).toBe(true);
-    await incompleteQuote.clickSelect();
+    // An incomplete live source stays inspectable but never reviewable: the
+    // quote-review buttons are disabled with zero writes, while the
+    // source-record action (owner mailbox exchange behind these terms)
+    // remains available.
+    const reviewUnavailable = incompleteQuote.findButton("Review unavailable");
+    expect(reviewUnavailable.disabled).toBe(true);
+    expect(reviewUnavailable.title).toContain("exact total");
+    const cta = incompleteQuote.findButton("Review selected result");
+    expect(cta.disabled).toBe(true);
+    expect(cta.title).toContain("exact total");
+    expect(incompleteQuote.container.querySelector('[role="dialog"]')).toBeNull();
     expect(incompleteQuote.actionCalls).toEqual([]);
+    expect(incompleteQuote.container.textContent).toContain("Original quote document");
     expect(incompleteQuote.container.textContent).toContain("Unknown");
   } finally {
     await incompleteQuote.cleanup();
@@ -1206,8 +1216,8 @@ test("contains service dialog focus, cycles first and last controls, handles Esc
 });
 
 test("gives assistant, evidence, and selection dialogs the shared modal keyboard contract", async () => {
-  const snapshot = parseWorkbenchSnapshot(projection, projection.project.id);
-  if (snapshot === null) throw new Error("W1 projection should parse");
+  const snapshot = parseWorkbenchSnapshot(twoOfferProjection(), projection.project.id);
+  if (snapshot === null) throw new Error("Two-offer projection should parse");
   const mounted = await mountEquipmentTab({ state: "ready", snapshot }, () => ({ ok: false, message: "controlled test refusal" }));
   const document = mounted.container.ownerDocument;
   const keyboardEvent = (key: string, shiftKey = false) => new document.defaultView!.KeyboardEvent("keydown", { bubbles: true, key, shiftKey });
@@ -1256,14 +1266,17 @@ test("gives assistant, evidence, and selection dialogs the shared modal keyboard
     if (!(assistant instanceof document.defaultView!.HTMLButtonElement)) throw new Error("Assistant opener not found");
     await exerciseModal(assistant as unknown as HTMLButtonElement);
 
-    await mounted.clickTab("Suppliers");
-    const evidence = mounted.container.querySelector('button[aria-label="Open evidence for Harbor Equipment"]');
+    await mounted.clickTab("Results");
+    const evidence = mounted.container.querySelector('button[aria-label="Inspect source for Harbor Equipment"]');
     if (!(evidence instanceof document.defaultView!.HTMLButtonElement)) throw new Error("Evidence opener not found");
     await exerciseModal(evidence as unknown as HTMLButtonElement);
 
     await mounted.clickTab("Project");
     const review = mounted.findButton("Review quote");
-    await exerciseModal(review, "Select exact quote");
+    // The two-offer fixture carries current compatible quotes with an exact
+    // basis, so review opens with selection enabled; the modal contract is
+    // what this exercises.
+    await exerciseModal(review);
   } finally {
     await mounted.cleanup();
   }
@@ -1362,22 +1375,25 @@ test("disables every mutation control while reconnecting and resumes after a fre
       root.render(createElement(WorkbenchView, { loadState: { state: "reconnecting", lastKnown: snapshot }, onAction }));
     });
     expect(findButton("Start bounded research").disabled).toBe(true);
+    // Quote review never opens from an incomplete source: the review control
+    // is disabled, no dialog appears, and zero actions are dispatched.
+    const reviewUnavailable = findButton("Review unavailable");
+    expect(reviewUnavailable.disabled).toBe(true);
     await act(async () => {
-      findButton("Review quote").click();
+      reviewUnavailable.click();
     });
-    expect(findButton("Select exact quote").disabled).toBe(true);
+    expect(container.querySelector('[role="dialog"]')).toBeNull();
     expect(actionCalls).toEqual([]);
-    await act(async () => {
-      const closeButton = container.querySelector('button[aria-label="Close decision review"]') as unknown as HTMLButtonElement | null;
-      if (closeButton === null) throw new Error("Decision review close button not found");
-      closeButton.click();
-    });
     await clickTab("Inbox");
     expect(findButton("Approve this decision").disabled).toBe(true);
-    expect(findButton("Retry bounded branch").disabled).toBe(true);
+    const inboxButtons = Array.from(container.querySelectorAll("button")).map((button) => button.textContent ?? "");
+    expect(inboxButtons.some((text) => text.includes("Retry bounded branch"))).toBe(false);
+    expect(container.textContent).toContain("reservation is retained");
     expect(findButton("Cancel").disabled).toBe(true);
     await clickTab("Recovery");
-    expect(findButton("Retry bounded branch").disabled).toBe(true);
+    const recoveryButtons = Array.from(container.querySelectorAll("button")).map((button) => button.textContent ?? "");
+    expect(recoveryButtons.some((text) => text.includes("Retry bounded branch"))).toBe(false);
+    expect(container.textContent).toContain("Retained in this projection:");
     expect(actionCalls).toEqual([]);
 
     await act(async () => {
@@ -1784,10 +1800,10 @@ test("renders the decision desk from real requirement and offer records", async 
     expect(mounted.container.textContent).toContain("Harbor Equipment");
     expect(mounted.container.textContent).toContain("Missing terms");
     expect(mounted.container.textContent).toContain("Validity not confirmed");
-    expect(mounted.container.textContent).toContain("Review selected offer");
-    expect(mounted.container.textContent).toContain("Ask about these quotes");
+    expect(mounted.container.textContent).toContain("Review selected result");
+    expect(mounted.container.textContent).toContain("Ask about these results");
     expect(mounted.container.textContent).toContain("No order is placed.");
-    expect(mounted.container.textContent).toContain("All 1 suppliers");
+    expect(mounted.container.textContent).toContain("All 1 results");
     expect(mounted.container.querySelector(".wb-comparison-tape")).toBeNull();
   } finally {
     await mounted.cleanup();
@@ -1854,7 +1870,7 @@ test("mixed native currencies stay visible without a frontend rank", async () =>
     expect(tape.textContent).toContain("Not comparable");
     expect(tape.textContent).toContain("No offer is ranked");
     expect(tape.textContent).not.toContain("lower than");
-    await mounted.clickTab("Suppliers");
+    await mounted.clickTab("Results");
     const prices = [...mounted.container.querySelectorAll(".wb-supplier-price strong")].map((node) => node.textContent ?? "");
     expect(prices.some((price) => price.includes("€"))).toBe(true);
     expect(prices.some((price) => price.includes("$"))).toBe(true);
@@ -1897,9 +1913,9 @@ test("bench actions open the real review dialog and assistant rail", async () =>
   if (snapshot === null) throw new Error("Two-offer projection should parse");
   const mounted = await mountE8Tab({ state: "ready", snapshot }, () => ({ ok: true, message: "controlled selection route" }));
   try {
-    expect(mounted.findButton("Review selected offer").disabled).toBe(false);
+    expect(mounted.findButton("Review selected result").disabled).toBe(false);
     await act(async () => {
-      mounted.findButton("Review selected offer").click();
+      mounted.findButton("Review selected result").click();
     });
     expect(mounted.container.textContent).toContain("DECISION REVIEW");
     expect(mounted.container.textContent).toContain("Selection is not an order.");
@@ -1910,7 +1926,7 @@ test("bench actions open the real review dialog and assistant rail", async () =>
     });
     expect(mounted.container.querySelector('[role="dialog"]')).toBeNull();
     await act(async () => {
-      mounted.findButton("Ask about these quotes").click();
+      mounted.findButton("Ask about these results").click();
     });
     expect(mounted.container.textContent).toContain("Ask about this decision.");
   } finally {
@@ -2062,16 +2078,19 @@ async function mountIntakeView(
 async function submitIntakeBudget(
   container: HTMLElement,
   dom: HappyWindow,
-  values: { readonly projectName: string; readonly region: string; readonly budget: string },
+  values: { readonly projectName: string; readonly region: string; readonly budget: string; readonly brief?: string },
 ): Promise<void> {
   const set = (name: string, value: string) => {
     const control = container.querySelector(`[name="${name}"]`);
-    if (!(control instanceof dom.window.HTMLInputElement)) throw new Error(`Control not found: ${name}`);
+    if (!(control instanceof dom.window.HTMLInputElement) && !(control instanceof dom.window.HTMLTextAreaElement)) {
+      throw new Error(`Control not found: ${name}`);
+    }
     (control as unknown as HTMLInputElement).value = value;
   };
   set("projectName", values.projectName);
   set("region", values.region);
   set("budget", values.budget);
+  set("detailSummary", values.brief ?? "Open a coffee shop in Amsterdam; rent a place and buy everything needed.");
   const button = Array.from(container.querySelectorAll("button")).find((candidate) =>
     candidate.textContent?.includes("Create workspace"),
   );
@@ -2117,7 +2136,7 @@ test("an over-precision intake budget is rejected before the intake route", asyn
       budget: "45000.555",
     });
     expect(seen).toHaveLength(0);
-    expect(mounted.container.textContent).toContain("whole euros and cents");
+    expect(mounted.container.textContent).toContain("up to two decimals");
   } finally {
     await mounted.cleanup();
   }
@@ -2408,8 +2427,8 @@ test("E16 compare journey keeps the decision desk above finance with paper-docum
   expect(html).toContain("wb-project-lower");
   expect(html).toContain("Everything on the table.");
   expect(html).toContain("Unknown charges stay visible.");
-  expect(html).toContain("An incomplete offer is not ranked as a saving.");
-  expect(html).toContain("All 1 suppliers");
+  expect(html).toContain("An incomplete result is not ranked as a saving.");
+  expect(html).toContain("All 1 results");
   const benchAt = html.indexOf("wb-bench-heading");
   const deskAt = html.indexOf("wb-desk-layout");
   const lowerAt = html.indexOf("wb-project-lower");
@@ -2606,7 +2625,7 @@ test("unsafe, malformed, and ambiguous budgets never reach the intake route", as
       });
       expect(seen).toHaveLength(0);
       const text = mounted.container.textContent ?? "";
-      expect(text.includes("whole euros and cents") || text.includes("too large to record safely")).toBe(true);
+      expect(text.includes("up to two decimals") || text.includes("too large to record safely")).toBe(true);
     } finally {
       await mounted.cleanup();
     }
@@ -2641,7 +2660,7 @@ test("non-Project tabs keep the readiness strip above the page content", async (
   if (snapshot === null) throw new Error("W1 projection should parse");
   const mounted = await mountE8Tab({ state: "ready", snapshot }, () => ({ ok: false, message: "controlled test refusal" }));
   try {
-    await mounted.clickTab("Suppliers");
+    await mounted.clickTab("Results");
     const app = mounted.container.querySelector(".wb-app");
     if (app === null) throw new Error("Workbench app not found");
     const appHtml = app.innerHTML;
@@ -2756,10 +2775,402 @@ test("narrow CSS hides no honest project, scope, or quote state from the markup"
     "Missing terms",
     "Validity not confirmed",
     "Unknown charges block an unqualified saving claim.",
-    "Review selected offer",
-    "Ask about these quotes",
+    "Review selected result",
+    "Ask about these results",
     "No order is placed.",
   ]) {
     expect(html).toContain(fact);
+  }
+});
+
+// -- Opening brief intake (P-01 opening mode) ---------------------------------
+
+function intakeField(
+  container: HTMLElement,
+  dom: HappyWindow,
+  label: string,
+): HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement {
+  const match = Array.from(container.querySelectorAll("label")).find(
+    (candidate) => candidate.textContent === label,
+  );
+  if (match === undefined || match.htmlFor.length === 0) throw new Error(`Label not found: ${label}`);
+  const control = container.querySelector(`#${match.htmlFor}`);
+  if (
+    !(control instanceof dom.window.HTMLInputElement) &&
+    !(control instanceof dom.window.HTMLTextAreaElement) &&
+    !(control instanceof dom.window.HTMLSelectElement)
+  ) {
+    throw new Error(`Control not found for label: ${label}`);
+  }
+  return control as unknown as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
+}
+
+async function submitMountedIntake(container: HTMLElement, dom: HappyWindow): Promise<void> {
+  const button = Array.from(container.querySelectorAll("button")).find((candidate) =>
+    candidate.textContent?.includes("Create workspace"),
+  );
+  if (!(button instanceof dom.window.HTMLButtonElement)) throw new Error("Submit button not found");
+  await act(async () => {
+    (button as unknown as HTMLButtonElement).click();
+  });
+}
+
+async function switchIntakeMode(container: HTMLElement, dom: HappyWindow, mode: string): Promise<void> {
+  const radio = container.querySelector(`input[type="radio"][value="${mode}"]`);
+  if (!(radio instanceof dom.window.HTMLInputElement)) throw new Error(`Intake mode radio not found: ${mode}`);
+  await act(async () => {
+    (radio as unknown as HTMLInputElement).click();
+  });
+}
+
+function hasIntakeLabel(container: HTMLElement, label: string): boolean {
+  return Array.from(container.querySelectorAll("label")).some(
+    (candidate) => candidate.textContent === label,
+  );
+}
+
+test("opening mode exposes the brief, title, category, and a currency-neutral ceiling", async () => {
+  const mounted = await mountIntakeView(async () => ({ ok: true, projectId: "project-labels" }));
+  try {
+    const brief = intakeField(mounted.container, mounted.dom, "Opening brief");
+    expect(brief.tagName.toLowerCase()).toBe("textarea");
+    expect(brief.closest(".wb-form-field")?.classList.contains("wb-form-field-full")).toBe(true);
+    expect((brief as unknown as HTMLTextAreaElement).placeholder).toContain("San Francisco");
+    intakeField(mounted.container, mounted.dom, "Opening title (optional)");
+    intakeField(mounted.container, mounted.dom, "Opening category (optional)");
+    intakeField(mounted.container, mounted.dom, "Budget upper limit in reporting currency (optional)");
+    const text = mounted.container.textContent ?? "";
+    expect(text.toLowerCase()).not.toContain("euro");
+    expect(text).toContain("2000 characters maximum");
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("an empty opening brief blocks submission without reaching intake", async () => {
+  const seen: import("../workbench-state").WorkbenchIntakeInput[] = [];
+  const mounted = await mountIntakeView(async (input) => {
+    seen.push(input);
+    return { ok: true, projectId: "project-blocked" };
+  });
+  try {
+    const set = (label: string, value: string) => {
+      (intakeField(mounted.container, mounted.dom, label) as unknown as HTMLInputElement).value = value;
+    };
+    set("Project name", "Harbor coffee opening");
+    set("City or region", "San Francisco, USA");
+    await submitMountedIntake(mounted.container, mounted.dom);
+    expect(seen).toHaveLength(0);
+    expect(mounted.container.textContent).toContain("opening brief");
+    expect((intakeField(mounted.container, mounted.dom, "Project name") as unknown as HTMLInputElement).value).toBe("Harbor coffee opening");
+
+    set("Opening brief", "   ");
+    await submitMountedIntake(mounted.container, mounted.dom);
+    expect(seen).toHaveLength(0);
+    expect(mounted.container.textContent).toContain("opening brief");
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("a short non-whitespace opening brief is accepted and preserved exactly", async () => {
+  const seen: import("../workbench-state").WorkbenchIntakeInput[] = [];
+  const mounted = await mountIntakeView(async (input) => {
+    seen.push(input);
+    return { ok: true, projectId: "project-short-brief" };
+  });
+  try {
+    const set = (label: string, value: string) => {
+      (intakeField(mounted.container, mounted.dom, label) as unknown as HTMLInputElement).value = value;
+    };
+    set("Project name", "Harbor coffee opening");
+    set("City or region", "San Francisco, USA");
+    set("Opening brief", "  Café?  ");
+    await submitMountedIntake(mounted.container, mounted.dom);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({ mode: "opening", detailSummary: "Café?" });
+    expect(mounted.container.textContent).toContain("Workspace created. Loading the persisted project.");
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("exact opening detail values and a USD ceiling reach intake once", async () => {
+  const seen: import("../workbench-state").WorkbenchIntakeInput[] = [];
+  const mounted = await mountIntakeView(async (input) => {
+    seen.push(input);
+    return { ok: true, projectId: "project-opening-brief" };
+  });
+  try {
+    const set = (label: string, value: string) => {
+      (intakeField(mounted.container, mounted.dom, label) as unknown as HTMLInputElement).value = value;
+    };
+    set("Project name", "Harbor coffee opening");
+    set("City or region", "San Francisco, USA");
+    set("Reporting currency", "USD");
+    set("Budget upper limit in reporting currency (optional)", "500000");
+    set("Opening title (optional)", "San Francisco coffee shop");
+    set("Opening category (optional)", "café opening");
+    set(
+      "Opening brief",
+      "  Open a coffee shop in San Francisco; rent a place and buy everything needed; budget USD 250,000-500,000  ",
+    );
+    await submitMountedIntake(mounted.container, mounted.dom);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toEqual({
+      mode: "opening",
+      projectName: "Harbor coffee opening",
+      workspaceKind: "private",
+      region: "San Francisco, USA",
+      currency: "USD",
+      budgetMinorUnits: 50000000,
+      detailTitle: "San Francisco coffee shop",
+      detailCategory: "café opening",
+      detailSummary: "Open a coffee shop in San Francisco; rent a place and buy everything needed; budget USD 250,000-500,000",
+      idempotencyKey: expect.any(String),
+    });
+    expect(mounted.container.textContent).toContain("Workspace created. Loading the persisted project.");
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("quote and equipment modes keep their own fields without the opening brief", async () => {
+  const seen: import("../workbench-state").WorkbenchIntakeInput[] = [];
+  const mounted = await mountIntakeView(async (input) => {
+    seen.push(input);
+    return { ok: true, projectId: "project-other-modes" };
+  });
+  try {
+    const set = (label: string, value: string) => {
+      (intakeField(mounted.container, mounted.dom, label) as unknown as HTMLInputElement).value = value;
+    };
+    await switchIntakeMode(mounted.container, mounted.dom, "quoteComparison");
+    expect(mounted.container.textContent).toContain("Requirement subject");
+    expect(hasIntakeLabel(mounted.container, "Opening brief")).toBe(false);
+    set("Project name", "Quote review");
+    set("Requirement subject", "Two-group espresso machine");
+    await submitMountedIntake(mounted.container, mounted.dom);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({ mode: "quoteComparison", detailTitle: "Two-group espresso machine" });
+    expect("detailSummary" in seen[0]!).toBe(false);
+
+    await switchIntakeMode(mounted.container, mounted.dom, "equipment");
+    expect(mounted.container.textContent).toContain("Equipment label");
+    expect(mounted.container.textContent).toContain("What needs attention?");
+    expect(hasIntakeLabel(mounted.container, "Opening brief")).toBe(false);
+    set("Project name", "Bar service");
+    set("Equipment label", "Atlas grinder");
+    set("What needs attention?", "Burrs need replacement.");
+    await submitMountedIntake(mounted.container, mounted.dom);
+    expect(seen).toHaveLength(2);
+    expect(seen[1]).toMatchObject({
+      mode: "equipment",
+      detailTitle: "Atlas grinder",
+      detailSummary: "Burrs need replacement.",
+    });
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+// -- Astra honest live-result UX: research semantics, gated review, recovery --
+
+function researchLeadProjection(): Record<string, unknown> {
+  const base = projection as unknown as Record<string, unknown>;
+  const template = (base.candidates as readonly Record<string, unknown>[])[0]!;
+  const evidence = (template.evidence as readonly Record<string, unknown>[])[0]!;
+  return {
+    ...base,
+    candidates: [{
+      id: "candidate-research-1",
+      requirementId: "requirement-w1-1",
+      productModel: "Two-group espresso machines",
+      variant: "research lead",
+      compatibility: "unknown",
+      conversationState: "researchCollected",
+      latestValidQuote: null,
+      evidence: [{
+        ...evidence,
+        id: "research-evidence-1",
+        field: "espresso machines",
+        sourceKind: "firecrawl.search",
+        sourceUrl: "https://www.reddit.com/r/restaurantowners/comments/1bcfts9",
+        verification: "unverified",
+        freshness: "fresh",
+        counterpartyRole: "researchSource",
+        executionMode: "live",
+      }],
+      provenance: { mode: "live", label: "Live provider result", ownerAuthoredTerms: false },
+    }],
+  };
+}
+
+test("generic research leads are never labeled suppliers, offers, or quotes", () => {
+  const snapshot = parseWorkbenchSnapshot(researchLeadProjection(), projection.project.id);
+  if (snapshot === null) throw new Error("Research-lead projection should parse");
+  expect(snapshot.offers).toHaveLength(1);
+  expect(hasCurrentReviewableQuote(snapshot.offers[0]!)).toBe(false);
+  const html = renderToStaticMarkup(createElement(WorkbenchView, { loadState: { state: "ready", snapshot } }));
+  expect(html).toContain("All 1 results");
+  expect(html).not.toContain("All 1 suppliers");
+  expect(html).not.toContain("suppliers");
+  expect(html).toContain("Unnamed research result");
+  expect(html).toContain("Source record · View source");
+  expect(html).not.toContain("Original quote document");
+  expect(html).not.toContain("Review quote from");
+  expect(html).toContain("Review unavailable");
+  expect(html).toContain("No reviewable result");
+});
+
+test("a generic web source stays a source record even when quote terms exist", () => {
+  const base = projection as unknown as Record<string, unknown>;
+  const template = (base.candidates as readonly Record<string, unknown>[])[0]!;
+  const evidence = (template.evidence as readonly Record<string, unknown>[])[0]!;
+  const snapshot = parseWorkbenchSnapshot({
+    ...base,
+    candidates: [{
+      ...template,
+      evidence: [{ ...evidence, sourceKind: "firecrawl.search", sourceUrl: "https://www.reddit.com/r/restaurantowners/comments/1bcfts9" }],
+    }],
+  }, projection.project.id);
+  if (snapshot === null) throw new Error("Firecrawl-evidence projection should parse");
+  const html = renderToStaticMarkup(createElement(WorkbenchView, { loadState: { state: "ready", snapshot } }));
+  expect(html).toContain("Source record · View source");
+  expect(html).not.toContain("Original quote document");
+});
+
+test("hasCurrentReviewableQuote gates on vendor, compatibility, currency, and basis", () => {
+  const control = parseWorkbenchSnapshot(twoOfferProjection(), projection.project.id);
+  if (control === null) throw new Error("Two-offer projection should parse");
+  expect(control.offers.length).toBeGreaterThan(0);
+  expect(control.offers.every((offer) => hasCurrentReviewableQuote(offer))).toBe(true);
+  const incomplete = parseWorkbenchSnapshot(projection, projection.project.id);
+  if (incomplete === null) throw new Error("W1 projection should parse");
+  expect(incomplete.offers.every((offer) => hasCurrentReviewableQuote(offer))).toBe(false);
+});
+
+test("recovery states show retained evidence, honest next steps, and no fake retry", async () => {
+  const snapshot = parseWorkbenchSnapshot(projection, projection.project.id);
+  if (snapshot === null) throw new Error("W1 projection should parse");
+  const mounted = await mountE8Tab({ state: "ready", snapshot }, () => ({ ok: false, message: "controlled test refusal" }));
+  try {
+    await mounted.clickTab("Recovery");
+    const text = mounted.container.textContent ?? "";
+    expect(text).toContain("Partial provider outcome");
+    expect(text).toContain("reservation is retained");
+    expect(text).toContain("Retained in this projection: 1 of 1 visible results carry recorded evidence.");
+    // The partial next step must not invent a scheduled retry: recovery
+    // waits for an explicit authorized action or a server-recorded retry,
+    // and the projection schedules none.
+    expect(text).toContain("Recovery waits for an explicit authorized action or a retry the server records in this projection — none is scheduled here.");
+    expect(text).not.toContain("re-drives");
+    expect(text).not.toContain("re-drive");
+    expect(text).not.toContain("No model continuation is running.");
+    expect(text).toContain("never resent automatically");
+    const buttons = Array.from(mounted.container.querySelectorAll("button")).map((button) => button.textContent ?? "");
+    expect(buttons.some((label) => label.includes("Retry bounded branch"))).toBe(false);
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+/**
+ * Astra F4 source-only research visibility: a collected source with URL and
+ * page text but no extracted price stays visible in the authorized
+ * workbench while vendor, candidate, and quote counts remain zero. It is
+ * never rendered as a supplier, product, quote, offer, or realized saving.
+ */
+const SOURCE_ONLY_URL = "https://supplier.example.test/espresso-atlas-2g";
+
+function sourceOnlyProjection() {
+  return {
+    ...projection,
+    candidates: [],
+    researchSources: [{
+      id: "evidence-source-1",
+      sourceKind: "firecrawl.scrape",
+      sourceUrl: SOURCE_ONLY_URL,
+      capturedAt: Date.UTC(2026, 8, 21),
+      completeness: "partial",
+      missingFacts: ["price"],
+      provenance: { mode: "fixture", label: "Controlled fixture", ownerAuthoredTerms: false },
+    }],
+    researchSourcesTruncated: false,
+    provenance: { mode: "fixture", label: "Controlled fixture", ownerAuthoredTerms: false },
+  };
+}
+
+function unpublishedPriceProjection() {
+  return {
+    ...sourceOnlyProjection(),
+    candidates: [{
+      id: "candidate-unpublished-1",
+      requirementId: "requirement-w1-1",
+      productModel: "Atlas 2G",
+      variant: "two-group · 220V",
+      compatibility: "unknown",
+      conversationState: "draft",
+      vendor: { id: "vendor-unpublished-1", name: "Harbor Equipment", regions: ["NL"], serviceCoverage: "Netherlands on-site" },
+      latestValidQuote: null,
+      comparisons: [],
+      evidence: [],
+      provenance: { mode: "fixture", label: "Controlled fixture", ownerAuthoredTerms: false },
+    }],
+  };
+}
+
+test("renders a source-only result with URL and missing price while supplier counts stay zero", async () => {
+  const snapshot = parseWorkbenchSnapshot(sourceOnlyProjection(), projection.project.id);
+  if (snapshot === null) throw new Error("Source-only projection should parse");
+  expect(snapshot.offers).toHaveLength(0);
+  expect(snapshot.researchSources).toHaveLength(1);
+  const mounted = await mountE8Tab({ state: "ready", snapshot }, () => ({ ok: false, message: "controlled test refusal" }));
+  try {
+    const projectText = mounted.container.textContent ?? "";
+    expect(projectText).toContain("All 0 results · 1 source");
+    expect(projectText).toContain("No results have arrived");
+    expect(projectText).toContain(SOURCE_ONLY_URL);
+    expect(projectText).toContain("1 research source without a supplier");
+    expect(projectText).toContain("Still missing: Price");
+    expect(projectText).toContain("no vendor, quote, or saving was created");
+    expect(projectText).not.toContain("Harbor Equipment");
+    expect(projectText).not.toContain("Review quote");
+    await mounted.clickTab("Results");
+    const resultsText = mounted.container.textContent ?? "";
+    expect(resultsText).toContain("No suppliers yet");
+    expect(resultsText).toContain(SOURCE_ONLY_URL);
+    expect(resultsText).toContain("1 research source without a supplier");
+    expect(resultsText).toContain("they are never shown as suppliers, quotes, or savings");
+    expect(resultsText).not.toContain("Review quote");
+  } finally {
+    await mounted.cleanup();
+  }
+});
+
+test("renders an unpublished-price supplier with no total, no ranking, and no saving claim", async () => {
+  const snapshot = parseWorkbenchSnapshot(unpublishedPriceProjection(), projection.project.id);
+  if (snapshot === null) throw new Error("Unpublished-price projection should parse");
+  expect(snapshot.offers).toHaveLength(1);
+  expect(snapshot.offers[0]?.vendor?.name).toBe("Harbor Equipment");
+  expect(snapshot.offers[0]?.quote).toBeNull();
+  expect(snapshot.offers[0]?.comparisons).toHaveLength(0);
+  expect(snapshot.researchSources).toHaveLength(1);
+  const mounted = await mountE8Tab({ state: "ready", snapshot }, () => ({ ok: false, message: "controlled test refusal" }));
+  try {
+    const projectText = mounted.container.textContent ?? "";
+    expect(projectText).toContain("Harbor Equipment");
+    expect(projectText).toContain("Quote terms have not arrived.");
+    expect(projectText).toContain("Review unavailable");
+    expect(projectText).not.toContain("lower than");
+    expect(projectText).not.toContain("is ranked");
+    await mounted.clickTab("Results");
+    const resultsText = mounted.container.textContent ?? "";
+    expect(resultsText).toContain("Harbor Equipment");
+    expect(resultsText).toContain("Exact total unavailable");
+    expect(resultsText).toContain(SOURCE_ONLY_URL);
+    expect(resultsText).not.toContain("Review quote");
+  } finally {
+    await mounted.cleanup();
   }
 });
