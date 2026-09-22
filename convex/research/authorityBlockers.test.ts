@@ -41,9 +41,11 @@ import * as grants from "../access/grants.js";
 import * as execJobs from "../execution/jobs.js";
 import * as reservations from "../execution/reservations.js";
 import * as operations from "../execution/operations.js";
+import * as attemptsFns from "../execution/attempts.js";
 import * as intake from "../domain/intake.js";
 import * as research from "./collection.js";
-import { canonicalJson } from "../shared/hashing.js";
+import { canonicalJson, payloadHash } from "../shared/hashing.js";
+import { reconciliationPricingBasis } from "../communication/contracts.js";
 import { RESEARCH_ALLOWANCE_ENV_VAR } from "../execution/allowance.js";
 import type { Id } from "../_generated/dataModel.js";
 
@@ -132,6 +134,11 @@ const createOperationRef = makeFunctionReference<
   MutationArgs<typeof operations.create>,
   MutationReturn<typeof operations.create>
 >("execution/operations:create");
+const reconcileAfterCrashRef = makeFunctionReference<
+  "mutation",
+  MutationArgs<typeof attemptsFns.reconcileAfterCrash>,
+  MutationReturn<typeof attemptsFns.reconcileAfterCrash>
+>("execution/attempts:reconcileAfterCrash");
 
 const OWNER_A = { tokenIdentifier: "blockers-owner-a" };
 const OWNER_B = { tokenIdentifier: "blockers-owner-b" };
@@ -1103,9 +1110,6 @@ describe("cancellation releases the global allowance (PR-33 blocker 3)", () => {
     // Attribution counterexample: org A holds a legacy reservation inserted
     // directly AFTER the global aggregate already belongs to org B's
     // attributed holds. Cancelling A must free A's org ledger only; the
-    // Attribution counterexample: org A holds a legacy reservation inserted
-    // directly AFTER the global aggregate already belongs to org B's
-    // attributed holds. Cancelling A must free A's org ledger only; the
     // deployment aggregate keeps B's exact 100,000. A repeat cancel is a
     // no-op on both ledgers, and cancelling B afterwards frees its own
     // exact amounts.
@@ -1278,5 +1282,231 @@ describe("cancellation releases the global allowance (PR-33 blocker 3)", () => {
       expect(cancelled.ok).toBe(true);
     }
     expect((await globalCommitted(t)).committed).toBe(0);
+  });
+});
+
+describe("reconciliation admit atomicity", () => {
+  test("post-global unbound admit denies with zero writes to budget, reservation, aggregate, and attempts", async () => {
+    // Atomicity counterexample: the global denial paths must run before
+    // every write. Two unbound reconciliation reservations (one
+    // absent-marker post-global row, one explicit-zero row) are both
+    // denied, and the denial commits no partial org-side debit: budget,
+    // reservations, aggregate, and attempts are all byte-identical after.
+    const t = init();
+    const fixture = await createOrgProjectRequirement(t, OWNER_A, "Admit atomicity");
+    const DRAFT = {
+      profile: "ownerRoleplay",
+      to: "owner@example.test",
+      cc: [],
+      bcc: [],
+      subject: "Controlled RFQ",
+      body: "Please confirm the controlled terms.",
+    };
+    const CANONICAL = canonicalJson(DRAFT);
+    const READ_BASIS = reconciliationPricingBasis(7);
+    const now = Date.now();
+    const grantId = await t.run(async (ctx) =>
+      ctx.db.insert("grants", {
+        organizationId: fixture.organizationId,
+        projectId: fixture.projectId,
+        operations: ["communication.send"],
+        communicationProfile: "ownerRoleplay",
+        recipientConfigVersion: 1,
+        inputVersions: { brief: "atomic-v1" },
+        canonicalPayload: CANONICAL,
+        payloadHash: payloadHash(DRAFT),
+        costCeilingMicroUsd: 1000,
+        roundLimit: 8,
+        expiresAt: now + 60 * 60 * 1000,
+        revocationVersion: 1,
+        status: "active",
+        createdAt: now,
+      }),
+    );
+    const jobId = await t.run(async (ctx) =>
+      ctx.db.insert("jobs", {
+        organizationId: fixture.organizationId,
+        projectId: fixture.projectId,
+        grantId,
+        grantVersion: 1,
+        kind: "communication",
+        state: "running",
+        inputVersions: { brief: "atomic-v1" },
+        createdAt: now,
+        updatedAt: now,
+      }),
+    );
+    const ids = await t.run(async (ctx) => {
+      const budgetId = await ctx.db.insert("providerBudgets", {
+        organizationId: fixture.organizationId,
+        ceilingMicroUsd: 100000,
+        reservedMicroUsd: 28,
+        spentMicroUsd: 0,
+        unresolvedMicroUsd: 0,
+        pricingBasis: "controlled-atomic-org",
+        updatedAt: now,
+      });
+      const globalId = await ctx.db.insert("deploymentAllowances", {
+        key: "firecrawl-shared-global-v1",
+        ceilingMicroUsd: 100000,
+        reservedMicroUsd: 0,
+        spentMicroUsd: 90,
+        unresolvedMicroUsd: 0,
+        pricingBasis: "controlled-atomic-global",
+        updatedAt: now,
+      });
+      return { budgetId, globalId };
+    });
+    // Deterministic post-global ordering for the absent-marker row: wait
+    // past the singleton's _creationTime before inserting reservations, so
+    // the age rule provably classifies them as unbound (never seeded).
+    const globalCreatedAt = await t.run(async (ctx) => {
+      const row = await ctx.db.get(ids.globalId);
+      if (row === null) throw new Error("global row missing");
+      return row._creationTime;
+    });
+    {
+      const deadline = Date.now() + 5000;
+      while (Date.now() <= globalCreatedAt) {
+        if (Date.now() > deadline) throw new Error("test clock did not advance past global creation");
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+    }
+    async function scaffoldUnboundOperation(
+      suffix: string,
+      token: string,
+      withExplicitZeroMarker: boolean,
+    ) {
+      return await t.run(async (ctx) => {
+        const reservationId = await ctx.db.insert("reservations", {
+          organizationId: fixture.organizationId,
+          jobId,
+          budgetId: ids.budgetId,
+          ceilingMicroUsd: 100000,
+          reservedMicroUsd: 14,
+          spentMicroUsd: 0,
+          unresolvedMicroUsd: 0,
+          pricingBasis: READ_BASIS,
+          state: "open",
+          updatedAt: Date.now(),
+          ...(withExplicitZeroMarker ? { globalReservedMicroUsd: 0 } : {}),
+        });
+        const operationId = await ctx.db.insert("operations", {
+          organizationId: fixture.organizationId,
+          projectId: fixture.projectId,
+          jobId,
+          kind: "communication.send",
+          requestId: `atomic-admit-${suffix}`,
+          requestKey: `atomic-admit-key-${suffix}-${Date.now()}`,
+          normalizedPayload: CANONICAL,
+          normalizedPayloadHash: payloadHash(DRAFT),
+          inputVersions: { brief: "atomic-v1" },
+          grantId,
+          grantVersion: 1,
+          state: "dispatching",
+          attemptToken: token,
+          reservationId,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        });
+        await ctx.db.insert("outboundSnapshots", {
+          organizationId: fixture.organizationId,
+          projectId: fixture.projectId,
+          operationId,
+          grantId,
+          to: "owner@example.test",
+          cc: [],
+          bcc: [],
+          communicationProfile: "ownerRoleplay",
+          recipientConfigVersion: 1,
+          payloadHash: payloadHash(DRAFT),
+          bodyHash: payloadHash(DRAFT.body),
+          counterpartyRole: "ownerStandIn",
+          createdAt: Date.now(),
+        });
+        return { reservationId, operationId };
+      });
+    }
+    const first = await scaffoldUnboundOperation("one", "controlled-atomic-token-1", false);
+    const second = await scaffoldUnboundOperation("two", "controlled-atomic-token-2", true);
+
+    async function observableState() {
+      return await t.run(async (ctx) => ({
+        budget: await ctx.db.get(ids.budgetId).then((b) =>
+          b === null
+            ? null
+            : {
+              reserved: b.reservedMicroUsd,
+              spent: b.spentMicroUsd,
+              unresolved: b.unresolvedMicroUsd,
+            },
+        ),
+        firstReservation: await ctx.db.get(first.reservationId).then((r) =>
+          r === null
+            ? null
+            : {
+              reserved: r.reservedMicroUsd,
+              spent: r.spentMicroUsd,
+              unresolved: r.unresolvedMicroUsd,
+              marker: r.globalReservedMicroUsd ?? null,
+              state: r.state,
+            },
+        ),
+        secondReservation: await ctx.db.get(second.reservationId).then((r) =>
+          r === null
+            ? null
+            : {
+              reserved: r.reservedMicroUsd,
+              spent: r.spentMicroUsd,
+              unresolved: r.unresolvedMicroUsd,
+              marker: r.globalReservedMicroUsd ?? null,
+              state: r.state,
+            },
+        ),
+        global: await ctx.db
+          .query("deploymentAllowances")
+          .withIndex("by_key", (q) => q.eq("key", "firecrawl-shared-global-v1"))
+          .unique()
+          .then((g) =>
+            g === null
+              ? null
+              : { reserved: g.reservedMicroUsd, spent: g.spentMicroUsd, unresolved: g.unresolvedMicroUsd },
+          ),
+        attempts: (await ctx.db.query("attempts").take(16)).length,
+      }));
+    }
+
+    const before = await observableState();
+    // Absent-marker post-global row: the tick above guarantees strict
+    // physical ordering, so the denial is deterministically the
+    // attribution gate (not coverage), with zero writes.
+    const deniedFirst = await t.mutation(reconcileAfterCrashRef, {
+      operationId: first.operationId,
+      mode: "admitRead",
+      attemptToken: "controlled-atomic-token-1",
+      readNumber: 1,
+    });
+    expect(deniedFirst.ok).toBe(false);
+    if (deniedFirst.ok) throw new Error("unbound admit must deny");
+    expect(deniedFirst).toMatchObject({
+      code: "allowance-exhausted",
+      message: "deployment reconciliation budget is not attributed to this reservation",
+    });
+    expect(await observableState()).toEqual(before);
+    // Explicit-zero row: denied deterministically at the attribution gate,
+    // with zero writes.
+    const deniedSecond = await t.mutation(reconcileAfterCrashRef, {
+      operationId: second.operationId,
+      mode: "admitRead",
+      attemptToken: "controlled-atomic-token-2",
+      readNumber: 1,
+    });
+    expect(deniedSecond.ok).toBe(false);
+    if (deniedSecond.ok) throw new Error("unbound admit must deny");
+    expect(deniedSecond).toMatchObject({
+      code: "allowance-exhausted",
+      message: "deployment reconciliation budget is not attributed to this reservation",
+    });
+    expect(await observableState()).toEqual(before);
   });
 });
