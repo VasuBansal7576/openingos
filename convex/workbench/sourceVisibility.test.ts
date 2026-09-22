@@ -259,6 +259,22 @@ describe("source-only research visibility", () => {
     expect(stored.candidates).toHaveLength(0);
     expect(stored.quotes).toHaveLength(0);
 
+    // Other evidence kinds belong to their own product workflows. An
+    // unreferenced owner-email snapshot must not be relabeled as a web
+    // research source merely because it is not attached to a candidate.
+    await t.run(async (ctx) => {
+      await ctx.db.insert("evidence", {
+        organizationId: organization.organizationId,
+        projectId: project.projectId,
+        sourceKind: "owner-email",
+        capturedAt: Date.now() + 1,
+        contentHash: "controlled-owner-email-not-research",
+        completeness: "complete",
+        counterpartyRole: "ownerStandIn",
+        executionMode: "fixture",
+      });
+    });
+
     // A suitable supplier with an unpublished price: vendor plus
     // candidate, but deliberately no quote row.
     const vendor = await asOwner.mutation(recordVendorRef, {
@@ -289,6 +305,7 @@ describe("source-only research visibility", () => {
     // provenance, and the explicit missing price fact.
     expect(view.researchSources).toHaveLength(1);
     const source = view.researchSources[0];
+    expect(source?.sourceKind.startsWith("firecrawl.")).toBe(true);
     expect(source?.id).toBe(stored.evidence[0]?._id);
     expect(source?.sourceUrl).toBe(SOURCE_URL);
     expect(source?.sourceKind).toBe(stored.evidence[0]?.sourceKind);

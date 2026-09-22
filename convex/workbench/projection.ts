@@ -929,6 +929,7 @@ async function readResearchSources(
     (row) =>
       row.organizationId === organizationId &&
       row.projectId === projectId &&
+      row.sourceKind.startsWith("firecrawl.") &&
       !referencedEvidenceIds.has(row._id),
   );
   const claimPage = await ctx.db
