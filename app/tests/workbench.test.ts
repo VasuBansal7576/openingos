@@ -3060,7 +3060,13 @@ test("recovery states show retained evidence, honest next steps, and no fake ret
     expect(text).toContain("Partial provider outcome");
     expect(text).toContain("reservation is retained");
     expect(text).toContain("Retained in this projection: 1 of 1 visible results carry recorded evidence.");
-    expect(text).toContain("No model continuation is running.");
+    // The partial next step must not invent a scheduled retry: recovery
+    // waits for an explicit authorized action or a server-recorded retry,
+    // and the projection schedules none.
+    expect(text).toContain("Recovery waits for an explicit authorized action or a retry the server records in this projection — none is scheduled here.");
+    expect(text).not.toContain("re-drives");
+    expect(text).not.toContain("re-drive");
+    expect(text).not.toContain("No model continuation is running.");
     expect(text).toContain("never resent automatically");
     const buttons = Array.from(mounted.container.querySelectorAll("button")).map((button) => button.textContent ?? "");
     expect(buttons.some((label) => label.includes("Retry bounded branch"))).toBe(false);

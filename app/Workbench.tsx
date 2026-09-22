@@ -758,7 +758,7 @@ function jobStateSummary(job: WorkbenchSnapshot["jobs"][number]): string {
 
 /** Honest next step for recovery-relevant jobs; null keeps other rows quiet. */
 function jobNextStep(job: WorkbenchSnapshot["jobs"][number]): string | null {
-  if (job.state === "partial") return "Next step: keep the completed evidence below while the server re-drives only the failed branch. No model continuation is running.";
+  if (job.state === "partial") return "Next step: completed evidence stays retained below. Recovery waits for an explicit authorized action or a retry the server records in this projection — none is scheduled here.";
   if (job.delivery === "unknown" || job.state === "failed") return "Next step: wait for server reconciliation or an authorized review. An ambiguous external action is never resent automatically.";
   if (job.delivery === "paused") return "Next step: raise the provider allowance or resume from the server. Completed evidence remains visible meanwhile.";
   return null;
