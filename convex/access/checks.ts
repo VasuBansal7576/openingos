@@ -128,7 +128,7 @@ async function readAuthorityForRole(
 ): Promise<readonly AuthorityObservation[]> {
   const projected = await ctx.db
     .query("membershipAuthorities")
-    .withIndex("by_organization_and_identity_and_scope_and_role_and_authority_until", (q) =>
+    .withIndex("by_organization_identity_scope_role_authority_until", (q) =>
       q
         .eq("organizationId", organizationId)
         .eq("identity", identity)
@@ -143,7 +143,7 @@ async function readAuthorityForRole(
   // `now` is retained only to preserve expired-denial semantics.
   const legacyPermanent = await ctx.db
     .query("memberships")
-    .withIndex("by_organization_and_identity_and_project_and_status_and_role_and_expires_at", (q) =>
+    .withIndex("by_organization_identity_project_status_role_expires_at", (q) =>
       q
         .eq("organizationId", organizationId)
         .eq("identity", identity)
@@ -156,7 +156,7 @@ async function readAuthorityForRole(
     .first();
   const legacyCurrentTemporary = await ctx.db
     .query("memberships")
-    .withIndex("by_organization_and_identity_and_project_and_status_and_role_and_expires_at", (q) =>
+    .withIndex("by_organization_identity_project_status_role_expires_at", (q) =>
       q
         .eq("organizationId", organizationId)
         .eq("identity", identity)
@@ -169,7 +169,7 @@ async function readAuthorityForRole(
     .first();
   const legacyExpired = await ctx.db
     .query("memberships")
-    .withIndex("by_organization_and_identity_and_project_and_status_and_role_and_expires_at", (q) =>
+    .withIndex("by_organization_identity_project_status_role_expires_at", (q) =>
       q
         .eq("organizationId", organizationId)
         .eq("identity", identity)

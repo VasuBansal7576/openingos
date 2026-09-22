@@ -707,7 +707,7 @@ export default defineSchema({
     // The deadline suffix lets migration reads select permanent rows and the
     // strongest currently valid temporary row without collecting history.
     .index(
-      "by_organization_and_identity_and_project_and_status_and_role_and_expires_at",
+      "by_organization_identity_project_status_role_expires_at",
       ["organizationId", "identity", "projectId", "status", "role", "expiresAt"],
     ),
 
@@ -744,7 +744,7 @@ export default defineSchema({
       ["identity", "authorityUntil", "organizationId", "projectId"],
     )
     .index(
-      "by_organization_and_identity_and_scope_and_role_and_authority_until",
+      "by_organization_identity_scope_role_authority_until",
       ["organizationId", "identity", "scopeKey", "role", "authorityUntil"],
     )
     .index("by_membership", ["membershipId"]),
@@ -981,7 +981,7 @@ export default defineSchema({
     // The identifiers are optional for migration compatibility, so legacy
     // rows without them are intentionally absent from this exact lookup.
     .index(
-      "by_provider_environment_and_provider_message_and_thread_and_inbox",
+      "by_provider_environment_message_thread_inbox",
       ["provider", "environment", "providerMessageId", "providerThreadId", "providerInboxId"],
     )
     // Replies use the outbound thread and inbox but have a different message
