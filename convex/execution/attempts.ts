@@ -23,7 +23,7 @@ import {
   MAX_OPERATIONS_PER_JOB,
 } from "../shared/scope.js";
 import { checkProjectAccess, denialValidator, identityOf } from "../access/checks.js";
-import { getGlobalAllowance, settleGlobalReservation } from "./allowance.js";
+import { getGlobalAllowance, settleGlobalReservation, attributedGlobalHold } from "./allowance.js";
 import {
   MAX_RECONCILIATION_READS,
   RECONCILIATION_RETRY_OWNER,
@@ -69,9 +69,9 @@ async function settleReservation(
       });
     }
     // Mirror only this reservation's attributed global hold in the same
-    // mutation (zero for legacy unattributed rows): never another tenant's
+    // mutation (see `attributedGlobalHold`): never another tenant's
     // exposure. The strict primitive fails closed on genuine drift.
-    await settleGlobalReservation(ctx, mode, reservation.globalReservedMicroUsd ?? 0);
+    await settleGlobalReservation(ctx, mode, reservation);
   }
   if (mode === "spend") {
     await ctx.db.patch(reservation._id, {
@@ -409,14 +409,14 @@ async function admitReconciliationRead(
   });
   // Mirror the read cost to the deployment aggregate when present. Legacy
   // fixtures without a global row keep org-only accounting. The global
-  // reserved leg moves only this reservation's attributed hold: a
-  // reservation that never funded the aggregate (attribution zero) cannot
-  // admit a read against another tenant's hold, and fails closed here.
-  // Attribution decrements in lockstep with the reservation so a later
-  // settlement moves exactly the remainder. The unresolved leg stays an
-  // aggregate-level coverage check that fails closed on insufficiency.
+  // reserved leg moves only this reservation's attributed hold (see
+  // `attributedGlobalHold`): a reservation that never funded the aggregate
+  // cannot admit a read against another tenant's hold, and fails closed
+  // here. Attribution decrements in lockstep with the reservation so a
+  // later settlement moves exactly the remainder. The unresolved leg stays
+  // an aggregate-level coverage check that fails closed on insufficiency.
   const global = await getGlobalAllowance(ctx);
-  const globalAttributed = reservation.globalReservedMicroUsd ?? 0;
+  const globalAttributed = attributedGlobalHold(reservation, global);
   if (global !== null) {
     if (globalAttributed < fromReserved) {
       return { ok: false as const, code: "allowance-exhausted", message: "deployment reconciliation budget is not attributed to this reservation" };

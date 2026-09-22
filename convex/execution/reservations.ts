@@ -461,12 +461,12 @@ export const settleServerRead = f1InternalMutation({
       unresolvedMicroUsd: budget.unresolvedMicroUsd + retain,
       updatedAt: now,
     });
-    // Global mirror moves only this reservation's attributed hold (zero
-    // for legacy unattributed rows): never another tenant's exposure.
+    // Global mirror moves only this reservation's attributed hold (see
+    // `attributedGlobalHold`): never another tenant's exposure.
     await settleGlobalReservation(
       ctx,
       args.mode === "release" ? "release" : "retainUnknown",
-      reservation.globalReservedMicroUsd ?? 0,
+      reservation,
     );
     await ctx.db.patch(reservation._id, {
       reservedMicroUsd: 0,
