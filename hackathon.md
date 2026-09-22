@@ -688,3 +688,25 @@ The combined local line through `2e80cc8`, together with source filter checkpoin
 Research-source projection now exposes only unpromoted Firecrawl evidence and does not relabel owner-email evidence as web research.
 No provider was called, no email was sent, no secret was accessed and nothing was deployed in this repair wave.
 The complete combined revision still requires a push, exact-head GitHub CI and a fresh separate Astra verdict before merge.
+
+### 2026-09-22 - reviewed repair line merged; production deployment live on convex.site
+
+Two SWE-2 High Orca workers ran in bypass mode under run `run_a7c586405dca`: an independent reviewer of `de50201` and a static-hosting implementer.
+The reviewer returned ACCEPT on `de50201` after running the full matrix itself (1462 tests, 0 failures, both strict typechecks, production build) and verifying all seven prior blockers plus the five later findings repaired in code: global allowance singleton attribution, unrelated-brief scope gate, stale-requirement binding, deterministic punctuation canonicalization, honest source/supplier labeling, honest replay messages and CI registration.
+Its one non-blocking observation: `reconcileActualCost` in `convex/execution/reconciliation.ts` does not mirror the aggregate; it is internal-only with zero production callers and drifts in the safe direction.
+The hosting worker added `@convex-dev/static-hosting@0.2.1`, `app.use(staticHosting)` with no `httpPrefix`, `registerStaticRoutes` as a GET `/` catch-all after the auth and `/agentmail/webhook` routes, and a `deploy` script; PR #37 head `75fbdfb` passed all exact-head checks.
+The same reviewer then ACCEPTed the hosting diff after verifying route precedence against the installed Convex router.
+
+PR #37 merged into `astra-repair-integration` (`360aa41`), PR #33 merged into `VasuBansal7576/r1-c1-u1-integration` (`fc0e4a2`), and PR #38 merged the integration line into `main` (`e344106`), with every exact-head check green at each step.
+
+All thirteen dev environment variables were copied to the production deployment `enchanted-caiman-248`; `SITE_URL` was set to `https://enchanted-caiman-248.convex.site` instead of the dev localhost value.
+`npx convex deploy` pushed the merged `main` code to prod with all components installed, and `npx @convex-dev/static-hosting upload --build --prod` built the frontend against `https://enchanted-caiman-248.convex.cloud` and published it.
+The app is publicly reachable at `https://enchanted-caiman-248.convex.site` (HTTP 200, real HTML shell).
+The dev deployment `polite-minnow-494` was then synced to the same merged code with `npx convex dev --once`.
+
+A Playwright user-journey pass ran against the public URL: the landing rendered with the honest empty state, keyboard tab order was exercised, a real "Plan an opening" intake created an Amsterdam Specialty Coffee Bar workspace (Amsterdam, Netherlands; EUR; need-by 2025-12-01; budget ceiling EUR 180,000) persisted on prod, all five workbench tabs rendered from server projection, and "Start bounded research" produced ten live Firecrawl source records correctly labeled as research sources rather than suppliers or quotes.
+The assistant dialog and a 390 x 844 narrow pass completed.
+Screenshots and a screen recording are preserved locally as evidence.
+This is the Netherlands/EUR scenario, matching the PRD section 52 target.
+
+Honestly open items: no `OPENAI_API_KEY` exists, so OpenAI extraction and the complete Jev/OpenAI chain remain unexercised; no AgentMail send/reply round trip has been observed on any deployment; no verified supplier quote, order, realized saving or commercial outcome exists; research results remain inspectable source records with unknown vendor, price and fit fields.

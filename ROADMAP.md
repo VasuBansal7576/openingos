@@ -174,7 +174,12 @@ This file supplies order, not duplicate contracts or a running automation.
 - [x] Record that the Firecrawl app allowance is hard bounded at 100000 micro-USD with no paid overage authorized.
 - [x] Inspect the populated state, empty state, keyboard tab order and partial Recovery state in a dev browser at desktop and 390x844 widths; the partial Recovery experience is incomplete.
 - [x] Deliver mergeable, exact-head-green repair PRs #30 at `6024328`, #31 at `c1fdf54` and #34 at `e8ceb0b`; coordinator review additionally proves legacy global-hold attribution and reconciliation-denial atomicity before accepting the backend branch.
-- [ ] Push the complete combined repair line, pass its exact-head GitHub checks and obtain a separate Astra ACCEPT; the current independent verdict remains `CHANGES REQUIRED` on earlier commit `35ad542` after five further findings were routed and repaired.
+- [x] Push the complete combined repair line, pass its exact-head GitHub checks and obtain an independent SWE-2 High ACCEPT (user-directed reviewer model). The reviewer ran the full matrix itself (1462 tests, 0 failures, both strict typechecks, production build) and verified all seven prior blockers plus the five later findings repaired; one non-blocking latent note on `reconcileActualCost` aggregate mirroring (zero production callers, safe direction).
+- [x] Add Convex static hosting via `@convex-dev/static-hosting@0.2.1` with app-owned root routing (PR #37 head `75fbdfb`, SWE-2 High worker, independent SWE-2 High review verified exact-route precedence over the SPA catch-all).
+- [x] Merge the reviewed line to `main` at `e344106` through PRs #37, #33 and #38, all exact-head checks green.
+- [x] Deploy to production Convex deployment `enchanted-caiman-248`, copy all provider env vars to prod with `SITE_URL=https://enchanted-caiman-248.convex.site`, and publish the frontend so the app is public at `https://enchanted-caiman-248.convex.site`.
+- [x] Run a Playwright user journey on the public URL: landing, keyboard tab order, real Amsterdam/EUR intake, all five workbench tabs, bounded live Firecrawl research returning ten honestly-labeled source records, assistant dialog and a 390 x 844 pass, with screenshots and video preserved locally.
+- [ ] Live OpenAI/Jev extraction remains blocked without an application `OPENAI_API_KEY`; no AgentMail send/reply round trip, verified supplier quote, order or realized saving has been observed.
 
 The completed money and Jev proof wave contains controlled proofs only, reviewed at `595d30c` with no actionable findings remaining.
 Luna owned `proofs/money/**`; Muse Spark owned `proofs/jev/**`; Astra owned shared tooling, integration and progress files.

@@ -10,21 +10,15 @@ Combined code checkpoint `e40da16` integrates authenticated isolated intake and 
 Its complete controlled local matrix, strict typechecks, production build and desktop/mobile browser QA pass.
 The six findings from the earlier independent Astra review were repaired in the prior checkpoint.
 The later seven-finding review described below remains the current integration gate.
-PR #27 (`728fc19`), PR #28 (`46a7450`) and PR #29 (`8f2deb31263a5bb715f1f248bcee2e3a1c3a6ed5`) merged into integration at `44e73618beb562a198c1eeafcfd045ff42ea928c` with exact-head CI green.
-Dev Convex deployment `polite-minnow-494` was updated with `npx convex dev --once` and reported Convex functions ready; this is dev, not production or a public origin.
-A fresh anonymous real app intake on dev persisted the exact San Francisco coffee shop owner scenario, and one bounded live Firecrawl request reached `observedSuccess` with a partial job showing 10 live provider results with unknown quote totals, unknown fit/service coverage, no realized saving, no order and no email.
-These are live research pages, not verified suppliers, leases, quotes, purchases or commercial outcomes.
-The AgentMail dev webhook covers only `message.received` with an inbox scope, and no email send/reply round trip was observed.
-Jev credential and model access was verified earlier, but this SF run did not exercise the complete Jev/OpenAI chain.
-No `OPENAI_API_KEY` is available, so S-21/D-12 and dependent live model work remain blocked.
+The Astra repair line and Convex static hosting are merged to `main` at `e344106` (PRs #37, #33 and #38, all exact-head checks green, independent SWE-2 High ACCEPT on both the repair commits and the hosting diff).
+The application is deployed to production Convex deployment `enchanted-caiman-248` and publicly served at `https://enchanted-caiman-248.convex.site` via `@convex-dev/static-hosting`.
+All provider environment variables are configured on prod; `SITE_URL` points at the public origin.
+A Playwright user journey against the public URL created a real Amsterdam/EUR workspace through intake and ran bounded live Firecrawl research, which returned ten live source records labeled honestly as sources (no supplier, quote, saving or order was created).
+The dev deployment `polite-minnow-494` runs the same merged code.
+No `OPENAI_API_KEY` is available, so OpenAI extraction and the complete Jev/OpenAI chain remain unexercised.
+No AgentMail send/reply round trip has been observed, and no verified supplier quote or commercial outcome exists.
 The Firecrawl app allowance is hard bounded at 100000 micro-USD with no paid overage authorized.
-A separate GPT-6 Astra review of `44e7361` returned `CHANGES REQUIRED` with seven blockers.
-OpenCode repair PR #30 head `6024328`, PR #31 head `c1fdf54` and source-visibility PR #34 head `e8ceb0b` are delivered, mergeable and green on every agreed application and repository check.
-A later independent review of combined checkpoint `35ad542` found five remaining defects in scope admission, aggregate-hold attribution, punctuation replay, source-only visibility and recovery copy.
-Those findings are repaired on the current combined local line through `2e80cc8` and source filter checkpoint `11ae05c`, where the complete local suite, both strict TypeScript checks and production build pass.
-They are not accepted until that complete combined revision is pushed, passes exact-head CI and receives a fresh Astra review.
 Greptile review is unavailable because the 50-credit trial is exhausted, and Devin review was skipped because its trial expired.
-ChatGPT Sites public origin and production Convex deployment remain incomplete, so published-origin outcomes remain unverified.
 
 Open [the standalone purchasing workbench](design/purchasing-workbench.html) in a browser to inspect the selected flow.
 Its images, fonts and fixture runtime are embedded.
@@ -35,7 +29,7 @@ The prototype is a design reference, not a live product demo.
 
 The evaluator starts a café project, researches vendors, compares evidence-backed offers, approves an RFQ and follows a reply through negotiation and selection.
 Convex owns persistent records, access checks, jobs and reactive updates.
-ChatGPT Sites hosts the frontend.
+Convex static hosting serves the frontend on the production `convex.site` origin.
 Firecrawl collects public vendor information, AgentMail transports correspondence, Jev makes bounded typed decisions, and OpenAI extracts and drafts content.
 
 All hackathon outreach goes only to the owner's privately configured mailbox.
@@ -88,8 +82,8 @@ The integration documents name required settings without storing their values.
 Coding-agent subscriptions and connected plugins do not automatically provide the deployed app's API access.
 
 Orca coordinates local workers; it is not the customer application's runtime.
-Standalone OpenCode and Codex CLI workers cannot claim publication to `chatgpt.site` without the ChatGPT Sites integration.
-The coordinator hands the tested source revision back to ChatGPT for authorized publication and public-access verification.
+The frontend publishes to `https://enchanted-caiman-248.convex.site` with `bun run deploy` after `npx convex deploy` pushes functions to prod; both steps run from a checkout whose `.env.local` selects the project.
+`SITE_URL` on prod is `https://enchanted-caiman-248.convex.site`.
 
 ## Hackathon submission
 
