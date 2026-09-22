@@ -9,6 +9,8 @@
  * schedules, or provider effects. Zero-effect refusal is covered by the
  * authority-blocker suite; this file pins the accept/refuse boundary,
  * including the three named adversarial briefs and close variants.
+ * Unrelated primary-intent wrappers refuse even when they borrow
+ * source/equipment tokens.
  */
 
 import { describe, expect, test } from "vitest";
@@ -82,6 +84,19 @@ describe("narrow semantic scope contract", () => {
       `Primary region: San Francisco, CA\nOpening brief: Explain quantum entanglement`,
     ]) {
       expect(verdict(variant)).toBe("unrelatedRefused");
+    }
+  });
+
+  test("refuses unrelated primary-intent wrappers even with source/equipment tokens", () => {
+    for (const wrapper of [
+      "Explain how to source coffee equipment analogies",
+      "Explain how to source coffee equipment analogies.",
+      "Book a vacation and source espresso equipment in Hawaii",
+      "Book a vacation and source espresso equipment in Hawaii.",
+      "book a vacation and source espresso equipment in hawaii",
+      `Primary region: Hawaii\nOpening brief: Book a vacation and source espresso equipment in Hawaii`,
+    ]) {
+      expect(verdict(wrapper)).toBe("unrelatedRefused");
     }
   });
 
